@@ -10,6 +10,7 @@ import { WebDirectoryPicker } from "./components/WebDirectoryPicker";
 import { Button } from "./components/ui/button";
 import { useSwarm } from "./store";
 import { useUpdates } from "./lib/updates";
+import { encodeProjectDir } from "./lib/utils";
 import {
   ensureNotifyPermission,
   fetchUsageForSession,
@@ -41,9 +42,17 @@ export default function App() {
     return () => updates.stopBackgroundPolling();
   }, [hydrate]);
 
-  // usage refresh — each agent shows ONLY its own session's usage
+  // usage refresh — each agent shows ONLY its own session's usage.
+  // Watcher events are filtered to the project dirs of open agents, all
+  // triggers are coalesced (min 2s apart), and nothing runs while the
+  // window is hidden (one refresh fires on becoming visible again).
   useEffect(() => {
     let alive = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let lastRun = 0;
+    let pendingWhileHidden = false;
+    const MIN_GAP_MS = 2000;
+
     const refresh = async () => {
       const { agents, order } = useSwarm.getState();
       await Promise.all(
@@ -62,13 +71,52 @@ export default function App() {
       );
     };
 
+    const schedule = () => {
+      if (!alive) return;
+      if (document.hidden) {
+        pendingWhileHidden = true;
+        return;
+      }
+      if (timer) return; // a run is already scheduled — coalesce
+      const wait = Math.max(0, lastRun + MIN_GAP_MS - Date.now());
+      timer = setTimeout(() => {
+        timer = null;
+        lastRun = Date.now();
+        void refresh();
+      }, wait);
+    };
+
+    lastRun = Date.now();
     void refresh();
-    const interval = setInterval(refresh, 4000);
-    const unlistenP = onUsageChanged(refresh);
+    const interval = setInterval(schedule, 4000);
+    const unlistenP = onUsageChanged((changedDirs) => {
+      // ignore changes from sessions we're not displaying (other Claude
+      // instances writing to ~/.claude/projects); empty = unknown → refresh
+      if (changedDirs && changedDirs.length > 0) {
+        const { agents, order } = useSwarm.getState();
+        const watched = new Set(
+          order
+            .map((id) => agents[id]?.cwd || homeRef.current)
+            .filter(Boolean)
+            .map(encodeProjectDir),
+        );
+        if (!changedDirs.some((d) => watched.has(d))) return;
+      }
+      schedule();
+    });
+    const onVisibility = () => {
+      if (!document.hidden && pendingWhileHidden) {
+        pendingWhileHidden = false;
+        schedule();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
       alive = false;
+      if (timer) clearTimeout(timer);
       clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibility);
       void unlistenP.then((u) => u());
     };
   }, [setUsage]);

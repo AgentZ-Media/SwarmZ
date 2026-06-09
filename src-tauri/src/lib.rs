@@ -75,13 +75,47 @@ fn start_usage_watcher(app: AppHandle) {
         {
             return;
         }
-        // keep the debouncer alive for the lifetime of this thread
+        // keep the debouncer alive for the lifetime of this thread.
+        // Emit the *project dir names* that changed so the frontend can skip
+        // refreshes for sessions it isn't displaying (an empty list means
+        // "unknown / everything", e.g. after a pricing refresh).
         for res in rx {
-            if res.is_ok() {
-                let _ = app.emit("usage://changed", ());
+            if let Ok(events) = res {
+                let mut dirs: Vec<String> = events
+                    .iter()
+                    .filter_map(|e| {
+                        e.path
+                            .strip_prefix(&dir)
+                            .ok()?
+                            .components()
+                            .next()
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    })
+                    .collect();
+                dirs.sort();
+                dirs.dedup();
+                if !dirs.is_empty() {
+                    let _ = app.emit("usage://changed", dirs);
+                }
             }
         }
         drop(debouncer);
+    });
+}
+
+/// Pull live model pricing once per run; retry while offline, refresh daily.
+fn start_pricing_refresher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let delay = if usage::refresh_pricing().await {
+                // empty list = "everything changed" (all costs were repriced)
+                let _ = app.emit("usage://changed", Vec::<String>::new());
+                std::time::Duration::from_secs(24 * 60 * 60)
+            } else {
+                std::time::Duration::from_secs(5 * 60)
+            };
+            tokio::time::sleep(delay).await;
+        }
     });
 }
 
@@ -99,6 +133,7 @@ pub fn run() {
         .manage(manager.clone())
         .setup(move |app| {
             start_usage_watcher(app.handle().clone());
+            start_pricing_refresher(app.handle().clone());
             Ok(())
         })
         .on_window_event(move |_window, event| {

@@ -11,7 +11,8 @@ SwarmZ — run, tile and monitor multiple Claude Code agents in parallel. One Re
 
 - `src/lib/transport.ts` picks the backend at runtime. Every backend capability is declared in `backend-types.ts` and must be implemented in **both** `backend-tauri.ts` and `backend-web.ts`.
 - `src/store.ts` holds all app state. Persisted: profiles + usage history (Tauri store `swarmz.json` / localStorage). In-memory only: agents, layout.
-- Usage is parsed from `~/.claude/projects/*.jsonl` by `src-tauri/src/usage.rs` (native) and `server/usage.mjs` (web) — keep the two implementations and their pricing tables in sync.
+- Usage is parsed from `~/.claude/projects/*.jsonl` by `src-tauri/src/usage.rs` (native) and `server/usage.mjs` (web) — keep the two implementations in sync. Parsing is **incremental**: a per-(file, since) offset cache only reads appended bytes; costs/by_model are recomputed from cached counters on every read (so pricing updates need no cache invalidation). Pricing is fetched live from the OpenRouter model catalog (daily refresh) with a hardcoded per-family fallback for offline; fallback tables in both files and in `README.md` must match.
+- Perf invariants: PTY output is coalesced (≤12 ms / 128 KiB) and addressed per agent (`pty://data/<id>`); the usage file-watcher emits the changed project-dir names and the frontend skips refreshes for dirs it doesn't display, throttles to ≥2 s, and pauses while the window is hidden.
 
 ## Releases & updates
 

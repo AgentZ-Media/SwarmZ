@@ -24,6 +24,7 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 - 🖥️ **Real terminals** — every agent is a PTY-backed login shell (`xterm.js` ↔ `node-pty` / `portable-pty`). `claude`, nvm, aliases and your environment resolve exactly like in iTerm or Terminal.
 - 🧱 **Tiling split-grid** — split any pane right (`⌘D`) or down (`⌘⇧D`), drag dividers to resize. Panes never remount when the grid is rearranged, so scrollback survives.
 - 📊 **Live usage** — model, tokens and **USD cost** per agent in real time, parsed from `~/.claude/projects/*.jsonl`.
+- 🍩 **Context gauge** — a donut in each pane header shows how full the agent's context window currently is (turns amber/red as it fills), with exact numbers on hover.
 - 💾 **All-time statistics** — every Claude session launched inside SwarmZ is persisted across restarts. The usage drawer toggles between **Session** (what's open right now) and **All time** (everything you've ever run here), with a per-model cost breakdown and session history.
 - 🔔 **Notifications** — when an agent rings the terminal bell (Claude waiting or done), the pane pulses and a native (or browser) notification fires.
 - 🎛️ **Profiles** — presets for startup command, flags and default working directory, persisted across restarts.
@@ -93,27 +94,28 @@ src/
   components/
     Terminal.tsx          xterm ↔ PTY bridge
     TilingGrid.tsx        absolute-positioned pane layout + resizers
-    AgentPane.tsx         pane header (model / tokens / cost / controls)
+    AgentPane.tsx         pane header (model / context gauge / tokens / cost / controls)
     UsageDashboard.tsx    usage drawer — Session & All-time views
     WebDirectoryPicker.tsx server-backed folder picker (web mode)
 
 server/                   the Node "engine" (web mode)
   index.mjs               http + static + WebSocket PTYs + usage SSE + fs browser
-  usage.mjs               JSONL parsing, pricing, mtime-cached aggregation
+  usage.mjs               incremental JSONL parsing (per-file offset cache), pricing
 
 src-tauri/src/            the Rust backend (native mode)
-  pty.rs                  PTY spawn / read / write / resize / kill
-  usage.rs                JSONL parsing, pricing, mtime-cached aggregation
+  pty.rs                  PTY spawn / read / write / resize / kill (output coalesced)
+  usage.rs                incremental JSONL parsing (per-file offset cache), pricing
   lib.rs                  commands, plugins, usage file-watcher
 ```
 
 ### Cost model
 
-Pricing (USD / 1M tokens), applied per model family while parsing usage:
+Per-model pricing (USD / 1M tokens, incl. cache write/read) is fetched live from the free, key-less [OpenRouter model catalog](https://openrouter.ai/api/v1/models) — once per run, refreshed daily, matched by normalized model id. While offline (or for unknown ids) a hardcoded per-family fallback applies:
 
 | Family | Input | Output | Cache write | Cache read |
 | --- | --- | --- | --- | --- |
-| Opus | 15 | 75 | 18.75 | 1.50 |
+| Fable | 10 | 50 | 12.50 | 1.00 |
+| Opus | 5 | 25 | 6.25 | 0.50 |
 | Sonnet | 3 | 15 | 3.75 | 0.30 |
 | Haiku | 1 | 5 | 1.25 | 0.10 |
 

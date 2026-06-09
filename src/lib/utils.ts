@@ -5,6 +5,11 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/** Claude encodes a cwd as the project dir name by replacing every `/` and `.` with `-`. */
+export function encodeProjectDir(cwd: string): string {
+  return cwd.replace(/[/.]/g, "-");
+}
+
 export function formatTokens(n: number): string {
   if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + "B";
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";

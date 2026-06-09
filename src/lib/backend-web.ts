@@ -9,8 +9,21 @@ type OutMsg =
   | { t: "resize"; id: string; cols: number; rows: number }
   | { t: "kill"; id: string };
 
-const dataCbs = new Set<(e: PtyDataEvent) => void>();
-const exitCbs = new Set<(e: PtyExitEvent) => void>();
+const dataCbs = new Map<string, Set<(e: PtyDataEvent) => void>>();
+const exitCbs = new Map<string, Set<(e: PtyExitEvent) => void>>();
+
+function subscribe<T>(map: Map<string, Set<(e: T) => void>>, id: string, cb: (e: T) => void) {
+  let set = map.get(id);
+  if (!set) {
+    set = new Set();
+    map.set(id, set);
+  }
+  set.add(cb);
+  return () => {
+    set.delete(cb);
+    if (set.size === 0) map.delete(id);
+  };
+}
 
 let ws: WebSocket | null = null;
 let queue: OutMsg[] = [];
@@ -37,9 +50,9 @@ function ensureWs() {
       return;
     }
     if (msg.t === "data" && msg.data !== undefined) {
-      dataCbs.forEach((cb) => cb({ id: msg.id, data: msg.data! }));
+      dataCbs.get(msg.id)?.forEach((cb) => cb({ id: msg.id, data: msg.data! }));
     } else if (msg.t === "exit") {
-      exitCbs.forEach((cb) => cb({ id: msg.id }));
+      exitCbs.get(msg.id)?.forEach((cb) => cb({ id: msg.id }));
     }
   };
   ws.onclose = () => {
@@ -69,14 +82,12 @@ export const webBackend: Backend = {
   ptyResize: (id, cols, rows) => sendWs({ t: "resize", id, cols, rows }),
   ptyKill: (id) => sendWs({ t: "kill", id }),
 
-  onPtyData: async (cb): Promise<Unlisten> => {
+  onPtyData: async (id, cb): Promise<Unlisten> => {
     ensureWs();
-    dataCbs.add(cb);
-    return () => dataCbs.delete(cb);
+    return subscribe(dataCbs, id, cb);
   },
-  onPtyExit: async (cb): Promise<Unlisten> => {
-    exitCbs.add(cb);
-    return () => exitCbs.delete(cb);
+  onPtyExit: async (id, cb): Promise<Unlisten> => {
+    return subscribe(exitCbs, id, cb);
   },
 
   fetchUsageForDir: (cwd) =>
@@ -90,7 +101,15 @@ export const webBackend: Backend = {
   fetchUsageTotals: () => getJson("/api/usage/totals"),
   onUsageChanged: async (cb): Promise<Unlisten> => {
     const es = new EventSource("/api/usage/stream");
-    es.addEventListener("changed", () => cb());
+    es.addEventListener("changed", (ev) => {
+      let dirs: string[] | undefined;
+      try {
+        dirs = JSON.parse((ev as MessageEvent).data)?.dirs;
+      } catch {
+        /* malformed payload → treat as "unknown" */
+      }
+      cb(dirs);
+    });
     return () => es.close();
   },
 

@@ -27,8 +27,9 @@ export interface Backend {
   ptyResize(id: string, cols: number, rows: number): Promise<void> | void;
   ptyKill(id: string): Promise<void> | void;
 
-  onPtyData(cb: (e: PtyDataEvent) => void): Promise<Unlisten>;
-  onPtyExit(cb: (e: PtyExitEvent) => void): Promise<Unlisten>;
+  /** Subscribe to output / exit of ONE agent's PTY (events are addressed per agent). */
+  onPtyData(id: string, cb: (e: PtyDataEvent) => void): Promise<Unlisten>;
+  onPtyExit(id: string, cb: (e: PtyExitEvent) => void): Promise<Unlisten>;
 
   fetchUsageForDir(cwd: string): Promise<SessionUsage | null>;
   fetchUsageForSession(
@@ -37,7 +38,11 @@ export interface Backend {
     sessionId?: string,
   ): Promise<SessionUsage | null>;
   fetchUsageTotals(): Promise<UsageTotals>;
-  onUsageChanged(cb: () => void): Promise<Unlisten>;
+  /**
+   * Fires when session files changed. `changedDirs` holds the affected
+   * project-dir names (encoded cwds); empty/undefined = unknown → refresh all.
+   */
+  onUsageChanged(cb: (changedDirs?: string[]) => void): Promise<Unlisten>;
 
   pickDirectory(): Promise<string | undefined>;
   getHome(): Promise<string>;

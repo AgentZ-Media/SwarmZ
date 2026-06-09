@@ -24,10 +24,10 @@ export const tauriBackend: Backend = {
   ptyResize: (id, cols, rows) => invoke<void>("pty_resize", { id, cols, rows }),
   ptyKill: (id) => invoke<void>("pty_kill", { id }),
 
-  onPtyData: (cb: (e: PtyDataEvent) => void) =>
-    listen<PtyDataEvent>("pty://data", (ev) => cb(ev.payload)),
-  onPtyExit: (cb: (e: PtyExitEvent) => void) =>
-    listen<PtyExitEvent>("pty://exit", (ev) => cb(ev.payload)),
+  onPtyData: (id: string, cb: (e: PtyDataEvent) => void) =>
+    listen<PtyDataEvent>(`pty://data/${id}`, (ev) => cb(ev.payload)),
+  onPtyExit: (id: string, cb: (e: PtyExitEvent) => void) =>
+    listen<PtyExitEvent>(`pty://exit/${id}`, (ev) => cb(ev.payload)),
 
   fetchUsageForDir: (cwd) =>
     invoke<SessionUsage | null>("usage_for_dir", { cwd }),
@@ -38,7 +38,8 @@ export const tauriBackend: Backend = {
       session: sessionId,
     }),
   fetchUsageTotals: () => invoke<UsageTotals>("usage_totals"),
-  onUsageChanged: (cb) => listen("usage://changed", () => cb()),
+  onUsageChanged: (cb) =>
+    listen<string[]>("usage://changed", (ev) => cb(ev.payload)),
 
   pickDirectory: async () => {
     const sel = await openDialog({ directory: true, multiple: false });

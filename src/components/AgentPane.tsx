@@ -25,7 +25,56 @@ import {
   prettyModel,
   shortPath,
 } from "@/lib/utils";
-import type { Agent } from "@/types";
+import type { Agent, SessionUsage } from "@/types";
+
+/** Tiny donut showing how full the agent's context window currently is. */
+function ContextDonut({ usage }: { usage: SessionUsage }) {
+  const used = usage.context_tokens;
+  const limit = usage.context_limit;
+  if (!used || !limit) return null;
+
+  const pct = Math.min(used / limit, 1);
+  const r = 5;
+  const circ = 2 * Math.PI * r;
+  const color =
+    pct >= 0.85
+      ? "var(--destructive)"
+      : pct >= 0.65
+        ? "var(--warning)"
+        : "var(--ring)";
+
+  return (
+    <Tip
+      label={
+        <span className="font-mono text-[11px]">
+          Context: {formatTokens(used)} / {formatTokens(limit)} (
+          {Math.round(pct * 100)}%)
+        </span>
+      }
+    >
+      <svg width={14} height={14} viewBox="0 0 14 14" className="shrink-0 -rotate-90">
+        <circle
+          cx={7}
+          cy={7}
+          r={r}
+          fill="none"
+          stroke="var(--border)"
+          strokeWidth={2.5}
+        />
+        <circle
+          cx={7}
+          cy={7}
+          r={r}
+          fill="none"
+          stroke={color}
+          strokeWidth={2.5}
+          strokeDasharray={`${pct * circ} ${circ}`}
+          strokeLinecap="round"
+        />
+      </svg>
+    </Tip>
+  );
+}
 
 function StatusDot({ agent }: { agent: Agent }) {
   const map: Record<string, string> = {
@@ -134,6 +183,7 @@ export function AgentPane({
 
         <div className="ml-auto flex items-center gap-1.5">
           {model && <Badge className="font-mono">{prettyModel(model)}</Badge>}
+          {usage && <ContextDonut usage={usage} />}
           {usage && totalTokens > 0 && (
             <Tip
               label={

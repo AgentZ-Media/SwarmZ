@@ -79,7 +79,8 @@ app.get("/api/usage/stream", (req, res) => {
   });
   res.write(": connected\n\n");
   const ping = setInterval(() => res.write(": ping\n\n"), 25000);
-  const onChange = () => res.write("event: changed\ndata: {}\n\n");
+  const onChange = (dirs) =>
+    res.write(`event: changed\ndata: ${JSON.stringify({ dirs })}\n\n`);
   usageWatchers.add(onChange);
   req.on("close", () => {
     clearInterval(ping);
@@ -105,12 +106,21 @@ const usageWatchers = new Set();
   const dir = claudeProjectsDir();
   if (!fs.existsSync(dir)) return;
   let timer = null;
+  // collect the project-dir names touched during the debounce window so the
+  // frontend can skip refreshes for sessions it isn't displaying
+  let pendingDirs = new Set();
   try {
-    fs.watch(dir, { recursive: true }, () => {
+    fs.watch(dir, { recursive: true }, (_event, filename) => {
+      if (filename) {
+        const seg = String(filename).split(path.sep)[0];
+        if (seg) pendingDirs.add(seg);
+      }
       if (timer) return;
       timer = setTimeout(() => {
         timer = null;
-        for (const w of usageWatchers) w();
+        const dirs = [...pendingDirs];
+        pendingDirs = new Set();
+        for (const w of usageWatchers) w(dirs);
       }, 500);
     });
   } catch (e) {
@@ -161,8 +171,32 @@ wss.on("connection", (ws) => {
         return;
       }
       ptys.set(msg.id, term);
-      term.onData((d) => send({ t: "data", id: msg.id, data: b64(d) }));
+      // coalesce output bursts (≤12 ms / 128 KiB) into one WS message so the
+      // browser isn't woken for every tiny chunk a TUI redraw produces
+      let pending = [];
+      let pendingLen = 0;
+      let flushTimer = null;
+      const flush = () => {
+        flushTimer = null;
+        if (!pendingLen) return;
+        const data = pending.join("");
+        pending = [];
+        pendingLen = 0;
+        send({ t: "data", id: msg.id, data: b64(data) });
+      };
+      term.onData((d) => {
+        pending.push(d);
+        pendingLen += d.length;
+        if (pendingLen >= 128 * 1024) {
+          if (flushTimer) clearTimeout(flushTimer);
+          flush();
+        } else if (!flushTimer) {
+          flushTimer = setTimeout(flush, 12);
+        }
+      });
       term.onExit(() => {
+        if (flushTimer) clearTimeout(flushTimer);
+        flush();
         ptys.delete(msg.id);
         send({ t: "exit", id: msg.id });
       });

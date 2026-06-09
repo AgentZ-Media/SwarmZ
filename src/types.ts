@@ -17,6 +17,10 @@ export interface SessionUsage {
   service_tier: string | null;
   git_branch: string | null;
   last_activity: string | null;
+  /** current context occupancy = full prompt of the latest main-chain turn */
+  context_tokens: number;
+  /** context window of the model that served that turn (200k, or 1m variants) */
+  context_limit: number;
   message_count: number;
   input_tokens: number;
   output_tokens: number;

@@ -102,25 +102,56 @@ impl PtyManager {
         };
         self.sessions.lock().insert(id.clone(), session);
 
-        // Reader thread: stream raw bytes (base64) to the frontend.
+        // Reader thread streams raw bytes into a channel; the emitter thread
+        // coalesces bursts (≤12 ms / 128 KiB) into one IPC event so the webview
+        // isn't woken for every 8 KiB chunk a TUI redraw produces. Events are
+        // addressed per agent (`pty://data/<id>`) so only the owning terminal's
+        // listener fires instead of every pane filtering a global stream.
         let app_for_reader = app.clone();
         let read_id = id.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let payload = PtyDataPayload {
-                            id: read_id.clone(),
-                            data: B64.encode(&buf[..n]),
-                        };
-                        let _ = app_for_reader.emit("pty://data", payload);
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
                     }
                     Err(_) => break,
                 }
             }
-            let _ = app_for_reader.emit("pty://exit", PtyExitPayload { id: read_id });
+            // dropping tx disconnects the channel → emitter flushes and exits
+        });
+        thread::spawn(move || {
+            use std::sync::mpsc::RecvTimeoutError;
+            use std::time::{Duration, Instant};
+            let data_event = format!("pty://data/{}", read_id);
+            while let Ok(first) = rx.recv() {
+                let mut chunk = first;
+                let deadline = Instant::now() + Duration::from_millis(12);
+                while chunk.len() < 128 * 1024 {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    match rx.recv_timeout(deadline - now) {
+                        Ok(more) => chunk.extend_from_slice(&more),
+                        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                let payload = PtyDataPayload {
+                    id: read_id.clone(),
+                    data: B64.encode(&chunk),
+                };
+                let _ = app_for_reader.emit(&data_event, payload);
+            }
+            let _ = app_for_reader.emit(
+                &format!("pty://exit/{}", read_id),
+                PtyExitPayload { id: read_id },
+            );
         });
 
         Ok(())

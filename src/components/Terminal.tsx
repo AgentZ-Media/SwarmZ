@@ -75,7 +75,7 @@ export function TerminalView({
       fontSize: 12.5,
       lineHeight: 1.25,
       letterSpacing: 0,
-      cursorBlink: true,
+      cursorBlink: false, // enabled per-pane below — only the active pane blinks
       cursorStyle: "bar",
       scrollback: 12000,
       allowProposedApi: true,
@@ -109,17 +109,15 @@ export function TerminalView({
       setAttention(agentId, true);
     });
 
-    // pty → terminal
-    const dataPromise = onPtyData((e) => {
-      if (e.id !== agentId) return;
+    // pty → terminal (events are addressed per agent)
+    const dataPromise = onPtyData(agentId, (e) => {
       if (!runningRef.current) {
         runningRef.current = true;
         setStatus(agentId, "running");
       }
       term.write(decodeBase64(e.data));
     });
-    const exitPromise = onPtyExit((e) => {
-      if (e.id !== agentId) return;
+    const exitPromise = onPtyExit(agentId, () => {
       setStatus(agentId, "exited");
       term.write("\r\n\x1b[2m[ process exited ]\x1b[0m\r\n");
     });
@@ -151,6 +149,13 @@ export function TerminalView({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId]);
+
+  // only the active pane's cursor blinks — a blinking cursor wakes the
+  // renderer every ~600ms, which adds up across many idle panes
+  useEffect(() => {
+    const term = termRef.current;
+    if (term) term.options.cursorBlink = active;
+  }, [active]);
 
   // focus terminal when its pane becomes active
   useEffect(() => {
