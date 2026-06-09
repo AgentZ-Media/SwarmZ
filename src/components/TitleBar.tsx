@@ -1,5 +1,14 @@
-import { BarChart3, Plus, SlidersHorizontal, Zap } from "lucide-react";
+import {
+  BarChart3,
+  Check,
+  Download,
+  Plus,
+  RefreshCw,
+  SlidersHorizontal,
+  Zap,
+} from "lucide-react";
 import { useSwarm } from "@/store";
+import { useUpdates } from "@/lib/updates";
 import { Button } from "./ui/button";
 import { Tip } from "./ui/tooltip";
 import { formatTokens, formatUsd } from "@/lib/utils";
@@ -58,6 +67,8 @@ export function TitleBar({ onManageProfiles }: { onManageProfiles: () => void })
       )}
 
       <div className="ml-auto flex items-center gap-2">
+        {IS_TAURI && <UpdatePill />}
+
         <div className="flex h-7 items-center gap-3 rounded-md border border-border bg-card px-3">
           <Tip label="Tokens across open agents (current sessions)">
             <span className="flex items-center gap-1.5 font-mono text-[11px] tabular-nums text-muted-foreground">
@@ -97,6 +108,8 @@ export function TitleBar({ onManageProfiles }: { onManageProfiles: () => void })
           </Button>
         </Tip>
 
+        {IS_TAURI && <UpdateCheckButton />}
+
         <Button
           size="sm"
           className="no-drag"
@@ -106,5 +119,80 @@ export function TitleBar({ onManageProfiles }: { onManageProfiles: () => void })
         </Button>
       </div>
     </header>
+  );
+}
+
+/** Shows only when an update is live: available → downloading → ready. */
+function UpdatePill() {
+  const stage = useUpdates((s) => s.stage);
+  const version = useUpdates((s) => s.version);
+  const progress = useUpdates((s) => s.progress);
+  const downloadAndInstall = useUpdates((s) => s.downloadAndInstall);
+  const restart = useUpdates((s) => s.restart);
+
+  if (stage === "idle") return null;
+
+  const label =
+    stage === "downloading"
+      ? `Downloading… ${progress}%`
+      : stage === "ready"
+        ? "Restart to update"
+        : stage === "error"
+          ? "Update failed — retry"
+          : version
+            ? `Update ${version}`
+            : "Update available";
+
+  return (
+    <button
+      className="no-drag flex h-7 items-center gap-1.5 rounded-md border border-ring/50 bg-ring/10 px-2.5 text-[11px] font-medium text-foreground hover:bg-ring/20 disabled:opacity-70"
+      disabled={stage === "downloading"}
+      onClick={() => (stage === "ready" ? restart() : downloadAndInstall())}
+      title={
+        stage === "ready"
+          ? "Restart SwarmZ to apply the update"
+          : "Download and install the update"
+      }
+    >
+      <Download size={12} className="text-ring" />
+      <span className="font-mono tabular-nums">{label}</span>
+    </button>
+  );
+}
+
+/** Manual "check for updates" — quiet icon button with transient feedback. */
+function UpdateCheckButton() {
+  const manualCheck = useUpdates((s) => s.manualCheck);
+  const stage = useUpdates((s) => s.stage);
+  const checkNow = useUpdates((s) => s.checkNow);
+
+  const label =
+    manualCheck === "checking"
+      ? "Checking for updates…"
+      : manualCheck === "uptodate"
+        ? "You're up to date"
+        : manualCheck === "error"
+          ? "Update check failed"
+          : "Check for updates";
+
+  return (
+    <Tip label={label}>
+      <Button
+        size="icon"
+        variant="ghost"
+        className="no-drag"
+        disabled={manualCheck === "checking" || stage === "downloading"}
+        onClick={() => void checkNow()}
+      >
+        {manualCheck === "uptodate" ? (
+          <Check size={15} className="text-success" />
+        ) : (
+          <RefreshCw
+            size={15}
+            className={manualCheck === "checking" ? "animate-spin" : ""}
+          />
+        )}
+      </Button>
+    </Tip>
   );
 }

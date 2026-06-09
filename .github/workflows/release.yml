@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - '!v*.*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ============================================================
+  # 1) Prepare release notes
+  # ============================================================
+  # Reads the per-version changelog file + the static install footer
+  # and passes them as a single output. Aborts if the changelog file
+  # is missing - this way no release can accidentally ship with the
+  # previous description.
+  prepare-notes:
+    name: Prepare release notes
+    runs-on: ubuntu-latest
+    outputs:
+      body: ${{ steps.notes.outputs.body }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build release body
+        id: notes
+        run: |
+          NOTES_FILE="docs/release-notes/${GITHUB_REF_NAME}.md"
+          FOOTER_FILE="docs/release-notes/_install_footer.md"
+          if [ ! -f "$NOTES_FILE" ]; then
+            echo "::error::Missing $NOTES_FILE - create it before tagging (see CLAUDE.md release checklist)."
+            exit 1
+          fi
+          if [ ! -f "$FOOTER_FILE" ]; then
+            echo "::error::Missing $FOOTER_FILE."
+            exit 1
+          fi
+          {
+            echo "body<<EOF_RELEASE_BODY"
+            cat "$NOTES_FILE"
+            echo
+            cat "$FOOTER_FILE"
+            echo "EOF_RELEASE_BODY"
+          } >> "$GITHUB_OUTPUT"
+
+  # ============================================================
+  # 2) macOS build (Apple Silicon)
+  # ============================================================
+  # Creates the GitHub release including `latest.json` for the
+  # in-app auto-updater. The app is ad-hoc signed only (no Apple
+  # Developer ID / notarization) - see the install footer for the
+  # Gatekeeper workaround users need on first launch.
+  build-macos:
+    name: Build macOS (Apple Silicon)
+    needs: prepare-notes
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: macos
+
+      - name: Setup pnpm
+        # Version comes from packageManager in package.json, so local and
+        # CI use the same pnpm version.
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and release (macOS)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Tauri updater signing key. Required so tauri-action emits the
+          # signed `latest.json` manifest + `.app.tar.gz` bundle that the
+          # in-app updater polls for. Repo secret:
+          #   - TAURI_SIGNING_PRIVATE_KEY: contents of ~/.tauri/swarmz_updater.key
+          #     (generated with an empty password, so no password secret needed)
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'SwarmZ ${{ github.ref_name }}'
+          releaseBody: ${{ needs.prepare-notes.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          args: --target aarch64-apple-darwin

@@ -27,6 +27,19 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 - 💾 **All-time statistics** — every Claude session launched inside SwarmZ is persisted across restarts. The usage drawer toggles between **Session** (what's open right now) and **All time** (everything you've ever run here), with a per-model cost breakdown and session history.
 - 🔔 **Notifications** — when an agent rings the terminal bell (Claude waiting or done), the pane pulses and a native (or browser) notification fires.
 - 🎛️ **Profiles** — presets for startup command, flags and default working directory, persisted across restarts.
+- 🔄 **Auto-updates** — the native app checks GitHub Releases in the background and updates in-app; manual check via the refresh button in the title bar.
+
+## 📦 Download
+
+Grab the latest `.dmg` from [**Releases**](https://github.com/AgentZ-Media/SwarmZ/releases) (macOS, Apple Silicon).
+
+SwarmZ is **not notarized by Apple** (indie release) — after installing, clear the quarantine flag once:
+
+```bash
+xattr -cr /Applications/SwarmZ.app
+```
+
+(or right-click the app → **Open** → **Open**). Updates after that are delivered in-app.
 
 ## 🚀 Quick start
 
@@ -76,6 +89,7 @@ src/lib/transport.ts      picks the backend at runtime
 src/
   store.ts                zustand store (agents, layout tree, profiles, usage history)
   lib/layout.ts           tiling binary-tree ops (split / remove / resize)
+  lib/updates.ts          auto-updater (background poll + manual check, Tauri only)
   components/
     Terminal.tsx          xterm ↔ PTY bridge
     TilingGrid.tsx        absolute-positioned pane layout + resizers

@@ -9,6 +9,7 @@ import { UsageDashboard } from "./components/UsageDashboard";
 import { WebDirectoryPicker } from "./components/WebDirectoryPicker";
 import { Button } from "./components/ui/button";
 import { useSwarm } from "./store";
+import { useUpdates } from "./lib/updates";
 import {
   ensureNotifyPermission,
   fetchUsageForSession,
@@ -35,6 +36,9 @@ export default function App() {
     void hydrate();
     void getHome().then((h) => (homeRef.current = h));
     void ensureNotifyPermission().then((g) => (notifyGranted.current = g));
+    const updates = useUpdates.getState();
+    updates.startBackgroundPolling();
+    return () => updates.stopBackgroundPolling();
   }, [hydrate]);
 
   // usage refresh — each agent shows ONLY its own session's usage
