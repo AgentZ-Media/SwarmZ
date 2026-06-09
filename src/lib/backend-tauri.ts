@@ -1,0 +1,81 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { homeDir } from "@tauri-apps/api/path";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
+import { LazyStore } from "@tauri-apps/plugin-store";
+import type {
+  Profile,
+  SessionUsage,
+  UsageHistoryEntry,
+  UsageTotals,
+} from "@/types";
+import type { Backend, PtyDataEvent, PtyExitEvent } from "./backend-types";
+
+const store = new LazyStore("swarmz.json");
+
+export const tauriBackend: Backend = {
+  ptySpawn: (args) => invoke<void>("pty_spawn", args),
+  ptyWrite: (id, data) => invoke<void>("pty_write", { id, data }),
+  ptyResize: (id, cols, rows) => invoke<void>("pty_resize", { id, cols, rows }),
+  ptyKill: (id) => invoke<void>("pty_kill", { id }),
+
+  onPtyData: (cb: (e: PtyDataEvent) => void) =>
+    listen<PtyDataEvent>("pty://data", (ev) => cb(ev.payload)),
+  onPtyExit: (cb: (e: PtyExitEvent) => void) =>
+    listen<PtyExitEvent>("pty://exit", (ev) => cb(ev.payload)),
+
+  fetchUsageForDir: (cwd) =>
+    invoke<SessionUsage | null>("usage_for_dir", { cwd }),
+  fetchUsageForSession: (cwd, sinceMs, sessionId) =>
+    invoke<SessionUsage | null>("usage_for_session", {
+      cwd,
+      since: sinceMs,
+      session: sessionId,
+    }),
+  fetchUsageTotals: () => invoke<UsageTotals>("usage_totals"),
+  onUsageChanged: (cb) => listen("usage://changed", () => cb()),
+
+  pickDirectory: async () => {
+    const sel = await openDialog({ directory: true, multiple: false });
+    return typeof sel === "string" ? sel : undefined;
+  },
+  getHome: () => homeDir(),
+
+  ensureNotifyPermission: async () => {
+    let granted = await isPermissionGranted();
+    if (!granted) granted = (await requestPermission()) === "granted";
+    return granted;
+  },
+  notify: async (title, body) => {
+    sendNotification({ title, body });
+  },
+
+  loadProfiles: async () => {
+    try {
+      return (await store.get<Profile[]>("profiles")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveProfiles: async (profiles) => {
+    await store.set("profiles", profiles);
+    await store.save();
+  },
+
+  loadUsageHistory: async () => {
+    try {
+      return (await store.get<UsageHistoryEntry[]>("usageHistory")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveUsageHistory: async (entries) => {
+    await store.set("usageHistory", entries);
+    await store.save();
+  },
+};
