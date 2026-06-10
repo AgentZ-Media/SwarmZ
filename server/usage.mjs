@@ -332,8 +332,13 @@ export async function usageForDir(cwd) {
   return parseFile(p);
 }
 
-/** Newest session file in `dir` born at/after `sinceMs` (i.e. ours, not history). */
-function pickNewSession(dir, sinceMs) {
+/**
+ * The session file in `dir` born at/after `sinceMs` (i.e. ours, not history).
+ * With several agents in the same folder, multiple files qualify — the agent's
+ * own session is the EARLIEST-born one (later births belong to younger panes),
+ * and sessions already latched by other agents (`exclude`) are never matched.
+ */
+function pickNewSession(dir, sinceMs, exclude = []) {
   let entries;
   try {
     entries = fs.readdirSync(dir);
@@ -341,9 +346,10 @@ function pickNewSession(dir, sinceMs) {
     return null;
   }
   const floor = sinceMs - 3000; // small clock-skew tolerance
-  let newest = null;
+  let oldest = null;
   for (const name of entries) {
     if (!name.endsWith(".jsonl")) continue;
+    if (exclude.includes(name.slice(0, -6))) continue; // another agent's session
     const p = path.join(dir, name);
     let st;
     try {
@@ -352,20 +358,20 @@ function pickNewSession(dir, sinceMs) {
       continue;
     }
     if (st.birthtimeMs < floor) continue; // pre-existing session — not ours
-    if (!newest || st.mtimeMs > newest.mt) newest = { mt: st.mtimeMs, p };
+    if (!oldest || st.birthtimeMs < oldest.born) oldest = { born: st.birthtimeMs, p };
   }
-  return newest ? newest.p : null;
+  return oldest ? oldest.p : null;
 }
 
 /** Usage for a single SwarmZ-launched session only. */
-export async function usageForSession(cwd, sinceMs, sessionId) {
+export async function usageForSession(cwd, sinceMs, sessionId, exclude = []) {
   const dir = path.join(claudeProjectsDir(), encodeProjectDir(cwd));
   let p = null;
   if (sessionId) {
     const candidate = path.join(dir, `${sessionId}.jsonl`);
     if (fs.existsSync(candidate)) p = candidate;
   }
-  if (!p) p = pickNewSession(dir, sinceMs);
+  if (!p) p = pickNewSession(dir, sinceMs, exclude);
   if (!p) return null;
   return parseFile(p, sinceMs);
 }

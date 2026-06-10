@@ -77,6 +77,19 @@ export function shortPath(p?: string): string {
   return s;
 }
 
+/**
+ * Apply the Settings "claude path" override to a startup command: a leading
+ * `claude` token is replaced with the configured binary path (quoted, so
+ * paths with spaces survive the shell). Other commands pass through untouched.
+ */
+export function applyClaudePath(startup: string, claudePath?: string): string {
+  const bin = claudePath?.trim();
+  if (!bin) return startup;
+  const cmd = startup.trimStart();
+  if (cmd !== "claude" && !cmd.startsWith("claude ")) return startup;
+  return `"${bin}"` + cmd.slice("claude".length);
+}
+
 /** Desaturated identity palette for profiles/agents — quiet, never neon. */
 export const AGENT_COLORS = [
   "#5b8def",

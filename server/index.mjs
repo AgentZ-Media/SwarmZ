@@ -43,8 +43,11 @@ app.get("/api/usage/session", async (req, res) => {
   const cwd = String(req.query.cwd || "");
   const since = Number(req.query.since || 0);
   const sid = req.query.sid ? String(req.query.sid) : undefined;
+  const exclude = req.query.exclude
+    ? String(req.query.exclude).split(",").filter(Boolean)
+    : [];
   if (!cwd) return res.json(null);
-  res.json(await usageForSession(cwd, since, sid));
+  res.json(await usageForSession(cwd, since, sid, exclude));
 });
 
 // directory browser for the web folder-picker
@@ -67,6 +70,72 @@ app.get("/api/fs/list", (req, res) => {
     parent: parent === resolved ? null : parent,
     home: os.homedir(),
     entries,
+  });
+});
+
+// ---- read-only git status for agent panes ----
+// Keep the queries and parsing in sync with src-tauri/src/git.rs (native backend).
+function gitRun(cwd, args, bin = "git") {
+  return new Promise((resolve) => {
+    execFile(bin, ["-C", cwd, ...args], { timeout: 4000 }, (err, stdout) =>
+      resolve(err ? null : stdout.trim()),
+    );
+  });
+}
+
+// git@host:user/repo.git / ssh://git@host/user/repo.git → browsable https URL
+function gitRemoteToHttps(remote) {
+  const r = (remote || "").trim();
+  let url = null;
+  if (r.startsWith("git@")) {
+    const i = r.indexOf(":");
+    if (i > 0) url = `https://${r.slice(4, i)}/${r.slice(i + 1)}`;
+  } else if (r.startsWith("ssh://")) {
+    url = "https://" + r.slice(6).replace(/^git@/, "");
+  } else if (r.startsWith("http://") || r.startsWith("https://")) {
+    url = r;
+  }
+  return url ? url.replace(/\/+$/, "").replace(/\.git$/, "") : null;
+}
+
+app.get("/api/git", async (req, res) => {
+  const cwd = String(req.query.cwd || "");
+  if (!cwd) return res.json(null);
+  // optional git binary override (Settings → Paths)
+  const bin = String(req.query.bin || "").trim() || "git";
+  const toplevel = await gitRun(cwd, ["rev-parse", "--show-toplevel"], bin);
+  if (!toplevel) return res.json(null);
+
+  const [branchRef, numstat, untrackedList, remote] = await Promise.all([
+    gitRun(cwd, ["symbolic-ref", "--short", "-q", "HEAD"], bin),
+    // staged + unstaged line counts vs HEAD; fails on a repo without commits → 0/0
+    gitRun(cwd, ["diff", "--numstat", "HEAD"], bin),
+    gitRun(cwd, ["ls-files", "--others", "--exclude-standard"], bin),
+    gitRun(cwd, ["remote", "get-url", "origin"], bin),
+  ]);
+  // detached HEAD → short SHA; unborn branch (fresh repo) has neither
+  const branch =
+    branchRef ||
+    (await gitRun(cwd, ["rev-parse", "--short", "HEAD"], bin)) ||
+    "(no commits)";
+
+  let insertions = 0;
+  let deletions = 0;
+  for (const line of (numstat || "").split("\n")) {
+    if (!line) continue;
+    const [a, d] = line.split("\t");
+    // binary files report "-" in both columns → count as 0
+    insertions += Number.parseInt(a, 10) || 0;
+    deletions += Number.parseInt(d, 10) || 0;
+  }
+
+  res.json({
+    repo: path.basename(toplevel),
+    branch,
+    insertions,
+    deletions,
+    untracked: (untrackedList || "").split("\n").filter(Boolean).length,
+    remote_url: gitRemoteToHttps(remote),
   });
 });
 
@@ -104,6 +173,9 @@ async function readClaudeAccessToken() {
   }
 }
 
+// `null` body means "no Claude login on this machine" (UI hides the meters);
+// transient problems (network, non-2xx, parse) respond 502 so the frontend
+// can keep showing the last known values instead of blanking out.
 app.get("/api/limits", async (_req, res) => {
   try {
     const token = await readClaudeAccessToken();
@@ -116,7 +188,7 @@ app.get("/api/limits", async (_req, res) => {
       },
       signal: AbortSignal.timeout(15000),
     });
-    if (!r.ok) return res.json(null);
+    if (!r.ok) return res.status(502).json({ error: `usage endpoint returned ${r.status}` });
     const data = await r.json();
     res.json({
       five_hour: data.five_hour ?? null,
@@ -124,8 +196,8 @@ app.get("/api/limits", async (_req, res) => {
       seven_day_sonnet: data.seven_day_sonnet ?? null,
       seven_day_opus: data.seven_day_opus ?? null,
     });
-  } catch {
-    res.json(null);
+  } catch (e) {
+    res.status(502).json({ error: String(e?.message ?? e) });
   }
 });
 

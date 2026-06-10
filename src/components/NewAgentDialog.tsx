@@ -17,7 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./ui/select";
-import { useSwarm } from "@/store";
+import { DEFAULT_STARTUP, useSwarm } from "@/store";
 import { shortPath } from "@/lib/utils";
 
 export function NewAgentDialog() {
@@ -26,11 +26,11 @@ export function NewAgentDialog() {
   const profiles = useSwarm((s) => s.profiles);
   const createAgent = useSwarm((s) => s.createAgent);
   const prefill = useSwarm((s) => s.newAgentPrefill);
-  const lastCwd = useSwarm((s) => s.lastCwd);
+  const settings = useSwarm((s) => s.settings);
 
   const [name, setName] = useState("");
   const [cwd, setCwd] = useState<string | undefined>();
-  const [startup, setStartup] = useState("claude --dangerously-skip-permissions");
+  const [startup, setStartup] = useState(DEFAULT_STARTUP);
   const [profileId, setProfileId] = useState<string | undefined>();
 
   // reset on open: inherit from the split-source pane if present, otherwise
@@ -43,11 +43,16 @@ export function NewAgentDialog() {
         profiles.find((p) => p.id === prefill.profileId)) ||
       profiles[0];
     setProfileId(profile?.id);
+    // the configured default command beats the preselected profile's startup —
+    // picking a profile by hand still overwrites the field (see onProfile)
     setStartup(
-      prefill?.startup ?? profile?.startup ?? "claude --dangerously-skip-permissions",
+      prefill?.startup ??
+        settings.defaultStartup ??
+        profile?.startup ??
+        DEFAULT_STARTUP,
     );
-    setCwd(prefill?.cwd ?? profile?.defaultCwd ?? lastCwd);
-  }, [open_, prefill, profiles, lastCwd]);
+    setCwd(prefill?.cwd ?? profile?.defaultCwd ?? settings.lastCwd);
+  }, [open_, prefill, profiles, settings]);
 
   const pickFolder = async () => {
     const selected = await pickDirectory();

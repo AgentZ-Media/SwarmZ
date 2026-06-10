@@ -47,8 +47,13 @@ fn read_credentials_file() -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-pub async fn fetch_limits() -> Option<SubscriptionLimits> {
-    let token = read_access_token()?;
+/// `Ok(None)` means "no Claude login on this machine" (UI hides the meters);
+/// transient problems (network, non-2xx, parse) are `Err` so the frontend can
+/// keep showing the last known values instead of blanking out.
+pub async fn fetch_limits() -> Result<Option<SubscriptionLimits>, String> {
+    let Some(token) = read_access_token() else {
+        return Ok(None);
+    };
     let client = reqwest::Client::new();
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
@@ -58,9 +63,12 @@ pub async fn fetch_limits() -> Option<SubscriptionLimits> {
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .ok()?;
+        .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return None;
+        return Err(format!("usage endpoint returned {}", resp.status()));
     }
-    resp.json::<SubscriptionLimits>().await.ok()
+    resp.json::<SubscriptionLimits>()
+        .await
+        .map(Some)
+        .map_err(|e| e.to_string())
 }

@@ -22,16 +22,19 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 ## ✨ Features
 
 - 🖥️ **Real terminals** — every agent is a PTY-backed login shell (`xterm.js` ↔ `node-pty` / `portable-pty`). `claude`, nvm, aliases and your environment resolve exactly like in iTerm or Terminal.
-- 🧱 **Tiling split-grid** — split any pane right (`⌘D`) or down (`⌘⇧D`), drag dividers to resize. Splitting opens the New Agent dialog prefilled with the source pane's folder, profile and startup command. Panes never remount when the grid is rearranged, so scrollback survives.
+- 🧱 **Tiling split-grid** — split any pane right (`⌘D`) or down (`⌘⇧D`), drag dividers to resize, or grab a pane's header to rearrange: drop it on another pane's edge to dock it there (left/right/top/bottom) or on the center to swap the two. Both gestures show a translucent preview while dragging; the layout applies on release, so terminals don't reflow mid-drag (`Esc` cancels). Splitting opens the New Agent dialog prefilled with the source pane's folder, profile and startup command. Panes never remount when the grid is rearranged, so scrollback survives.
 - 📊 **Usage tracking** — model, tokens and estimated USD cost per agent, parsed from `~/.claude/projects/*.jsonl`. Shown on demand: a stats button in every pane header and a global usage drawer — headers stay clean.
 - 🍩 **Context gauge** — a donut plus a `free/total` readout in each pane header shows how much of the agent's context window is left (turns amber/red as it fills).
+- 🌿 **Git at a glance** — panes whose folder is inside a git repo show the branch plus live diff counters: `+added` / `−removed` lines (green/red) and untracked files, refreshed every few seconds, strictly read-only. Repo name and an **Open repo in browser** action (from the `origin` remote) live in the pane menu and stats popover.
+- 📐 **Responsive pane headers** — as a pane gets narrower it sheds secondary info (folder path, git counters, gauge readout, split buttons) until only the title, model and context donut remain; everything stays reachable via tooltips and the ⋯ menu.
 - 📈 **Plan limits** — the title bar shows the Claude subscription limits of the account logged into Claude Code on this machine: 5-hour session window, weekly windows and reset times.
 - 💾 **All-time statistics** — every Claude session launched inside SwarmZ is persisted across restarts. The usage drawer toggles between **Session** (what's open right now) and **All time** (everything you've ever run here), with a per-model cost breakdown and session history.
 - 🏷️ **Auto-naming** — Claude Code generates a topic title for every session (and updates it on `/rename`); SwarmZ captures it from the terminal title and names the pane after it. Rename a pane yourself and the auto-title backs off; clear the name to hand it back.
 - 🚦 **Live status** — the pane status dot mirrors what Claude is actually doing: amber while it's working, green when idle, blue when it waits for input. Captured from Claude Code's terminal progress reporting (plus the bell), no polling involved.
 - 🔔 **Notifications** — when an agent rings the terminal bell (Claude waiting or done), the pane pulses and a native (or browser) notification fires.
 - 🎛️ **Profiles** — presets for startup command, flags and default working directory, persisted across restarts. New agents prefill the profile's default folder, or the last folder you used.
-- 🔄 **Auto-updates** — the native app checks GitHub Releases in the background and updates in-app; manual check via the refresh button in the title bar.
+- 🔄 **Auto-updates** — the native app checks GitHub Releases in the background and updates in-app; manual check and an automatic-download toggle live in Settings.
+- ⚙️ **Settings** — `⌘,` (or the gear in the title bar) opens a settings window: default terminal font size, default startup command, path overrides for the `claude` and `git` binaries, update controls and an About panel.
 
 ## 📦 Download
 
@@ -94,8 +97,9 @@ src/lib/transport.ts      picks the backend at runtime
 
 src/
   store.ts                zustand store (agents, layout tree, profiles, usage history)
-  lib/layout.ts           tiling binary-tree ops (split / remove / resize)
+  lib/layout.ts           tiling binary-tree ops (split / remove / resize / move-swap)
   lib/updates.ts          auto-updater (background poll + manual check, Tauri only)
+  lib/git.ts              per-pane git status poller (branch, ±lines, untracked)
   components/
     Terminal.tsx          xterm ↔ PTY bridge
     TilingGrid.tsx        absolute-positioned pane layout + resizers
@@ -104,12 +108,13 @@ src/
     WebDirectoryPicker.tsx server-backed folder picker (web mode)
 
 server/                   the Node "engine" (web mode)
-  index.mjs               http + static + WebSocket PTYs + usage SSE + fs browser
+  index.mjs               http + static + WebSocket PTYs + usage SSE + fs browser + git status
   usage.mjs               incremental JSONL parsing (per-file offset cache), pricing
 
 src-tauri/src/            the Rust backend (native mode)
   pty.rs                  PTY spawn / read / write / resize / kill (output coalesced)
   usage.rs                incremental JSONL parsing (per-file offset cache), pricing
+  git.rs                  read-only git status (branch, ±lines, untracked, remote)
   lib.rs                  commands, plugins, usage file-watcher
 ```
 
@@ -130,7 +135,7 @@ Per-model pricing (USD / 1M tokens, incl. cache write/read) is fetched live from
 | --- | --- | --- |
 | Profiles | ✅ | Tauri store (`swarmz.json`) / localStorage |
 | Usage history (all-time stats) | ✅ | Tauri store (`swarmz.json`) / localStorage |
-| App settings (last used folder) | ✅ | Tauri store (`swarmz.json`) / localStorage |
+| App settings (Settings window: last used folder, font size, default command, binary paths, auto-update) | ✅ | Tauri store (`swarmz.json`) / localStorage |
 | Window size & position | ✅ native app | `tauri-plugin-window-state` (browser handles its own window in web mode) |
 | Agents & layout | ❌ per session | in-memory |
 

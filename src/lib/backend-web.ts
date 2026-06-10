@@ -1,5 +1,6 @@
 import type {
   AppSettings,
+  GitInfo,
   Profile,
   SubscriptionLimits,
   UsageHistoryEntry,
@@ -97,10 +98,13 @@ export const webBackend: Backend = {
 
   fetchUsageForDir: (cwd) =>
     getJson(`/api/usage/dir?cwd=${encodeURIComponent(cwd)}`),
-  fetchUsageForSession: (cwd, sinceMs, sessionId) => {
+  fetchUsageForSession: (cwd, sinceMs, sessionId, excludeSessionIds) => {
     const sid = sessionId ? `&sid=${encodeURIComponent(sessionId)}` : "";
+    const ex = excludeSessionIds?.length
+      ? `&exclude=${encodeURIComponent(excludeSessionIds.join(","))}`
+      : "";
     return getJson(
-      `/api/usage/session?cwd=${encodeURIComponent(cwd)}&since=${sinceMs}${sid}`,
+      `/api/usage/session?cwd=${encodeURIComponent(cwd)}&since=${sinceMs}${sid}${ex}`,
     );
   },
   fetchUsageTotals: () => getJson("/api/usage/totals"),
@@ -126,6 +130,20 @@ export const webBackend: Backend = {
     } catch {
       return "";
     }
+  },
+
+  fetchGitInfo: async (cwd, gitBin) => {
+    try {
+      const bin = gitBin ? `&bin=${encodeURIComponent(gitBin)}` : "";
+      return await getJson<GitInfo | null>(
+        `/api/git?cwd=${encodeURIComponent(cwd)}${bin}`,
+      );
+    } catch {
+      return null;
+    }
+  },
+  openUrl: async (url) => {
+    window.open(url, "_blank", "noopener");
   },
 
   ensureNotifyPermission: async () => {
@@ -189,10 +207,10 @@ export const webBackend: Backend = {
   },
 
   fetchSubscriptionLimits: async () => {
-    try {
-      return await getJson<SubscriptionLimits | null>("/api/limits");
-    } catch {
-      return null;
-    }
+    // null = no Claude login (hide); errors propagate so the store keeps
+    // the last known values instead of blanking out.
+    const r = await fetch("/api/limits");
+    if (!r.ok) throw new Error(`limits fetch failed: ${r.status}`);
+    return (await r.json()) as SubscriptionLimits | null;
   },
 };

@@ -446,24 +446,32 @@ fn file_created_ms(path: &Path) -> u64 {
 }
 
 /// The session file in `dir` created at/after `since_ms` (i.e. born during this
-/// agent's life), preferring the most recently active one.
-fn pick_new_session(dir: &Path, since_ms: u64) -> Option<PathBuf> {
+/// agent's life). With several agents in the same folder, multiple files
+/// qualify — the agent's own session is the EARLIEST-born one (later births
+/// belong to younger panes), and sessions already latched by other agents
+/// (`exclude`) are never matched.
+fn pick_new_session(dir: &Path, since_ms: u64, exclude: &[String]) -> Option<PathBuf> {
     let floor = since_ms.saturating_sub(3000); // small clock-skew tolerance
-    let mut newest: Option<(u64, PathBuf)> = None;
+    let mut oldest: Option<(u64, PathBuf)> = None;
     for entry in fs::read_dir(dir).ok()?.flatten() {
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        if file_created_ms(&p) < floor {
+        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            if exclude.iter().any(|e| e == stem) {
+                continue; // another agent's session
+            }
+        }
+        let born = file_created_ms(&p);
+        if born < floor {
             continue; // pre-existing session — not ours
         }
-        let mt = mtime_of(&p);
-        if newest.as_ref().map(|(m, _)| mt > *m).unwrap_or(true) {
-            newest = Some((mt, p));
+        if oldest.as_ref().map(|(b, _)| born < *b).unwrap_or(true) {
+            oldest = Some((born, p));
         }
     }
-    newest.map(|(_, p)| p)
+    oldest.map(|(_, p)| p)
 }
 
 /// Usage for a single SwarmZ-launched session only. Latches onto `session_id`
@@ -472,6 +480,7 @@ pub fn usage_for_session(
     cwd: &str,
     since_ms: u64,
     session_id: Option<&str>,
+    exclude: &[String],
 ) -> Option<SessionUsage> {
     let dir = claude_projects_dir()?.join(encode_project_dir(cwd));
     if !dir.is_dir() {
@@ -483,10 +492,10 @@ pub fn usage_for_session(
             if p.is_file() {
                 p
             } else {
-                pick_new_session(&dir, since_ms)?
+                pick_new_session(&dir, since_ms, exclude)?
             }
         }
-        None => pick_new_session(&dir, since_ms)?,
+        None => pick_new_session(&dir, since_ms, exclude)?,
     };
     Some(parse_file(&path, Some(since_ms)))
 }

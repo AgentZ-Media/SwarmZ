@@ -1,9 +1,11 @@
-import { useState, type ReactNode } from "react";
+import { memo, useState, type ReactNode } from "react";
 import {
   BarChart3,
   Bell,
   Columns2,
+  ExternalLink,
   Folder,
+  GitBranch,
   MoreVertical,
   Rows2,
   X,
@@ -26,7 +28,44 @@ import {
   prettyModel,
   shortPath,
 } from "@/lib/utils";
-import type { Agent, SessionUsage } from "@/types";
+import { openUrl } from "@/lib/transport";
+import type { Agent, GitInfo, SessionUsage } from "@/types";
+
+/** Branch + dirty counters (±lines, untracked) for the pane header. */
+function GitChip({ git }: { git: GitInfo }) {
+  return (
+    <Tip
+      label={
+        <span className="font-mono text-[11px]">
+          {git.repo} · {git.branch} · +{git.insertions} −{git.deletions}
+          {git.untracked > 0 && ` · ${git.untracked} untracked`}
+        </span>
+      }
+    >
+      <span className="flex shrink-0 items-center gap-1 font-mono text-[10px] tabular-nums @max-md:hidden">
+        <span className="flex items-center gap-1 text-faint">
+          <GitBranch size={10} className="shrink-0" />
+          <span className="max-w-28 truncate">{git.branch}</span>
+        </span>
+        {git.insertions > 0 && (
+          <span className="rounded bg-success/15 px-1 text-success">
+            +{git.insertions}
+          </span>
+        )}
+        {git.deletions > 0 && (
+          <span className="rounded bg-destructive/15 px-1 text-destructive">
+            −{git.deletions}
+          </span>
+        )}
+        {git.untracked > 0 && (
+          <span className="rounded bg-secondary px-1 text-faint">
+            ?{git.untracked}
+          </span>
+        )}
+      </span>
+    </Tip>
+  );
+}
 
 /** Donut + "free / total" readout for the agent's current context window. */
 function ContextGauge({ usage }: { usage: SessionUsage }) {
@@ -75,7 +114,7 @@ function ContextGauge({ usage }: { usage: SessionUsage }) {
             strokeLinecap="round"
           />
         </svg>
-        <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+        <span className="font-mono text-[11px] tabular-nums text-muted-foreground @max-xl:hidden">
           {formatTokens(free)}
           <span className="text-faint">/{formatTokens(limit)} free</span>
         </span>
@@ -99,6 +138,7 @@ function StatRow({ k, v }: { k: string; v: ReactNode }) {
 /** Per-pane stats: everything tracked for this agent, on demand. */
 function AgentStatsButton({ agent }: { agent: Agent }) {
   const u = agent.usage;
+  const git = agent.git;
   const totalTokens = u
     ? u.input_tokens +
       u.output_tokens +
@@ -109,7 +149,7 @@ function AgentStatsButton({ agent }: { agent: Agent }) {
     <DropdownMenu>
       <Tip label="Agent stats">
         <DropdownMenuTrigger asChild>
-          <button className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground">
+          <button className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-md:hidden">
             <BarChart3 size={13} />
           </button>
         </DropdownMenuTrigger>
@@ -163,7 +203,24 @@ function AgentStatsButton({ agent }: { agent: Agent }) {
                 <StatRow k="Est. API cost" v={formatUsd(u.cost_usd)} />
               </div>
               <div className="space-y-1 border-t border-border pt-2">
-                {u.git_branch && <StatRow k="Branch" v={u.git_branch} />}
+                {git && <StatRow k="Repo" v={git.repo} />}
+                {(git?.branch || u.git_branch) && (
+                  <StatRow k="Branch" v={git?.branch ?? u.git_branch} />
+                )}
+                {git && (git.insertions > 0 || git.deletions > 0) && (
+                  <StatRow
+                    k="Changes"
+                    v={
+                      <>
+                        <span className="text-success">+{git.insertions}</span>{" "}
+                        <span className="text-destructive">−{git.deletions}</span>
+                      </>
+                    }
+                  />
+                )}
+                {git && git.untracked > 0 && (
+                  <StatRow k="Untracked files" v={git.untracked} />
+                )}
                 {(u.cwd || agent.cwd) && (
                   <StatRow k="Folder" v={shortPath(u.cwd ?? agent.cwd)} />
                 )}
@@ -218,12 +275,15 @@ function StatusDot({ agent }: { agent: Agent }) {
   );
 }
 
-export function AgentPane({
+export const AgentPane = memo(function AgentPane({
   agentId,
   active,
+  onHeaderDragStart,
 }: {
   agentId: string;
   active: boolean;
+  /** mousedown on the header (outside buttons/inputs) — used by the grid to drag-rearrange panes */
+  onHeaderDragStart?: (agentId: string, e: React.MouseEvent) => void;
 }) {
   const agent = useSwarm((s) => s.agents[agentId]);
   const removeAgent = useSwarm((s) => s.removeAgent);
@@ -246,12 +306,19 @@ export function AgentPane({
       )}
       onMouseDown={() => focusAgent(agentId)}
     >
-      {/* header */}
+      {/* header — a container query root: as the pane narrows, secondary
+          info collapses away until only title, model and context donut remain
+          (everything stays reachable via tooltips, the stats popover and ⋯) */}
       <div
         className={cn(
-          "flex h-9 shrink-0 items-center gap-2 border-b border-border px-2.5",
+          "@container flex h-9 shrink-0 cursor-grab items-center gap-2 border-b border-border px-2.5",
           active ? "bg-secondary/70" : "bg-transparent",
         )}
+        onMouseDown={(e) => {
+          if (editing) return;
+          if ((e.target as HTMLElement).closest("button, input")) return;
+          onHeaderDragStart?.(agentId, e);
+        }}
       >
         <StatusDot agent={agent} />
 
@@ -282,12 +349,13 @@ export function AgentPane({
             </span>
             {agent.cwd && (
               <Tip label={agent.cwd}>
-                <span className="flex min-w-0 items-center gap-1 font-mono text-[10px] text-faint">
+                <span className="flex min-w-0 items-center gap-1 font-mono text-[10px] text-faint @max-xl:hidden">
                   <Folder size={10} className="shrink-0" />
                   <span className="truncate">{shortPath(agent.cwd)}</span>
                 </span>
               </Tip>
             )}
+            {agent.git && <GitChip git={agent.git} />}
           </div>
         )}
 
@@ -301,7 +369,7 @@ export function AgentPane({
 
           <Tip label="Split right">
             <button
-              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
+              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-xl:hidden"
               onClick={(e) => {
                 e.stopPropagation();
                 focusAgent(agentId);
@@ -313,7 +381,7 @@ export function AgentPane({
           </Tip>
           <Tip label="Split down">
             <button
-              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
+              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-xl:hidden"
               onClick={(e) => {
                 e.stopPropagation();
                 focusAgent(agentId);
@@ -333,8 +401,23 @@ export function AgentPane({
             <DropdownMenuContent align="end">
               <div className="px-2 py-1.5 font-mono text-[10px] text-muted-foreground">
                 {shortPath(agent.cwd)}
+                {agent.git && (
+                  <div className="mt-1 flex items-center gap-1 text-faint">
+                    <GitBranch size={10} className="shrink-0" />
+                    <span className="truncate">
+                      {agent.git.repo} · {agent.git.branch}
+                    </span>
+                  </div>
+                )}
               </div>
               <DropdownMenuSeparator />
+              {agent.git?.remote_url && (
+                <DropdownMenuItem
+                  onSelect={() => void openUrl(agent.git!.remote_url!)}
+                >
+                  <ExternalLink /> Open repo in browser
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem onSelect={() => setEditing(true)}>
                 Rename
               </DropdownMenuItem>
@@ -376,4 +459,4 @@ export function AgentPane({
       </div>
     </div>
   );
-}
+});

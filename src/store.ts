@@ -11,7 +11,9 @@ import {
 import type {
   Agent,
   AgentStatus,
+  AppSettings,
   ClaudeActivity,
+  GitInfo,
   LayoutNode,
   Profile,
   SessionUsage,
@@ -20,19 +22,22 @@ import type {
 import {
   collectPanes,
   findPaneByAgent,
+  movePane as movePaneInLayout,
   newPane,
   removePaneByAgent,
   setSplitSizes,
   splitPane,
+  type DropZone,
 } from "@/lib/layout";
 import { pickColor } from "@/lib/utils";
 
-const DEFAULT_STARTUP = "claude --dangerously-skip-permissions";
+// Built-in fallback — the effective default is settings.defaultStartup (Settings dialog).
+export const DEFAULT_STARTUP = "claude --dangerously-skip-permissions";
 
-// Per-pane terminal zoom (⌘+/⌘−). Default must match the xterm setup in Terminal.tsx.
+// Per-pane terminal zoom (⌘+/⌘−). The effective default is settings.defaultFontSize.
 export const DEFAULT_FONT_SIZE = 12.5;
-const MIN_FONT_SIZE = 8;
-const MAX_FONT_SIZE = 28;
+export const MIN_FONT_SIZE = 8;
+export const MAX_FONT_SIZE = 28;
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
@@ -78,8 +83,8 @@ interface SwarmState {
   dashboardOpen: boolean;
   newAgentOpen: boolean;
   newAgentPrefill: NewAgentPrefill | null;
-  /** working directory of the most recently launched agent, persisted across restarts */
-  lastCwd?: string;
+  /** persisted app preferences (Settings dialog) — includes the last used folder */
+  settings: AppSettings;
   agentCounter: number;
 
   // derived helpers
@@ -97,15 +102,20 @@ interface SwarmState {
   setAttention: (agentId: string, on: boolean) => void;
   setActivity: (agentId: string, activity: ClaudeActivity | undefined) => void;
   setUsage: (agentId: string, usage: SessionUsage | null) => void;
+  setGitInfo: (agentId: string, git: GitInfo | null) => void;
   renameAgent: (agentId: string, name: string) => void;
   setAgentTitle: (agentId: string, title: string) => void;
   /** per-pane zoom: step the font size by delta, or restore the default */
   adjustFontSize: (agentId: string, delta: number | "reset") => void;
   clearUsageHistory: () => void;
 
+  /** merge + persist app preferences (Settings dialog) */
+  updateSettings: (patch: Partial<AppSettings>) => void;
+
   // layout
   setSizes: (splitId: string, sizes: number[]) => void;
   splitActive: (direction: "row" | "column") => void;
+  movePane: (srcPaneId: string, targetPaneId: string, zone: DropZone) => void;
 
   // profiles
   saveProfile: (p: Omit<Profile, "id"> & { id?: string }) => void;
@@ -126,7 +136,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   dashboardOpen: false,
   newAgentOpen: false,
   newAgentPrefill: null,
-  lastCwd: undefined,
+  settings: {},
   agentCounter: 0,
 
   activeAgentId: () => {
@@ -139,7 +149,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   hydrate: async () => {
     try {
       const settings = await loadSettings();
-      if (settings?.lastCwd) set({ lastCwd: settings.lastCwd });
+      if (settings) set({ settings });
     } catch {
       /* ignore */
     }
@@ -199,7 +209,11 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       // a name typed in the dialog wins over captured terminal titles
       renamed: !!opts.name?.trim(),
       cwd: opts.cwd || profile?.defaultCwd,
-      startup: opts.startup ?? profile?.startup ?? DEFAULT_STARTUP,
+      startup:
+        opts.startup ??
+        profile?.startup ??
+        state.settings.defaultStartup ??
+        DEFAULT_STARTUP,
       color: opts.color || profile?.color || pickColor(n),
       status: "starting",
       attention: false,
@@ -233,9 +247,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       agentCounter: n,
       newAgentOpen: false,
       newAgentPrefill: null,
-      ...(agent.cwd ? { lastCwd: agent.cwd } : {}),
     });
-    if (agent.cwd) void saveSettings({ lastCwd: agent.cwd });
+    if (agent.cwd) get().updateSettings({ lastCwd: agent.cwd });
     return id;
   },
 
@@ -351,9 +364,35 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     });
   },
 
+  setGitInfo: (agentId, git) => {
+    const state = get();
+    const agent = state.agents[agentId];
+    if (!agent) return;
+    // polled every few seconds — only touch the store when something changed
+    const prev = agent.git;
+    const same =
+      prev === git ||
+      (!!prev &&
+        !!git &&
+        prev.repo === git.repo &&
+        prev.branch === git.branch &&
+        prev.insertions === git.insertions &&
+        prev.deletions === git.deletions &&
+        prev.untracked === git.untracked &&
+        prev.remote_url === git.remote_url);
+    if (same) return;
+    set({ agents: { ...state.agents, [agentId]: { ...agent, git } } });
+  },
+
   clearUsageHistory: () => {
     set({ usageHistory: {} });
     void saveUsageHistory([]);
+  },
+
+  updateSettings: (patch) => {
+    const settings = { ...get().settings, ...patch };
+    set({ settings });
+    void saveSettings(settings);
   },
 
   renameAgent: (agentId, name) => {
@@ -392,13 +431,12 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const state = get();
     const agent = state.agents[agentId];
     if (!agent) return;
+    const base =
+      agent.fontSize ?? state.settings.defaultFontSize ?? DEFAULT_FONT_SIZE;
     const fontSize =
       delta === "reset"
         ? undefined
-        : Math.min(
-            MAX_FONT_SIZE,
-            Math.max(MIN_FONT_SIZE, (agent.fontSize ?? DEFAULT_FONT_SIZE) + delta),
-          );
+        : Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, base + delta));
     if (fontSize === agent.fontSize) return;
     set({ agents: { ...state.agents, [agentId]: { ...agent, fontSize } } });
   },
@@ -407,6 +445,12 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const state = get();
     if (!state.layout) return;
     set({ layout: setSplitSizes(state.layout, splitId, sizes) });
+  },
+
+  movePane: (srcPaneId, targetPaneId, zone) => {
+    const state = get();
+    if (!state.layout) return;
+    set({ layout: movePaneInLayout(state.layout, srcPaneId, targetPaneId, zone) });
   },
 
   splitActive: (direction) => {

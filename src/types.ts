@@ -89,10 +89,40 @@ export interface SubscriptionLimits {
   seven_day_opus: RateLimitWindow | null;
 }
 
-/** Small app-wide preferences, persisted across restarts. */
+/**
+ * Read-only git snapshot of an agent's working directory, polled every few
+ * seconds. Produced by `git_info` (Rust) / `/api/git` (web) — both shell out
+ * to the git binary and must stay in sync.
+ */
+export interface GitInfo {
+  /** repo root folder name */
+  repo: string;
+  /** branch name, or the short commit SHA when HEAD is detached */
+  branch: string;
+  /** added lines of tracked files (working tree + index vs HEAD) */
+  insertions: number;
+  /** removed lines of tracked files (working tree + index vs HEAD) */
+  deletions: number;
+  /** files git doesn't track yet (.gitignore respected) */
+  untracked: number;
+  /** browsable https URL of the `origin` remote, if one exists */
+  remote_url: string | null;
+}
+
+/** Small app-wide preferences, persisted across restarts. Edited in the Settings dialog. */
 export interface AppSettings {
   /** last working directory an agent was launched in — prefilled in the New Agent dialog */
   lastCwd?: string;
+  /** download updates in the background as soon as they're found (native only; installing still needs a restart) */
+  autoUpdate?: boolean;
+  /** default terminal font size for panes without a per-pane zoom override */
+  defaultFontSize?: number;
+  /** startup command the New Agent dialog opens with; unset = built-in default, "" = plain shell */
+  defaultStartup?: string;
+  /** absolute path used instead of `claude` at the start of startup commands */
+  claudePath?: string;
+  /** absolute path to the git binary used for the read-only pane git status */
+  gitPath?: string;
 }
 
 export interface Profile {
@@ -125,6 +155,8 @@ export interface Agent {
   activity?: ClaudeActivity;
   /** per-pane terminal font size override (⌘+/⌘− zoom); unset = default */
   fontSize?: number;
+  /** live git snapshot of the cwd; null = checked and not inside a repo */
+  git?: GitInfo | null;
 }
 
 // ---- Tiling layout tree ----

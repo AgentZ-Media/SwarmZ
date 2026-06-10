@@ -1,12 +1,10 @@
 import {
   BarChart3,
-  Check,
   Download,
   Gauge,
   Plus,
-  RefreshCw,
+  Settings,
   SlidersHorizontal,
-  Zap,
 } from "lucide-react";
 import { useSwarm } from "@/store";
 import { useUpdates } from "@/lib/updates";
@@ -16,7 +14,13 @@ import { Tip } from "./ui/tooltip";
 import { IS_TAURI } from "@/lib/transport";
 import type { RateLimitWindow } from "@/types";
 
-export function TitleBar({ onManageProfiles }: { onManageProfiles: () => void }) {
+export function TitleBar({
+  onManageProfiles,
+  onOpenSettings,
+}: {
+  onManageProfiles: () => void;
+  onOpenSettings: () => void;
+}) {
   const setNewAgentOpen = useSwarm((s) => s.setNewAgentOpen);
   const setDashboardOpen = useSwarm((s) => s.setDashboardOpen);
   const dashboardOpen = useSwarm((s) => s.dashboardOpen);
@@ -34,10 +38,13 @@ export function TitleBar({ onManageProfiles }: { onManageProfiles: () => void })
       style={{ paddingLeft: IS_TAURI ? 80 : 16 }}
     >
       {/* decorative — pointer-events-none lets the drag fall through to the header */}
-      <div className="pointer-events-none flex items-center gap-2.5">
-        <div className="flex h-6 w-6 items-center justify-center rounded-md bg-primary">
-          <Zap size={13} className="text-primary-foreground" fill="currentColor" />
-        </div>
+      <div className="pointer-events-none flex items-center gap-2">
+        <img
+          src="/favicon.png"
+          alt=""
+          draggable={false}
+          className="h-7 w-7"
+        />
         <span className="text-sm font-semibold tracking-tight text-foreground">
           SwarmZ
         </span>
@@ -80,7 +87,16 @@ export function TitleBar({ onManageProfiles }: { onManageProfiles: () => void })
           </Button>
         </Tip>
 
-        {IS_TAURI && <UpdateCheckButton />}
+        <Tip label="Settings">
+          <Button
+            size="icon"
+            variant="ghost"
+            className="no-drag"
+            onClick={onOpenSettings}
+          >
+            <Settings size={15} />
+          </Button>
+        </Tip>
 
         <Button
           size="sm"
@@ -232,39 +248,3 @@ function UpdatePill() {
   );
 }
 
-/** Manual "check for updates" — quiet icon button with transient feedback. */
-function UpdateCheckButton() {
-  const manualCheck = useUpdates((s) => s.manualCheck);
-  const stage = useUpdates((s) => s.stage);
-  const checkNow = useUpdates((s) => s.checkNow);
-
-  const label =
-    manualCheck === "checking"
-      ? "Checking for updates…"
-      : manualCheck === "uptodate"
-        ? "You're up to date"
-        : manualCheck === "error"
-          ? "Update check failed"
-          : "Check for updates";
-
-  return (
-    <Tip label={label}>
-      <Button
-        size="icon"
-        variant="ghost"
-        className="no-drag"
-        disabled={manualCheck === "checking" || stage === "downloading"}
-        onClick={() => void checkNow()}
-      >
-        {manualCheck === "uptodate" ? (
-          <Check size={15} className="text-success" />
-        ) : (
-          <RefreshCw
-            size={15}
-            className={manualCheck === "checking" ? "animate-spin" : ""}
-          />
-        )}
-      </Button>
-    </Tip>
-  );
-}

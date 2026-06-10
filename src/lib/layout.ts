@@ -113,6 +113,94 @@ export function removePaneByAgent(
   return recurse(root);
 }
 
+/** Drop target when dragging a pane: center swaps, edges dock the pane to that side. */
+export type DropZone = "center" | "left" | "right" | "top" | "bottom";
+
+/** Insert an existing pane next to `targetPaneId` (tmux-style sibling insertion
+ *  when the parent split already runs in `direction`, otherwise wrap in a new split). */
+function insertPaneBeside(
+  root: LayoutNode,
+  targetPaneId: string,
+  pane: PaneNode,
+  direction: "row" | "column",
+  before: boolean,
+): LayoutNode {
+  function recurse(node: LayoutNode, parent: SplitNode | null): LayoutNode {
+    if (node.type === "pane") {
+      if (node.id !== targetPaneId) return node;
+      if (parent && parent.direction === direction) {
+        return node; // sibling insertion handled at the parent level below
+      }
+      const split: SplitNode = {
+        type: "split",
+        id: nanoid(8),
+        direction,
+        sizes: [50, 50],
+        children: before ? [pane, node] : [node, pane],
+      };
+      return split;
+    }
+
+    if (node.direction === direction) {
+      const idx = node.children.findIndex(
+        (c) => c.type === "pane" && c.id === targetPaneId,
+      );
+      if (idx >= 0) {
+        const children = [...node.children];
+        const sizes = [...node.sizes];
+        const half = (sizes[idx] ?? 50) / 2;
+        sizes[idx] = half;
+        const at = before ? idx : idx + 1;
+        children.splice(at, 0, pane);
+        sizes.splice(at, 0, half || 50);
+        return { ...node, children, sizes };
+      }
+    }
+    return {
+      ...node,
+      children: node.children.map((c) => recurse(c, node)),
+    };
+  }
+
+  return recurse(root, null);
+}
+
+/**
+ * Move `srcPaneId` onto `targetPaneId`: "center" swaps the two panes in place,
+ * edge zones detach the source pane and dock it to that side of the target.
+ * Pane nodes (ids + agentIds) are preserved, so panes never remount.
+ */
+export function movePane(
+  root: LayoutNode,
+  srcPaneId: string,
+  targetPaneId: string,
+  zone: DropZone,
+): LayoutNode {
+  if (srcPaneId === targetPaneId) return root;
+  const panes = collectPanes(root);
+  const src = panes.find((p) => p.id === srcPaneId);
+  const target = panes.find((p) => p.id === targetPaneId);
+  if (!src || !target) return root;
+
+  if (zone === "center") {
+    const swap = (node: LayoutNode): LayoutNode => {
+      if (node.type === "pane") {
+        if (node.id === srcPaneId) return target;
+        if (node.id === targetPaneId) return src;
+        return node;
+      }
+      return { ...node, children: node.children.map(swap) };
+    };
+    return swap(root);
+  }
+
+  const without = removePaneByAgent(root, src.agentId);
+  if (!without) return root;
+  const direction = zone === "left" || zone === "right" ? "row" : "column";
+  const before = zone === "left" || zone === "top";
+  return insertPaneBeside(without, targetPaneId, src, direction, before);
+}
+
 export function setSplitSizes(
   root: LayoutNode,
   splitId: string,

@@ -12,6 +12,7 @@ import {
   ptyWrite,
 } from "@/lib/transport";
 import { DEFAULT_FONT_SIZE, useSwarm } from "@/store";
+import { applyClaudePath } from "@/lib/utils";
 
 // harmonized with the design tokens in styles.css — muted, low-noise ANSI set
 const THEME = {
@@ -81,7 +82,12 @@ export function TerminalView({
   const setAttention = useSwarm((s) => s.setAttention);
   const setActivity = useSwarm((s) => s.setActivity);
   const setAgentTitle = useSwarm((s) => s.setAgentTitle);
-  const fontSize = useSwarm((s) => s.agents[agentId]?.fontSize ?? DEFAULT_FONT_SIZE);
+  const fontSize = useSwarm(
+    (s) =>
+      s.agents[agentId]?.fontSize ??
+      s.settings.defaultFontSize ??
+      DEFAULT_FONT_SIZE,
+  );
 
   useEffect(() => {
     if (!containerRef.current || spawnedRef.current) return;
@@ -174,7 +180,13 @@ export function TerminalView({
       term.write("\r\n\x1b[2m[ process exited ]\x1b[0m\r\n");
     });
 
-    void ptySpawn({ id: agentId, cwd, startup, cols, rows }).then(() => {
+    void ptySpawn({
+      id: agentId,
+      cwd,
+      startup: applyClaudePath(startup, useSwarm.getState().settings.claudePath),
+      cols,
+      rows,
+    }).then(() => {
       setStatus(agentId, "running");
     });
 

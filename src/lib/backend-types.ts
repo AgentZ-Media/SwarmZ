@@ -1,5 +1,6 @@
 import type {
   AppSettings,
+  GitInfo,
   Profile,
   SessionUsage,
   SubscriptionLimits,
@@ -38,6 +39,8 @@ export interface Backend {
     cwd: string,
     sinceMs: number,
     sessionId?: string,
+    /** session ids already claimed by other agents — never match these */
+    excludeSessionIds?: string[],
   ): Promise<SessionUsage | null>;
   fetchUsageTotals(): Promise<UsageTotals>;
   /**
@@ -48,6 +51,14 @@ export interface Backend {
 
   pickDirectory(): Promise<string | undefined>;
   getHome(): Promise<string>;
+
+  /**
+   * Read-only git snapshot for a directory; null when it isn't inside a repo.
+   * `gitBin` overrides the git binary (Settings → Paths).
+   */
+  fetchGitInfo(cwd: string, gitBin?: string): Promise<GitInfo | null>;
+  /** Open a URL in the user's default browser. */
+  openUrl(url: string): Promise<void>;
 
   ensureNotifyPermission(): Promise<boolean>;
   notify(title: string, body: string): Promise<void>;
@@ -61,6 +72,9 @@ export interface Backend {
   loadSettings(): Promise<AppSettings | null>;
   saveSettings(settings: AppSettings): Promise<void>;
 
-  /** null when no Claude Code login is found or the request fails. */
+  /**
+   * null when no Claude Code login is found (UI hides the meters); transient
+   * fetch errors reject so callers can keep showing the last known values.
+   */
   fetchSubscriptionLimits(): Promise<SubscriptionLimits | null>;
 }

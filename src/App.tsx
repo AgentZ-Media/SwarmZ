@@ -5,12 +5,14 @@ import { TitleBar } from "./components/TitleBar";
 import { TilingGrid } from "./components/TilingGrid";
 import { NewAgentDialog } from "./components/NewAgentDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
+import { SettingsDialog } from "./components/SettingsDialog";
 import { UsageDashboard } from "./components/UsageDashboard";
 import { WebDirectoryPicker } from "./components/WebDirectoryPicker";
 import { Button } from "./components/ui/button";
 import { useSwarm } from "./store";
 import { useUpdates } from "./lib/updates";
 import { useLimits } from "./lib/limits";
+import { startGitPolling } from "./lib/git";
 import { encodeProjectDir } from "./lib/utils";
 import {
   ensureNotifyPermission,
@@ -30,6 +32,7 @@ export default function App() {
   const order = useSwarm((s) => s.order);
 
   const [profilesOpen, setProfilesOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const homeRef = useRef<string>("");
   const notifyGranted = useRef(false);
   const prevAttention = useRef<Set<string>>(new Set());
@@ -42,9 +45,11 @@ export default function App() {
     const updates = useUpdates.getState();
     updates.startBackgroundPolling();
     const stopLimits = useLimits.getState().start();
+    const stopGit = startGitPolling();
     return () => {
       updates.stopBackgroundPolling();
       stopLimits();
+      stopGit();
     };
   }, [hydrate]);
 
@@ -67,8 +72,14 @@ export default function App() {
           if (!a) return;
           const dir = a.cwd || homeRef.current;
           if (!dir) return;
+          // sessions other agents have latched onto — with several agents in
+          // the same folder, an unlatched pane must never match a sibling's file
+          const exclude = order
+            .filter((oid) => oid !== id)
+            .map((oid) => agents[oid]?.sessionId)
+            .filter((s): s is string => !!s);
           try {
-            const u = await fetchUsageForSession(dir, a.createdAt, a.sessionId);
+            const u = await fetchUsageForSession(dir, a.createdAt, a.sessionId, exclude);
             if (alive && u) setUsage(id, u);
           } catch {
             /* ignore */
@@ -153,6 +164,10 @@ export default function App() {
       if (k === "t") {
         e.preventDefault();
         setNewAgentOpen(true);
+      } else if (k === ",") {
+        // macOS convention: ⌘, opens settings
+        e.preventDefault();
+        setSettingsOpen(true);
       } else if (k === "d") {
         e.preventDefault();
         splitActive(e.shiftKey ? "column" : "row");
@@ -178,7 +193,10 @@ export default function App() {
   return (
     <TooltipProvider delayDuration={300}>
       <div className="flex h-screen w-screen flex-col overflow-hidden bg-background">
-        <TitleBar onManageProfiles={() => setProfilesOpen(true)} />
+        <TitleBar
+          onManageProfiles={() => setProfilesOpen(true)}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
         <main className="relative min-h-0 min-w-0 flex-1 p-2">
           {order.length === 0 ? (
             <EmptyState onNew={() => setNewAgentOpen(true)} />
@@ -190,6 +208,7 @@ export default function App() {
 
       <NewAgentDialog />
       <ProfilesDialog open={profilesOpen} onOpenChange={setProfilesOpen} />
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       <UsageDashboard />
       <WebDirectoryPicker />
     </TooltipProvider>

@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { IS_TAURI } from "./transport";
+import { useSwarm } from "@/store";
 
 // Same logic as ScriptZ: silent background poll (30s after startup, then
 // hourly) plus a manual check with visible feedback. Native (Tauri) only —
@@ -52,6 +53,11 @@ export const useUpdates = create<UpdatesState>((set, get) => {
       if (update) {
         availableUpdate = update;
         set({ stage: "available", version: update.version, manualCheck: null });
+        // auto-update (Settings): download right away — installing still
+        // happens on restart, the title-bar pill flips to "Restart to update"
+        if (useSwarm.getState().settings.autoUpdate) {
+          void get().downloadAndInstall();
+        }
       } else if (opts.manual) {
         set({ manualCheck: "uptodate" });
       }

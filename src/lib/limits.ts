@@ -23,8 +23,10 @@ export const useLimits = create<LimitsState>((set) => ({
 
     const refresh = async () => {
       try {
+        // null = no Claude login on this machine → hide the meters
         set({ limits: await fetchSubscriptionLimits(), loaded: true });
       } catch {
+        // transient fetch error → keep showing the last known values
         set({ loaded: true });
       }
     };

@@ -1,3 +1,4 @@
+mod git;
 mod limits;
 mod pty;
 mod usage;
@@ -49,8 +50,18 @@ fn usage_for_dir(cwd: String) -> Option<SessionUsage> {
 }
 
 #[tauri::command]
-fn usage_for_session(cwd: String, since: f64, session: Option<String>) -> Option<SessionUsage> {
-    usage::usage_for_session(&cwd, since as u64, session.as_deref())
+fn usage_for_session(
+    cwd: String,
+    since: f64,
+    session: Option<String>,
+    exclude: Option<Vec<String>>,
+) -> Option<SessionUsage> {
+    usage::usage_for_session(
+        &cwd,
+        since as u64,
+        session.as_deref(),
+        exclude.as_deref().unwrap_or(&[]),
+    )
 }
 
 #[tauri::command]
@@ -59,8 +70,17 @@ fn usage_totals() -> UsageTotals {
 }
 
 #[tauri::command]
-async fn subscription_limits() -> Option<limits::SubscriptionLimits> {
+async fn subscription_limits() -> Result<Option<limits::SubscriptionLimits>, String> {
     limits::fetch_limits().await
+}
+
+#[tauri::command]
+async fn git_info(cwd: String, bin: Option<String>) -> Option<git::GitInfo> {
+    // subprocess work — keep it off the async runtime's core threads
+    tauri::async_runtime::spawn_blocking(move || git::git_info(&cwd, bin.as_deref()))
+        .await
+        .ok()
+        .flatten()
 }
 
 fn start_usage_watcher(app: AppHandle) {
@@ -158,6 +178,7 @@ pub fn run() {
             usage_for_session,
             usage_totals,
             subscription_limits,
+            git_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

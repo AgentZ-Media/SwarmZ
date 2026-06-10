@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { openUrl as openerOpenUrl } from "@tauri-apps/plugin-opener";
 import {
   isPermissionGranted,
   requestPermission,
@@ -10,6 +11,7 @@ import {
 import { LazyStore } from "@tauri-apps/plugin-store";
 import type {
   AppSettings,
+  GitInfo,
   Profile,
   SessionUsage,
   SubscriptionLimits,
@@ -33,11 +35,12 @@ export const tauriBackend: Backend = {
 
   fetchUsageForDir: (cwd) =>
     invoke<SessionUsage | null>("usage_for_dir", { cwd }),
-  fetchUsageForSession: (cwd, sinceMs, sessionId) =>
+  fetchUsageForSession: (cwd, sinceMs, sessionId, excludeSessionIds) =>
     invoke<SessionUsage | null>("usage_for_session", {
       cwd,
       since: sinceMs,
       session: sessionId,
+      exclude: excludeSessionIds,
     }),
   fetchUsageTotals: () => invoke<UsageTotals>("usage_totals"),
   onUsageChanged: (cb) =>
@@ -48,6 +51,10 @@ export const tauriBackend: Backend = {
     return typeof sel === "string" ? sel : undefined;
   },
   getHome: () => homeDir(),
+
+  fetchGitInfo: (cwd, gitBin) =>
+    invoke<GitInfo | null>("git_info", { cwd, bin: gitBin }),
+  openUrl: (url) => openerOpenUrl(url),
 
   ensureNotifyPermission: async () => {
     let granted = await isPermissionGranted();
