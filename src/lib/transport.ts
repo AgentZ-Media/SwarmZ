@@ -29,5 +29,8 @@ export const loadProfiles = backend.loadProfiles;
 export const saveProfiles = backend.saveProfiles;
 export const loadUsageHistory = backend.loadUsageHistory;
 export const saveUsageHistory = backend.saveUsageHistory;
+export const loadSettings = backend.loadSettings;
+export const saveSettings = backend.saveSettings;
+export const fetchSubscriptionLimits = backend.fetchSubscriptionLimits;
 
 export type { PtyDataEvent, PtyExitEvent } from "./backend-types";

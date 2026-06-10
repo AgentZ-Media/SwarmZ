@@ -2,6 +2,7 @@ import {
   BarChart3,
   Check,
   Download,
+  Gauge,
   Plus,
   RefreshCw,
   SlidersHorizontal,
@@ -9,10 +10,11 @@ import {
 } from "lucide-react";
 import { useSwarm } from "@/store";
 import { useUpdates } from "@/lib/updates";
+import { useLimits } from "@/lib/limits";
 import { Button } from "./ui/button";
 import { Tip } from "./ui/tooltip";
-import { formatTokens, formatUsd } from "@/lib/utils";
 import { IS_TAURI } from "@/lib/transport";
+import type { RateLimitWindow } from "@/types";
 
 export function TitleBar({ onManageProfiles }: { onManageProfiles: () => void }) {
   const setNewAgentOpen = useSwarm((s) => s.setNewAgentOpen);
@@ -21,21 +23,6 @@ export function TitleBar({ onManageProfiles }: { onManageProfiles: () => void })
   const agents = useSwarm((s) => s.agents);
   const order = useSwarm((s) => s.order);
 
-  const live = order.reduce(
-    (acc, id) => {
-      const u = agents[id]?.usage;
-      if (u) {
-        acc.cost += u.cost_usd;
-        acc.tokens +=
-          u.input_tokens +
-          u.output_tokens +
-          u.cache_creation_tokens +
-          u.cache_read_tokens;
-      }
-      return acc;
-    },
-    { cost: 0, tokens: 0 },
-  );
   const running = order.filter(
     (id) => agents[id]?.status === "running" || agents[id]?.status === "attention",
   ).length;
@@ -69,22 +56,7 @@ export function TitleBar({ onManageProfiles }: { onManageProfiles: () => void })
       <div className="ml-auto flex items-center gap-2">
         {IS_TAURI && <UpdatePill />}
 
-        <div className="flex h-7 items-center gap-3 rounded-md border border-border bg-card px-3">
-          <Tip label="Tokens across open agents (current sessions)">
-            <span className="flex items-center gap-1.5 font-mono text-[11px] tabular-nums text-muted-foreground">
-              <span className="text-[10px] font-medium uppercase tracking-wider text-faint">
-                tok
-              </span>
-              {formatTokens(live.tokens)}
-            </span>
-          </Tip>
-          <div className="h-3.5 w-px bg-border" />
-          <Tip label="Cost across open agents (current sessions)">
-            <span className="font-mono text-[11px] tabular-nums text-foreground">
-              {formatUsd(live.cost)}
-            </span>
-          </Tip>
-        </div>
+        <LimitsPill />
 
         <Tip label="Usage dashboard">
           <Button
@@ -119,6 +91,106 @@ export function TitleBar({ onManageProfiles }: { onManageProfiles: () => void })
         </Button>
       </div>
     </header>
+  );
+}
+
+function limitColor(pct: number) {
+  return pct >= 85
+    ? "var(--destructive)"
+    : pct >= 65
+      ? "var(--warning)"
+      : "var(--success)";
+}
+
+function formatReset(iso: string | null) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+  const time = d.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const withinDay = d.getTime() - Date.now() < 24 * 60 * 60 * 1000;
+  if (withinDay) return time;
+  const day = d.toLocaleDateString(undefined, { weekday: "short" });
+  return `${day} ${time}`;
+}
+
+function LimitMeter({
+  label,
+  tip,
+  win,
+}: {
+  label: string;
+  tip: string;
+  win: RateLimitWindow;
+}) {
+  const pct = Math.min(Math.max(win.utilization ?? 0, 0), 100);
+  const reset = formatReset(win.resets_at);
+  return (
+    <Tip
+      label={
+        <span className="font-mono text-[11px]">
+          {tip}: {Math.round(pct)}% used
+          {reset ? ` · resets ${reset}` : ""}
+        </span>
+      }
+    >
+      <span className="flex items-center gap-1.5">
+        <span className="text-[10px] font-medium uppercase tracking-wider text-faint">
+          {label}
+        </span>
+        <span className="h-1 w-10 overflow-hidden rounded-full bg-secondary">
+          <span
+            className="block h-full rounded-full"
+            style={{ width: `${pct}%`, backgroundColor: limitColor(pct) }}
+          />
+        </span>
+        <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+          {Math.round(pct)}%
+        </span>
+      </span>
+    </Tip>
+  );
+}
+
+/**
+ * Usage limits of the Claude subscription logged in on this machine
+ * (5-hour session window + weekly windows). Hidden when no login is found.
+ */
+function LimitsPill() {
+  const limits = useLimits((s) => s.limits);
+  if (!limits) return null;
+
+  const meters: { label: string; tip: string; win: RateLimitWindow }[] = [];
+  if (limits.five_hour)
+    meters.push({ label: "5h", tip: "5-hour session limit", win: limits.five_hour });
+  if (limits.seven_day)
+    meters.push({ label: "wk", tip: "Weekly limit (all models)", win: limits.seven_day });
+  if (limits.seven_day_sonnet?.utilization)
+    meters.push({
+      label: "son",
+      tip: "Weekly Sonnet limit",
+      win: limits.seven_day_sonnet,
+    });
+  if (limits.seven_day_opus?.utilization)
+    meters.push({
+      label: "opus",
+      tip: "Weekly Opus limit",
+      win: limits.seven_day_opus,
+    });
+  if (meters.length === 0) return null;
+
+  return (
+    <div className="flex h-7 items-center gap-3 rounded-md border border-border bg-card px-3">
+      <Gauge size={12} className="shrink-0 text-faint" />
+      {meters.map((m, i) => (
+        <span key={m.label} className="flex items-center gap-3">
+          {i > 0 && <span className="h-3.5 w-px bg-border" />}
+          <LimitMeter label={m.label} tip={m.tip} win={m.win} />
+        </span>
+      ))}
+    </div>
   );
 }
 

@@ -1,4 +1,9 @@
-import type { Profile, UsageHistoryEntry } from "@/types";
+import type {
+  AppSettings,
+  Profile,
+  SubscriptionLimits,
+  UsageHistoryEntry,
+} from "@/types";
 import type { Backend, PtyDataEvent, PtyExitEvent, Unlisten } from "./backend-types";
 import { requestDirectory } from "./dirpicker";
 
@@ -164,6 +169,30 @@ export const webBackend: Backend = {
       localStorage.setItem("swarmz.usage-history", JSON.stringify(entries));
     } catch {
       /* ignore */
+    }
+  },
+
+  loadSettings: async () => {
+    try {
+      const raw = localStorage.getItem("swarmz.settings");
+      return raw ? (JSON.parse(raw) as AppSettings) : null;
+    } catch {
+      return null;
+    }
+  },
+  saveSettings: async (settings) => {
+    try {
+      localStorage.setItem("swarmz.settings", JSON.stringify(settings));
+    } catch {
+      /* ignore */
+    }
+  },
+
+  fetchSubscriptionLimits: async () => {
+    try {
+      return await getJson<SubscriptionLimits | null>("/api/limits");
+    } catch {
+      return null;
     }
   },
 };

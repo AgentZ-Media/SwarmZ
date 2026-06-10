@@ -2,6 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { WebSocketServer } from "ws";
@@ -67,6 +68,65 @@ app.get("/api/fs/list", (req, res) => {
     home: os.homedir(),
     entries,
   });
+});
+
+// ---- Claude subscription limits (5h / 7d windows) ----
+// Claude Code stores its OAuth credentials in the macOS Keychain
+// ("Claude Code-credentials"); on other setups a plain file exists at
+// ~/.claude/.credentials.json. Both hold {"claudeAiOauth":{"accessToken":…}}.
+function readKeychainCredentials() {
+  return new Promise((resolve) => {
+    execFile(
+      "security",
+      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      (err, stdout) => resolve(err ? null : stdout.trim() || null),
+    );
+  });
+}
+
+async function readClaudeAccessToken() {
+  let raw = null;
+  if (process.platform === "darwin") raw = await readKeychainCredentials();
+  if (!raw) {
+    try {
+      raw = fs.readFileSync(
+        path.join(os.homedir(), ".claude", ".credentials.json"),
+        "utf8",
+      );
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return JSON.parse(raw)?.claudeAiOauth?.accessToken ?? null;
+  } catch {
+    return null;
+  }
+}
+
+app.get("/api/limits", async (_req, res) => {
+  try {
+    const token = await readClaudeAccessToken();
+    if (!token) return res.json(null);
+    const r = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json",
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!r.ok) return res.json(null);
+    const data = await r.json();
+    res.json({
+      five_hour: data.five_hour ?? null,
+      seven_day: data.seven_day ?? null,
+      seven_day_sonnet: data.seven_day_sonnet ?? null,
+      seven_day_opus: data.seven_day_opus ?? null,
+    });
+  } catch {
+    res.json(null);
+  }
 });
 
 // live usage stream (SSE)

@@ -61,6 +61,32 @@ export interface UsageTotals {
   by_model: ModelUsage[];
 }
 
+/** One rate-limit window of the Claude subscription (5h session, 7d week, …). */
+export interface RateLimitWindow {
+  /** percent used, 0–100 */
+  utilization: number | null;
+  /** ISO timestamp when the window resets */
+  resets_at: string | null;
+}
+
+/**
+ * Usage limits of the Claude subscription logged in on this machine,
+ * fetched from the Anthropic OAuth usage endpoint with Claude Code's
+ * own credentials (Keychain / ~/.claude/.credentials.json).
+ */
+export interface SubscriptionLimits {
+  five_hour: RateLimitWindow | null;
+  seven_day: RateLimitWindow | null;
+  seven_day_sonnet: RateLimitWindow | null;
+  seven_day_opus: RateLimitWindow | null;
+}
+
+/** Small app-wide preferences, persisted across restarts. */
+export interface AppSettings {
+  /** last working directory an agent was launched in — prefilled in the New Agent dialog */
+  lastCwd?: string;
+}
+
 export interface Profile {
   id: string;
   name: string;

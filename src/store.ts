@@ -2,8 +2,10 @@ import { create } from "zustand";
 import { nanoid } from "nanoid";
 import {
   loadProfiles,
+  loadSettings,
   loadUsageHistory,
   saveProfiles,
+  saveSettings,
   saveUsageHistory,
 } from "@/lib/transport";
 import type {
@@ -50,6 +52,15 @@ interface CreateAgentOpts {
   color?: string;
 }
 
+/** Values the New Agent dialog opens with (e.g. inherited from the pane being split). */
+export interface NewAgentPrefill {
+  cwd?: string;
+  profileId?: string;
+  startup?: string;
+  /** set when the dialog was opened via a split button — the new pane splits in this direction */
+  direction?: "row" | "column";
+}
+
 interface SwarmState {
   agents: Record<string, Agent>;
   order: string[];
@@ -60,6 +71,9 @@ interface SwarmState {
   usageHistory: Record<string, UsageHistoryEntry>;
   dashboardOpen: boolean;
   newAgentOpen: boolean;
+  newAgentPrefill: NewAgentPrefill | null;
+  /** working directory of the most recently launched agent, persisted across restarts */
+  lastCwd?: string;
   agentCounter: number;
 
   // derived helpers
@@ -101,6 +115,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   usageHistory: {},
   dashboardOpen: false,
   newAgentOpen: false,
+  newAgentPrefill: null,
+  lastCwd: undefined,
   agentCounter: 0,
 
   activeAgentId: () => {
@@ -111,6 +127,12 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   },
 
   hydrate: async () => {
+    try {
+      const settings = await loadSettings();
+      if (settings?.lastCwd) set({ lastCwd: settings.lastCwd });
+    } catch {
+      /* ignore */
+    }
     try {
       const history = await loadUsageHistory();
       if (history?.length) {
@@ -198,7 +220,10 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       activePaneId,
       agentCounter: n,
       newAgentOpen: false,
+      newAgentPrefill: null,
+      ...(agent.cwd ? { lastCwd: agent.cwd } : {}),
     });
+    if (agent.cwd) void saveSettings({ lastCwd: agent.cwd });
     return id;
   },
 
@@ -328,7 +353,19 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   },
 
   splitActive: (direction) => {
-    get().createAgent({}, direction);
+    const state = get();
+    const activeId = state.activeAgentId();
+    const agent = activeId ? state.agents[activeId] : undefined;
+    // open the New Agent dialog inheriting the split-source pane's setup
+    set({
+      newAgentOpen: true,
+      newAgentPrefill: {
+        cwd: agent?.cwd,
+        profileId: agent?.profileId,
+        startup: agent?.startup,
+        direction,
+      },
+    });
   },
 
   saveProfile: (p) => {
@@ -352,5 +389,6 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   },
 
   setDashboardOpen: (open) => set({ dashboardOpen: open }),
-  setNewAgentOpen: (open) => set({ newAgentOpen: open }),
+  setNewAgentOpen: (open) =>
+    set(open ? { newAgentOpen: true, newAgentPrefill: null } : { newAgentOpen: false }),
 }));

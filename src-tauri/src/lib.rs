@@ -1,3 +1,4 @@
+mod limits;
 mod pty;
 mod usage;
 
@@ -55,6 +56,11 @@ fn usage_for_session(cwd: String, since: f64, session: Option<String>) -> Option
 #[tauri::command]
 fn usage_totals() -> UsageTotals {
     usage::usage_totals()
+}
+
+#[tauri::command]
+async fn subscription_limits() -> Option<limits::SubscriptionLimits> {
+    limits::fetch_limits().await
 }
 
 fn start_usage_watcher(app: AppHandle) {
@@ -130,6 +136,8 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // remember window size/position/maximized across restarts
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(manager.clone())
         .setup(move |app| {
             start_usage_watcher(app.handle().clone());
@@ -149,6 +157,7 @@ pub fn run() {
             usage_for_dir,
             usage_for_session,
             usage_totals,
+            subscription_limits,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

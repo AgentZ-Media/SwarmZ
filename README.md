@@ -22,12 +22,13 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 ## ✨ Features
 
 - 🖥️ **Real terminals** — every agent is a PTY-backed login shell (`xterm.js` ↔ `node-pty` / `portable-pty`). `claude`, nvm, aliases and your environment resolve exactly like in iTerm or Terminal.
-- 🧱 **Tiling split-grid** — split any pane right (`⌘D`) or down (`⌘⇧D`), drag dividers to resize. Panes never remount when the grid is rearranged, so scrollback survives.
-- 📊 **Live usage** — model, tokens and **USD cost** per agent in real time, parsed from `~/.claude/projects/*.jsonl`.
-- 🍩 **Context gauge** — a donut in each pane header shows how full the agent's context window currently is (turns amber/red as it fills), with exact numbers on hover.
+- 🧱 **Tiling split-grid** — split any pane right (`⌘D`) or down (`⌘⇧D`), drag dividers to resize. Splitting opens the New Agent dialog prefilled with the source pane's folder, profile and startup command. Panes never remount when the grid is rearranged, so scrollback survives.
+- 📊 **Usage tracking** — model, tokens and estimated USD cost per agent, parsed from `~/.claude/projects/*.jsonl`. Shown on demand: a stats button in every pane header and a global usage drawer — headers stay clean.
+- 🍩 **Context gauge** — a donut plus a `free/total` readout in each pane header shows how much of the agent's context window is left (turns amber/red as it fills).
+- 📈 **Plan limits** — the title bar shows the Claude subscription limits of the account logged into Claude Code on this machine: 5-hour session window, weekly windows and reset times.
 - 💾 **All-time statistics** — every Claude session launched inside SwarmZ is persisted across restarts. The usage drawer toggles between **Session** (what's open right now) and **All time** (everything you've ever run here), with a per-model cost breakdown and session history.
 - 🔔 **Notifications** — when an agent rings the terminal bell (Claude waiting or done), the pane pulses and a native (or browser) notification fires.
-- 🎛️ **Profiles** — presets for startup command, flags and default working directory, persisted across restarts.
+- 🎛️ **Profiles** — presets for startup command, flags and default working directory, persisted across restarts. New agents prefill the profile's default folder, or the last folder you used.
 - 🔄 **Auto-updates** — the native app checks GitHub Releases in the background and updates in-app; manual check via the refresh button in the title bar.
 
 ## 📦 Download
@@ -125,6 +126,8 @@ Per-model pricing (USD / 1M tokens, incl. cache write/read) is fetched live from
 | --- | --- | --- |
 | Profiles | ✅ | Tauri store (`swarmz.json`) / localStorage |
 | Usage history (all-time stats) | ✅ | Tauri store (`swarmz.json`) / localStorage |
+| App settings (last used folder) | ✅ | Tauri store (`swarmz.json`) / localStorage |
+| Window size & position | ✅ native app | `tauri-plugin-window-state` (browser handles its own window in web mode) |
 | Agents & layout | ❌ per session | in-memory |
 
 Usage history only records Claude sessions launched **inside SwarmZ** — plain shells and dev servers never show up in the stats. Snapshots are stored locally, so all-time numbers survive even if `~/.claude` session files are cleaned up.
@@ -132,7 +135,7 @@ Usage history only records Claude sessions launched **inside SwarmZ** — plain 
 ## 📝 Notes
 
 - The terminal runs whatever your `claude` resolves to. If a pane shows `zsh: permission denied: claude`, your Claude Code install is missing its platform-native binary — reinstall Claude Code, not SwarmZ.
-- Everything is local: PTYs, usage parsing and persistence all happen on your machine. SwarmZ makes no network requests of its own.
+- Everything is local: PTYs, usage parsing and persistence all happen on your machine. SwarmZ's only own network requests are the key-less OpenRouter pricing catalog and the Anthropic usage endpoint for your plan limits (authenticated with your local Claude Code login; the token never leaves your machine except to Anthropic).
 
 ## 🤝 Contributing
 

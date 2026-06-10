@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Folder, FolderOpen } from "lucide-react";
+import { Folder, FolderOpen, X } from "lucide-react";
 import { pickDirectory } from "@/lib/transport";
 import {
   Dialog,
@@ -25,22 +25,29 @@ export function NewAgentDialog() {
   const setOpen = useSwarm((s) => s.setNewAgentOpen);
   const profiles = useSwarm((s) => s.profiles);
   const createAgent = useSwarm((s) => s.createAgent);
+  const prefill = useSwarm((s) => s.newAgentPrefill);
+  const lastCwd = useSwarm((s) => s.lastCwd);
 
   const [name, setName] = useState("");
   const [cwd, setCwd] = useState<string | undefined>();
   const [startup, setStartup] = useState("claude --dangerously-skip-permissions");
   const [profileId, setProfileId] = useState<string | undefined>();
 
-  // reset on open
+  // reset on open: inherit from the split-source pane if present, otherwise
+  // fall back to the profile's default cwd or the last used folder
   useEffect(() => {
-    if (open_) {
-      setName("");
-      setCwd(undefined);
-      const first = profiles[0];
-      setProfileId(first?.id);
-      setStartup(first?.startup ?? "claude --dangerously-skip-permissions");
-    }
-  }, [open_, profiles]);
+    if (!open_) return;
+    setName("");
+    const profile =
+      (prefill?.profileId &&
+        profiles.find((p) => p.id === prefill.profileId)) ||
+      profiles[0];
+    setProfileId(profile?.id);
+    setStartup(
+      prefill?.startup ?? profile?.startup ?? "claude --dangerously-skip-permissions",
+    );
+    setCwd(prefill?.cwd ?? profile?.defaultCwd ?? lastCwd);
+  }, [open_, prefill, profiles, lastCwd]);
 
   const pickFolder = async () => {
     const selected = await pickDirectory();
@@ -57,14 +64,21 @@ export function NewAgentDialog() {
   };
 
   const submit = () => {
-    createAgent({ name, cwd, startup, profileId });
+    createAgent({ name, cwd, startup, profileId }, prefill?.direction ?? "row");
   };
+
+  const title =
+    prefill?.direction === "column"
+      ? "Split down"
+      : prefill?.direction === "row"
+        ? "Split right"
+        : "New Agent";
 
   return (
     <Dialog open={open_} onOpenChange={setOpen}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>New Agent</DialogTitle>
+          <DialogTitle>{title}</DialogTitle>
           <DialogDescription>
             Spawn a terminal running Claude with the chosen profile.
           </DialogDescription>
@@ -105,26 +119,37 @@ export function NewAgentDialog() {
 
           <div>
             <Label>Working directory</Label>
-            <button
-              onClick={pickFolder}
-              className="flex h-9 w-full items-center gap-2 rounded-md border border-border bg-secondary/60 px-3 text-left text-sm transition-colors hover:border-input"
-            >
-              {cwd ? (
-                <>
-                  <FolderOpen size={14} className="shrink-0 text-muted-foreground" />
-                  <span className="truncate font-mono text-xs text-foreground">
-                    {shortPath(cwd)}
-                  </span>
-                </>
-              ) : (
-                <>
-                  <Folder size={14} className="shrink-0 text-faint" />
-                  <span className="text-faint">
-                    Home directory (click to choose…)
-                  </span>
-                </>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={pickFolder}
+                className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-secondary/60 px-3 text-left text-sm transition-colors hover:border-input"
+              >
+                {cwd ? (
+                  <>
+                    <FolderOpen size={14} className="shrink-0 text-muted-foreground" />
+                    <span className="truncate font-mono text-xs text-foreground">
+                      {shortPath(cwd)}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <Folder size={14} className="shrink-0 text-faint" />
+                    <span className="text-faint">
+                      Home directory (click to choose…)
+                    </span>
+                  </>
+                )}
+              </button>
+              {cwd && (
+                <button
+                  onClick={() => setCwd(undefined)}
+                  title="Reset to home directory"
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border text-faint transition-colors hover:border-input hover:text-foreground"
+                >
+                  <X size={14} />
+                </button>
               )}
-            </button>
+            </div>
           </div>
 
           <div>

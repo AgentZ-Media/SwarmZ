@@ -9,8 +9,10 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import type {
+  AppSettings,
   Profile,
   SessionUsage,
+  SubscriptionLimits,
   UsageHistoryEntry,
   UsageTotals,
 } from "@/types";
@@ -79,4 +81,19 @@ export const tauriBackend: Backend = {
     await store.set("usageHistory", entries);
     await store.save();
   },
+
+  loadSettings: async () => {
+    try {
+      return (await store.get<AppSettings>("settings")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveSettings: async (settings) => {
+    await store.set("settings", settings);
+    await store.save();
+  },
+
+  fetchSubscriptionLimits: () =>
+    invoke<SubscriptionLimits | null>("subscription_limits"),
 };

@@ -1,6 +1,8 @@
 import type {
+  AppSettings,
   Profile,
   SessionUsage,
+  SubscriptionLimits,
   UsageHistoryEntry,
   UsageTotals,
 } from "@/types";
@@ -55,4 +57,10 @@ export interface Backend {
 
   loadUsageHistory(): Promise<UsageHistoryEntry[] | null>;
   saveUsageHistory(entries: UsageHistoryEntry[]): Promise<void>;
+
+  loadSettings(): Promise<AppSettings | null>;
+  saveSettings(settings: AppSettings): Promise<void>;
+
+  /** null when no Claude Code login is found or the request fails. */
+  fetchSubscriptionLimits(): Promise<SubscriptionLimits | null>;
 }

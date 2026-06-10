@@ -10,6 +10,7 @@ import { WebDirectoryPicker } from "./components/WebDirectoryPicker";
 import { Button } from "./components/ui/button";
 import { useSwarm } from "./store";
 import { useUpdates } from "./lib/updates";
+import { useLimits } from "./lib/limits";
 import { encodeProjectDir } from "./lib/utils";
 import {
   ensureNotifyPermission,
@@ -39,7 +40,11 @@ export default function App() {
     void ensureNotifyPermission().then((g) => (notifyGranted.current = g));
     const updates = useUpdates.getState();
     updates.startBackgroundPolling();
-    return () => updates.stopBackgroundPolling();
+    const stopLimits = useLimits.getState().start();
+    return () => {
+      updates.stopBackgroundPolling();
+      stopLimits();
+    };
   }, [hydrate]);
 
   // usage refresh — each agent shows ONLY its own session's usage.
