@@ -1,7 +1,7 @@
 {
   "name": "swarmz",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "packageManager": "pnpm@10.26.1",
   "scripts": {
@@ -40,6 +40,7 @@
     "@xterm/xterm": "^6.0.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
     "express": "^5.2.1",
     "lucide-react": "^1.17.0",
     "nanoid": "^5.1.11",

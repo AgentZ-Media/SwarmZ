@@ -3,6 +3,7 @@ import type {
   DetectedCommand,
   FolderCommands,
   GitInfo,
+  PersistedWorkspaces,
   Profile,
   SessionUsage,
   SubscriptionLimits,
@@ -86,6 +87,10 @@ export interface Backend {
 
   loadSettings(): Promise<AppSettings | null>;
   saveSettings(settings: AppSettings): Promise<void>;
+
+  /** Workspace tabs (name/order/defaultCwd) — agents inside are in-memory. */
+  loadWorkspaces(): Promise<PersistedWorkspaces | null>;
+  saveWorkspaces(ws: PersistedWorkspaces): Promise<void>;
 
   /**
    * null when no Claude Code login is found (UI hides the meters); transient

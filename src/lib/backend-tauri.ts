@@ -14,6 +14,7 @@ import type {
   DetectedCommand,
   FolderCommands,
   GitInfo,
+  PersistedWorkspaces,
   Profile,
   SessionUsage,
   SubscriptionLimits,
@@ -130,6 +131,18 @@ export const tauriBackend: Backend = {
   },
   saveSettings: async (settings) => {
     await store.set("settings", settings);
+    await store.save();
+  },
+
+  loadWorkspaces: async () => {
+    try {
+      return (await store.get<PersistedWorkspaces>("workspaces")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveWorkspaces: async (ws) => {
+    await store.set("workspaces", ws);
     await store.save();
   },
 

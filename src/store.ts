@@ -5,11 +5,13 @@ import {
   loadProfiles,
   loadSettings,
   loadUsageHistory,
+  loadWorkspaces,
   ptyHasChildren,
   saveCommandPresets,
   saveProfiles,
   saveSettings,
   saveUsageHistory,
+  saveWorkspaces,
 } from "@/lib/transport";
 import type {
   Agent,
@@ -24,6 +26,7 @@ import type {
   Profile,
   SessionUsage,
   UsageHistoryEntry,
+  Workspace,
 } from "@/types";
 import {
   collectPanes,
@@ -35,7 +38,8 @@ import {
   splitPane,
   type DropZone,
 } from "@/lib/layout";
-import { pickColor } from "@/lib/utils";
+import { destroyTerm, focusTerm } from "@/lib/term-host";
+import { folderName, pickColor } from "@/lib/utils";
 
 // Built-in fallback — the effective default is settings.defaultStartup (Settings dialog).
 export const DEFAULT_STARTUP = "claude --dangerously-skip-permissions";
@@ -71,6 +75,22 @@ export function presetKey(cwd?: string): string {
   return cwd || "~";
 }
 
+// Workspace tabs persist (name/order/defaultCwd) — debounced like the history.
+let persistWorkspacesTimer: ReturnType<typeof setTimeout> | null = null;
+function schedulePersistWorkspaces() {
+  if (persistWorkspacesTimer) return;
+  persistWorkspacesTimer = setTimeout(() => {
+    persistWorkspacesTimer = null;
+    const s = useSwarm.getState();
+    void saveWorkspaces({
+      workspaces: s.workspaceOrder
+        .map((id) => s.workspaces[id])
+        .filter((w): w is Workspace => !!w),
+      activeId: s.activeWorkspaceId,
+    });
+  }, 300);
+}
+
 interface CreateAgentOpts {
   name?: string;
   cwd?: string;
@@ -91,8 +111,22 @@ export interface NewAgentPrefill {
 interface SwarmState {
   agents: Record<string, Agent>;
   order: string[];
-  layout: LayoutNode | null;
-  activePaneId: string | null;
+  /** workspace tabs — name/order/defaultCwd persist, everything inside is in-memory */
+  workspaces: Record<string, Workspace>;
+  workspaceOrder: string[];
+  activeWorkspaceId: string;
+  /** tiling tree per workspace (in-memory, like the agents) */
+  layouts: Record<string, LayoutNode | null>;
+  /** active pane per workspace */
+  activePaneIds: Record<string, string | null>;
+  /** fleet overview: every workspace rendered live as a scaled card (⌘E) */
+  fleetOpen: boolean;
+  /** command palette (⌘K) */
+  paletteOpen: boolean;
+  /** workspace pending close while it still contains agents */
+  closeWorkspaceConfirm: string | null;
+  /** tab highlighted as drop target while a pane is dragged over it */
+  tabDropTarget: string | null;
   /** focus mode: this agent's pane is enlarged as an overlay above the grid (in-memory) */
   focusedAgentId: string | null;
   profiles: Profile[];
@@ -104,6 +138,7 @@ interface SwarmState {
   /** persisted app preferences (Settings dialog) — includes the last used folder */
   settings: AppSettings;
   agentCounter: number;
+  workspaceCounter: number;
   /** PiP-style shell terminals floating above the grid (in-memory) */
   floatingTerminals: Record<string, FloatingTerminal>;
   floatingOrder: string[];
@@ -121,6 +156,27 @@ interface SwarmState {
 
   // derived helpers
   activeAgentId: () => string | null;
+
+  // workspaces
+  createWorkspace: (opts?: {
+    name?: string;
+    defaultCwd?: string;
+    activate?: boolean;
+  }) => string;
+  renameWorkspace: (id: string, name: string) => void;
+  setActiveWorkspace: (id: string) => void;
+  /** reorder the tab strip: move workspace `id` to position `toIndex` */
+  moveWorkspace: (id: string, toIndex: number) => void;
+  /** close a workspace; with agents inside it raises the confirm dialog first */
+  requestCloseWorkspace: (id: string) => void;
+  resolveCloseWorkspace: (confirmed: boolean) => void;
+  /** move an agent's pane into another workspace (splits its active pane) */
+  moveAgentToWorkspace: (agentId: string, workspaceId: string) => void;
+  /** jump to the next agent that needs attention, across all workspaces (⌘⇧A) */
+  attentionJump: () => void;
+  setFleetOpen: (open: boolean) => void;
+  setPaletteOpen: (open: boolean) => void;
+  setTabDropTarget: (id: string | null) => void;
 
   // lifecycle
   hydrate: () => Promise<void>;
@@ -181,10 +237,15 @@ interface SwarmState {
   /** merge + persist app preferences (Settings dialog) */
   updateSettings: (patch: Partial<AppSettings>) => void;
 
-  // layout
-  setSizes: (splitId: string, sizes: number[]) => void;
+  // layout (workspace-scoped — drags must commit against the grid they started in)
+  setSizes: (workspaceId: string, splitId: string, sizes: number[]) => void;
   splitActive: (direction: "row" | "column") => void;
-  movePane: (srcPaneId: string, targetPaneId: string, zone: DropZone) => void;
+  movePane: (
+    workspaceId: string,
+    srcPaneId: string,
+    targetPaneId: string,
+    zone: DropZone,
+  ) => void;
 
   // profiles
   saveProfile: (p: Omit<Profile, "id"> & { id?: string }) => void;
@@ -196,11 +257,22 @@ interface SwarmState {
   setFileDrag: (drag: { targetId: string | null } | null) => void;
 }
 
+// the app always has at least one workspace — created synchronously so
+// agents can be spawned before hydrate() finishes
+const initialWorkspace: Workspace = { id: nanoid(8), name: "Workspace 1" };
+
 export const useSwarm = create<SwarmState>((set, get) => ({
   agents: {},
   order: [],
-  layout: null,
-  activePaneId: null,
+  workspaces: { [initialWorkspace.id]: initialWorkspace },
+  workspaceOrder: [initialWorkspace.id],
+  activeWorkspaceId: initialWorkspace.id,
+  layouts: { [initialWorkspace.id]: null },
+  activePaneIds: { [initialWorkspace.id]: null },
+  fleetOpen: false,
+  paletteOpen: false,
+  closeWorkspaceConfirm: null,
+  tabDropTarget: null,
   focusedAgentId: null,
   profiles: [],
   usageHistory: {},
@@ -209,6 +281,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   newAgentPrefill: null,
   settings: {},
   agentCounter: 0,
+  workspaceCounter: 1,
   floatingTerminals: {},
   floatingOrder: [],
   commandPresets: {},
@@ -217,16 +290,220 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   fileDrag: null,
 
   activeAgentId: () => {
-    const { layout, activePaneId } = get();
-    if (!activePaneId) return null;
-    const pane = collectPanes(layout).find((p) => p.id === activePaneId);
+    const { layouts, activePaneIds, activeWorkspaceId } = get();
+    const paneId = activePaneIds[activeWorkspaceId];
+    if (!paneId) return null;
+    const pane = collectPanes(layouts[activeWorkspaceId] ?? null).find(
+      (p) => p.id === paneId,
+    );
     return pane?.agentId ?? null;
+  },
+
+  createWorkspace: (opts = {}) => {
+    const state = get();
+    const id = nanoid(8);
+    const n = state.workspaceCounter + 1;
+    const name =
+      opts.name?.trim() ||
+      (opts.defaultCwd ? folderName(opts.defaultCwd) : `Workspace ${n}`);
+    const ws: Workspace = {
+      id,
+      name,
+      renamed: !!opts.name?.trim(),
+      defaultCwd: opts.defaultCwd,
+    };
+    set({
+      workspaces: { ...state.workspaces, [id]: ws },
+      workspaceOrder: [...state.workspaceOrder, id],
+      layouts: { ...state.layouts, [id]: null },
+      activePaneIds: { ...state.activePaneIds, [id]: null },
+      workspaceCounter: n,
+      ...(opts.activate !== false
+        ? { activeWorkspaceId: id, focusedAgentId: null, fleetOpen: false }
+        : {}),
+    });
+    schedulePersistWorkspaces();
+    return id;
+  },
+
+  renameWorkspace: (id, name) => {
+    const state = get();
+    const ws = state.workspaces[id];
+    const trimmed = name.trim();
+    if (!ws || !trimmed || (ws.name === trimmed && ws.renamed)) return;
+    set({
+      workspaces: {
+        ...state.workspaces,
+        [id]: { ...ws, name: trimmed, renamed: true },
+      },
+    });
+    schedulePersistWorkspaces();
+  },
+
+  setActiveWorkspace: (id) => {
+    const state = get();
+    if (!state.workspaces[id] || state.activeWorkspaceId === id) {
+      // clicking the active tab while the fleet is open still exits the fleet
+      if (state.fleetOpen && state.activeWorkspaceId === id)
+        set({ fleetOpen: false });
+      return;
+    }
+    set({ activeWorkspaceId: id, focusedAgentId: null, fleetOpen: false });
+    schedulePersistWorkspaces();
+  },
+
+  moveWorkspace: (id, toIndex) => {
+    const state = get();
+    const from = state.workspaceOrder.indexOf(id);
+    if (from < 0) return;
+    const to = Math.max(0, Math.min(state.workspaceOrder.length - 1, toIndex));
+    if (from === to) return;
+    const workspaceOrder = [...state.workspaceOrder];
+    workspaceOrder.splice(from, 1);
+    workspaceOrder.splice(to, 0, id);
+    set({ workspaceOrder });
+    schedulePersistWorkspaces();
+  },
+
+  requestCloseWorkspace: (id) => {
+    const state = get();
+    if (!state.workspaces[id]) return;
+    const hasAgents = state.order.some(
+      (aid) => state.agents[aid]?.workspaceId === id,
+    );
+    if (hasAgents) set({ closeWorkspaceConfirm: id });
+    else closeWorkspace(id);
+  },
+
+  resolveCloseWorkspace: (confirmed) => {
+    const id = get().closeWorkspaceConfirm;
+    set({ closeWorkspaceConfirm: null });
+    if (confirmed && id) closeWorkspace(id);
+  },
+
+  moveAgentToWorkspace: (agentId, workspaceId) => {
+    const state = get();
+    const agent = state.agents[agentId];
+    if (!agent || !state.workspaces[workspaceId]) return;
+    if (agent.workspaceId === workspaceId) return;
+    const srcId = agent.workspaceId;
+
+    const srcLayout = removePaneByAgent(state.layouts[srcId] ?? null, agentId);
+    const srcPanes = collectPanes(srcLayout);
+    const srcActive = srcPanes.find(
+      (p) => p.id === state.activePaneIds[srcId],
+    )
+      ? state.activePaneIds[srcId]
+      : (srcPanes[0]?.id ?? null);
+
+    let dstLayout = state.layouts[workspaceId] ?? null;
+    if (!dstLayout) {
+      dstLayout = newPane(agentId);
+    } else {
+      const dstPanes = collectPanes(dstLayout);
+      const target =
+        dstPanes.find((p) => p.id === state.activePaneIds[workspaceId]) ??
+        dstPanes[0];
+      dstLayout = splitPane(dstLayout, target.id, agentId, "row");
+    }
+    const created = findPaneByAgent(dstLayout, agentId);
+
+    set({
+      agents: {
+        ...state.agents,
+        [agentId]: { ...agent, workspaceId },
+      },
+      layouts: {
+        ...state.layouts,
+        [srcId]: srcLayout,
+        [workspaceId]: dstLayout,
+      },
+      activePaneIds: {
+        ...state.activePaneIds,
+        [srcId]: srcActive,
+        [workspaceId]: created?.id ?? state.activePaneIds[workspaceId] ?? null,
+      },
+      focusedAgentId:
+        state.focusedAgentId === agentId ? null : state.focusedAgentId,
+      tabDropTarget: null,
+    });
+  },
+
+  attentionJump: () => {
+    const { agents, order } = get();
+    const waiting = order.filter((id) => {
+      const a = agents[id];
+      return a && (a.attention || a.activity === "waiting");
+    });
+    if (waiting.length === 0) return;
+    const current = get().activeAgentId();
+    const idx = current ? waiting.indexOf(current) : -1;
+    const next = waiting[(idx + 1) % waiting.length];
+    set({ fleetOpen: false });
+    get().focusAgent(next);
+    focusTerm(next);
+  },
+
+  setFleetOpen: (open) =>
+    set(open ? { fleetOpen: true, focusedAgentId: null } : { fleetOpen: false }),
+  setPaletteOpen: (open) => set({ paletteOpen: open }),
+  setTabDropTarget: (id) => {
+    if (get().tabDropTarget !== id) set({ tabDropTarget: id });
   },
 
   hydrate: async () => {
     try {
       const settings = await loadSettings();
       if (settings) set({ settings });
+    } catch {
+      /* ignore */
+    }
+    try {
+      const persisted = await loadWorkspaces();
+      if (persisted?.workspaces.length) {
+        const state = get();
+        // normally the untouched seed workspace is replaced; if an agent was
+        // already spawned before hydrate resolved, keep its workspace and
+        // merge the persisted tabs in after it — never drop saved tabs
+        const keepSeed = state.order.length > 0;
+        const workspaces: Record<string, Workspace> = keepSeed
+          ? { ...state.workspaces }
+          : {};
+        const layouts: Record<string, LayoutNode | null> = keepSeed
+          ? { ...state.layouts }
+          : {};
+        const activePaneIds: Record<string, string | null> = keepSeed
+          ? { ...state.activePaneIds }
+          : {};
+        const workspaceOrder: string[] = keepSeed
+          ? [...state.workspaceOrder]
+          : [];
+        for (const w of persisted.workspaces) {
+          if (workspaces[w.id]) continue;
+          workspaces[w.id] = w;
+          layouts[w.id] = null;
+          activePaneIds[w.id] = null;
+          workspaceOrder.push(w.id);
+        }
+        // avoid duplicate default names after restarts ("Workspace 3" twice)
+        let counter = workspaceOrder.length;
+        for (const id of workspaceOrder) {
+          const m = /^Workspace (\d+)$/.exec(workspaces[id]?.name ?? "");
+          if (m) counter = Math.max(counter, Number(m[1]));
+        }
+        set({
+          workspaces,
+          workspaceOrder,
+          layouts,
+          activePaneIds,
+          activeWorkspaceId: keepSeed
+            ? get().activeWorkspaceId
+            : persisted.activeId && workspaces[persisted.activeId]
+              ? persisted.activeId
+              : workspaceOrder[0],
+          workspaceCounter: counter,
+        });
+      }
     } catch {
       /* ignore */
     }
@@ -293,12 +570,14 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const state = get();
     const id = nanoid(10);
     const n = state.agentCounter + 1;
+    const wsId = state.activeWorkspaceId;
     const profile = opts.profileId
       ? state.profiles.find((p) => p.id === opts.profileId)
       : undefined;
     const agent: Agent = {
       id,
       name: opts.name?.trim() || `Agent ${n}`,
+      workspaceId: wsId,
       // a name typed in the dialog wins over captured terminal titles
       renamed: !!opts.name?.trim(),
       cwd: opts.cwd || profile?.defaultCwd,
@@ -314,8 +593,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       profileId: opts.profileId,
     };
 
-    let layout = state.layout;
-    let activePaneId = state.activePaneId;
+    let layout = state.layouts[wsId] ?? null;
+    let activePaneId = state.activePaneIds[wsId] ?? null;
 
     if (!layout) {
       const pane = newPane(id);
@@ -324,7 +603,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     } else {
       const panes = collectPanes(layout);
       const targetPaneId =
-        panes.find((p) => p.id === state.activePaneId)?.id ?? panes[0]?.id;
+        panes.find((p) => p.id === activePaneId)?.id ?? panes[0]?.id;
       if (targetPaneId) {
         layout = splitPane(layout, targetPaneId, id, direction);
       }
@@ -332,27 +611,50 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       activePaneId = created?.id ?? activePaneId;
     }
 
+    // the first project folder names the tab and becomes its default cwd
+    // (until the user renames the workspace / a defaultCwd exists)
+    let workspaces = state.workspaces;
+    const ws = state.workspaces[wsId];
+    if (ws && agent.cwd && !ws.defaultCwd) {
+      workspaces = {
+        ...workspaces,
+        [wsId]: {
+          ...ws,
+          defaultCwd: agent.cwd,
+          ...(ws.renamed ? {} : { name: folderName(agent.cwd) }),
+        },
+      };
+    }
+
     set({
       agents: { ...state.agents, [id]: agent },
       order: [...state.order, id],
-      layout,
-      activePaneId,
+      workspaces,
+      layouts: { ...state.layouts, [wsId]: layout },
+      activePaneIds: { ...state.activePaneIds, [wsId]: activePaneId },
       agentCounter: n,
       newAgentOpen: false,
       newAgentPrefill: null,
-      // a new pane should be visible immediately — leave focus mode
+      // a new pane should be visible immediately — leave focus mode & fleet
       focusedAgentId: null,
+      fleetOpen: false,
     });
+    if (workspaces !== state.workspaces) schedulePersistWorkspaces();
     if (agent.cwd) get().updateSettings({ lastCwd: agent.cwd });
     return id;
   },
 
   removeAgent: (agentId) => {
     const state = get();
-    const layout = removePaneByAgent(state.layout, agentId);
+    const agent = state.agents[agentId];
+    if (!agent) return;
+    // panes only detach on unmount — the terminal + PTY die here
+    destroyTerm(agentId);
+    const wsId = agent.workspaceId;
+    const layout = removePaneByAgent(state.layouts[wsId] ?? null, agentId);
     const { [agentId]: _removed, ...rest } = state.agents;
     const order = state.order.filter((id) => id !== agentId);
-    let activePaneId = state.activePaneId;
+    let activePaneId = state.activePaneIds[wsId] ?? null;
     const panes = collectPanes(layout);
     if (!panes.find((p) => p.id === activePaneId)) {
       activePaneId = panes[0]?.id ?? null;
@@ -360,8 +662,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     set({
       agents: rest,
       order,
-      layout,
-      activePaneId,
+      layouts: { ...state.layouts, [wsId]: layout },
+      activePaneIds: { ...state.activePaneIds, [wsId]: activePaneId },
       focusedAgentId:
         state.focusedAgentId === agentId ? null : state.focusedAgentId,
     });
@@ -449,6 +751,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
 
   removeFloatingTerminal: (id) => {
     const state = get();
+    // removal is what kills the PTY (windows stay mounted while minimized/detached)
+    destroyTerm(id);
     const { [id]: _removed, ...rest } = state.floatingTerminals;
     set({
       floatingTerminals: rest,
@@ -550,9 +854,21 @@ export const useSwarm = create<SwarmState>((set, get) => ({
 
   focusAgent: (agentId) => {
     const state = get();
-    const pane = findPaneByAgent(state.layout, agentId);
-    if (pane) set({ activePaneId: pane.id });
-    if (state.agents[agentId]?.attention) {
+    const agent = state.agents[agentId];
+    if (!agent) return;
+    const wsId = agent.workspaceId;
+    const pane = findPaneByAgent(state.layouts[wsId] ?? null, agentId);
+    const switchingWs = wsId !== state.activeWorkspaceId;
+    set({
+      ...(switchingWs
+        ? { activeWorkspaceId: wsId, focusedAgentId: null }
+        : {}),
+      ...(pane
+        ? { activePaneIds: { ...state.activePaneIds, [wsId]: pane.id } }
+        : {}),
+    });
+    if (switchingWs) schedulePersistWorkspaces();
+    if (agent.attention) {
       get().setAttention(agentId, false);
     }
   },
@@ -564,8 +880,11 @@ export const useSwarm = create<SwarmState>((set, get) => ({
 
   setActivePane: (paneId) => {
     const state = get();
-    const pane = collectPanes(state.layout).find((p) => p.id === paneId);
-    set({ activePaneId: paneId });
+    const wsId = state.activeWorkspaceId;
+    const pane = collectPanes(state.layouts[wsId] ?? null).find(
+      (p) => p.id === paneId,
+    );
+    set({ activePaneIds: { ...state.activePaneIds, [wsId]: paneId } });
     if (pane && state.agents[pane.agentId]?.attention) {
       get().setAttention(pane.agentId, false);
     }
@@ -729,16 +1048,28 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     set({ agents: { ...state.agents, [agentId]: { ...agent, fontSize } } });
   },
 
-  setSizes: (splitId, sizes) => {
+  setSizes: (workspaceId, splitId, sizes) => {
     const state = get();
-    if (!state.layout) return;
-    set({ layout: setSplitSizes(state.layout, splitId, sizes) });
+    const layout = state.layouts[workspaceId];
+    if (!layout) return;
+    set({
+      layouts: {
+        ...state.layouts,
+        [workspaceId]: setSplitSizes(layout, splitId, sizes),
+      },
+    });
   },
 
-  movePane: (srcPaneId, targetPaneId, zone) => {
+  movePane: (workspaceId, srcPaneId, targetPaneId, zone) => {
     const state = get();
-    if (!state.layout) return;
-    set({ layout: movePaneInLayout(state.layout, srcPaneId, targetPaneId, zone) });
+    const layout = state.layouts[workspaceId];
+    if (!layout) return;
+    set({
+      layouts: {
+        ...state.layouts,
+        [workspaceId]: movePaneInLayout(layout, srcPaneId, targetPaneId, zone),
+      },
+    });
   },
 
   splitActive: (direction) => {
@@ -787,3 +1118,73 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     set({ fileDrag: drag });
   },
 }));
+
+/**
+ * Tear a workspace down: kill its agents (terminals + their floating
+ * terminals; detached floats survive), drop its layout, and keep the app in a
+ * valid state — at least one workspace always exists, and closing the active
+ * tab activates its neighbour.
+ */
+function closeWorkspace(id: string) {
+  const store = useSwarm.getState();
+  if (!store.workspaces[id]) return;
+  const agentIds = store.order.filter(
+    (aid) => store.agents[aid]?.workspaceId === id,
+  );
+
+  // owned floating terminals die with their agents (this also kills their PTYs)
+  for (const tid of [...store.floatingOrder]) {
+    const t = useSwarm.getState().floatingTerminals[tid];
+    if (t?.agentId && agentIds.includes(t.agentId)) {
+      store.removeFloatingTerminal(tid);
+    }
+  }
+  for (const aid of agentIds) destroyTerm(aid);
+
+  const state = useSwarm.getState();
+  const agents = { ...state.agents };
+  for (const aid of agentIds) delete agents[aid];
+  const order = state.order.filter((aid) => !agentIds.includes(aid));
+
+  const workspaces = { ...state.workspaces };
+  delete workspaces[id];
+  const layouts = { ...state.layouts };
+  delete layouts[id];
+  const activePaneIds = { ...state.activePaneIds };
+  delete activePaneIds[id];
+  let workspaceOrder = state.workspaceOrder.filter((w) => w !== id);
+  let activeWorkspaceId = state.activeWorkspaceId;
+  let workspaceCounter = state.workspaceCounter;
+
+  if (workspaceOrder.length === 0) {
+    const fresh: Workspace = {
+      id: nanoid(8),
+      name: `Workspace ${++workspaceCounter}`,
+    };
+    workspaces[fresh.id] = fresh;
+    layouts[fresh.id] = null;
+    activePaneIds[fresh.id] = null;
+    workspaceOrder = [fresh.id];
+    activeWorkspaceId = fresh.id;
+  } else if (activeWorkspaceId === id) {
+    const oldIdx = state.workspaceOrder.indexOf(id);
+    activeWorkspaceId =
+      workspaceOrder[Math.min(Math.max(oldIdx - 1, 0), workspaceOrder.length - 1)];
+  }
+
+  useSwarm.setState({
+    agents,
+    order,
+    workspaces,
+    workspaceOrder,
+    layouts,
+    activePaneIds,
+    activeWorkspaceId,
+    workspaceCounter,
+    focusedAgentId:
+      state.focusedAgentId && agentIds.includes(state.focusedAgentId)
+        ? null
+        : state.focusedAgentId,
+  });
+  schedulePersistWorkspaces();
+}

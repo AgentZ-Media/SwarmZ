@@ -36,6 +36,8 @@ const MARGIN = 16; // px gap to the grid edge for the initial bottom-right spot
  */
 export function FloatingTerminals() {
   const order = useSwarm((s) => s.floatingOrder);
+  // hidden (not unmounted!) while the fleet overview is up
+  const fleetOpen = useSwarm((s) => s.fleetOpen);
   const layerRef = useRef<HTMLDivElement>(null);
 
   // keep windows reachable when the app window shrinks
@@ -61,7 +63,10 @@ export function FloatingTerminals() {
   return (
     <div
       ref={layerRef}
-      className="pointer-events-none absolute inset-0 z-40 overflow-hidden"
+      className={cn(
+        "pointer-events-none absolute inset-0 z-40 overflow-hidden",
+        fleetOpen && "invisible",
+      )}
     >
       {order.map((id, i) => (
         <FloatingTerminalWindow key={id} id={id} index={i} />
@@ -86,6 +91,12 @@ const FloatingTerminalWindow = memo(function FloatingTerminalWindow({
   const update = useSwarm((s) => s.updateFloatingTerminal);
   const remove = useSwarm((s) => s.removeFloatingTerminal);
   const raise = useSwarm((s) => s.raiseFloatingTerminal);
+  // windows follow their owner's workspace; detached windows show everywhere
+  const inActiveWs = useSwarm((s) => {
+    const t = s.floatingTerminals[id];
+    if (!t?.agentId) return true;
+    return s.agents[t.agentId]?.workspaceId === s.activeWorkspaceId;
+  });
   const windowRef = useRef<HTMLDivElement>(null);
   const [commandsOpen, setCommandsOpen] = useState(true);
   // closing while a process runs needs a second click (the X turns red)
@@ -204,6 +215,7 @@ const FloatingTerminalWindow = memo(function FloatingTerminalWindow({
       className={cn(
         "pointer-events-auto absolute flex flex-col overflow-hidden rounded-lg border border-border bg-card shadow-[0_16px_48px_-12px_rgba(0,0,0,0.7)]",
         term.x === null && "invisible", // not laid out yet
+        !inActiveWs && "invisible pointer-events-none",
       )}
       style={{
         left: term.x ?? 0,

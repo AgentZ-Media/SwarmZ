@@ -64,6 +64,11 @@ export function timeAgo(iso: string | null | undefined): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
+/** Last path segment — used to auto-name a workspace after its first project folder. */
+export function folderName(p: string): string {
+  return p.split("/").filter(Boolean).pop() ?? p;
+}
+
 export function shortPath(p?: string): string {
   if (!p) return "~";
   const home = "/Users/";

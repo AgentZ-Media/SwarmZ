@@ -1,17 +1,17 @@
 import { useEffect, useRef, useState } from "react";
-import { Plus, Zap } from "lucide-react";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { TitleBar } from "./components/TitleBar";
-import { TilingGrid } from "./components/TilingGrid";
+import { WorkspaceLayer } from "./components/WorkspaceLayer";
 import { FloatingTerminals } from "./components/FloatingTerminals";
 import { CloseAgentDialog } from "./components/CloseAgentDialog";
+import { CloseWorkspaceDialog } from "./components/CloseWorkspaceDialog";
+import { CommandPalette } from "./components/CommandPalette";
 import { QuitConfirmDialog } from "./components/QuitConfirmDialog";
 import { NewAgentDialog } from "./components/NewAgentDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { UsageDashboard } from "./components/UsageDashboard";
 import { WebDirectoryPicker } from "./components/WebDirectoryPicker";
-import { Button } from "./components/ui/button";
 import { useSwarm } from "./store";
 import { useUpdates } from "./lib/updates";
 import { useLimits } from "./lib/limits";
@@ -35,7 +35,6 @@ export default function App() {
   const requestRemoveAgent = useSwarm((s) => s.requestRemoveAgent);
   const createFloatingTerminal = useSwarm((s) => s.createFloatingTerminal);
   const adjustFontSize = useSwarm((s) => s.adjustFontSize);
-  const order = useSwarm((s) => s.order);
 
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -171,6 +170,7 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey)) return;
       const k = e.key.toLowerCase();
+      const s = useSwarm.getState();
       if (k === "t") {
         e.preventDefault();
         setNewAgentOpen(true);
@@ -178,25 +178,58 @@ export default function App() {
         // macOS convention: ⌘, opens settings
         e.preventDefault();
         setSettingsOpen(true);
+      } else if (k === "k") {
+        e.preventDefault();
+        s.setPaletteOpen(!s.paletteOpen);
+      } else if (k === "e") {
+        e.preventDefault();
+        s.setFleetOpen(!s.fleetOpen);
+      } else if (k === "a" && e.shiftKey) {
+        // jump to the next agent waiting for input, across all workspaces
+        e.preventDefault();
+        s.attentionJump();
+      } else if (k === "n" && e.shiftKey) {
+        e.preventDefault();
+        s.createWorkspace();
       } else if (k === "d") {
         e.preventDefault();
         splitActive(e.shiftKey ? "column" : "row");
+      } else if (k === "w" && e.shiftKey) {
+        e.preventDefault();
+        s.requestCloseWorkspace(s.activeWorkspaceId);
       } else if (k === "w") {
-        const id = useSwarm.getState().activeAgentId();
+        const id = s.activeAgentId();
         if (id) {
           e.preventDefault();
           requestRemoveAgent(id);
         }
       } else if (k === "j") {
         // floating terminal for the active pane
-        const id = useSwarm.getState().activeAgentId();
+        const id = s.activeAgentId();
         if (id) {
           e.preventDefault();
           createFloatingTerminal(id);
         }
+      } else if (k >= "1" && k <= "9") {
+        // ⌘1–9 switch workspaces
+        const wid = s.workspaceOrder[Number(k) - 1];
+        if (wid) {
+          e.preventDefault();
+          s.setActiveWorkspace(wid);
+        }
+      } else if (e.shiftKey && (k === "[" || k === "{" || k === "]" || k === "}")) {
+        // ⌘⇧[ / ⌘⇧] cycle workspaces
+        e.preventDefault();
+        const idx = s.workspaceOrder.indexOf(s.activeWorkspaceId);
+        const delta = k === "[" || k === "{" ? -1 : 1;
+        const next =
+          s.workspaceOrder[
+            (idx + delta + s.workspaceOrder.length) % s.workspaceOrder.length
+          ];
+        if (next) s.setActiveWorkspace(next);
       } else if (k === "+" || k === "=" || k === "-" || k === "0") {
         // per-pane zoom — "=" covers ⌘+ on layouts where + needs shift (US)
-        const id = useSwarm.getState().activeAgentId();
+        const id = s.activeAgentId();
         if (id) {
           e.preventDefault();
           adjustFontSize(id, k === "0" ? "reset" : k === "-" ? -1 : 1);
@@ -214,54 +247,26 @@ export default function App() {
           onManageProfiles={() => setProfilesOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
         />
-        <main className="relative min-h-0 min-w-0 flex-1 p-2">
-          {order.length === 0 ? (
-            <EmptyState onNew={() => setNewAgentOpen(true)} />
-          ) : (
-            <TilingGrid />
-          )}
-          {/* floating terminals live above the grid — and survive it (detached) */}
+        <main className="relative min-h-0 min-w-0 flex-1">
+          {/* all workspace grids stay mounted in here — see WorkspaceLayer */}
+          <WorkspaceLayer />
+          {/* floating terminals live above the grids — and survive them (detached) */}
           <FloatingTerminals />
         </main>
       </div>
 
       <CloseAgentDialog />
+      <CloseWorkspaceDialog />
       <QuitConfirmDialog />
       <NewAgentDialog />
+      <CommandPalette
+        onOpenProfiles={() => setProfilesOpen(true)}
+        onOpenSettings={() => setSettingsOpen(true)}
+      />
       <ProfilesDialog open={profilesOpen} onOpenChange={setProfilesOpen} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       <UsageDashboard />
       <WebDirectoryPicker />
     </TooltipProvider>
-  );
-}
-
-function EmptyState({ onNew }: { onNew: () => void }) {
-  return (
-    <div className="flex h-full w-full items-center justify-center rounded-lg border border-dashed border-border">
-      <div className="flex flex-col items-center gap-5 text-center">
-        <div className="flex h-14 w-14 items-center justify-center rounded-xl border border-border bg-card">
-          <Zap size={22} className="text-foreground" fill="currentColor" />
-        </div>
-        <div>
-          <h1 className="text-lg font-semibold tracking-tight">
-            Welcome to SwarmZ
-          </h1>
-          <p className="mt-1.5 max-w-xs text-sm leading-relaxed text-muted-foreground">
-            Spawn parallel Claude agents, tile them into a grid, and watch
-            tokens &amp; cost in real time.
-          </p>
-        </div>
-        <Button onClick={onNew}>
-          <Plus size={15} /> Launch your first agent
-        </Button>
-        <p className="text-[11px] text-faint">
-          or press{" "}
-          <kbd className="rounded-md border border-border bg-secondary px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-            ⌘T
-          </kbd>
-        </p>
-      </div>
-    </div>
   );
 }

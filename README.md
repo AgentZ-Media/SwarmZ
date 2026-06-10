@@ -17,6 +17,9 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 ## ✨ Features
 
 - 🖥️ **Real terminals** — every agent is a PTY-backed login shell (`xterm.js` ↔ `portable-pty`). `claude`, nvm, aliases and your environment resolve exactly like in iTerm or Terminal.
+- 🗂️ **Workspaces** — tabs in the title bar, each with its own tiling grid. A workspace is whatever you need it to be: one repo, one feature with several worktrees, or a mixed monitoring wall. The first project folder names the tab automatically; every tab shows a live status dot and `busy/total` count. Switch with `⌘1–9` (or `⌘⇧[` / `⌘⇧]`), rename with a double-click, reorder by dragging, and drag any pane's header onto a tab to move that agent — terminal, scrollback and running processes come along untouched. Tabs (name, order, default folder) survive restarts.
+- 🛰️ **Fleet overview** — `⌘E` zooms out to every workspace at once, live: real terminals scaled down, not snapshots. Workspaces needing attention pulse blue; click any pane to jump straight to it. The perfect second-monitor view while a dozen agents work.
+- ⌨️ **Command palette** — `⌘K` fuzzy-jumps to any agent or workspace and reaches every global action without the mouse. `⌘⇧A` cycles through agents waiting for your input, across all workspaces.
 - 📎 **Drag & drop files** — drag an image (or any file) from Finder onto a terminal and its path is typed in, escaped exactly like Terminal.app does — Claude Code attaches it. While dragging, every terminal shows a drop zone and the one under the cursor lights up; works on panes and floating terminals alike.
 - 🧱 **Tiling split-grid** — split any pane right (`⌘D`) or down (`⌘⇧D`), drag dividers to resize, or grab a pane's header to rearrange: drop it on another pane's edge to dock it there (left/right/top/bottom) or on the center to swap the two. Both gestures show a translucent preview while dragging; the layout applies on release, so terminals don't reflow mid-drag (`Esc` cancels). Splitting opens the New Agent dialog prefilled with the source pane's folder, profile and startup command. Panes never remount when the grid is rearranged, so scrollback survives.
 - 🪟 **Floating terminals** — open a small picture-in-picture shell on top of any pane (`⌘J`, the terminal button in the header, or the ⋯ menu), running in the pane's folder — perfect for a dev server or quick git commands without leaving SwarmZ. Drag it anywhere, resize it from the corner, or collapse it to a slim pill while the process keeps running. A quick-command bar offers one-click **presets saved per project folder** plus commands **auto-detected from the project**: `package.json` scripts (run with the package manager your lockfile implies), Cargo targets, Makefile and justfile recipes. Everything is editable in place — editing a detected command saves it as a preset that **overrides** the original, and detected commands can be hidden per folder (and restored). The window names itself after the last command you ran, typed or clicked. Closing a pane checks its floating terminals first — if a process is still running you choose between killing it or **detaching** the terminal, which keeps it alive as an unowned floating pill.
@@ -28,7 +31,7 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 - 📈 **Plan limits** — the title bar shows the Claude subscription limits of the account logged into Claude Code on this machine: 5-hour session window, weekly windows and reset times.
 - 💾 **All-time statistics** — every Claude session launched inside SwarmZ is persisted across restarts. The usage drawer toggles between **Session** (what's open right now) and **All time** (everything you've ever run here), with a per-model cost breakdown and session history.
 - 🏷️ **Auto-naming** — Claude Code generates a topic title for every session (and updates it on `/rename`); SwarmZ captures it from the terminal title and names the pane after it. Rename a pane yourself and the auto-title backs off; clear the name to hand it back.
-- 🚦 **Live status** — the pane status dot mirrors what Claude is actually doing: amber while it's working, green when idle, blue when it waits for input. Captured from Claude Code's terminal progress reporting (plus the bell), no polling involved. The title bar sums it up live (`2 working · 1 idle`), and quitting the app while agents are still working raises a warning that lists them first.
+- 🚦 **Live status** — the pane status dot mirrors what Claude is actually doing: amber while it's working, green when idle, blue when it waits for input. Captured from Claude Code's terminal progress reporting (plus the bell), no polling involved. Every workspace tab sums up its agents live (`2/4` busy), and quitting the app while agents are still working raises a warning that lists them first.
 - 🔔 **Notifications** — when an agent rings the terminal bell (Claude waiting or done), the pane pulses and a native notification fires.
 - 🎛️ **Profiles** — presets for startup command, flags and default working directory, persisted across restarts. New agents prefill the profile's default folder, or the last folder you used.
 - 🔄 **Auto-updates** — the native app checks GitHub Releases in the background and updates in-app; manual check and an automatic-download toggle live in Settings.
@@ -61,6 +64,13 @@ pnpm tauri build        # → src-tauri/target/release/bundle/
 | Shortcut | Action |
 | --- | --- |
 | `⌘T` | New agent |
+| `⌘K` | Command palette |
+| `⌘E` | Fleet overview (all workspaces live) |
+| `⌘⇧A` | Jump to the next agent waiting for input |
+| `⌘1` … `⌘9` | Switch workspace |
+| `⌘⇧[` / `⌘⇧]` | Previous / next workspace |
+| `⌘⇧N` | New workspace |
+| `⌘⇧W` | Close current workspace |
 | `⌘D` | Split active pane right |
 | `⌘⇧D` | Split active pane down |
 | `⌘W` | Close active agent |
@@ -76,14 +86,19 @@ src/lib/transport.ts      the transport layer — frontend ↔ backend
   backend-tauri.ts        Tauri webview → Rust invoke + events
 
 src/
-  store.ts                zustand store (agents, layout tree, profiles, usage history)
-  lib/layout.ts           tiling binary-tree ops (split / remove / resize / move-swap)
+  store.ts                zustand store (workspaces, agents, layout trees, profiles, usage history)
+  lib/layout.ts           tiling binary-tree ops (split / remove / resize / move-swap / rects)
+  lib/term-host.ts        terminals live HERE, outside React — xterm + PTY per id,
+                          panes only attach/detach the DOM (move across workspaces freely)
   lib/updates.ts          auto-updater (background poll + manual check)
   lib/git.ts              per-pane git status poller (branch, ±lines, untracked)
   lib/dnd.ts              OS file drag & drop → escaped path typed into the target terminal
   components/
-    Terminal.tsx          xterm ↔ PTY bridge
-    TilingGrid.tsx        absolute-positioned pane layout + resizers
+    Terminal.tsx          thin attach-wrapper around term-host
+    WorkspaceLayer.tsx    always-mounted grid per workspace + fleet overview (⌘E)
+    TilingGrid.tsx        absolute-positioned pane layout + resizers (per workspace)
+    TitleBar.tsx          workspace tab strip + limits / update / global actions
+    CommandPalette.tsx    ⌘K palette (cmdk) — jump to agents, workspaces, actions
     AgentPane.tsx         pane header (model / context gauge / tokens / cost / controls)
     FloatingTerminals.tsx PiP shell windows + per-project quick-command bar
     UsageDashboard.tsx    usage drawer — Session & All-time views
@@ -115,6 +130,7 @@ Per-model pricing (USD / 1M tokens, incl. cache write/read) is fetched live from
 | Usage history (all-time stats) | ✅ | Tauri store (`swarmz.json`) / localStorage |
 | Command presets (per project folder) | ✅ | Tauri store (`swarmz.json`) / localStorage |
 | App settings (Settings window: last used folder, font size, default command, binary paths, auto-update) | ✅ | Tauri store (`swarmz.json`) / localStorage |
+| Workspace tabs (name, order, default folder, active tab) | ✅ | Tauri store (`swarmz.json`) / localStorage |
 | Window size & position | ✅ | `tauri-plugin-window-state` |
 | Agents & layout | ❌ per session | in-memory |
 | Floating terminals | ❌ per session | in-memory |
