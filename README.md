@@ -18,6 +18,7 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 
 - 🖥️ **Real terminals** — every agent is a PTY-backed login shell (`xterm.js` ↔ `portable-pty`). `claude`, nvm, aliases and your environment resolve exactly like in iTerm or Terminal.
 - 🗂️ **Workspaces** — tabs in the title bar, each with its own tiling grid. A workspace is whatever you need it to be: one repo, one feature with several worktrees, or a mixed monitoring wall. The first project folder names the tab automatically; every tab shows a live status dot and `busy/total` count. Switch with `⌘1–9` (or `⌘⇧[` / `⌘⇧]`), rename with a double-click, reorder by dragging, and drag any pane's header onto a tab to move that agent — terminal, scrollback and running processes come along untouched. Tabs (name, order, default folder) survive restarts.
+- 🔁 **Session restore** — quit SwarmZ and the next launch brings everything back: every workspace, the exact pane layout, and each Claude pane reopens its previous conversation (`claude --resume`). The grid is saved continuously, so even after a crash the last state comes back. Toggleable in Settings (floating terminals don't come back — they're plain shells).
 - 🛰️ **Fleet overview** — `⌘E` zooms out to every workspace at once, live: real terminals scaled down, not snapshots. Workspaces needing attention pulse blue; click any pane to jump straight to it. The perfect second-monitor view while a dozen agents work.
 - ⌨️ **Command palette** — `⌘K` fuzzy-jumps to any agent or workspace and reaches every global action without the mouse. `⌘⇧A` cycles through agents waiting for your input, across all workspaces.
 - 📎 **Drag & drop files** — drag an image (or any file) from Finder onto a terminal and its path is typed in, escaped exactly like Terminal.app does — Claude Code attaches it. While dragging, every terminal shows a drop zone and the one under the cursor lights up; works on panes and floating terminals alike.
@@ -35,7 +36,7 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 - 🔔 **Notifications** — when an agent rings the terminal bell (Claude waiting or done), the pane pulses and a native notification fires.
 - 🎛️ **Profiles** — presets for startup command, flags and default working directory, persisted across restarts. New agents prefill the profile's default folder, or the last folder you used.
 - 🔄 **Auto-updates** — the native app checks GitHub Releases in the background and updates in-app; manual check and an automatic-download toggle live in Settings.
-- ⚙️ **Settings** — `⌘,` (or the gear in the title bar) opens a settings window: default terminal font size, default startup command, path overrides for the `claude` and `git` binaries, update controls and an About panel.
+- ⚙️ **Settings** — `⌘,` (or the gear in the title bar) opens a settings window: session restore, default terminal font size, default startup command, path overrides for the `claude` and `git` binaries, update controls and an About panel.
 
 ## 📦 Download
 

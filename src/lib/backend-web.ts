@@ -3,6 +3,7 @@ import type {
   DetectedCommand,
   FolderCommands,
   GitInfo,
+  PersistedGrid,
   PersistedWorkspaces,
   Profile,
   SubscriptionLimits,
@@ -255,6 +256,22 @@ export const webBackend: Backend = {
   saveWorkspaces: async (ws) => {
     try {
       localStorage.setItem("swarmz.workspaces", JSON.stringify(ws));
+    } catch {
+      /* ignore */
+    }
+  },
+
+  loadGrid: async () => {
+    try {
+      const raw = localStorage.getItem("swarmz.grid");
+      return raw ? (JSON.parse(raw) as PersistedGrid) : null;
+    } catch {
+      return null;
+    }
+  },
+  saveGrid: async (grid) => {
+    try {
+      localStorage.setItem("swarmz.grid", JSON.stringify(grid));
     } catch {
       /* ignore */
     }

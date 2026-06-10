@@ -1,7 +1,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { IS_TAURI } from "./transport";
-import { useSwarm } from "@/store";
+import { flushPersistGrid, useSwarm } from "@/store";
 
 /** Agents whose Claude is actively working right now (OSC 9;4 busy). */
 export function workingAgentIds(): string[] {
@@ -42,16 +42,27 @@ export function startQuitGuard(): () => void {
   const win = getCurrentWindow();
   const unlistenClose = win.onCloseRequested((e) => {
     if (confirmed) return;
-    const busy = workingAgentIds();
-    if (busy.length === 0) return;
     e.preventDefault();
-    useSwarm.getState().setQuitConfirm(busy);
+    const busy = workingAgentIds();
+    if (busy.length > 0) {
+      useSwarm.getState().setQuitConfirm(busy);
+      return;
+    }
+    // the debounced grid snapshot must hit disk before the webview goes away;
+    // the re-issued close() passes the guard via `confirmed` (window-state
+    // plugin still saves on the real close)
+    void flushPersistGrid().finally(() => {
+      confirmed = true;
+      void win.close();
+    });
   });
   const unlistenQuit = listen("app://quit-requested", () => {
     const busy = workingAgentIds();
     if (busy.length === 0 || confirmed) {
-      confirmed = true;
-      void win.close();
+      void flushPersistGrid().finally(() => {
+        confirmed = true;
+        void win.close();
+      });
     } else {
       useSwarm.getState().setQuitConfirm(busy);
     }
@@ -66,6 +77,8 @@ export function startQuitGuard(): () => void {
 export function resolveQuitConfirm(quit: boolean) {
   useSwarm.getState().setQuitConfirm(null);
   if (!quit || !IS_TAURI) return;
-  confirmed = true;
-  void getCurrentWindow().close();
+  void flushPersistGrid().finally(() => {
+    confirmed = true;
+    void getCurrentWindow().close();
+  });
 }

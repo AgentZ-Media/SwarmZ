@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { DEFAULT_FONT_SIZE, useSwarm } from "@/store";
-import { applyClaudePath } from "@/lib/utils";
+import { applyClaudePath, resumeStartup } from "@/lib/utils";
 import {
   attachTerm,
   focusTerm,
@@ -81,7 +81,12 @@ export function TerminalView({
     };
     return attachTerm(agentId, containerRef.current, {
       cwd,
-      startup: applyClaudePath(startup, store.settings.claudePath),
+      // restored panes reopen their previous claude conversation (--resume);
+      // agent.startup stays clean for split-prefill and the grid snapshot
+      startup: applyClaudePath(
+        resumeStartup(startup, store.agents[agentId]?.resume),
+        store.settings.claudePath,
+      ),
       fontSize:
         store.agents[agentId]?.fontSize ??
         store.settings.defaultFontSize ??

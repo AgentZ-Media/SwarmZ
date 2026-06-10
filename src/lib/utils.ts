@@ -96,6 +96,21 @@ export function applyClaudePath(startup: string, claudePath?: string): string {
 }
 
 /**
+ * Rewrite a claude startup command so a restored pane reopens its previous
+ * conversation: `--resume <sessionId>` is appended to a leading `claude`
+ * command. Non-claude commands, commands that already pick a session
+ * (--resume/--continue) and compound commands (;, &&, |) pass through
+ * untouched and start fresh.
+ */
+export function resumeStartup(startup: string, sessionId?: string): string {
+  if (!sessionId) return startup;
+  const cmd = startup.trimStart();
+  if (cmd !== "claude" && !cmd.startsWith("claude ")) return startup;
+  if (/\s--(resume|continue)\b/.test(cmd) || /[;&|]/.test(cmd)) return startup;
+  return `${startup} --resume ${sessionId}`;
+}
+
+/**
  * Backslash-escape a dropped file path the way Terminal.app/iTerm do when a
  * file is dragged in — Claude Code (and shells) un-escape exactly this form.
  * ASCII specials (space, quotes, parens, …) get escaped; unicode stays as-is.

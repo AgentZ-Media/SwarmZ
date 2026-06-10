@@ -3,6 +3,7 @@ import type {
   DetectedCommand,
   FolderCommands,
   GitInfo,
+  PersistedGrid,
   PersistedWorkspaces,
   Profile,
   SessionUsage,
@@ -91,6 +92,10 @@ export interface Backend {
   /** Workspace tabs (name/order/defaultCwd) — agents inside are in-memory. */
   loadWorkspaces(): Promise<PersistedWorkspaces | null>;
   saveWorkspaces(ws: PersistedWorkspaces): Promise<void>;
+
+  /** Snapshot of the grid (agent panes + tiling trees) for restore-on-launch. */
+  loadGrid(): Promise<PersistedGrid | null>;
+  saveGrid(grid: PersistedGrid): Promise<void>;
 
   /**
    * null when no Claude Code login is found (UI hides the meters); transient

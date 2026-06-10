@@ -14,6 +14,7 @@ import type {
   DetectedCommand,
   FolderCommands,
   GitInfo,
+  PersistedGrid,
   PersistedWorkspaces,
   Profile,
   SessionUsage,
@@ -143,6 +144,18 @@ export const tauriBackend: Backend = {
   },
   saveWorkspaces: async (ws) => {
     await store.set("workspaces", ws);
+    await store.save();
+  },
+
+  loadGrid: async () => {
+    try {
+      return (await store.get<PersistedGrid>("grid")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveGrid: async (grid) => {
+    await store.set("grid", grid);
     await store.save();
   },
 

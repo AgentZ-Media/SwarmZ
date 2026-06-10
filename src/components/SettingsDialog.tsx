@@ -174,6 +174,26 @@ function TerminalSection() {
       />
 
       <Row
+        label="Restore agents on launch"
+        help={
+          <>
+            Reopen the last grid on start and resume each pane's Claude
+            conversation (
+            <code className="font-mono text-muted-foreground">
+              claude --resume
+            </code>
+            ). Floating terminals don't come back.
+          </>
+        }
+      >
+        <Switch
+          checked={settings.restoreAgents !== false}
+          onCheckedChange={(v) => updateSettings({ restoreAgents: v })}
+          label="Restore agents on launch"
+        />
+      </Row>
+
+      <Row
         label="Default font size"
         help="Applies to all panes without their own zoom. ⌘+ / ⌘− zooms a single pane, ⌘0 resets it."
       >

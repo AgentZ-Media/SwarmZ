@@ -39,6 +39,8 @@ export const loadSettings = backend.loadSettings;
 export const saveSettings = backend.saveSettings;
 export const loadWorkspaces = backend.loadWorkspaces;
 export const saveWorkspaces = backend.saveWorkspaces;
+export const loadGrid = backend.loadGrid;
+export const saveGrid = backend.saveGrid;
 export const fetchSubscriptionLimits = backend.fetchSubscriptionLimits;
 
 export type { PtyDataEvent, PtyExitEvent } from "./backend-types";

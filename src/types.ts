@@ -123,6 +123,8 @@ export interface AppSettings {
   claudePath?: string;
   /** absolute path to the git binary used for the read-only pane git status */
   gitPath?: string;
+  /** restore the last grid on launch and resume each pane's claude session (default on) */
+  restoreAgents?: boolean;
 }
 
 /**
@@ -141,10 +143,39 @@ export interface Workspace {
   defaultCwd?: string;
 }
 
-/** Shape persisted for workspaces (tabs survive restarts, agents don't). */
+/** Shape persisted for workspaces (tabs survive restarts). */
 export interface PersistedWorkspaces {
   workspaces: Workspace[];
   activeId: string | null;
+}
+
+/** Restore-relevant slice of an Agent, snapshotted into the persisted grid. */
+export interface PersistedAgent {
+  id: string;
+  name: string;
+  renamed?: boolean;
+  workspaceId: string;
+  cwd?: string;
+  /** original startup command — `--resume` is injected at spawn, never stored */
+  startup: string;
+  color: string;
+  profileId?: string;
+  fontSize?: number;
+  /** claude session to resume when this pane is restored */
+  sessionId?: string;
+}
+
+/**
+ * Continuously persisted snapshot of the live grid: every agent pane plus the
+ * tiling trees referencing them. Restored on launch (settings.restoreAgents)
+ * by respawning each pane with `claude --resume <sessionId>`. Floating
+ * terminals are plain shells without a session — they are not captured.
+ */
+export interface PersistedGrid {
+  agents: PersistedAgent[];
+  /** tiling tree per workspace id — pane nodes reference agent ids above */
+  layouts: Record<string, LayoutNode | null>;
+  activePaneIds?: Record<string, string | null>;
 }
 
 export interface Profile {
@@ -171,6 +202,11 @@ export interface Agent {
   usage?: SessionUsage;
   /** latched once this agent's own claude session file is discovered */
   sessionId?: string;
+  /**
+   * claude session this restored pane should reopen — applied at PTY spawn
+   * (`--resume`), kept off `startup` so splits/persistence see the clean command
+   */
+  resume?: string;
   /** last terminal title captured from the PTY (claude's auto-generated topic) */
   title?: string;
   /** true once the user named the agent themselves — captured titles stop renaming it */

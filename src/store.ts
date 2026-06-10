@@ -2,12 +2,14 @@ import { create } from "zustand";
 import { nanoid } from "nanoid";
 import {
   loadCommandPresets,
+  loadGrid,
   loadProfiles,
   loadSettings,
   loadUsageHistory,
   loadWorkspaces,
   ptyHasChildren,
   saveCommandPresets,
+  saveGrid,
   saveProfiles,
   saveSettings,
   saveUsageHistory,
@@ -23,6 +25,7 @@ import type {
   FolderCommands,
   GitInfo,
   LayoutNode,
+  PersistedGrid,
   Profile,
   SessionUsage,
   UsageHistoryEntry,
@@ -91,6 +94,56 @@ function schedulePersistWorkspaces() {
   }, 300);
 }
 
+/**
+ * Restore-relevant snapshot of the live grid: agent panes + tiling trees.
+ * Persisted continuously (debounced) and flushed on quit (lib/quit.ts), so a
+ * restart — or a crash — can respawn every pane and resume its claude session.
+ */
+function snapshotGrid(): PersistedGrid {
+  const s = useSwarm.getState();
+  return {
+    agents: s.order
+      .map((id) => s.agents[id])
+      .filter((a): a is Agent => !!a)
+      .map((a) => ({
+        id: a.id,
+        name: a.name,
+        renamed: a.renamed,
+        workspaceId: a.workspaceId,
+        cwd: a.cwd,
+        startup: a.startup,
+        color: a.color,
+        profileId: a.profileId,
+        fontSize: a.fontSize,
+        sessionId: a.sessionId,
+      })),
+    layouts: s.layouts,
+    activePaneIds: s.activePaneIds,
+  };
+}
+
+let persistGridTimer: ReturnType<typeof setTimeout> | null = null;
+function schedulePersistGrid() {
+  if (persistGridTimer) return;
+  persistGridTimer = setTimeout(() => {
+    persistGridTimer = null;
+    void saveGrid(snapshotGrid());
+  }, 500);
+}
+
+/** Write the grid snapshot NOW — quit must not lose the debounce window. */
+export async function flushPersistGrid(): Promise<void> {
+  if (persistGridTimer) {
+    clearTimeout(persistGridTimer);
+    persistGridTimer = null;
+  }
+  try {
+    await saveGrid(snapshotGrid());
+  } catch {
+    /* never block quitting on a failed write */
+  }
+}
+
 interface CreateAgentOpts {
   name?: string;
   cwd?: string;
@@ -111,11 +164,11 @@ export interface NewAgentPrefill {
 interface SwarmState {
   agents: Record<string, Agent>;
   order: string[];
-  /** workspace tabs — name/order/defaultCwd persist, everything inside is in-memory */
+  /** workspace tabs — name/order/defaultCwd persist */
   workspaces: Record<string, Workspace>;
   workspaceOrder: string[];
   activeWorkspaceId: string;
-  /** tiling tree per workspace (in-memory, like the agents) */
+  /** tiling tree per workspace — snapshotted with the agents for restore-on-launch */
   layouts: Record<string, LayoutNode | null>;
   /** active pane per workspace */
   activePaneIds: Record<string, string | null>;
@@ -427,6 +480,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         state.focusedAgentId === agentId ? null : state.focusedAgentId,
       tabDropTarget: null,
     });
+    schedulePersistGrid();
   },
 
   attentionJump: () => {
@@ -503,6 +557,71 @@ export const useSwarm = create<SwarmState>((set, get) => ({
               : workspaceOrder[0],
           workspaceCounter: counter,
         });
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      // restore the last grid: rebuild every persisted pane — mounting them
+      // spawns the PTYs, and TerminalView appends `--resume` (agent.resume)
+      // so each claude pane reopens its previous conversation
+      const grid = await loadGrid();
+      const state = get();
+      if (
+        state.settings.restoreAgents !== false &&
+        state.order.length === 0 && // nothing spawned before hydrate resolved
+        grid?.agents.length
+      ) {
+        const saved = new Map(grid.agents.map((a) => [a.id, a]));
+        const agents: Record<string, Agent> = {};
+        const order: string[] = [];
+        const layouts = { ...state.layouts };
+        const activePaneIds = { ...state.activePaneIds };
+        // walk the persisted trees — panes whose agent (or workspace) didn't
+        // make it back are pruned, agents in no pane are dropped, so even a
+        // torn snapshot restores to something consistent
+        for (const wsId of state.workspaceOrder) {
+          let layout = grid.layouts[wsId] ?? null;
+          for (const pane of collectPanes(layout)) {
+            const p = saved.get(pane.agentId);
+            if (!p || p.workspaceId !== wsId || agents[p.id]) {
+              layout = removePaneByAgent(layout, pane.agentId);
+              continue;
+            }
+            agents[p.id] = {
+              id: p.id,
+              name: p.name,
+              renamed: p.renamed,
+              workspaceId: wsId,
+              cwd: p.cwd,
+              startup: p.startup,
+              color: p.color,
+              status: "starting",
+              attention: false,
+              createdAt: Date.now(),
+              profileId: p.profileId,
+              fontSize: p.fontSize,
+              // the pane IS that session again — usage latches right back on
+              sessionId: p.sessionId,
+              resume: p.sessionId,
+            };
+            order.push(p.id);
+          }
+          layouts[wsId] = layout;
+          const panes = collectPanes(layout);
+          const active = grid.activePaneIds?.[wsId];
+          activePaneIds[wsId] =
+            panes.find((pn) => pn.id === active)?.id ?? panes[0]?.id ?? null;
+        }
+        if (order.length) {
+          // keep default names unique after the restore ("Agent 3" twice)
+          let counter = state.agentCounter;
+          for (const id of order) {
+            const m = /^Agent (\d+)$/.exec(agents[id].name);
+            if (m) counter = Math.max(counter, Number(m[1]));
+          }
+          set({ agents, order, layouts, activePaneIds, agentCounter: counter });
+        }
       }
     } catch {
       /* ignore */
@@ -640,6 +759,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       fleetOpen: false,
     });
     if (workspaces !== state.workspaces) schedulePersistWorkspaces();
+    schedulePersistGrid();
     if (agent.cwd) get().updateSettings({ lastCwd: agent.cwd });
     return id;
   },
@@ -667,6 +787,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       focusedAgentId:
         state.focusedAgentId === agentId ? null : state.focusedAgentId,
     });
+    schedulePersistGrid();
   },
 
   requestRemoveAgent: (agentId) => {
@@ -969,6 +1090,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       agents: { ...state.agents, [agentId]: { ...agent, usage, sessionId } },
       usageHistory,
     });
+    // a freshly latched session id is what makes this pane resumable
+    if (sessionId && !agent.sessionId) schedulePersistGrid();
   },
 
   setGitInfo: (agentId, git) => {
@@ -1016,6 +1139,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
           : { ...agent, name: agent.title || agent.name, renamed: false },
       },
     });
+    schedulePersistGrid();
   },
 
   setAgentTitle: (agentId, title) => {
@@ -1032,6 +1156,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         },
       },
     });
+    if (!agent.renamed) schedulePersistGrid();
   },
 
   adjustFontSize: (agentId, delta) => {
@@ -1046,6 +1171,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         : Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, base + delta));
     if (fontSize === agent.fontSize) return;
     set({ agents: { ...state.agents, [agentId]: { ...agent, fontSize } } });
+    schedulePersistGrid();
   },
 
   setSizes: (workspaceId, splitId, sizes) => {
@@ -1058,6 +1184,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         [workspaceId]: setSplitSizes(layout, splitId, sizes),
       },
     });
+    schedulePersistGrid();
   },
 
   movePane: (workspaceId, srcPaneId, targetPaneId, zone) => {
@@ -1070,6 +1197,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         [workspaceId]: movePaneInLayout(layout, srcPaneId, targetPaneId, zone),
       },
     });
+    schedulePersistGrid();
   },
 
   splitActive: (direction) => {
@@ -1187,4 +1315,5 @@ function closeWorkspace(id: string) {
         : state.focusedAgentId,
   });
   schedulePersistWorkspaces();
+  schedulePersistGrid();
 }
