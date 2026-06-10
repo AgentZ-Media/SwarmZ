@@ -11,6 +11,7 @@ import {
 import type {
   Agent,
   AgentStatus,
+  ClaudeActivity,
   LayoutNode,
   Profile,
   SessionUsage,
@@ -27,6 +28,11 @@ import {
 import { pickColor } from "@/lib/utils";
 
 const DEFAULT_STARTUP = "claude --dangerously-skip-permissions";
+
+// Per-pane terminal zoom (⌘+/⌘−). Default must match the xterm setup in Terminal.tsx.
+export const DEFAULT_FONT_SIZE = 12.5;
+const MIN_FONT_SIZE = 8;
+const MAX_FONT_SIZE = 28;
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
@@ -89,8 +95,12 @@ interface SwarmState {
   // status / usage
   setStatus: (agentId: string, status: AgentStatus) => void;
   setAttention: (agentId: string, on: boolean) => void;
+  setActivity: (agentId: string, activity: ClaudeActivity | undefined) => void;
   setUsage: (agentId: string, usage: SessionUsage | null) => void;
   renameAgent: (agentId: string, name: string) => void;
+  setAgentTitle: (agentId: string, title: string) => void;
+  /** per-pane zoom: step the font size by delta, or restore the default */
+  adjustFontSize: (agentId: string, delta: number | "reset") => void;
   clearUsageHistory: () => void;
 
   // layout
@@ -186,6 +196,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const agent: Agent = {
       id,
       name: opts.name?.trim() || `Agent ${n}`,
+      // a name typed in the dialog wins over captured terminal titles
+      renamed: !!opts.name?.trim(),
       cwd: opts.cwd || profile?.defaultCwd,
       startup: opts.startup ?? profile?.startup ?? DEFAULT_STARTUP,
       color: opts.color || profile?.color || pickColor(n),
@@ -281,6 +293,13 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     });
   },
 
+  setActivity: (agentId, activity) => {
+    const state = get();
+    const agent = state.agents[agentId];
+    if (!agent || agent.activity === activity) return;
+    set({ agents: { ...state.agents, [agentId]: { ...agent, activity } } });
+  },
+
   setUsage: (agentId, usage) => {
     const state = get();
     const agent = state.agents[agentId];
@@ -341,9 +360,47 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const state = get();
     const agent = state.agents[agentId];
     if (!agent) return;
+    const trimmed = name.trim();
+    // clearing the name hands naming back to the captured terminal title
     set({
-      agents: { ...state.agents, [agentId]: { ...agent, name: name.trim() || agent.name } },
+      agents: {
+        ...state.agents,
+        [agentId]: trimmed
+          ? { ...agent, name: trimmed, renamed: true }
+          : { ...agent, name: agent.title || agent.name, renamed: false },
+      },
     });
+  },
+
+  setAgentTitle: (agentId, title) => {
+    const state = get();
+    const agent = state.agents[agentId];
+    if (!agent || agent.title === title) return;
+    set({
+      agents: {
+        ...state.agents,
+        [agentId]: {
+          ...agent,
+          title,
+          ...(agent.renamed ? {} : { name: title }),
+        },
+      },
+    });
+  },
+
+  adjustFontSize: (agentId, delta) => {
+    const state = get();
+    const agent = state.agents[agentId];
+    if (!agent) return;
+    const fontSize =
+      delta === "reset"
+        ? undefined
+        : Math.min(
+            MAX_FONT_SIZE,
+            Math.max(MIN_FONT_SIZE, (agent.fontSize ?? DEFAULT_FONT_SIZE) + delta),
+          );
+    if (fontSize === agent.fontSize) return;
+    set({ agents: { ...state.agents, [agentId]: { ...agent, fontSize } } });
   },
 
   setSizes: (splitId, sizes) => {

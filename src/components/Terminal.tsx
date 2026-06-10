@@ -11,7 +11,7 @@ import {
   ptySpawn,
   ptyWrite,
 } from "@/lib/transport";
-import { useSwarm } from "@/store";
+import { DEFAULT_FONT_SIZE, useSwarm } from "@/store";
 
 // harmonized with the design tokens in styles.css — muted, low-noise ANSI set
 const THEME = {
@@ -45,6 +45,21 @@ function decodeBase64(b64: string): Uint8Array {
   return bytes;
 }
 
+/**
+ * Terminal titles (OSC 0/2) the pane should adopt as agent name — claude's
+ * auto-generated topic, /rename titles, … Shell noise is filtered out: cwd
+ * titles, the echoed startup command, bare shell names.
+ */
+function cleanTitle(raw: string, startup: string): string | null {
+  const t = raw.replace(/^[✳✶✻✽✢·]\s*/, "").trim();
+  if (!t) return null;
+  if (t.startsWith("/") || t.startsWith("~")) return null;
+  const cmd = startup.trim();
+  if (cmd && (t === cmd || t === cmd.split(/\s+/)[0])) return null;
+  if (/^-?(zsh|bash|fish|sh)$/.test(t)) return null;
+  return t;
+}
+
 export function TerminalView({
   agentId,
   cwd,
@@ -64,6 +79,9 @@ export function TerminalView({
 
   const setStatus = useSwarm((s) => s.setStatus);
   const setAttention = useSwarm((s) => s.setAttention);
+  const setActivity = useSwarm((s) => s.setActivity);
+  const setAgentTitle = useSwarm((s) => s.setAgentTitle);
+  const fontSize = useSwarm((s) => s.agents[agentId]?.fontSize ?? DEFAULT_FONT_SIZE);
 
   useEffect(() => {
     if (!containerRef.current || spawnedRef.current) return;
@@ -72,7 +90,7 @@ export function TerminalView({
     const term = new XTerm({
       fontFamily:
         '"JetBrains Mono Variable","JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace',
-      fontSize: 12.5,
+      fontSize,
       lineHeight: 1.25,
       letterSpacing: 0,
       cursorBlink: false, // enabled per-pane below — only the active pane blinks
@@ -109,6 +127,39 @@ export function TerminalView({
       setAttention(agentId, true);
     });
 
+    // OSC 0/2 title → agent name (claude auto-generates a topic title after
+    // the first prompt and updates it via /rename)
+    const titleDisp = term.onTitleChange((t) => {
+      const title = cleanTitle(t, startup);
+      if (title) setAgentTitle(agentId, title);
+    });
+
+    // OSC 9;4 progress reporting → busy/idle. Claude Code emits this because
+    // the PTY env advertises support (ConEmuANSI=ON, see backend spawn code):
+    // indeterminate/set while working, clear once it's done.
+    const progressDisp = term.parser.registerOscHandler(9, (data) => {
+      if (!data.startsWith("4;")) return false;
+      const state = data.split(";")[1];
+      if (state === "1" || state === "3") setActivity(agentId, "busy");
+      else if (state === "0" || state === "2") setActivity(agentId, "idle");
+      return true;
+    });
+
+    // OSC 21337 tab status — claude's native status pill protocol
+    // (`indicator=…;status=…;status-color=…`, statuses Idle/Working…/Waiting).
+    // Emission is disabled in current Claude Code builds; pre-wired so panes
+    // pick it up the moment it ships.
+    const tabStatusDisp = term.parser.registerOscHandler(21337, (data) => {
+      const status = /(?:^|(?<!\\);)status=((?:\\.|[^;])*)/.exec(data)?.[1];
+      if (status === undefined) return true;
+      const text = status.replace(/\\(.)/g, "$1");
+      if (!text) setActivity(agentId, undefined);
+      else if (/^working/i.test(text)) setActivity(agentId, "busy");
+      else if (/^waiting/i.test(text)) setActivity(agentId, "waiting");
+      else setActivity(agentId, "idle");
+      return true;
+    });
+
     // pty → terminal (events are addressed per agent)
     const dataPromise = onPtyData(agentId, (e) => {
       if (!runningRef.current) {
@@ -119,6 +170,7 @@ export function TerminalView({
     });
     const exitPromise = onPtyExit(agentId, () => {
       setStatus(agentId, "exited");
+      setActivity(agentId, undefined);
       term.write("\r\n\x1b[2m[ process exited ]\x1b[0m\r\n");
     });
 
@@ -141,6 +193,9 @@ export function TerminalView({
       ro.disconnect();
       inputDisp.dispose();
       bellDisp.dispose();
+      titleDisp.dispose();
+      progressDisp.dispose();
+      tabStatusDisp.dispose();
       void dataPromise.then((u) => u());
       void exitPromise.then((u) => u());
       void ptyKill(agentId);
@@ -149,6 +204,20 @@ export function TerminalView({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId]);
+
+  // per-pane zoom (⌘+/⌘−) — changing the cell size doesn't resize the
+  // container, so the ResizeObserver won't fire; refit + pty resize manually
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || term.options.fontSize === fontSize) return;
+    term.options.fontSize = fontSize;
+    try {
+      fitRef.current?.fit();
+      void ptyResize(agentId, term.cols, term.rows);
+    } catch {
+      /* element detached */
+    }
+  }, [fontSize, agentId]);
 
   // only the active pane's cursor blinks — a blinking cursor wakes the
   // renderer every ~600ms, which adds up across many idle panes

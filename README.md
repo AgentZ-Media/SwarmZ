@@ -27,6 +27,8 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 - 🍩 **Context gauge** — a donut plus a `free/total` readout in each pane header shows how much of the agent's context window is left (turns amber/red as it fills).
 - 📈 **Plan limits** — the title bar shows the Claude subscription limits of the account logged into Claude Code on this machine: 5-hour session window, weekly windows and reset times.
 - 💾 **All-time statistics** — every Claude session launched inside SwarmZ is persisted across restarts. The usage drawer toggles between **Session** (what's open right now) and **All time** (everything you've ever run here), with a per-model cost breakdown and session history.
+- 🏷️ **Auto-naming** — Claude Code generates a topic title for every session (and updates it on `/rename`); SwarmZ captures it from the terminal title and names the pane after it. Rename a pane yourself and the auto-title backs off; clear the name to hand it back.
+- 🚦 **Live status** — the pane status dot mirrors what Claude is actually doing: amber while it's working, green when idle, blue when it waits for input. Captured from Claude Code's terminal progress reporting (plus the bell), no polling involved.
 - 🔔 **Notifications** — when an agent rings the terminal bell (Claude waiting or done), the pane pulses and a native (or browser) notification fires.
 - 🎛️ **Profiles** — presets for startup command, flags and default working directory, persisted across restarts. New agents prefill the profile's default folder, or the last folder you used.
 - 🔄 **Auto-updates** — the native app checks GitHub Releases in the background and updates in-app; manual check via the refresh button in the title bar.
@@ -77,6 +79,8 @@ pnpm engine             # → http://localhost:4178
 | `⌘D` | Split active pane right |
 | `⌘⇧D` | Split active pane down |
 | `⌘W` | Close active agent |
+| `⌘+` / `⌘−` | Zoom active pane in / out (per-pane font size) |
+| `⌘0` | Reset active pane zoom |
 
 ## 🏗️ Architecture
 

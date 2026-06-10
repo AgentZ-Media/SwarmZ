@@ -1,5 +1,13 @@
 export type AgentStatus = "starting" | "running" | "attention" | "exited";
 
+/**
+ * Claude Code's own working state, captured from terminal escape sequences:
+ * OSC 9;4 progress reporting (busy/idle, emitted because SwarmZ advertises
+ * support via ConEmuANSI=ON) and the OSC 21337 tab-status protocol
+ * (idle/busy/waiting — dormant in current Claude Code builds, pre-wired here).
+ */
+export type ClaudeActivity = "busy" | "idle" | "waiting";
+
 export interface ModelUsage {
   model: string;
   input_tokens: number;
@@ -109,6 +117,14 @@ export interface Agent {
   usage?: SessionUsage;
   /** latched once this agent's own claude session file is discovered */
   sessionId?: string;
+  /** last terminal title captured from the PTY (claude's auto-generated topic) */
+  title?: string;
+  /** true once the user named the agent themselves — captured titles stop renaming it */
+  renamed?: boolean;
+  /** claude's working state, if it reported one (see ClaudeActivity) */
+  activity?: ClaudeActivity;
+  /** per-pane terminal font size override (⌘+/⌘− zoom); unset = default */
+  fontSize?: number;
 }
 
 // ---- Tiling layout tree ----

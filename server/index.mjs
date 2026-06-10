@@ -223,6 +223,9 @@ wss.on("connection", (ws) => {
             TERM: "xterm-256color",
             COLORTERM: "truecolor",
             SWARMZ: "1",
+            // makes Claude Code emit OSC 9;4 progress (busy/idle status dot);
+            // least invasive support marker — see src-tauri/src/pty.rs
+            ConEmuANSI: "ON",
           },
         });
       } catch (e) {

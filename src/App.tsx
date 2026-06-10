@@ -26,6 +26,7 @@ export default function App() {
   const setNewAgentOpen = useSwarm((s) => s.setNewAgentOpen);
   const splitActive = useSwarm((s) => s.splitActive);
   const removeAgent = useSwarm((s) => s.removeAgent);
+  const adjustFontSize = useSwarm((s) => s.adjustFontSize);
   const order = useSwarm((s) => s.order);
 
   const [profilesOpen, setProfilesOpen] = useState(false);
@@ -161,11 +162,18 @@ export default function App() {
           e.preventDefault();
           removeAgent(id);
         }
+      } else if (k === "+" || k === "=" || k === "-" || k === "0") {
+        // per-pane zoom — "=" covers ⌘+ on layouts where + needs shift (US)
+        const id = useSwarm.getState().activeAgentId();
+        if (id) {
+          e.preventDefault();
+          adjustFontSize(id, k === "0" ? "reset" : k === "-" ? -1 : 1);
+        }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [setNewAgentOpen, splitActive, removeAgent]);
+  }, [setNewAgentOpen, splitActive, removeAgent, adjustFontSize]);
 
   return (
     <TooltipProvider delayDuration={300}>

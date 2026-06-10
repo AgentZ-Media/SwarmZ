@@ -184,26 +184,37 @@ function AgentStatsButton({ agent }: { agent: Agent }) {
 }
 
 function StatusDot({ agent }: { agent: Agent }) {
-  const map: Record<string, string> = {
-    starting: "var(--warning)",
-    running: "var(--success)",
-    attention: "var(--ring)",
-    exited: "var(--faint)",
+  // claude's reported activity refines the coarse pty status while running
+  const state =
+    agent.status === "running" && agent.activity
+      ? agent.activity === "waiting"
+        ? "attention"
+        : agent.activity
+      : agent.status;
+  const map: Record<string, { color: string; label: string }> = {
+    starting: { color: "var(--warning)", label: "Starting" },
+    running: { color: "var(--success)", label: "Running" },
+    busy: { color: "var(--warning)", label: "Working…" },
+    idle: { color: "var(--success)", label: "Idle" },
+    attention: { color: "var(--ring)", label: "Waiting for input" },
+    exited: { color: "var(--faint)", label: "Exited" },
   };
-  const color = map[agent.status] ?? "var(--faint)";
+  const { color, label } = map[state] ?? { color: "var(--faint)", label: state };
   return (
-    <span className="relative flex h-1.5 w-1.5">
-      {agent.status === "running" && (
+    <Tip label={label}>
+      <span className="relative flex h-1.5 w-1.5">
+        {(state === "running" || state === "busy") && (
+          <span
+            className="absolute inline-flex h-full w-full rounded-full opacity-60"
+            style={{ backgroundColor: color }}
+          />
+        )}
         <span
-          className="absolute inline-flex h-full w-full rounded-full opacity-60"
+          className="relative inline-flex h-1.5 w-1.5 rounded-full"
           style={{ backgroundColor: color }}
         />
-      )}
-      <span
-        className="relative inline-flex h-1.5 w-1.5 rounded-full"
-        style={{ backgroundColor: color }}
-      />
-    </span>
+      </span>
+    </Tip>
   );
 }
 

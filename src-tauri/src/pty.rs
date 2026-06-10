@@ -72,6 +72,11 @@ impl PtyManager {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("SWARMZ", "1");
+        // Claude Code only emits OSC 9;4 progress (busy/idle, shown as the
+        // pane status dot) for terminals it recognizes as supporting it. The
+        // ConEmu marker is the least invasive way to opt in — nothing else on
+        // macOS reads it, unlike TERM_PROGRAM which changes other behaviors.
+        cmd.env("ConEmuANSI", "ON");
 
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         // Slave is held by the child; drop our handle so EOF propagates on exit.
