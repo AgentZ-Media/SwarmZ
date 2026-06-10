@@ -476,6 +476,10 @@ fn pick_new_session(dir: &Path, since_ms: u64, exclude: &[String]) -> Option<Pat
 
 /// Usage for a single SwarmZ-launched session only. Latches onto `session_id`
 /// once known; otherwise discovers the session file born after `since_ms`.
+/// A latched file is parsed WITHOUT the since-filter: the whole file is this
+/// pane's session, and after a restart + `--resume` the pre-restart turns must
+/// still count (stats popover, context donut) even though the agent's
+/// `createdAt` was reset to launch time.
 pub fn usage_for_session(
     cwd: &str,
     since_ms: u64,
@@ -486,18 +490,18 @@ pub fn usage_for_session(
     if !dir.is_dir() {
         return None;
     }
-    let path = match session_id.filter(|s| !s.is_empty()) {
+    let (path, since) = match session_id.filter(|s| !s.is_empty()) {
         Some(sid) => {
             let p = dir.join(format!("{}.jsonl", sid));
             if p.is_file() {
-                p
+                (p, None)
             } else {
-                pick_new_session(&dir, since_ms, exclude)?
+                (pick_new_session(&dir, since_ms, exclude)?, Some(since_ms))
             }
         }
-        None => pick_new_session(&dir, since_ms, exclude)?,
+        None => (pick_new_session(&dir, since_ms, exclude)?, Some(since_ms)),
     };
-    Some(parse_file(&path, Some(since_ms)))
+    Some(parse_file(&path, since))
 }
 
 // ---- Aggregate totals (parse_file's incremental cache keeps this cheap) ----

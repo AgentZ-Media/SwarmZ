@@ -81,6 +81,16 @@ export default function App() {
           if (!a) return;
           const dir = a.cwd || homeRef.current;
           if (!dir) return;
+          // session discovery is gated on real activity: a pane whose claude
+          // never went busy has no session file of its own and would latch
+          // (and later resume) a sibling session born in the same folder
+          if (!a.sessionId && !a.firstBusyAt) return;
+          // discovery floor: only files born around the first activity match,
+          // not anything since pane creation (5s + backend skew). A latched
+          // session parses the whole file — the backend ignores `since` then
+          const since = a.sessionId
+            ? a.createdAt
+            : Math.max(a.createdAt, a.firstBusyAt! - 5000);
           // sessions other agents have latched onto — with several agents in
           // the same folder, an unlatched pane must never match a sibling's file
           const exclude = order
@@ -88,7 +98,7 @@ export default function App() {
             .map((oid) => agents[oid]?.sessionId)
             .filter((s): s is string => !!s);
           try {
-            const u = await fetchUsageForSession(dir, a.createdAt, a.sessionId, exclude);
+            const u = await fetchUsageForSession(dir, since, a.sessionId, exclude);
             if (alive && u) setUsage(id, u);
           } catch {
             /* ignore */

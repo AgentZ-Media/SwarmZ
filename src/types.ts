@@ -213,6 +213,12 @@ export interface Agent {
   renamed?: boolean;
   /** claude's working state, if it reported one (see ClaudeActivity) */
   activity?: ClaudeActivity;
+  /**
+   * epoch ms of the first "busy" report — proof this pane's claude actually
+   * worked. Session discovery is gated on it: a pane that never did anything
+   * must not latch (and later resume) a sibling session from the same folder
+   */
+  firstBusyAt?: number;
   /** per-pane terminal font size override (⌘+/⌘− zoom); unset = default */
   fontSize?: number;
   /** live git snapshot of the cwd; null = checked and not inside a repo */

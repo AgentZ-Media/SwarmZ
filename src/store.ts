@@ -1038,7 +1038,9 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const state = get();
     const agent = state.agents[agentId];
     if (!agent || agent.activity === activity) return;
-    set({ agents: { ...state.agents, [agentId]: { ...agent, activity } } });
+    const firstBusyAt =
+      agent.firstBusyAt ?? (activity === "busy" ? Date.now() : undefined);
+    set({ agents: { ...state.agents, [agentId]: { ...agent, activity, firstBusyAt } } });
   },
 
   setUsage: (agentId, usage) => {
