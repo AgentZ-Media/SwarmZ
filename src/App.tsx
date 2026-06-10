@@ -3,6 +3,8 @@ import { Plus, Zap } from "lucide-react";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { TitleBar } from "./components/TitleBar";
 import { TilingGrid } from "./components/TilingGrid";
+import { FloatingTerminals } from "./components/FloatingTerminals";
+import { CloseAgentDialog } from "./components/CloseAgentDialog";
 import { NewAgentDialog } from "./components/NewAgentDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -27,7 +29,8 @@ export default function App() {
   const setUsage = useSwarm((s) => s.setUsage);
   const setNewAgentOpen = useSwarm((s) => s.setNewAgentOpen);
   const splitActive = useSwarm((s) => s.splitActive);
-  const removeAgent = useSwarm((s) => s.removeAgent);
+  const requestRemoveAgent = useSwarm((s) => s.requestRemoveAgent);
+  const createFloatingTerminal = useSwarm((s) => s.createFloatingTerminal);
   const adjustFontSize = useSwarm((s) => s.adjustFontSize);
   const order = useSwarm((s) => s.order);
 
@@ -175,7 +178,14 @@ export default function App() {
         const id = useSwarm.getState().activeAgentId();
         if (id) {
           e.preventDefault();
-          removeAgent(id);
+          requestRemoveAgent(id);
+        }
+      } else if (k === "j") {
+        // floating terminal for the active pane
+        const id = useSwarm.getState().activeAgentId();
+        if (id) {
+          e.preventDefault();
+          createFloatingTerminal(id);
         }
       } else if (k === "+" || k === "=" || k === "-" || k === "0") {
         // per-pane zoom — "=" covers ⌘+ on layouts where + needs shift (US)
@@ -188,7 +198,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [setNewAgentOpen, splitActive, removeAgent, adjustFontSize]);
+  }, [setNewAgentOpen, splitActive, requestRemoveAgent, createFloatingTerminal, adjustFontSize]);
 
   return (
     <TooltipProvider delayDuration={300}>
@@ -203,9 +213,12 @@ export default function App() {
           ) : (
             <TilingGrid />
           )}
+          {/* floating terminals live above the grid — and survive it (detached) */}
+          <FloatingTerminals />
         </main>
       </div>
 
+      <CloseAgentDialog />
       <NewAgentDialog />
       <ProfilesDialog open={profilesOpen} onOpenChange={setProfilesOpen} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />

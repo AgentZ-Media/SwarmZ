@@ -23,10 +23,12 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 
 - 🖥️ **Real terminals** — every agent is a PTY-backed login shell (`xterm.js` ↔ `node-pty` / `portable-pty`). `claude`, nvm, aliases and your environment resolve exactly like in iTerm or Terminal.
 - 🧱 **Tiling split-grid** — split any pane right (`⌘D`) or down (`⌘⇧D`), drag dividers to resize, or grab a pane's header to rearrange: drop it on another pane's edge to dock it there (left/right/top/bottom) or on the center to swap the two. Both gestures show a translucent preview while dragging; the layout applies on release, so terminals don't reflow mid-drag (`Esc` cancels). Splitting opens the New Agent dialog prefilled with the source pane's folder, profile and startup command. Panes never remount when the grid is rearranged, so scrollback survives.
+- 🪟 **Floating terminals** — open a small picture-in-picture shell on top of any pane (`⌘J`, the terminal button in the header, or the ⋯ menu), running in the pane's folder — perfect for a dev server or quick git commands without leaving SwarmZ. Drag it anywhere, resize it from the corner, or collapse it to a slim pill while the process keeps running. A quick-command bar offers one-click **presets saved per project folder** plus commands **auto-detected from the project**: `package.json` scripts (run with the package manager your lockfile implies), Cargo targets, Makefile and justfile recipes. Everything is editable in place — editing a detected command saves it as a preset that **overrides** the original, and detected commands can be hidden per folder (and restored). The window names itself after the last command you ran, typed or clicked. Closing a pane checks its floating terminals first — if a process is still running you choose between killing it or **detaching** the terminal, which keeps it alive as an unowned floating pill.
+- 🔍 **Focus mode** — the maximize button in any pane header (or a double-click on the header) zooms that pane into an overlay above the dimmed grid, for when one agent needs your full attention. Everything else keeps running underneath — click the backdrop or the button again to drop back into the grid. Nothing remounts, so scrollback and sessions are untouched.
 - 📊 **Usage tracking** — model, tokens and estimated USD cost per agent, parsed from `~/.claude/projects/*.jsonl`. Shown on demand: a stats button in every pane header and a global usage drawer — headers stay clean.
 - 🍩 **Context gauge** — a donut plus a `free/total` readout in each pane header shows how much of the agent's context window is left (turns amber/red as it fills).
 - 🌿 **Git at a glance** — panes whose folder is inside a git repo show the branch plus live diff counters: `+added` / `−removed` lines (green/red) and untracked files, refreshed every few seconds, strictly read-only. Repo name and an **Open repo in browser** action (from the `origin` remote) live in the pane menu and stats popover.
-- 📐 **Responsive pane headers** — as a pane gets narrower it sheds secondary info (folder path, git counters, gauge readout, split buttons) until only the title, model and context donut remain; everything stays reachable via tooltips and the ⋯ menu.
+- 📐 **Responsive pane headers** — as a pane gets narrower it sheds secondary info (folder path, git counters, gauge readout, split buttons) until only the title, model, context donut and focus button remain; everything stays reachable via tooltips and the ⋯ menu.
 - 📈 **Plan limits** — the title bar shows the Claude subscription limits of the account logged into Claude Code on this machine: 5-hour session window, weekly windows and reset times.
 - 💾 **All-time statistics** — every Claude session launched inside SwarmZ is persisted across restarts. The usage drawer toggles between **Session** (what's open right now) and **All time** (everything you've ever run here), with a per-model cost breakdown and session history.
 - 🏷️ **Auto-naming** — Claude Code generates a topic title for every session (and updates it on `/rename`); SwarmZ captures it from the terminal title and names the pane after it. Rename a pane yourself and the auto-title backs off; clear the name to hand it back.
@@ -82,6 +84,7 @@ pnpm engine             # → http://localhost:4178
 | `⌘D` | Split active pane right |
 | `⌘⇧D` | Split active pane down |
 | `⌘W` | Close active agent |
+| `⌘J` | Floating terminal on the active pane |
 | `⌘+` / `⌘−` | Zoom active pane in / out (per-pane font size) |
 | `⌘0` | Reset active pane zoom |
 
@@ -104,17 +107,19 @@ src/
     Terminal.tsx          xterm ↔ PTY bridge
     TilingGrid.tsx        absolute-positioned pane layout + resizers
     AgentPane.tsx         pane header (model / context gauge / tokens / cost / controls)
+    FloatingTerminals.tsx PiP shell windows + per-project quick-command bar
     UsageDashboard.tsx    usage drawer — Session & All-time views
     WebDirectoryPicker.tsx server-backed folder picker (web mode)
 
 server/                   the Node "engine" (web mode)
-  index.mjs               http + static + WebSocket PTYs + usage SSE + fs browser + git status
+  index.mjs               http + static + WebSocket PTYs + usage SSE + fs browser + git status + project commands
   usage.mjs               incremental JSONL parsing (per-file offset cache), pricing
 
 src-tauri/src/            the Rust backend (native mode)
   pty.rs                  PTY spawn / read / write / resize / kill (output coalesced)
   usage.rs                incremental JSONL parsing (per-file offset cache), pricing
   git.rs                  read-only git status (branch, ±lines, untracked, remote)
+  project.rs              auto-detected project commands (scripts / cargo / make / just)
   lib.rs                  commands, plugins, usage file-watcher
 ```
 
@@ -135,9 +140,11 @@ Per-model pricing (USD / 1M tokens, incl. cache write/read) is fetched live from
 | --- | --- | --- |
 | Profiles | ✅ | Tauri store (`swarmz.json`) / localStorage |
 | Usage history (all-time stats) | ✅ | Tauri store (`swarmz.json`) / localStorage |
+| Command presets (per project folder) | ✅ | Tauri store (`swarmz.json`) / localStorage |
 | App settings (Settings window: last used folder, font size, default command, binary paths, auto-update) | ✅ | Tauri store (`swarmz.json`) / localStorage |
 | Window size & position | ✅ native app | `tauri-plugin-window-state` (browser handles its own window in web mode) |
 | Agents & layout | ❌ per session | in-memory |
+| Floating terminals | ❌ per session | in-memory |
 
 Usage history only records Claude sessions launched **inside SwarmZ** — plain shells and dev servers never show up in the stats. Snapshots are stored locally, so all-time numbers survive even if `~/.claude` session files are cleaned up.
 

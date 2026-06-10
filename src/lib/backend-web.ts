@@ -1,5 +1,7 @@
 import type {
   AppSettings,
+  DetectedCommand,
+  FolderCommands,
   GitInfo,
   Profile,
   SubscriptionLimits,
@@ -87,6 +89,15 @@ export const webBackend: Backend = {
   ptyWrite: (id, data) => sendWs({ t: "input", id, data }),
   ptyResize: (id, cols, rows) => sendWs({ t: "resize", id, cols, rows }),
   ptyKill: (id) => sendWs({ t: "kill", id }),
+  ptyHasChildren: async (id) => {
+    try {
+      return await getJson<boolean>(
+        `/api/pty/has-children?id=${encodeURIComponent(id)}`,
+      );
+    } catch {
+      return false;
+    }
+  },
 
   onPtyData: async (id, cb): Promise<Unlisten> => {
     ensureWs();
@@ -158,6 +169,16 @@ export const webBackend: Backend = {
     }
   },
 
+  detectProjectCommands: async (cwd) => {
+    try {
+      return await getJson<DetectedCommand[]>(
+        `/api/project-commands?cwd=${encodeURIComponent(cwd)}`,
+      );
+    } catch {
+      return [];
+    }
+  },
+
   loadProfiles: async () => {
     try {
       const raw = localStorage.getItem("swarmz.profiles");
@@ -169,6 +190,22 @@ export const webBackend: Backend = {
   saveProfiles: async (profiles) => {
     try {
       localStorage.setItem("swarmz.profiles", JSON.stringify(profiles));
+    } catch {
+      /* ignore */
+    }
+  },
+
+  loadCommandPresets: async () => {
+    try {
+      const raw = localStorage.getItem("swarmz.command-presets");
+      return raw ? (JSON.parse(raw) as Record<string, FolderCommands>) : null;
+    } catch {
+      return null;
+    }
+  },
+  saveCommandPresets: async (presets) => {
+    try {
+      localStorage.setItem("swarmz.command-presets", JSON.stringify(presets));
     } catch {
       /* ignore */
     }

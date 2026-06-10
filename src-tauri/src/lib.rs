@@ -1,5 +1,6 @@
 mod git;
 mod limits;
+mod project;
 mod pty;
 mod usage;
 
@@ -42,6 +43,26 @@ fn pty_resize(
 #[tauri::command]
 fn pty_kill(state: State<'_, SharedPtyManager>, id: String) -> Result<(), String> {
     state.kill(&id)
+}
+
+#[tauri::command]
+async fn pty_has_children(
+    state: State<'_, SharedPtyManager>,
+    id: String,
+) -> Result<bool, String> {
+    let manager = Arc::clone(state.inner());
+    // subprocess work (pgrep) — keep it off the async runtime's core threads
+    tauri::async_runtime::spawn_blocking(move || manager.has_children(&id))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn project_commands(cwd: String) -> Vec<project::DetectedCommand> {
+    // file reads — keep them off the async runtime's core threads
+    tauri::async_runtime::spawn_blocking(move || project::detect(&cwd))
+        .await
+        .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -174,6 +195,8 @@ pub fn run() {
             pty_write,
             pty_resize,
             pty_kill,
+            pty_has_children,
+            project_commands,
             usage_for_dir,
             usage_for_session,
             usage_totals,

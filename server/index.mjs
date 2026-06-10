@@ -73,6 +73,106 @@ app.get("/api/fs/list", (req, res) => {
   });
 });
 
+// ---- auto-detected quick commands for a project folder ----
+// Shown in floating terminals. Keep the detection rules in sync with
+// src-tauri/src/project.rs (native backend). Note: script names are sorted
+// alphabetically to match the Rust side's map ordering.
+const MAX_PER_SOURCE = 12;
+const MAX_TOTAL = 30;
+
+// plain [A-Za-z0-9_-] names only — filters file targets (build/foo.o),
+// pattern rules (%.o) and special targets (.PHONY)
+const isSimpleTarget = (name) => /^[A-Za-z0-9_-]+$/.test(name);
+
+app.get("/api/project-commands", (req, res) => {
+  const cwd = String(req.query.cwd || "");
+  if (!cwd) return res.json([]);
+  const out = [];
+  const exists = (...p) => fs.existsSync(path.join(cwd, ...p));
+  const read = (...p) => {
+    try {
+      return fs.readFileSync(path.join(cwd, ...p), "utf8");
+    } catch {
+      return null;
+    }
+  };
+
+  // package.json scripts, run with the package manager the lockfile implies
+  const pkgRaw = read("package.json");
+  if (pkgRaw) {
+    let scripts = null;
+    try {
+      scripts = JSON.parse(pkgRaw)?.scripts ?? null;
+    } catch {
+      /* malformed package.json → skip */
+    }
+    if (scripts && typeof scripts === "object") {
+      const pm =
+        exists("bun.lockb") || exists("bun.lock")
+          ? "bun"
+          : exists("pnpm-lock.yaml")
+            ? "pnpm"
+            : exists("yarn.lock")
+              ? "yarn"
+              : "npm";
+      for (const name of Object.keys(scripts).sort().slice(0, MAX_PER_SOURCE)) {
+        const command = pm === "yarn" ? `yarn ${name}` : `${pm} run ${name}`;
+        out.push({ label: name, command, source: "package.json" });
+      }
+    }
+  }
+
+  if (exists("Cargo.toml")) {
+    for (const cmd of ["cargo build", "cargo test", "cargo run"]) {
+      if (cmd === "cargo run" && !exists("src", "main.rs")) continue;
+      out.push({ label: cmd, command: cmd, source: "cargo" });
+    }
+  }
+
+  const makefile = read("Makefile");
+  if (makefile) {
+    let n = 0;
+    for (const line of makefile.split("\n")) {
+      if (n >= MAX_PER_SOURCE) break;
+      // target lines start at column 0; assignments (FOO = …, FOO := …)
+      // and rule bodies (indented) don't
+      if (/^\s/.test(line) || line.startsWith("#")) continue;
+      const colon = line.indexOf(":");
+      if (colon < 0) continue;
+      if (line.slice(0, colon).includes("=") || line[colon + 1] === "=") continue;
+      const name = line.slice(0, colon).trim();
+      if (isSimpleTarget(name)) {
+        out.push({ label: name, command: `make ${name}`, source: "make" });
+        n++;
+      }
+    }
+  }
+
+  for (const just of ["justfile", "Justfile", ".justfile"]) {
+    const raw = read(just);
+    if (raw === null) continue;
+    let n = 0;
+    for (const line of raw.split("\n")) {
+      if (n >= MAX_PER_SOURCE) break;
+      if (/^\s/.test(line) || line.startsWith("#")) continue;
+      const colon = line.indexOf(":");
+      if (colon < 0) continue;
+      // `name := value` assignments and `alias x := y` aren't recipes
+      if (line[colon + 1] === "=") continue;
+      // recipe name is the first token before the colon (rest = params)
+      const name = line.slice(0, colon).trim().split(/\s+/)[0] ?? "";
+      // leading '_' marks private recipes by just convention
+      if (isSimpleTarget(name) && !name.startsWith("_")) {
+        out.push({ label: name, command: `just ${name}`, source: "just" });
+        n++;
+      }
+    }
+    break; // first existing justfile wins
+  }
+
+  res.json(out.slice(0, MAX_TOTAL));
+});
+
 // ---- read-only git status for agent panes ----
 // Keep the queries and parsing in sync with src-tauri/src/git.rs (native backend).
 function gitRun(cwd, args, bin = "git") {
@@ -201,6 +301,20 @@ app.get("/api/limits", async (_req, res) => {
   }
 });
 
+// ---- "is something still running in this PTY?" ----
+// True when the PTY's shell has at least one child process (dev server,
+// build, …) — used to warn before killing a floating terminal. Unknown ids
+// and failed checks report false. Keep in sync with PtyManager::has_children
+// in src-tauri/src/pty.rs (native backend).
+const ptyPids = new Map(); // pty id → shell pid, registered on spawn
+app.get("/api/pty/has-children", (req, res) => {
+  const pid = ptyPids.get(String(req.query.id || ""));
+  if (!pid) return res.json(false);
+  execFile("pgrep", ["-P", String(pid)], (err, stdout) =>
+    res.json(!err && stdout.trim().length > 0),
+  );
+});
+
 // live usage stream (SSE)
 app.get("/api/usage/stream", (req, res) => {
   res.writeHead(200, {
@@ -306,6 +420,7 @@ wss.on("connection", (ws) => {
         return;
       }
       ptys.set(msg.id, term);
+      ptyPids.set(msg.id, term.pid);
       // coalesce output bursts (≤12 ms / 128 KiB) into one WS message so the
       // browser isn't woken for every tiny chunk a TUI redraw produces
       let pending = [];
@@ -333,6 +448,7 @@ wss.on("connection", (ws) => {
         if (flushTimer) clearTimeout(flushTimer);
         flush();
         ptys.delete(msg.id);
+        ptyPids.delete(msg.id);
         send({ t: "exit", id: msg.id });
       });
       if (msg.startup && msg.startup.trim()) {
@@ -359,6 +475,7 @@ wss.on("connection", (ws) => {
       const term = ptys.get(msg.id);
       if (term) {
         ptys.delete(msg.id);
+        ptyPids.delete(msg.id);
         try {
           term.kill();
         } catch {
@@ -369,7 +486,8 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    for (const term of ptys.values()) {
+    for (const [id, term] of ptys.entries()) {
+      ptyPids.delete(id);
       try {
         term.kill();
       } catch {

@@ -1,5 +1,7 @@
 import type {
   AppSettings,
+  DetectedCommand,
+  FolderCommands,
   GitInfo,
   Profile,
   SessionUsage,
@@ -29,6 +31,12 @@ export interface Backend {
   ptyWrite(id: string, data: string): Promise<void> | void;
   ptyResize(id: string, cols: number, rows: number): Promise<void> | void;
   ptyKill(id: string): Promise<void> | void;
+  /**
+   * True when the shell in this PTY has a foreground child process (dev
+   * server, build, …) — used to warn before killing a floating terminal.
+   * Unknown sessions and check failures resolve false.
+   */
+  ptyHasChildren(id: string): Promise<boolean>;
 
   /** Subscribe to output / exit of ONE agent's PTY (events are addressed per agent). */
   onPtyData(id: string, cb: (e: PtyDataEvent) => void): Promise<Unlisten>;
@@ -63,8 +71,15 @@ export interface Backend {
   ensureNotifyPermission(): Promise<boolean>;
   notify(title: string, body: string): Promise<void>;
 
+  /** Runnable commands found in a folder's project files (scripts, targets, …). */
+  detectProjectCommands(cwd: string): Promise<DetectedCommand[]>;
+
   loadProfiles(): Promise<Profile[] | null>;
   saveProfiles(profiles: Profile[]): Promise<void>;
+
+  /** Quick-command customizations (presets + hidden), keyed by project folder (cwd). */
+  loadCommandPresets(): Promise<Record<string, FolderCommands> | null>;
+  saveCommandPresets(presets: Record<string, FolderCommands>): Promise<void>;
 
   loadUsageHistory(): Promise<UsageHistoryEntry[] | null>;
   saveUsageHistory(entries: UsageHistoryEntry[]): Promise<void>;

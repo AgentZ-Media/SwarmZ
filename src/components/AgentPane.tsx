@@ -6,8 +6,11 @@ import {
   ExternalLink,
   Folder,
   GitBranch,
+  Maximize2,
+  Minimize2,
   MoreVertical,
   Rows2,
+  SquareTerminal,
   X,
 } from "lucide-react";
 import { useSwarm } from "@/store";
@@ -286,10 +289,13 @@ export const AgentPane = memo(function AgentPane({
   onHeaderDragStart?: (agentId: string, e: React.MouseEvent) => void;
 }) {
   const agent = useSwarm((s) => s.agents[agentId]);
-  const removeAgent = useSwarm((s) => s.removeAgent);
+  const requestRemoveAgent = useSwarm((s) => s.requestRemoveAgent);
+  const createFloatingTerminal = useSwarm((s) => s.createFloatingTerminal);
   const splitActive = useSwarm((s) => s.splitActive);
   const focusAgent = useSwarm((s) => s.focusAgent);
   const renameAgent = useSwarm((s) => s.renameAgent);
+  const focused = useSwarm((s) => s.focusedAgentId === agentId);
+  const setFocusedAgent = useSwarm((s) => s.setFocusedAgent);
   const [editing, setEditing] = useState(false);
 
   if (!agent) return null;
@@ -319,6 +325,11 @@ export const AgentPane = memo(function AgentPane({
           if ((e.target as HTMLElement).closest("button, input")) return;
           onHeaderDragStart?.(agentId, e);
         }}
+        onDoubleClick={(e) => {
+          if (editing) return;
+          if ((e.target as HTMLElement).closest("button, input")) return;
+          setFocusedAgent(focused ? null : agentId);
+        }}
       >
         <StatusDot agent={agent} />
 
@@ -343,7 +354,11 @@ export const AgentPane = memo(function AgentPane({
                 "shrink-0 truncate text-xs font-medium",
                 active ? "text-foreground" : "text-muted-foreground",
               )}
-              onDoubleClick={() => setEditing(true)}
+              onDoubleClick={(e) => {
+                // double-click on the title renames; don't toggle focus mode
+                e.stopPropagation();
+                setEditing(true);
+              }}
             >
               {agent.name}
             </span>
@@ -367,6 +382,18 @@ export const AgentPane = memo(function AgentPane({
 
           <AgentStatsButton agent={agent} />
 
+          <Tip label="Floating terminal">
+            <button
+              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-xl:hidden"
+              onClick={(e) => {
+                e.stopPropagation();
+                createFloatingTerminal(agentId);
+              }}
+            >
+              <SquareTerminal size={13} />
+            </button>
+          </Tip>
+
           <Tip label="Split right">
             <button
               className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-xl:hidden"
@@ -389,6 +416,18 @@ export const AgentPane = memo(function AgentPane({
               }}
             >
               <Rows2 size={13} />
+            </button>
+          </Tip>
+
+          <Tip label={focused ? "Exit focus" : "Focus"}>
+            <button
+              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
+              onClick={(e) => {
+                e.stopPropagation();
+                setFocusedAgent(focused ? null : agentId);
+              }}
+            >
+              {focused ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
             </button>
           </Tip>
 
@@ -421,14 +460,23 @@ export const AgentPane = memo(function AgentPane({
               <DropdownMenuItem onSelect={() => setEditing(true)}>
                 Rename
               </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => setFocusedAgent(focused ? null : agentId)}
+              >
+                {focused ? <Minimize2 /> : <Maximize2 />}{" "}
+                {focused ? "Exit focus" : "Focus"}
+              </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => splitActive("row")}>
                 <Columns2 /> Split right
               </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => splitActive("column")}>
                 <Rows2 /> Split down
               </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => createFloatingTerminal(agentId)}>
+                <SquareTerminal /> Floating terminal
+              </DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem danger onSelect={() => removeAgent(agentId)}>
+              <DropdownMenuItem danger onSelect={() => requestRemoveAgent(agentId)}>
                 <X /> Close agent
               </DropdownMenuItem>
             </DropdownMenuContent>
@@ -439,7 +487,7 @@ export const AgentPane = memo(function AgentPane({
               className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-destructive/15 hover:text-destructive"
               onClick={(e) => {
                 e.stopPropagation();
-                removeAgent(agentId);
+                requestRemoveAgent(agentId);
               }}
             >
               <X size={13} />

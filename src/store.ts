@@ -1,9 +1,12 @@
 import { create } from "zustand";
 import { nanoid } from "nanoid";
 import {
+  loadCommandPresets,
   loadProfiles,
   loadSettings,
   loadUsageHistory,
+  ptyHasChildren,
+  saveCommandPresets,
   saveProfiles,
   saveSettings,
   saveUsageHistory,
@@ -13,6 +16,9 @@ import type {
   AgentStatus,
   AppSettings,
   ClaudeActivity,
+  CommandPreset,
+  FloatingTerminal,
+  FolderCommands,
   GitInfo,
   LayoutNode,
   Profile,
@@ -55,6 +61,16 @@ function schedulePersistHistory() {
   }, 1500);
 }
 
+// Floating terminals open as a small PiP window; cascaded so stacked windows
+// stay grabbable.
+const FLOAT_DEFAULT_W = 520;
+const FLOAT_DEFAULT_H = 340;
+
+/** Command presets are keyed by project folder; agents without a cwd share "~". */
+export function presetKey(cwd?: string): string {
+  return cwd || "~";
+}
+
 interface CreateAgentOpts {
   name?: string;
   cwd?: string;
@@ -77,6 +93,8 @@ interface SwarmState {
   order: string[];
   layout: LayoutNode | null;
   activePaneId: string | null;
+  /** focus mode: this agent's pane is enlarged as an overlay above the grid (in-memory) */
+  focusedAgentId: string | null;
   profiles: Profile[];
   /** all-time usage of claude sessions launched inside SwarmZ, keyed by session id */
   usageHistory: Record<string, UsageHistoryEntry>;
@@ -86,6 +104,13 @@ interface SwarmState {
   /** persisted app preferences (Settings dialog) — includes the last used folder */
   settings: AppSettings;
   agentCounter: number;
+  /** PiP-style shell terminals floating above the grid (in-memory) */
+  floatingTerminals: Record<string, FloatingTerminal>;
+  floatingOrder: string[];
+  /** quick-command customizations (presets + hidden detected), keyed by project folder (persisted) */
+  commandPresets: Record<string, FolderCommands>;
+  /** pending "close agent" that needs a decision about running floating terminals */
+  closeConfirm: { agentId: string; termIds: string[] } | null;
 
   // derived helpers
   activeAgentId: () => string | null;
@@ -94,8 +119,43 @@ interface SwarmState {
   hydrate: () => Promise<void>;
   createAgent: (opts?: CreateAgentOpts, direction?: "row" | "column") => string;
   removeAgent: (agentId: string) => void;
+  /**
+   * Close an agent pane the safe way: floating terminals with a running
+   * process raise the close-confirm dialog (close vs. detach); idle ones are
+   * closed along with the pane. All UI close paths go through this.
+   */
+  requestRemoveAgent: (agentId: string) => void;
+  /** resolve the pending close-confirm: kill the terminals, detach them, or cancel */
+  resolveCloseConfirm: (choice: "kill" | "detach" | "cancel") => void;
+
+  // floating terminals
+  createFloatingTerminal: (agentId: string) => void;
+  /** remove from the store — the window unmounts, which kills the PTY */
+  removeFloatingTerminal: (id: string) => void;
+  /** bring a window above its siblings (last in order renders on top) */
+  raiseFloatingTerminal: (id: string) => void;
+  updateFloatingTerminal: (
+    id: string,
+    patch: Partial<Omit<FloatingTerminal, "id">>,
+  ) => void;
+
+  // command presets (per project folder)
+  /** create a preset, or update one in place when `id` is given (edit/override) */
+  saveCommandPreset: (
+    cwd: string | undefined,
+    label: string,
+    command: string,
+    id?: string,
+  ) => void;
+  deleteCommandPreset: (cwd: string | undefined, id: string) => void;
+  /** remove an auto-detected command from this folder's quick-command bar */
+  hideDetectedCommand: (cwd: string | undefined, command: string) => void;
+  /** bring back everything hidden in this folder */
+  restoreHiddenCommands: (cwd: string | undefined) => void;
   focusAgent: (agentId: string) => void;
   setActivePane: (paneId: string) => void;
+  /** enter/leave focus mode (null = leave) */
+  setFocusedAgent: (agentId: string | null) => void;
 
   // status / usage
   setStatus: (agentId: string, status: AgentStatus) => void;
@@ -131,6 +191,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   order: [],
   layout: null,
   activePaneId: null,
+  focusedAgentId: null,
   profiles: [],
   usageHistory: {},
   dashboardOpen: false,
@@ -138,6 +199,10 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   newAgentPrefill: null,
   settings: {},
   agentCounter: 0,
+  floatingTerminals: {},
+  floatingOrder: [],
+  commandPresets: {},
+  closeConfirm: null,
 
   activeAgentId: () => {
     const { layout, activePaneId } = get();
@@ -159,6 +224,22 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         const map: Record<string, UsageHistoryEntry> = {};
         for (const e of history) map[e.session_id] = e;
         set({ usageHistory: map });
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      const presets = await loadCommandPresets();
+      if (presets) {
+        // tolerate the pre-release shape where a folder mapped to a bare
+        // preset array (no hidden list)
+        const normalized: Record<string, FolderCommands> = {};
+        for (const [key, value] of Object.entries(presets)) {
+          normalized[key] = Array.isArray(value)
+            ? { presets: value, hidden: [] }
+            : value;
+        }
+        set({ commandPresets: normalized });
       }
     } catch {
       /* ignore */
@@ -247,6 +328,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       agentCounter: n,
       newAgentOpen: false,
       newAgentPrefill: null,
+      // a new pane should be visible immediately — leave focus mode
+      focusedAgentId: null,
     });
     if (agent.cwd) get().updateSettings({ lastCwd: agent.cwd });
     return id;
@@ -262,7 +345,193 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     if (!panes.find((p) => p.id === activePaneId)) {
       activePaneId = panes[0]?.id ?? null;
     }
-    set({ agents: rest, order, layout, activePaneId });
+    set({
+      agents: rest,
+      order,
+      layout,
+      activePaneId,
+      focusedAgentId:
+        state.focusedAgentId === agentId ? null : state.focusedAgentId,
+    });
+  },
+
+  requestRemoveAgent: (agentId) => {
+    const state = get();
+    const termIds = state.floatingOrder.filter(
+      (tid) => state.floatingTerminals[tid]?.agentId === agentId,
+    );
+    if (termIds.length === 0) {
+      get().removeAgent(agentId);
+      return;
+    }
+    void (async () => {
+      // a floating terminal blocks the close only while something actually
+      // runs in it — exited/idle shells are closed along with the pane
+      const busy: string[] = [];
+      await Promise.all(
+        termIds.map(async (tid) => {
+          if (get().floatingTerminals[tid]?.status === "exited") return;
+          if (await ptyHasChildren(tid)) busy.push(tid);
+        }),
+      );
+      if (busy.length > 0) {
+        set({ closeConfirm: { agentId, termIds: busy } });
+      } else {
+        for (const tid of termIds) get().removeFloatingTerminal(tid);
+        get().removeAgent(agentId);
+      }
+    })();
+  },
+
+  resolveCloseConfirm: (choice) => {
+    const confirm = get().closeConfirm;
+    if (!confirm) return;
+    set({ closeConfirm: null });
+    if (choice === "cancel") return;
+    const state = get();
+    const termIds = state.floatingOrder.filter(
+      (tid) => state.floatingTerminals[tid]?.agentId === confirm.agentId,
+    );
+    for (const tid of termIds) {
+      if (choice === "detach" && confirm.termIds.includes(tid)) {
+        // keep the PTY alive as an unowned, minimized pill
+        get().updateFloatingTerminal(tid, { agentId: null, minimized: true });
+      } else {
+        get().removeFloatingTerminal(tid);
+      }
+    }
+    get().removeAgent(confirm.agentId);
+  },
+
+  createFloatingTerminal: (agentId) => {
+    const state = get();
+    const agent = state.agents[agentId];
+    if (!agent) return;
+    const id = `float-${nanoid(10)}`;
+    const term: FloatingTerminal = {
+      id,
+      agentId,
+      cwd: agent.cwd,
+      name: "Terminal",
+      status: "running",
+      minimized: false,
+      // positioned bottom-right by the window component once it knows the
+      // grid size (x/y null = not laid out yet)
+      x: null,
+      y: null,
+      w: FLOAT_DEFAULT_W,
+      h: FLOAT_DEFAULT_H,
+      z:
+        Math.max(
+          0,
+          ...Object.values(state.floatingTerminals).map((t) => t.z),
+        ) + 1,
+    };
+    set({
+      floatingTerminals: { ...state.floatingTerminals, [id]: term },
+      floatingOrder: [...state.floatingOrder, id],
+    });
+  },
+
+  removeFloatingTerminal: (id) => {
+    const state = get();
+    const { [id]: _removed, ...rest } = state.floatingTerminals;
+    set({
+      floatingTerminals: rest,
+      floatingOrder: state.floatingOrder.filter((tid) => tid !== id),
+    });
+  },
+
+  raiseFloatingTerminal: (id) => {
+    const state = get();
+    const term = state.floatingTerminals[id];
+    if (!term) return;
+    const top = Math.max(
+      0,
+      ...Object.values(state.floatingTerminals).map((t) => t.z),
+    );
+    if (term.z === top) return;
+    get().updateFloatingTerminal(id, { z: top + 1 });
+  },
+
+  updateFloatingTerminal: (id, patch) => {
+    const state = get();
+    const term = state.floatingTerminals[id];
+    if (!term) return;
+    set({
+      floatingTerminals: {
+        ...state.floatingTerminals,
+        [id]: { ...term, ...patch },
+      },
+    });
+  },
+
+  saveCommandPreset: (cwd, label, command, id) => {
+    const trimmed = command.trim();
+    if (!trimmed) return;
+    const key = presetKey(cwd);
+    const state = get();
+    const folder = state.commandPresets[key] ?? { presets: [], hidden: [] };
+    const finalLabel = label.trim() || trimmed;
+    let presets: CommandPreset[];
+    if (id && folder.presets.some((p) => p.id === id)) {
+      // edit in place — keeps the chip's position
+      presets = folder.presets.map((p) =>
+        p.id === id ? { ...p, label: finalLabel, command: trimmed } : p,
+      );
+    } else {
+      // re-saving an identical command just refreshes its label
+      presets = [
+        ...folder.presets.filter((p) => p.command !== trimmed),
+        { id: nanoid(8), label: finalLabel, command: trimmed },
+      ];
+    }
+    const commandPresets = {
+      ...state.commandPresets,
+      [key]: { ...folder, presets },
+    };
+    set({ commandPresets });
+    void saveCommandPresets(commandPresets);
+  },
+
+  deleteCommandPreset: (cwd, id) => {
+    const key = presetKey(cwd);
+    const state = get();
+    const folder = state.commandPresets[key];
+    if (!folder) return;
+    const presets = folder.presets.filter((p) => p.id !== id);
+    const commandPresets = { ...state.commandPresets, [key]: { ...folder, presets } };
+    if (presets.length === 0 && folder.hidden.length === 0)
+      delete commandPresets[key];
+    set({ commandPresets });
+    void saveCommandPresets(commandPresets);
+  },
+
+  hideDetectedCommand: (cwd, command) => {
+    const key = presetKey(cwd);
+    const state = get();
+    const folder = state.commandPresets[key] ?? { presets: [], hidden: [] };
+    if (folder.hidden.includes(command)) return;
+    const commandPresets = {
+      ...state.commandPresets,
+      [key]: { ...folder, hidden: [...folder.hidden, command] },
+    };
+    set({ commandPresets });
+    void saveCommandPresets(commandPresets);
+  },
+
+  restoreHiddenCommands: (cwd) => {
+    const key = presetKey(cwd);
+    const state = get();
+    const folder = state.commandPresets[key];
+    if (!folder?.hidden.length) return;
+    const commandPresets = {
+      ...state.commandPresets,
+      [key]: { ...folder, hidden: [] },
+    };
+    if (folder.presets.length === 0) delete commandPresets[key];
+    set({ commandPresets });
+    void saveCommandPresets(commandPresets);
   },
 
   focusAgent: (agentId) => {
@@ -272,6 +541,11 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     if (state.agents[agentId]?.attention) {
       get().setAttention(agentId, false);
     }
+  },
+
+  setFocusedAgent: (agentId) => {
+    if (agentId) get().focusAgent(agentId);
+    set({ focusedAgentId: agentId });
   },
 
   setActivePane: (paneId) => {

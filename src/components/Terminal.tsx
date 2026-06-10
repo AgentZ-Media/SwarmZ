@@ -66,17 +66,28 @@ export function TerminalView({
   cwd,
   startup,
   active,
+  onCommand,
 }: {
   agentId: string;
   cwd?: string;
   startup: string;
   active: boolean;
+  /**
+   * Fires with the line the user typed when they hit Enter (floating
+   * terminals name themselves after it). Best-effort: history recall, line
+   * editing via escape sequences and pastes make the buffer unreliable —
+   * those lines are skipped rather than guessed.
+   */
+  onCommand?: (command: string) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const spawnedRef = useRef(false);
   const runningRef = useRef(false);
+  // keep the latest callback without re-running the spawn effect
+  const onCommandRef = useRef(onCommand);
+  onCommandRef.current = onCommand;
 
   const setStatus = useSwarm((s) => s.setStatus);
   const setAttention = useSwarm((s) => s.setAttention);
@@ -123,9 +134,33 @@ export function TerminalView({
     const cols = term.cols;
     const rows = term.rows;
 
-    // stream input → pty
+    // stream input → pty; optionally track the typed line for onCommand
+    let lineBuf = "";
+    let lineDirty = false; // an escape sequence touched the line — don't trust it
     const inputDisp = term.onData((data) => {
       void ptyWrite(agentId, data);
+      if (!onCommandRef.current) return;
+      for (const ch of data) {
+        if (ch === "\r" || ch === "\n") {
+          const cmd = lineBuf.trim();
+          if (cmd && !lineDirty) onCommandRef.current(cmd);
+          lineBuf = "";
+          lineDirty = false;
+        } else if (ch === "\x7f" || ch === "\b") {
+          lineBuf = lineBuf.slice(0, -1);
+        } else if (ch === "\x1b" || ch < " ") {
+          // arrows, history recall, ^C, pastes … — buffer no longer mirrors
+          // the shell's line (^C starts a fresh, trustworthy one)
+          if (ch === "\x03") {
+            lineBuf = "";
+            lineDirty = false;
+          } else {
+            lineDirty = true;
+          }
+        } else {
+          lineBuf += ch;
+        }
+      }
     });
 
     // bell → attention

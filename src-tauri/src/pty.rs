@@ -15,6 +15,8 @@ struct PtySession {
     master: Box<dyn MasterPty + Send>,
     writer: SharedWriter,
     child: Box<dyn Child + Send + Sync>,
+    /// pid of the spawned shell — used for the has-children check
+    pid: Option<u32>,
 }
 
 #[derive(Default)]
@@ -100,10 +102,12 @@ impl PtyManager {
             });
         }
 
+        let pid = child.process_id();
         let session = PtySession {
             master: pair.master,
             writer,
             child,
+            pid,
         };
         self.sessions.lock().insert(id.clone(), session);
 
@@ -182,6 +186,23 @@ impl PtyManager {
                 pixel_height: 0,
             })
             .map_err(|e| e.to_string())
+    }
+
+    /// True when the session's shell has at least one child process — i.e.
+    /// something (dev server, build, …) is still running in this terminal.
+    /// Unknown sessions and failed checks report false.
+    /// Keep in sync with `/api/pty/has-children` in `server/index.mjs`.
+    pub fn has_children(&self, id: &str) -> bool {
+        let pid = match self.sessions.lock().get(id).and_then(|s| s.pid) {
+            Some(p) => p,
+            None => return false,
+        };
+        std::process::Command::new("pgrep")
+            .arg("-P")
+            .arg(pid.to_string())
+            .output()
+            .map(|o| o.status.success() && !o.stdout.is_empty())
+            .unwrap_or(false)
     }
 
     pub fn kill(&self, id: &str) -> Result<(), String> {

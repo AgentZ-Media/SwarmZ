@@ -1,6 +1,7 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSwarm } from "@/store";
 import { AgentPane } from "./AgentPane";
+import { cn } from "@/lib/utils";
 import type { DropZone } from "@/lib/layout";
 import type { LayoutNode } from "@/types";
 
@@ -86,6 +87,11 @@ function withSizes(
 
 const GAP = 4; // px gutter between panes
 
+// Focus mode: the focused pane zooms to this rect, floating above the dimmed
+// grid — everything underneath stays mounted and keeps running.
+const FOCUS_RECT: Rect = { x: 2, y: 2.5, w: 96, h: 95 };
+const FOCUS_ANIM_MS = 150;
+
 /** Absolute-position style for a percent rect, matching the pane wrappers. */
 function rectStyle(rect: Rect): React.CSSProperties {
   return {
@@ -112,7 +118,26 @@ export function TilingGrid() {
   const activePaneId = useSwarm((s) => s.activePaneId);
   const setSizes = useSwarm((s) => s.setSizes);
   const movePane = useSwarm((s) => s.movePane);
+  const focusedAgentId = useSwarm((s) => s.focusedAgentId);
+  const setFocusedAgent = useSwarm((s) => s.setFocusedAgent);
   const containerRef = useRef<HTMLDivElement>(null);
+  // When focus mode exits, the pane needs to animate back to its grid slot —
+  // keep it elevated (and the backdrop fading out) until the transition ends.
+  // Set during render (not in an effect) so the transition class is still on
+  // the wrapper in the very commit where the rect snaps back.
+  const [closingFocusId, setClosingFocusId] = useState<string | null>(null);
+  const prevFocusRef = useRef<string | null>(null);
+  if (prevFocusRef.current !== focusedAgentId) {
+    if (!focusedAgentId && prevFocusRef.current) {
+      setClosingFocusId(prevFocusRef.current);
+    }
+    prevFocusRef.current = focusedAgentId;
+  }
+  useEffect(() => {
+    if (!closingFocusId) return;
+    const t = setTimeout(() => setClosingFocusId(null), FOCUS_ANIM_MS + 50);
+    return () => clearTimeout(t);
+  }, [closingFocusId]);
   // While a divider is dragged, the real layout stays frozen; only this
   // preview updates (rendered as a translucent tile overlay). Committed on mouseup.
   const [preview, setPreview] = useState<{
@@ -195,6 +220,8 @@ export function TilingGrid() {
   const startPaneDrag = useCallback(
     (agentId: string, e: React.MouseEvent) => {
       if (e.button !== 0) return;
+      // no rearranging while a pane floats above the grid
+      if (useSwarm.getState().focusedAgentId) return;
       const container = containerRef.current;
       const root = useSwarm.getState().layout;
       if (!container || !root) return;
@@ -287,15 +314,36 @@ export function TilingGrid() {
 
   return (
     <div ref={containerRef} className="relative h-full w-full">
-      {panes.map((p) => (
-        <div key={p.agentId} className="absolute" style={rectStyle(p.rect)}>
-          <AgentPane
-            agentId={p.agentId}
-            active={p.paneId === activePaneId}
-            onHeaderDragStart={startPaneDrag}
-          />
-        </div>
-      ))}
+      {(focusedAgentId || closingFocusId) && (
+        <div
+          className={cn(
+            "absolute inset-0 z-20 bg-background/70 transition-opacity duration-150",
+            focusedAgentId ? "animate-overlay-in opacity-100" : "opacity-0",
+          )}
+          onMouseDown={() => setFocusedAgent(null)}
+        />
+      )}
+      {panes.map((p) => {
+        const focused = p.agentId === focusedAgentId;
+        const animating = focused || p.agentId === closingFocusId;
+        return (
+          <div
+            key={p.agentId}
+            className={cn(
+              "absolute",
+              animating &&
+                "z-30 transition-[left,top,width,height] duration-150 ease-out",
+            )}
+            style={rectStyle(focused ? FOCUS_RECT : p.rect)}
+          >
+            <AgentPane
+              agentId={p.agentId}
+              active={p.paneId === activePaneId}
+              onHeaderDragStart={startPaneDrag}
+            />
+          </div>
+        );
+      })}
       {handles.map((h, idx) => (
         <div
           key={`${h.splitId}-${h.index}-${idx}`}

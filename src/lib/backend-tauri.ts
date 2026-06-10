@@ -11,6 +11,8 @@ import {
 import { LazyStore } from "@tauri-apps/plugin-store";
 import type {
   AppSettings,
+  DetectedCommand,
+  FolderCommands,
   GitInfo,
   Profile,
   SessionUsage,
@@ -27,6 +29,13 @@ export const tauriBackend: Backend = {
   ptyWrite: (id, data) => invoke<void>("pty_write", { id, data }),
   ptyResize: (id, cols, rows) => invoke<void>("pty_resize", { id, cols, rows }),
   ptyKill: (id) => invoke<void>("pty_kill", { id }),
+  ptyHasChildren: async (id) => {
+    try {
+      return await invoke<boolean>("pty_has_children", { id });
+    } catch {
+      return false;
+    }
+  },
 
   onPtyData: (id: string, cb: (e: PtyDataEvent) => void) =>
     listen<PtyDataEvent>(`pty://data/${id}`, (ev) => cb(ev.payload)),
@@ -65,6 +74,14 @@ export const tauriBackend: Backend = {
     sendNotification({ title, body });
   },
 
+  detectProjectCommands: async (cwd) => {
+    try {
+      return await invoke<DetectedCommand[]>("project_commands", { cwd });
+    } catch {
+      return [];
+    }
+  },
+
   loadProfiles: async () => {
     try {
       return (await store.get<Profile[]>("profiles")) ?? null;
@@ -74,6 +91,21 @@ export const tauriBackend: Backend = {
   },
   saveProfiles: async (profiles) => {
     await store.set("profiles", profiles);
+    await store.save();
+  },
+
+  loadCommandPresets: async () => {
+    try {
+      return (
+        (await store.get<Record<string, FolderCommands>>("commandPresets")) ??
+        null
+      );
+    } catch {
+      return null;
+    }
+  },
+  saveCommandPresets: async (presets) => {
+    await store.set("commandPresets", presets);
     await store.save();
   },
 

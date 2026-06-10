@@ -159,6 +159,63 @@ export interface Agent {
   git?: GitInfo | null;
 }
 
+// ---- Floating terminals & quick commands ----
+
+/** One saved quick command. Stored per project folder, keyed by cwd. */
+export interface CommandPreset {
+  id: string;
+  label: string;
+  command: string;
+}
+
+/**
+ * Everything the user customized about quick commands in one project folder:
+ * saved presets and auto-detected commands they removed. A preset whose label
+ * or command matches a detected command overrides it.
+ */
+export interface FolderCommands {
+  presets: CommandPreset[];
+  /** detected commands hidden by the user, matched by command string */
+  hidden: string[];
+}
+
+/**
+ * A runnable command auto-detected from project files in a folder —
+ * package.json scripts (package-manager aware via the lockfile), Cargo.toml,
+ * Makefile and justfile targets. Produced by `project_commands` (Rust) /
+ * `/api/project-commands` (web) — keep both implementations in sync.
+ */
+export interface DetectedCommand {
+  label: string;
+  command: string;
+  /** where it was found: "package.json" | "cargo" | "make" | "just" */
+  source: string;
+}
+
+/**
+ * A small PiP-style shell terminal floating above the grid (in-memory).
+ * Owned by an agent pane; detaching (when the pane closes while a process is
+ * still running) keeps the PTY alive with `agentId: null`.
+ */
+export interface FloatingTerminal {
+  id: string;
+  /** owning agent; null once detached */
+  agentId: string | null;
+  cwd?: string;
+  /** display name — the last command run, or "Terminal" */
+  name: string;
+  status: "running" | "exited";
+  /** collapsed to just the title bar (PTY keeps running) */
+  minimized: boolean;
+  /** window rect in px relative to the grid area; x/y null until first layout */
+  x: number | null;
+  y: number | null;
+  w: number;
+  h: number;
+  /** stacking order — raised on click; render order stays stable (xterm canvas) */
+  z: number;
+}
+
 // ---- Tiling layout tree ----
 export interface PaneNode {
   type: "pane";
