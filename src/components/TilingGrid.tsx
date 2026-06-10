@@ -2,74 +2,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSwarm } from "@/store";
 import { AgentPane } from "./AgentPane";
 import { cn } from "@/lib/utils";
-import type { DropZone } from "@/lib/layout";
+import {
+  computeLayout,
+  type DropZone,
+  type HandleRect,
+  type PaneRect,
+  type Rect,
+} from "@/lib/layout";
 import type { LayoutNode } from "@/types";
-
-interface Rect {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-interface PaneRect {
-  paneId: string;
-  agentId: string;
-  rect: Rect;
-}
-interface HandleRect {
-  splitId: string;
-  index: number; // boundary between child index and index+1
-  direction: "row" | "column";
-  /** position of the divider bar, in percent of the container */
-  pos: { x: number; y: number; span: number };
-  /** the parent split's extent along the drag axis, in percent of container */
-  regionPercent: number;
-  sizes: number[];
-}
-
-function computeLayout(
-  node: LayoutNode,
-  rect: Rect,
-  panes: PaneRect[],
-  handles: HandleRect[],
-) {
-  if (node.type === "pane") {
-    panes.push({ paneId: node.id, agentId: node.agentId, rect });
-    return;
-  }
-  const total = node.sizes.reduce((a, b) => a + b, 0) || node.children.length;
-  let offset = 0;
-  node.children.forEach((child, i) => {
-    const frac = (node.sizes[i] ?? total / node.children.length) / total;
-    const childRect: Rect =
-      node.direction === "row"
-        ? { x: rect.x + offset * rect.w, y: rect.y, w: frac * rect.w, h: rect.h }
-        : { x: rect.x, y: rect.y + offset * rect.h, w: rect.w, h: frac * rect.h };
-    computeLayout(child, childRect, panes, handles);
-    offset += frac;
-    if (i < node.children.length - 1) {
-      if (node.direction === "row") {
-        handles.push({
-          splitId: node.id,
-          index: i,
-          direction: "row",
-          pos: { x: rect.x + offset * rect.w, y: rect.y, span: rect.h },
-          regionPercent: rect.w,
-          sizes: node.sizes,
-        });
-      } else {
-        handles.push({
-          splitId: node.id,
-          index: i,
-          direction: "column",
-          pos: { x: rect.x, y: rect.y + offset * rect.h, span: rect.w },
-          regionPercent: rect.h,
-          sizes: node.sizes,
-        });
-      }
-    }
-  });
-}
 
 /** Clone the layout with one split's sizes replaced — used to project the drag preview. */
 function withSizes(
@@ -113,12 +53,15 @@ function zoneAt(rx: number, ry: number): DropZone {
   return "bottom";
 }
 
-export function TilingGrid() {
-  const layout = useSwarm((s) => s.layout);
-  const activePaneId = useSwarm((s) => s.activePaneId);
+export function TilingGrid({ workspaceId }: { workspaceId: string }) {
+  const layout = useSwarm((s) => s.layouts[workspaceId] ?? null);
+  const activePaneId = useSwarm((s) => s.activePaneIds[workspaceId] ?? null);
+  const isActiveWs = useSwarm((s) => s.activeWorkspaceId === workspaceId);
   const setSizes = useSwarm((s) => s.setSizes);
   const movePane = useSwarm((s) => s.movePane);
-  const focusedAgentId = useSwarm((s) => s.focusedAgentId);
+  const focusedAgentId = useSwarm((s) =>
+    s.activeWorkspaceId === workspaceId ? s.focusedAgentId : null,
+  );
   const setFocusedAgent = useSwarm((s) => s.setFocusedAgent);
   const containerRef = useRef<HTMLDivElement>(null);
   // When focus mode exits, the pane needs to animate back to its grid slot —
@@ -199,7 +142,7 @@ export function TilingGrid() {
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
         setPreview(null);
-        if (commit && latest) setSizes(handle.splitId, latest);
+        if (commit && latest) setSizes(workspaceId, handle.splitId, latest);
       };
       const onUp = () => finish(true);
       const onKey = (ev: KeyboardEvent) => {
@@ -212,22 +155,25 @@ export function TilingGrid() {
       window.addEventListener("mouseup", onUp);
       window.addEventListener("keydown", onKey);
     },
-    [setSizes],
+    [setSizes, workspaceId],
   );
 
   /** Mousedown on a pane header: after a small movement threshold this becomes
-   *  a pane drag — plain clicks (focus, rename, buttons) are unaffected. */
+   *  a pane drag — drop on another pane rearranges, drop on a workspace tab
+   *  moves the agent there. Plain clicks (focus, rename, buttons) are unaffected. */
   const startPaneDrag = useCallback(
     (agentId: string, e: React.MouseEvent) => {
       if (e.button !== 0) return;
       // no rearranging while a pane floats above the grid
       if (useSwarm.getState().focusedAgentId) return;
       const container = containerRef.current;
-      const root = useSwarm.getState().layout;
+      const root = useSwarm.getState().layouts[workspaceId] ?? null;
       if (!container || !root) return;
       const allPanes: PaneRect[] = [];
       computeLayout(root, { x: 0, y: 0, w: 100, h: 100 }, allPanes, []);
-      if (allPanes.length < 2) return;
+      // a single pane can still be dragged — onto another workspace's tab
+      if (allPanes.length < 2 && useSwarm.getState().workspaceOrder.length < 2)
+        return;
       const src = allPanes.find((p) => p.agentId === agentId);
       if (!src) return;
 
@@ -236,6 +182,7 @@ export function TilingGrid() {
       const startY = e.clientY;
       let active = false;
       let target: { paneId: string; zone: DropZone } | null = null;
+      let tabTarget: string | null = null;
       let lastKey = "";
 
       const hitTest = (cx: number, cy: number) => {
@@ -262,8 +209,21 @@ export function TilingGrid() {
           document.body.style.cursor = "grabbing";
           document.body.style.userSelect = "none";
         }
-        target = hitTest(ev.clientX, ev.clientY);
-        const key = target ? `${target.paneId}:${target.zone}` : "none";
+        // hovering a workspace tab (title bar) beats pane targets
+        const tabEl = (
+          document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null
+        )?.closest?.("[data-ws-tab]") as HTMLElement | null;
+        tabTarget =
+          tabEl && tabEl.dataset.wsTab !== workspaceId
+            ? (tabEl.dataset.wsTab ?? null)
+            : null;
+        useSwarm.getState().setTabDropTarget(tabTarget);
+        target = tabTarget ? null : hitTest(ev.clientX, ev.clientY);
+        const key = tabTarget
+          ? `tab:${tabTarget}`
+          : target
+            ? `${target.paneId}:${target.zone}`
+            : "none";
         if (key !== lastKey) {
           lastKey = key;
           setPaneDrag({
@@ -280,8 +240,11 @@ export function TilingGrid() {
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
         setPaneDrag(null);
-        if (commit && active && target) {
-          movePane(src.paneId, target.paneId, target.zone);
+        useSwarm.getState().setTabDropTarget(null);
+        if (commit && active && tabTarget) {
+          useSwarm.getState().moveAgentToWorkspace(agentId, tabTarget);
+        } else if (commit && active && target) {
+          movePane(workspaceId, src.paneId, target.paneId, target.zone);
         }
       };
       const onUp = () => finish(true);
@@ -292,7 +255,7 @@ export function TilingGrid() {
       window.addEventListener("mouseup", onUp);
       window.addEventListener("keydown", onKey);
     },
-    [movePane],
+    [movePane, workspaceId],
   );
 
   if (!layout) return null;
@@ -338,7 +301,9 @@ export function TilingGrid() {
           >
             <AgentPane
               agentId={p.agentId}
-              active={p.paneId === activePaneId}
+              // only the active workspace's active pane focuses/blinks —
+              // hidden workspaces must never steal keyboard focus
+              active={isActiveWs && p.paneId === activePaneId}
               onHeaderDragStart={startPaneDrag}
             />
           </div>

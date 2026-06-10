@@ -116,6 +116,83 @@ export function removePaneByAgent(
 /** Drop target when dragging a pane: center swaps, edges dock the pane to that side. */
 export type DropZone = "center" | "left" | "right" | "top" | "bottom";
 
+// ---- Geometry: layout tree → pane/divider rects (percent of the container) ----
+
+export interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+export interface PaneRect {
+  paneId: string;
+  agentId: string;
+  rect: Rect;
+}
+export interface HandleRect {
+  splitId: string;
+  index: number; // boundary between child index and index+1
+  direction: "row" | "column";
+  /** position of the divider bar, in percent of the container */
+  pos: { x: number; y: number; span: number };
+  /** the parent split's extent along the drag axis, in percent of container */
+  regionPercent: number;
+  sizes: number[];
+}
+
+/** Walk the tree and collect pane rects (and divider handles) in percent. */
+export function computeLayout(
+  node: LayoutNode,
+  rect: Rect,
+  panes: PaneRect[],
+  handles: HandleRect[],
+) {
+  if (node.type === "pane") {
+    panes.push({ paneId: node.id, agentId: node.agentId, rect });
+    return;
+  }
+  const total = node.sizes.reduce((a, b) => a + b, 0) || node.children.length;
+  let offset = 0;
+  node.children.forEach((child, i) => {
+    const frac = (node.sizes[i] ?? total / node.children.length) / total;
+    const childRect: Rect =
+      node.direction === "row"
+        ? { x: rect.x + offset * rect.w, y: rect.y, w: frac * rect.w, h: rect.h }
+        : { x: rect.x, y: rect.y + offset * rect.h, w: rect.w, h: frac * rect.h };
+    computeLayout(child, childRect, panes, handles);
+    offset += frac;
+    if (i < node.children.length - 1) {
+      if (node.direction === "row") {
+        handles.push({
+          splitId: node.id,
+          index: i,
+          direction: "row",
+          pos: { x: rect.x + offset * rect.w, y: rect.y, span: rect.h },
+          regionPercent: rect.w,
+          sizes: node.sizes,
+        });
+      } else {
+        handles.push({
+          splitId: node.id,
+          index: i,
+          direction: "column",
+          pos: { x: rect.x, y: rect.y + offset * rect.h, span: rect.w },
+          regionPercent: rect.h,
+          sizes: node.sizes,
+        });
+      }
+    }
+  });
+}
+
+/** Pane rects of a full layout, in percent of the container. */
+export function paneRects(node: LayoutNode | null): PaneRect[] {
+  if (!node) return [];
+  const panes: PaneRect[] = [];
+  computeLayout(node, { x: 0, y: 0, w: 100, h: 100 }, panes, []);
+  return panes;
+}
+
 /** Insert an existing pane next to `targetPaneId` (tmux-style sibling insertion
  *  when the parent split already runs in `direction`, otherwise wrap in a new split). */
 function insertPaneBeside(

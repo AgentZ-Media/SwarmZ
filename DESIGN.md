@@ -72,5 +72,7 @@ conflict with the surface ladder, and keep motion to the existing keyframes
 - Radius: `rounded-md` for controls, `rounded-lg` for cards/panes, `rounded-xl` for dialogs.
 - Control heights: 36px (`h-9`) default, 32px (`h-8`) compact, 24px (`h-6`) inline icon buttons.
 - Spacing inside cards: `p-3` (stats), `p-2.5` (rows), dialogs `p-5`.
-- No sidebar by design — the tiling grid owns the viewport. New global features
-  go into the title bar, a drawer (like UsageDashboard), or a future command palette.
+- No sidebar by design — the tiling grid owns the viewport. Top-level navigation
+  is the workspace tab strip inside the title bar; new global features go into
+  the title bar, a drawer (like UsageDashboard), the command palette (⌘K) or
+  the fleet overview (⌘E).

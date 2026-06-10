@@ -27,6 +27,7 @@ export function NewAgentDialog() {
   const createAgent = useSwarm((s) => s.createAgent);
   const prefill = useSwarm((s) => s.newAgentPrefill);
   const settings = useSwarm((s) => s.settings);
+  const workspace = useSwarm((s) => s.workspaces[s.activeWorkspaceId]);
 
   const [name, setName] = useState("");
   const [cwd, setCwd] = useState<string | undefined>();
@@ -51,8 +52,14 @@ export function NewAgentDialog() {
         profile?.startup ??
         DEFAULT_STARTUP,
     );
-    setCwd(prefill?.cwd ?? profile?.defaultCwd ?? settings.lastCwd);
-  }, [open_, prefill, profiles, settings]);
+    // workspace context wins over the generic profile/last-used fallbacks
+    setCwd(
+      prefill?.cwd ??
+        workspace?.defaultCwd ??
+        profile?.defaultCwd ??
+        settings.lastCwd,
+    );
+  }, [open_, prefill, profiles, settings, workspace]);
 
   const pickFolder = async () => {
     const selected = await pickDirectory();

@@ -3,6 +3,7 @@ import type {
   DetectedCommand,
   FolderCommands,
   GitInfo,
+  PersistedWorkspaces,
   Profile,
   SubscriptionLimits,
   UsageHistoryEntry,
@@ -238,6 +239,22 @@ export const webBackend: Backend = {
   saveSettings: async (settings) => {
     try {
       localStorage.setItem("swarmz.settings", JSON.stringify(settings));
+    } catch {
+      /* ignore */
+    }
+  },
+
+  loadWorkspaces: async () => {
+    try {
+      const raw = localStorage.getItem("swarmz.workspaces");
+      return raw ? (JSON.parse(raw) as PersistedWorkspaces) : null;
+    } catch {
+      return null;
+    }
+  },
+  saveWorkspaces: async (ws) => {
+    try {
+      localStorage.setItem("swarmz.workspaces", JSON.stringify(ws));
     } catch {
       /* ignore */
     }

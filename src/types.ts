@@ -125,6 +125,28 @@ export interface AppSettings {
   gitPath?: string;
 }
 
+/**
+ * A named container with its own tiling grid — the top-level organization
+ * unit (title-bar tabs, ⌘1–9). Deliberately NOT bound to a project: one
+ * workspace can be a repo, a feature with several worktrees, or a mixed
+ * monitoring wall. Name/order/defaultCwd persist across restarts; the agents
+ * inside are in-memory like everywhere else.
+ */
+export interface Workspace {
+  id: string;
+  name: string;
+  /** true once the user named it — auto-naming from the first project folder stops */
+  renamed?: boolean;
+  /** prefilled working directory for new agents in this workspace */
+  defaultCwd?: string;
+}
+
+/** Shape persisted for workspaces (tabs survive restarts, agents don't). */
+export interface PersistedWorkspaces {
+  workspaces: Workspace[];
+  activeId: string | null;
+}
+
 export interface Profile {
   id: string;
   name: string;
@@ -137,6 +159,8 @@ export interface Profile {
 export interface Agent {
   id: string;
   name: string;
+  /** workspace this agent's pane lives in */
+  workspaceId: string;
   cwd?: string;
   startup: string;
   color: string;

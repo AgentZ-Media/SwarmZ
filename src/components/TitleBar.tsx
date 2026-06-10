@@ -1,16 +1,21 @@
+import { useEffect, useRef, useState } from "react";
 import {
   BarChart3,
   Download,
   Gauge,
+  LayoutGrid,
   Plus,
   Settings,
   SlidersHorizontal,
+  X,
 } from "lucide-react";
+import { useShallow } from "zustand/react/shallow";
 import { useSwarm } from "@/store";
 import { useUpdates } from "@/lib/updates";
 import { useLimits } from "@/lib/limits";
 import { Button } from "./ui/button";
 import { Tip } from "./ui/tooltip";
+import { cn } from "@/lib/utils";
 import { IS_TAURI } from "@/lib/transport";
 import type { RateLimitWindow } from "@/types";
 
@@ -24,77 +29,39 @@ export function TitleBar({
   const setNewAgentOpen = useSwarm((s) => s.setNewAgentOpen);
   const setDashboardOpen = useSwarm((s) => s.setDashboardOpen);
   const dashboardOpen = useSwarm((s) => s.dashboardOpen);
-  const agents = useSwarm((s) => s.agents);
-  const order = useSwarm((s) => s.order);
-
-  const alive = order.filter(
-    (id) => agents[id]?.status === "running" || agents[id]?.status === "attention",
-  );
-  const working = alive.filter((id) => agents[id]?.activity === "busy").length;
-  const idle = alive.length - working;
+  const fleetOpen = useSwarm((s) => s.fleetOpen);
+  const setFleetOpen = useSwarm((s) => s.setFleetOpen);
 
   return (
     <header
       data-tauri-drag-region
-      className="drag-region flex h-11 shrink-0 items-center gap-3 border-b border-border bg-background pr-3"
+      className="drag-region flex h-11 shrink-0 items-center gap-2 border-b border-border bg-background pr-3"
       style={{ paddingLeft: IS_TAURI ? 80 : 16 }}
     >
-      {/* decorative — pointer-events-none lets the drag fall through to the header */}
-      <div className="pointer-events-none flex items-center gap-2">
-        <img
-          src="/favicon.png"
-          alt=""
-          draggable={false}
-          className="h-7 w-7"
-        />
-        <span className="text-sm font-semibold tracking-tight text-foreground">
-          SwarmZ
-        </span>
-      </div>
+      <img
+        src="/favicon.png"
+        alt="SwarmZ"
+        draggable={false}
+        className="pointer-events-none h-7 w-7 shrink-0"
+      />
 
-      {order.length > 0 && (
-        <div className="pointer-events-none flex items-center gap-1.5 text-[11px] text-muted-foreground">
-          {/* working = claude reported "busy" (OSC 9;4) — same signal as the pane status dot */}
-          <span className="relative flex h-1.5 w-1.5">
-            {working > 0 && (
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60" />
-            )}
-            <span
-              className={`relative inline-flex h-1.5 w-1.5 rounded-full ${
-                working > 0
-                  ? "bg-warning"
-                  : alive.length > 0
-                    ? "bg-success"
-                    : "bg-faint"
-              }`}
-            />
-          </span>
-          {working > 0 ? (
-            <>
-              <span className="font-mono tabular-nums">{working}</span>
-              <span className="text-faint">working</span>
-              {idle > 0 && (
-                <>
-                  <span className="ml-1 font-mono tabular-nums">{idle}</span>
-                  <span className="text-faint">idle</span>
-                </>
-              )}
-            </>
-          ) : (
-            <>
-              <span className="font-mono tabular-nums">{alive.length}</span>
-              <span className="text-faint">
-                {alive.length > 0 ? "idle" : "active"}
-              </span>
-            </>
-          )}
-        </div>
-      )}
+      <WorkspaceTabs />
 
-      <div className="ml-auto flex items-center gap-2">
+      <div className="ml-auto flex shrink-0 items-center gap-2">
         {IS_TAURI && <UpdatePill />}
 
         <LimitsPill />
+
+        <Tip label="Fleet overview — every workspace live (⌘E)">
+          <Button
+            size="icon"
+            variant={fleetOpen ? "secondary" : "ghost"}
+            className="no-drag"
+            onClick={() => setFleetOpen(!fleetOpen)}
+          >
+            <LayoutGrid size={15} />
+          </Button>
+        </Tip>
 
         <Tip label="Usage dashboard">
           <Button
@@ -138,6 +105,213 @@ export function TitleBar({
         </Button>
       </div>
     </header>
+  );
+}
+
+// ---- Workspace tabs ----
+
+/**
+ * The tab strip: one tab per workspace with a live aggregated status dot,
+ * agent count and inline rename (double-click). Tabs reorder via drag, accept
+ * pane drops (move an agent into another workspace — see TilingGrid) and
+ * switch with ⌘1–9.
+ */
+function WorkspaceTabs() {
+  const workspaceOrder = useSwarm((s) => s.workspaceOrder);
+  const createWorkspace = useSwarm((s) => s.createWorkspace);
+  const stripRef = useRef<HTMLDivElement>(null);
+
+  return (
+    <div
+      ref={stripRef}
+      className="no-drag no-scrollbar flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
+    >
+      {workspaceOrder.map((id, i) => (
+        <WorkspaceTab key={id} id={id} index={i} stripRef={stripRef} />
+      ))}
+      <Tip label="New workspace (⌘⇧N)">
+        <button
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
+          onClick={() => createWorkspace()}
+        >
+          <Plus size={14} />
+        </button>
+      </Tip>
+    </div>
+  );
+}
+
+/** Aggregated live state of one workspace, for its tab dot. */
+function useWorkspaceStats(id: string) {
+  return useSwarm(
+    useShallow((s) => {
+      let total = 0;
+      let busy = 0;
+      let attention = false;
+      for (const aid of s.order) {
+        const a = s.agents[aid];
+        if (!a || a.workspaceId !== id) continue;
+        total++;
+        if (a.activity === "busy") busy++;
+        if (a.attention || a.activity === "waiting") attention = true;
+      }
+      return { total, busy, attention };
+    }),
+  );
+}
+
+function WorkspaceTab({
+  id,
+  index,
+  stripRef,
+}: {
+  id: string;
+  index: number;
+  stripRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const name = useSwarm((s) => s.workspaces[id]?.name ?? "");
+  const active = useSwarm((s) => s.activeWorkspaceId === id);
+  const isDropTarget = useSwarm((s) => s.tabDropTarget === id);
+  const setActiveWorkspace = useSwarm((s) => s.setActiveWorkspace);
+  const requestCloseWorkspace = useSwarm((s) => s.requestCloseWorkspace);
+  const renameWorkspace = useSwarm((s) => s.renameWorkspace);
+  const moveWorkspace = useSwarm((s) => s.moveWorkspace);
+  const stats = useWorkspaceStats(id);
+  const [editing, setEditing] = useState(false);
+  // a drag that actually moved suppresses the click-to-activate on mouseup
+  const draggedRef = useRef(false);
+
+  // keep the active tab in view when switching via keyboard
+  const tabRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (active)
+      tabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [active]);
+
+  const startReorder = (e: React.MouseEvent) => {
+    if (e.button !== 0 || editing) return;
+    if ((e.target as HTMLElement).closest("button:not([data-ws-tab]), input"))
+      return;
+    const strip = stripRef.current;
+    if (!strip) return;
+    const startX = e.clientX;
+    draggedRef.current = false;
+
+    const onMove = (ev: MouseEvent) => {
+      if (!draggedRef.current && Math.abs(ev.clientX - startX) < 6) return;
+      draggedRef.current = true;
+      document.body.style.cursor = "grabbing";
+      document.body.style.userSelect = "none";
+      // live reorder: drop the tab where the cursor crosses a sibling's midpoint
+      const tabs = Array.from(
+        strip.querySelectorAll<HTMLElement>("[data-ws-tab]"),
+      );
+      let to = tabs.length - 1;
+      for (let i = 0; i < tabs.length; i++) {
+        const r = tabs[i].getBoundingClientRect();
+        if (ev.clientX < r.left + r.width / 2) {
+          to = i;
+          break;
+        }
+      }
+      moveWorkspace(id, to);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      // let the click handler read the flag before clearing it
+      setTimeout(() => (draggedRef.current = false), 0);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  return (
+    <button
+      ref={tabRef}
+      data-ws-tab={id}
+      onMouseDown={startReorder}
+      onClick={() => {
+        if (!draggedRef.current) setActiveWorkspace(id);
+      }}
+      onDoubleClick={(e) => {
+        if ((e.target as HTMLElement).closest("input")) return;
+        setEditing(true);
+      }}
+      onAuxClick={(e) => {
+        // middle-click closes, like browser tabs
+        if (e.button === 1) requestCloseWorkspace(id);
+      }}
+      title={`${name} — ⌘${index + 1}`}
+      className={cn(
+        "group/tab flex h-7 max-w-44 shrink-0 items-center gap-1.5 rounded-md border px-2 transition-colors",
+        active
+          ? "border-border bg-card text-foreground"
+          : "border-transparent text-muted-foreground hover:bg-accent hover:text-foreground",
+        isDropTarget && "border-ring bg-ring/10 text-foreground",
+        stats.attention && !active && "attn-pulse",
+      )}
+    >
+      <span className="relative flex h-1.5 w-1.5 shrink-0">
+        {stats.busy > 0 && (
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60" />
+        )}
+        <span
+          className="relative inline-flex h-1.5 w-1.5 rounded-full"
+          style={{
+            backgroundColor: stats.attention
+              ? "var(--ring)"
+              : stats.busy > 0
+                ? "var(--warning)"
+                : stats.total > 0
+                  ? "var(--success)"
+                  : "var(--faint)",
+          }}
+        />
+      </span>
+
+      {editing ? (
+        <input
+          autoFocus
+          defaultValue={name}
+          onFocus={(e) => e.target.select()}
+          onBlur={(e) => {
+            renameWorkspace(id, e.target.value);
+            setEditing(false);
+          }}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            if (e.key === "Escape") setEditing(false);
+          }}
+          onMouseDown={(e) => e.stopPropagation()}
+          className="h-5 w-24 rounded bg-secondary px-1 text-xs text-foreground outline-none select-text"
+        />
+      ) : (
+        <span className="min-w-0 truncate text-xs font-medium">{name}</span>
+      )}
+
+      {stats.total > 0 && (
+        <span className="font-mono text-[10px] tabular-nums text-faint">
+          {stats.busy > 0 ? `${stats.busy}/${stats.total}` : stats.total}
+        </span>
+      )}
+
+      <span
+        role="button"
+        tabIndex={-1}
+        onClick={(e) => {
+          e.stopPropagation();
+          requestCloseWorkspace(id);
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+        className="-mr-0.5 hidden h-4 w-4 shrink-0 items-center justify-center rounded text-faint hover:bg-destructive/15 hover:text-destructive group-hover/tab:flex"
+      >
+        <X size={10} />
+      </span>
+    </button>
   );
 }
 
@@ -278,4 +452,3 @@ function UpdatePill() {
     </button>
   );
 }
-

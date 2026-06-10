@@ -141,6 +141,14 @@ body {
   background-clip: content-box;
 }
 
+/* horizontal tab strip: scrollable on overflow, but never shows a bar */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
 /* draggable macOS titlebar region */
 .drag-region {
   -webkit-app-region: drag;
