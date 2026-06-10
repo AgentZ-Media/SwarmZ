@@ -13,6 +13,7 @@ import {
 } from "@/lib/transport";
 import { DEFAULT_FONT_SIZE, useSwarm } from "@/store";
 import { applyClaudePath } from "@/lib/utils";
+import { registerTerm, unregisterTerm } from "@/lib/term-registry";
 
 // harmonized with the design tokens in styles.css — muted, low-noise ANSI set
 const THEME = {
@@ -130,6 +131,7 @@ export function TerminalView({
 
     termRef.current = term;
     fitRef.current = fit;
+    registerTerm(agentId, term);
 
     const cols = term.cols;
     const rows = term.rows;
@@ -246,6 +248,7 @@ export function TerminalView({
       void dataPromise.then((u) => u());
       void exitPromise.then((u) => u());
       void ptyKill(agentId);
+      unregisterTerm(agentId);
       term.dispose();
       termRef.current = null;
     };

@@ -111,6 +111,13 @@ interface SwarmState {
   commandPresets: Record<string, FolderCommands>;
   /** pending "close agent" that needs a decision about running floating terminals */
   closeConfirm: { agentId: string; termIds: string[] } | null;
+  /** pending app-quit while these agents are still working (see lib/quit.ts) */
+  quitConfirm: string[] | null;
+  /**
+   * OS file drag in progress (see lib/dnd.ts): targetId is the pty id of the
+   * drop zone under the cursor, null while hovering elsewhere (in-memory)
+   */
+  fileDrag: { targetId: string | null } | null;
 
   // derived helpers
   activeAgentId: () => string | null;
@@ -127,6 +134,8 @@ interface SwarmState {
   requestRemoveAgent: (agentId: string) => void;
   /** resolve the pending close-confirm: kill the terminals, detach them, or cancel */
   resolveCloseConfirm: (choice: "kill" | "detach" | "cancel") => void;
+  /** open/close the quit warning (busy agent ids; null = dismissed) */
+  setQuitConfirm: (agentIds: string[] | null) => void;
 
   // floating terminals
   createFloatingTerminal: (agentId: string) => void;
@@ -184,6 +193,7 @@ interface SwarmState {
   // ui
   setDashboardOpen: (open: boolean) => void;
   setNewAgentOpen: (open: boolean) => void;
+  setFileDrag: (drag: { targetId: string | null } | null) => void;
 }
 
 export const useSwarm = create<SwarmState>((set, get) => ({
@@ -203,6 +213,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   floatingOrder: [],
   commandPresets: {},
   closeConfirm: null,
+  quitConfirm: null,
+  fileDrag: null,
 
   activeAgentId: () => {
     const { layout, activePaneId } = get();
@@ -402,6 +414,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     }
     get().removeAgent(confirm.agentId);
   },
+
+  setQuitConfirm: (agentIds) => set({ quitConfirm: agentIds }),
 
   createFloatingTerminal: (agentId) => {
     const state = get();
@@ -766,4 +780,10 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   setDashboardOpen: (open) => set({ dashboardOpen: open }),
   setNewAgentOpen: (open) =>
     set(open ? { newAgentOpen: true, newAgentPrefill: null } : { newAgentOpen: false }),
+  setFileDrag: (drag) => {
+    // drag-over fires at mouse-move rate — only re-render on actual changes
+    const cur = get().fileDrag;
+    if (!!cur === !!drag && cur?.targetId === drag?.targetId) return;
+    set({ fileDrag: drag });
+  },
 }));

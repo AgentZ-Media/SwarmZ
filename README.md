@@ -4,24 +4,20 @@
 
 **Run, tile and monitor a swarm of Claude Code agents — real terminals, live tokens & cost.**
 
-Native macOS app · Local web app · 100% local — nothing ever leaves your machine
+Native macOS app · 100% local — nothing ever leaves your machine
 
 </div>
 
 ---
 
-Each agent is a real PTY-backed terminal running `claude` from your system `PATH`, tiled into a resizable split-grid with per-agent usage tracking parsed straight from `~/.claude`.
-
-One codebase, two ways to run it:
-
-- **Native macOS app** — Tauri 2 (Apple Silicon), PTYs handled in Rust.
-- **Local web app** — open `localhost` in any browser; a small Node "engine" spawns the PTYs locally and streams them over WebSocket.
+Each agent is a real PTY-backed terminal running `claude` from your system `PATH`, tiled into a resizable split-grid with per-agent usage tracking parsed straight from `~/.claude`. Native macOS app — Tauri 2 (Apple Silicon), PTYs handled in Rust.
 
 Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design.
 
 ## ✨ Features
 
-- 🖥️ **Real terminals** — every agent is a PTY-backed login shell (`xterm.js` ↔ `node-pty` / `portable-pty`). `claude`, nvm, aliases and your environment resolve exactly like in iTerm or Terminal.
+- 🖥️ **Real terminals** — every agent is a PTY-backed login shell (`xterm.js` ↔ `portable-pty`). `claude`, nvm, aliases and your environment resolve exactly like in iTerm or Terminal.
+- 📎 **Drag & drop files** — drag an image (or any file) from Finder onto a terminal and its path is typed in, escaped exactly like Terminal.app does — Claude Code attaches it. While dragging, every terminal shows a drop zone and the one under the cursor lights up; works on panes and floating terminals alike.
 - 🧱 **Tiling split-grid** — split any pane right (`⌘D`) or down (`⌘⇧D`), drag dividers to resize, or grab a pane's header to rearrange: drop it on another pane's edge to dock it there (left/right/top/bottom) or on the center to swap the two. Both gestures show a translucent preview while dragging; the layout applies on release, so terminals don't reflow mid-drag (`Esc` cancels). Splitting opens the New Agent dialog prefilled with the source pane's folder, profile and startup command. Panes never remount when the grid is rearranged, so scrollback survives.
 - 🪟 **Floating terminals** — open a small picture-in-picture shell on top of any pane (`⌘J`, the terminal button in the header, or the ⋯ menu), running in the pane's folder — perfect for a dev server or quick git commands without leaving SwarmZ. Drag it anywhere, resize it from the corner, or collapse it to a slim pill while the process keeps running. A quick-command bar offers one-click **presets saved per project folder** plus commands **auto-detected from the project**: `package.json` scripts (run with the package manager your lockfile implies), Cargo targets, Makefile and justfile recipes. Everything is editable in place — editing a detected command saves it as a preset that **overrides** the original, and detected commands can be hidden per folder (and restored). The window names itself after the last command you ran, typed or clicked. Closing a pane checks its floating terminals first — if a process is still running you choose between killing it or **detaching** the terminal, which keeps it alive as an unowned floating pill.
 - 🔍 **Focus mode** — the maximize button in any pane header (or a double-click on the header) zooms that pane into an overlay above the dimmed grid, for when one agent needs your full attention. Everything else keeps running underneath — click the backdrop or the button again to drop back into the grid. Nothing remounts, so scrollback and sessions are untouched.
@@ -32,8 +28,8 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 - 📈 **Plan limits** — the title bar shows the Claude subscription limits of the account logged into Claude Code on this machine: 5-hour session window, weekly windows and reset times.
 - 💾 **All-time statistics** — every Claude session launched inside SwarmZ is persisted across restarts. The usage drawer toggles between **Session** (what's open right now) and **All time** (everything you've ever run here), with a per-model cost breakdown and session history.
 - 🏷️ **Auto-naming** — Claude Code generates a topic title for every session (and updates it on `/rename`); SwarmZ captures it from the terminal title and names the pane after it. Rename a pane yourself and the auto-title backs off; clear the name to hand it back.
-- 🚦 **Live status** — the pane status dot mirrors what Claude is actually doing: amber while it's working, green when idle, blue when it waits for input. Captured from Claude Code's terminal progress reporting (plus the bell), no polling involved.
-- 🔔 **Notifications** — when an agent rings the terminal bell (Claude waiting or done), the pane pulses and a native (or browser) notification fires.
+- 🚦 **Live status** — the pane status dot mirrors what Claude is actually doing: amber while it's working, green when idle, blue when it waits for input. Captured from Claude Code's terminal progress reporting (plus the bell), no polling involved. The title bar sums it up live (`2 working · 1 idle`), and quitting the app while agents are still working raises a warning that lists them first.
+- 🔔 **Notifications** — when an agent rings the terminal bell (Claude waiting or done), the pane pulses and a native notification fires.
 - 🎛️ **Profiles** — presets for startup command, flags and default working directory, persisted across restarts. New agents prefill the profile's default folder, or the last folder you used.
 - 🔄 **Auto-updates** — the native app checks GitHub Releases in the background and updates in-app; manual check and an automatic-download toggle live in Settings.
 - ⚙️ **Settings** — `⌘,` (or the gear in the title bar) opens a settings window: default terminal font size, default startup command, path overrides for the `claude` and `git` binaries, update controls and an About panel.
@@ -54,26 +50,10 @@ xattr -cr /Applications/SwarmZ.app
 
 Requires [pnpm](https://pnpm.io) and a working [Claude Code](https://claude.com/claude-code) install (`claude` on your `PATH`).
 
-### Native app (Tauri)
-
 ```bash
 pnpm install
 pnpm tauri dev          # dev
 pnpm tauri build        # → src-tauri/target/release/bundle/
-```
-
-### Local web app (browser)
-
-```bash
-pnpm install
-pnpm dev:web            # engine + Vite with HMR → http://localhost:1420
-```
-
-Or serve the production build from a single local server:
-
-```bash
-pnpm build
-pnpm engine             # → http://localhost:4178
 ```
 
 ## ⌨️ Keyboard shortcuts
@@ -90,32 +70,25 @@ pnpm engine             # → http://localhost:4178
 
 ## 🏗️ Architecture
 
-A single React frontend talks to a **transport layer** that auto-detects its host at runtime:
-
 ```
-src/lib/transport.ts      picks the backend at runtime
+src/lib/transport.ts      the transport layer — frontend ↔ backend
   backend-types.ts        the Backend interface — every capability lives here
   backend-tauri.ts        Tauri webview → Rust invoke + events
-  backend-web.ts          browser → WebSocket (PTY) + HTTP/SSE (usage) to the engine
 
 src/
   store.ts                zustand store (agents, layout tree, profiles, usage history)
   lib/layout.ts           tiling binary-tree ops (split / remove / resize / move-swap)
-  lib/updates.ts          auto-updater (background poll + manual check, Tauri only)
+  lib/updates.ts          auto-updater (background poll + manual check)
   lib/git.ts              per-pane git status poller (branch, ±lines, untracked)
+  lib/dnd.ts              OS file drag & drop → escaped path typed into the target terminal
   components/
     Terminal.tsx          xterm ↔ PTY bridge
     TilingGrid.tsx        absolute-positioned pane layout + resizers
     AgentPane.tsx         pane header (model / context gauge / tokens / cost / controls)
     FloatingTerminals.tsx PiP shell windows + per-project quick-command bar
     UsageDashboard.tsx    usage drawer — Session & All-time views
-    WebDirectoryPicker.tsx server-backed folder picker (web mode)
 
-server/                   the Node "engine" (web mode)
-  index.mjs               http + static + WebSocket PTYs + usage SSE + fs browser + git status + project commands
-  usage.mjs               incremental JSONL parsing (per-file offset cache), pricing
-
-src-tauri/src/            the Rust backend (native mode)
+src-tauri/src/            the Rust backend
   pty.rs                  PTY spawn / read / write / resize / kill (output coalesced)
   usage.rs                incremental JSONL parsing (per-file offset cache), pricing
   git.rs                  read-only git status (branch, ±lines, untracked, remote)
@@ -142,7 +115,7 @@ Per-model pricing (USD / 1M tokens, incl. cache write/read) is fetched live from
 | Usage history (all-time stats) | ✅ | Tauri store (`swarmz.json`) / localStorage |
 | Command presets (per project folder) | ✅ | Tauri store (`swarmz.json`) / localStorage |
 | App settings (Settings window: last used folder, font size, default command, binary paths, auto-update) | ✅ | Tauri store (`swarmz.json`) / localStorage |
-| Window size & position | ✅ native app | `tauri-plugin-window-state` (browser handles its own window in web mode) |
+| Window size & position | ✅ | `tauri-plugin-window-state` |
 | Agents & layout | ❌ per session | in-memory |
 | Floating terminals | ❌ per session | in-memory |
 
@@ -159,4 +132,4 @@ Issues and PRs welcome. Before submitting:
 
 - `./node_modules/.bin/tsc --noEmit` must pass.
 - UI changes should follow the design system in [`DESIGN.md`](DESIGN.md) (monochrome first, blue is a signal, numbers are mono).
-- New backend capabilities go into `backend-types.ts` and must be implemented for **both** Tauri and web mode.
+- New backend capabilities go into `backend-types.ts` and are implemented in `backend-tauri.ts`.

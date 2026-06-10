@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useSwarm, presetKey } from "@/store";
 import { TerminalView } from "./Terminal";
+import { FileDropOverlay } from "./FileDropOverlay";
 import { Tip } from "./ui/tooltip";
 import { Badge } from "./ui/misc";
 import { cn, shortPath } from "@/lib/utils";
@@ -297,7 +298,8 @@ const FloatingTerminalWindow = memo(function FloatingTerminalWindow({
             onRun={(label) => update(id, { name: label })}
           />
         )}
-        <div className="relative min-h-0 flex-1">
+        {/* terminal — also an OS-file drop zone (see lib/dnd.ts) */}
+        <div className="relative min-h-0 flex-1" data-file-drop={id}>
           <TerminalView
             agentId={id}
             cwd={term.cwd}
@@ -310,6 +312,7 @@ const FloatingTerminalWindow = memo(function FloatingTerminalWindow({
               })
             }
           />
+          <FileDropOverlay targetId={id} />
         </div>
       </div>
 

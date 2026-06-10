@@ -27,9 +27,11 @@ export function TitleBar({
   const agents = useSwarm((s) => s.agents);
   const order = useSwarm((s) => s.order);
 
-  const running = order.filter(
+  const alive = order.filter(
     (id) => agents[id]?.status === "running" || agents[id]?.status === "attention",
-  ).length;
+  );
+  const working = alive.filter((id) => agents[id]?.activity === "busy").length;
+  const idle = alive.length - working;
 
   return (
     <header
@@ -52,11 +54,40 @@ export function TitleBar({
 
       {order.length > 0 && (
         <div className="pointer-events-none flex items-center gap-1.5 text-[11px] text-muted-foreground">
-          <span
-            className={`h-1.5 w-1.5 rounded-full ${running > 0 ? "bg-success" : "bg-faint"}`}
-          />
-          <span className="font-mono tabular-nums">{running}</span>
-          <span className="text-faint">active</span>
+          {/* working = claude reported "busy" (OSC 9;4) — same signal as the pane status dot */}
+          <span className="relative flex h-1.5 w-1.5">
+            {working > 0 && (
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60" />
+            )}
+            <span
+              className={`relative inline-flex h-1.5 w-1.5 rounded-full ${
+                working > 0
+                  ? "bg-warning"
+                  : alive.length > 0
+                    ? "bg-success"
+                    : "bg-faint"
+              }`}
+            />
+          </span>
+          {working > 0 ? (
+            <>
+              <span className="font-mono tabular-nums">{working}</span>
+              <span className="text-faint">working</span>
+              {idle > 0 && (
+                <>
+                  <span className="ml-1 font-mono tabular-nums">{idle}</span>
+                  <span className="text-faint">idle</span>
+                </>
+              )}
+            </>
+          ) : (
+            <>
+              <span className="font-mono tabular-nums">{alive.length}</span>
+              <span className="text-faint">
+                {alive.length > 0 ? "idle" : "active"}
+              </span>
+            </>
+          )}
         </div>
       )}
 

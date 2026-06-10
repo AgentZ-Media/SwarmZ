@@ -90,6 +90,15 @@ export function applyClaudePath(startup: string, claudePath?: string): string {
   return `"${bin}"` + cmd.slice("claude".length);
 }
 
+/**
+ * Backslash-escape a dropped file path the way Terminal.app/iTerm do when a
+ * file is dragged in — Claude Code (and shells) un-escape exactly this form.
+ * ASCII specials (space, quotes, parens, …) get escaped; unicode stays as-is.
+ */
+export function escapeDropPath(p: string): string {
+  return p.replace(/[^A-Za-z0-9,._+/@%\u0080-\uffff-]/g, (c) => "\\" + c);
+}
+
 /** Desaturated identity palette for profiles/agents — quiet, never neon. */
 export const AGENT_COLORS = [
   "#5b8def",

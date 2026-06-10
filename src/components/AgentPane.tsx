@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useSwarm } from "@/store";
 import { TerminalView } from "./Terminal";
+import { FileDropOverlay } from "./FileDropOverlay";
 import { Tip } from "./ui/tooltip";
 import { Badge } from "./ui/misc";
 import {
@@ -307,7 +308,7 @@ export const AgentPane = memo(function AgentPane({
     <div
       className={cn(
         "flex h-full w-full flex-col overflow-hidden rounded-lg border bg-card transition-colors",
-        active ? "border-ring/50" : "border-border",
+        active ? "border-ring ring-1 ring-ring/40" : "border-border",
         agent.attention && !active && "attn-pulse border-ring/50",
       )}
       onMouseDown={() => focusAgent(agentId)}
@@ -317,8 +318,10 @@ export const AgentPane = memo(function AgentPane({
           (everything stays reachable via tooltips, the stats popover and ⋯) */}
       <div
         className={cn(
-          "@container flex h-9 shrink-0 cursor-grab items-center gap-2 border-b border-border px-2.5",
-          active ? "bg-secondary/70" : "bg-transparent",
+          "@container flex h-9 shrink-0 cursor-grab items-center gap-2 border-b px-2.5",
+          active
+            ? "border-ring/30 bg-ring/10"
+            : "border-border bg-transparent",
         )}
         onMouseDown={(e) => {
           if (editing) return;
@@ -496,14 +499,15 @@ export const AgentPane = memo(function AgentPane({
         </div>
       </div>
 
-      {/* terminal */}
-      <div className="relative min-h-0 flex-1">
+      {/* terminal — also an OS-file drop zone (see lib/dnd.ts) */}
+      <div className="relative min-h-0 flex-1" data-file-drop={agentId}>
         <TerminalView
           agentId={agentId}
           cwd={agent.cwd}
           startup={agent.startup}
           active={active}
         />
+        <FileDropOverlay targetId={agentId} />
       </div>
     </div>
   );

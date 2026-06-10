@@ -203,6 +203,19 @@ pub fn run() {
             subscription_limits,
             git_info,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // ⌘Q / menu quit (code Some(0)): hand the decision to the frontend,
+            // which warns when agents are still working and closes the window
+            // on confirm (→ ExitRequested with code None, which passes here).
+            // prevent_exit() is a built-in no-op for the updater's restart
+            // (RESTART_EXIT_CODE), so updates keep working.
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if code.is_some() {
+                    api.prevent_exit();
+                    let _ = app.emit("app://quit-requested", ());
+                }
+            }
+        });
 }

@@ -45,7 +45,10 @@ export const ScrollArea = React.forwardRef<
     className={cn("relative overflow-hidden", className)}
     {...props}
   >
-    <ScrollAreaPrimitive.Viewport className="h-full w-full rounded-[inherit]">
+    {/* Radix wraps children in a `display: table; min-width: 100%` div that
+        sizes to its content, so long unbreakable text grows past the viewport
+        and `truncate` never kicks in — force it to block/full-width. */}
+    <ScrollAreaPrimitive.Viewport className="h-full w-full rounded-[inherit] [&>div]:!block [&>div]:w-full">
       {children}
     </ScrollAreaPrimitive.Viewport>
     <ScrollAreaPrimitive.Scrollbar
@@ -70,18 +73,20 @@ export function Stat({
   accent?: string;
 }) {
   return (
-    <div className="rounded-lg border border-border bg-card p-3">
-      <div className="text-[10px] font-medium uppercase tracking-wider text-faint">
+    <div className="min-w-0 rounded-lg border border-border bg-card p-3">
+      <div className="truncate text-[10px] font-medium uppercase tracking-wider text-faint">
         {label}
       </div>
       <div
-        className="mt-1 font-mono text-lg font-semibold tabular-nums tracking-tight"
+        className="mt-1 truncate font-mono text-lg font-semibold tabular-nums tracking-tight"
         style={accent ? { color: accent } : undefined}
       >
         {value}
       </div>
       {sub && (
-        <div className="mt-0.5 text-xs text-muted-foreground">{sub}</div>
+        <div className="mt-0.5 truncate text-xs text-muted-foreground">
+          {sub}
+        </div>
       )}
     </div>
   );

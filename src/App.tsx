@@ -5,6 +5,7 @@ import { TitleBar } from "./components/TitleBar";
 import { TilingGrid } from "./components/TilingGrid";
 import { FloatingTerminals } from "./components/FloatingTerminals";
 import { CloseAgentDialog } from "./components/CloseAgentDialog";
+import { QuitConfirmDialog } from "./components/QuitConfirmDialog";
 import { NewAgentDialog } from "./components/NewAgentDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -15,6 +16,8 @@ import { useSwarm } from "./store";
 import { useUpdates } from "./lib/updates";
 import { useLimits } from "./lib/limits";
 import { startGitPolling } from "./lib/git";
+import { startQuitGuard } from "./lib/quit";
+import { startFileDropListener } from "./lib/dnd";
 import { encodeProjectDir } from "./lib/utils";
 import {
   ensureNotifyPermission,
@@ -49,10 +52,14 @@ export default function App() {
     updates.startBackgroundPolling();
     const stopLimits = useLimits.getState().start();
     const stopGit = startGitPolling();
+    const stopQuitGuard = startQuitGuard();
+    const stopFileDrop = startFileDropListener();
     return () => {
       updates.stopBackgroundPolling();
       stopLimits();
       stopGit();
+      stopQuitGuard();
+      stopFileDrop();
     };
   }, [hydrate]);
 
@@ -219,6 +226,7 @@ export default function App() {
       </div>
 
       <CloseAgentDialog />
+      <QuitConfirmDialog />
       <NewAgentDialog />
       <ProfilesDialog open={profilesOpen} onOpenChange={setProfilesOpen} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />

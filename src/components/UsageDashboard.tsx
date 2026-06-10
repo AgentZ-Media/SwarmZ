@@ -234,15 +234,17 @@ export function UsageDashboard() {
                       key={m.model}
                       className="rounded-lg border border-border bg-card p-2.5"
                     >
-                      <div className="flex items-center justify-between">
-                        <span className="flex items-center gap-1.5 text-xs font-medium text-foreground">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-foreground">
                           <span
-                            className="h-2 w-2 rounded-full"
+                            className="h-2 w-2 shrink-0 rounded-full"
                             style={{ backgroundColor: accent }}
                           />
-                          {prettyModel(m.model)}
+                          <span className="truncate" title={m.model}>
+                            {prettyModel(m.model)}
+                          </span>
                         </span>
-                        <span className="font-mono text-xs tabular-nums text-foreground">
+                        <span className="shrink-0 font-mono text-xs tabular-nums text-foreground">
                           {formatUsd(m.cost_usd)}
                         </span>
                       </div>
@@ -312,10 +314,10 @@ function SessionAgentList() {
                 style={{ backgroundColor: a.color }}
               />
               <span className="flex-1 truncate text-xs">{a.name}</span>
-              <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
+              <span className="shrink-0 whitespace-nowrap font-mono text-[10px] tabular-nums text-muted-foreground">
                 {formatTokens(tok)}
               </span>
-              <span className="w-12 text-right font-mono text-[10px] tabular-nums text-foreground">
+              <span className="min-w-12 shrink-0 whitespace-nowrap text-right font-mono text-[10px] tabular-nums text-foreground">
                 {u && u.cost_usd > 0 ? formatUsd(u.cost_usd) : "—"}
               </span>
             </div>
@@ -371,13 +373,13 @@ function HistoryList({
               <span className="flex-1 truncate text-xs" title={e.cwd ?? undefined}>
                 {e.agent_name}
               </span>
-              <span className="font-mono text-[10px] tabular-nums text-faint">
+              <span className="shrink-0 whitespace-nowrap font-mono text-[10px] tabular-nums text-faint">
                 {formatDay(e.last_updated)}
               </span>
-              <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
+              <span className="shrink-0 whitespace-nowrap font-mono text-[10px] tabular-nums text-muted-foreground">
                 {formatTokens(tok)}
               </span>
-              <span className="w-12 text-right font-mono text-[10px] tabular-nums text-foreground">
+              <span className="min-w-12 shrink-0 whitespace-nowrap text-right font-mono text-[10px] tabular-nums text-foreground">
                 {e.cost_usd > 0 ? formatUsd(e.cost_usd) : "—"}
               </span>
             </div>
