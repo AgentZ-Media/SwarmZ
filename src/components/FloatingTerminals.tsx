@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useSwarm, presetKey } from "@/store";
 import { TerminalView } from "./Terminal";
+import { DictationButton, DictationOverlay } from "./Dictation";
 import { FileDropOverlay } from "./FileDropOverlay";
 import { Tip } from "./ui/tooltip";
 import { Badge } from "./ui/misc";
@@ -260,6 +261,7 @@ const FloatingTerminalWindow = memo(function FloatingTerminalWindow({
         )}
 
         <div className="ml-auto flex items-center gap-0.5">
+          {!minimized && <DictationButton targetId={id} />}
           {!minimized && (
             <Tip label="Quick commands">
               <button
@@ -325,6 +327,7 @@ const FloatingTerminalWindow = memo(function FloatingTerminalWindow({
             }
           />
           <FileDropOverlay targetId={id} />
+          <DictationOverlay targetId={id} />
         </div>
       </div>
 

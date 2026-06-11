@@ -168,6 +168,14 @@ body {
 .xterm-viewport::-webkit-scrollbar {
   width: 8px;
 }
+/* xterm 6's scrollbar toggles a bare `visible` class on its scrollbar node —
+   Tailwind's `.visible` utility (generated for WorkspaceLayer) turns that into
+   `visibility: visible`, which punches through the `invisible` wrapper of
+   inactive workspaces: hidden terminals' scrollbar thumbs float over the
+   active grid. Pin it to the ancestor; xterm fades via opacity anyway. */
+.xterm .xterm-scrollable-element > .visible {
+  visibility: inherit;
+}
 
 @keyframes pulse-ring {
   0% {

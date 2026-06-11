@@ -6,8 +6,11 @@ import { FloatingTerminals } from "./components/FloatingTerminals";
 import { CloseAgentDialog } from "./components/CloseAgentDialog";
 import { CloseWorkspaceDialog } from "./components/CloseWorkspaceDialog";
 import { CommandPalette } from "./components/CommandPalette";
+import { InsertCommandPalette } from "./components/InsertCommandPalette";
 import { QuitConfirmDialog } from "./components/QuitConfirmDialog";
 import { NewAgentDialog } from "./components/NewAgentDialog";
+import { LoadPresetDialog } from "./components/LoadPresetDialog";
+import { SavePresetDialog } from "./components/SavePresetDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { UsageDashboard } from "./components/UsageDashboard";
@@ -18,6 +21,15 @@ import { useLimits } from "./lib/limits";
 import { startGitPolling } from "./lib/git";
 import { startQuitGuard } from "./lib/quit";
 import { startFileDropListener } from "./lib/dnd";
+import { fetchKeyStatus } from "./lib/openrouter";
+import {
+  armHoldDictation,
+  cancelHoldDictation,
+  dictationReady,
+  finishHoldDictation,
+  startDictation,
+  stopDictation,
+} from "./lib/dictation";
 import { encodeProjectDir } from "./lib/utils";
 import {
   ensureNotifyPermission,
@@ -53,6 +65,10 @@ export default function App() {
     const stopGit = startGitPolling();
     const stopQuitGuard = startQuitGuard();
     const stopFileDrop = startFileDropListener();
+    // dictation UI is hidden until a working OpenRouter key is found
+    void fetchKeyStatus()
+      .then((st) => useSwarm.getState().setOpenrouterStatus(st))
+      .catch(() => {});
     return () => {
       updates.stopBackgroundPolling();
       stopLimits();
@@ -181,6 +197,23 @@ export default function App() {
       if (!(e.metaKey || e.ctrlKey)) return;
       const k = e.key.toLowerCase();
       const s = useSwarm.getState();
+      if (k === "meta") {
+        // plain ⌘ is the push-to-talk key (hold mode): recording arms after a
+        // short delay so ⌘-shortcuts never open the mic
+        if (
+          (s.settings.dictationHotkeyMode ?? "hold") === "hold" &&
+          !e.repeat
+        ) {
+          armHoldDictation(() => {
+            const st = useSwarm.getState();
+            return st.focusedAgentId ?? st.activeAgentId();
+          });
+        }
+        return;
+      }
+      // any other key while plain-⌘ dictation is armed/recording means a
+      // shortcut, not speech — abort silently, then handle the shortcut
+      cancelHoldDictation();
       if (k === "t") {
         e.preventDefault();
         setNewAgentOpen(true);
@@ -188,6 +221,10 @@ export default function App() {
         // macOS convention: ⌘, opens settings
         e.preventDefault();
         setSettingsOpen(true);
+      } else if (k === "k" && e.shiftKey) {
+        // ⌘⇧K must come before plain ⌘K — that branch doesn't check shift
+        e.preventDefault();
+        s.setCommandPickerOpen(!s.commandPickerOpen);
       } else if (k === "k") {
         e.preventDefault();
         s.setPaletteOpen(!s.paletteOpen);
@@ -220,6 +257,19 @@ export default function App() {
           e.preventDefault();
           createFloatingTerminal(id);
         }
+      } else if (k === "m" && e.shiftKey) {
+        // ⌘⇧M — toggle-mode dictation (hold mode listens to plain ⌘ instead)
+        e.preventDefault();
+        if (e.repeat || !dictationReady()) return;
+        if ((s.settings.dictationHotkeyMode ?? "hold") !== "toggle") return;
+        const d = s.dictation;
+        if (d?.phase === "recording") {
+          void stopDictation();
+          return;
+        }
+        if (d) return; // transcribing — let it finish
+        const target = s.focusedAgentId ?? s.activeAgentId();
+        if (target) void startDictation(target);
       } else if (k >= "1" && k <= "9") {
         // ⌘1–9 switch workspaces
         const wid = s.workspaceOrder[Number(k) - 1];
@@ -250,6 +300,22 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [setNewAgentOpen, splitActive, requestRemoveAgent, createFloatingTerminal, adjustFontSize]);
 
+  // push-to-talk release: letting go of ⌘ finishes (transcribes) a hold-mode
+  // dictation; recordings shorter than ~1s are discarded in lib/dictation.ts.
+  // Losing window focus mid-recording also finishes rather than cancels.
+  useEffect(() => {
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === "Meta") finishHoldDictation();
+    };
+    const onBlur = () => finishHoldDictation();
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
+
   return (
     <TooltipProvider delayDuration={300}>
       <div className="flex h-screen w-screen flex-col overflow-hidden bg-background">
@@ -269,10 +335,13 @@ export default function App() {
       <CloseWorkspaceDialog />
       <QuitConfirmDialog />
       <NewAgentDialog />
+      <LoadPresetDialog />
+      <SavePresetDialog />
       <CommandPalette
         onOpenProfiles={() => setProfilesOpen(true)}
         onOpenSettings={() => setSettingsOpen(true)}
       />
+      <InsertCommandPalette />
       <ProfilesDialog open={profilesOpen} onOpenChange={setProfilesOpen} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       <UsageDashboard />

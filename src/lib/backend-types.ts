@@ -1,5 +1,6 @@
 import type {
   AppSettings,
+  CustomCommandsData,
   DetectedCommand,
   FolderCommands,
   GitInfo,
@@ -10,6 +11,7 @@ import type {
   SubscriptionLimits,
   UsageHistoryEntry,
   UsageTotals,
+  WorkspacePreset,
 } from "@/types";
 
 export interface PtyDataEvent {
@@ -83,6 +85,10 @@ export interface Backend {
   loadCommandPresets(): Promise<Record<string, FolderCommands> | null>;
   saveCommandPresets(presets: Record<string, FolderCommands>): Promise<void>;
 
+  /** Custom prompt snippets for the insert picker — global + per folder (cwd). */
+  loadCustomCommands(): Promise<CustomCommandsData | null>;
+  saveCustomCommands(data: CustomCommandsData): Promise<void>;
+
   loadUsageHistory(): Promise<UsageHistoryEntry[] | null>;
   saveUsageHistory(entries: UsageHistoryEntry[]): Promise<void>;
 
@@ -96,6 +102,10 @@ export interface Backend {
   /** Snapshot of the grid (agent panes + tiling trees) for restore-on-launch. */
   loadGrid(): Promise<PersistedGrid | null>;
   saveGrid(grid: PersistedGrid): Promise<void>;
+
+  /** Workspace presets (named layouts of agent templates). null = never saved → seed. */
+  loadWorkspacePresets(): Promise<WorkspacePreset[] | null>;
+  saveWorkspacePresets(presets: WorkspacePreset[]): Promise<void>;
 
   /**
    * null when no Claude Code login is found (UI hides the meters); transient

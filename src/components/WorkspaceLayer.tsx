@@ -3,6 +3,7 @@ import { Plus, Zap } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
 import { useSwarm } from "@/store";
 import { TilingGrid } from "./TilingGrid";
+import { PresetThumbnail } from "./PresetThumbnail";
 import { Button } from "./ui/button";
 import { cn } from "@/lib/utils";
 import { paneRects } from "@/lib/layout";
@@ -251,9 +252,12 @@ function FleetCard({
 }
 
 function EmptyState({ onNew }: { onNew: () => void }) {
+  const presets = useSwarm((s) => s.workspacePresets);
+  const requestLoadPreset = useSwarm((s) => s.requestLoadPreset);
   return (
-    <div className="flex h-full w-full items-center justify-center rounded-lg border border-dashed border-border">
-      <div className="flex flex-col items-center gap-5 text-center">
+    <div className="flex h-full w-full overflow-y-auto rounded-lg border border-dashed border-border">
+      {/* m-auto centers but stays scrollable when presets outgrow the pane */}
+      <div className="m-auto flex max-w-lg flex-col items-center gap-5 p-6 text-center">
         <div className="flex h-14 w-14 items-center justify-center rounded-xl border border-border bg-card">
           <Zap size={22} className="text-foreground" fill="currentColor" />
         </div>
@@ -266,6 +270,26 @@ function EmptyState({ onNew }: { onNew: () => void }) {
             tokens &amp; cost in real time.
           </p>
         </div>
+        {presets.length > 0 && (
+          <div className="flex flex-wrap items-stretch justify-center gap-2.5">
+            {presets.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => requestLoadPreset(p.id)}
+                className="group flex w-28 flex-col gap-2 rounded-lg border border-border bg-card p-2.5 transition-colors hover:border-ring/60 hover:bg-accent"
+                title={`Load preset "${p.name}"`}
+              >
+                <PresetThumbnail
+                  layout={p.layout}
+                  className="h-14 w-full transition-opacity group-hover:opacity-90"
+                />
+                <span className="truncate text-[11px] font-medium text-muted-foreground transition-colors group-hover:text-foreground">
+                  {p.name}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
         <Button onClick={onNew}>
           <Plus size={15} /> Launch an agent
         </Button>

@@ -11,6 +11,7 @@ import {
 import { LazyStore } from "@tauri-apps/plugin-store";
 import type {
   AppSettings,
+  CustomCommandsData,
   DetectedCommand,
   FolderCommands,
   GitInfo,
@@ -21,6 +22,7 @@ import type {
   SubscriptionLimits,
   UsageHistoryEntry,
   UsageTotals,
+  WorkspacePreset,
 } from "@/types";
 import type { Backend, PtyDataEvent, PtyExitEvent } from "./backend-types";
 
@@ -111,6 +113,18 @@ export const tauriBackend: Backend = {
     await store.save();
   },
 
+  loadCustomCommands: async () => {
+    try {
+      return (await store.get<CustomCommandsData>("customCommands")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveCustomCommands: async (data) => {
+    await store.set("customCommands", data);
+    await store.save();
+  },
+
   loadUsageHistory: async () => {
     try {
       return (await store.get<UsageHistoryEntry[]>("usageHistory")) ?? null;
@@ -156,6 +170,18 @@ export const tauriBackend: Backend = {
   },
   saveGrid: async (grid) => {
     await store.set("grid", grid);
+    await store.save();
+  },
+
+  loadWorkspacePresets: async () => {
+    try {
+      return (await store.get<WorkspacePreset[]>("workspacePresets")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveWorkspacePresets: async (presets) => {
+    await store.set("workspacePresets", presets);
     await store.save();
   },
 

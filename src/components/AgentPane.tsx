@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useSwarm } from "@/store";
 import { TerminalView } from "./Terminal";
+import { DictationButton, DictationOverlay } from "./Dictation";
 import { FileDropOverlay } from "./FileDropOverlay";
 import { Tip } from "./ui/tooltip";
 import { Badge } from "./ui/misc";
@@ -385,6 +386,8 @@ export const AgentPane = memo(function AgentPane({
 
           <AgentStatsButton agent={agent} />
 
+          <DictationButton targetId={agentId} />
+
           <Tip label="Floating terminal">
             <button
               className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-xl:hidden"
@@ -508,6 +511,7 @@ export const AgentPane = memo(function AgentPane({
           active={active}
         />
         <FileDropOverlay targetId={agentId} />
+        <DictationOverlay targetId={agentId} />
       </div>
     </div>
   );

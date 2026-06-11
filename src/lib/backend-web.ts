@@ -8,6 +8,7 @@ import type {
   Profile,
   SubscriptionLimits,
   UsageHistoryEntry,
+  WorkspacePreset,
 } from "@/types";
 import type { Backend, PtyDataEvent, PtyExitEvent, Unlisten } from "./backend-types";
 import { requestDirectory } from "./dirpicker";
@@ -213,6 +214,10 @@ export const webBackend: Backend = {
     }
   },
 
+  // web mode is abandoned — dead stubs only
+  loadCustomCommands: async () => null,
+  saveCustomCommands: async () => {},
+
   loadUsageHistory: async () => {
     try {
       const raw = localStorage.getItem("swarmz.usage-history");
@@ -272,6 +277,22 @@ export const webBackend: Backend = {
   saveGrid: async (grid) => {
     try {
       localStorage.setItem("swarmz.grid", JSON.stringify(grid));
+    } catch {
+      /* ignore */
+    }
+  },
+
+  loadWorkspacePresets: async () => {
+    try {
+      const raw = localStorage.getItem("swarmz.workspacePresets");
+      return raw ? (JSON.parse(raw) as WorkspacePreset[]) : null;
+    } catch {
+      return null;
+    }
+  },
+  saveWorkspacePresets: async (presets) => {
+    try {
+      localStorage.setItem("swarmz.workspacePresets", JSON.stringify(presets));
     } catch {
       /* ignore */
     }

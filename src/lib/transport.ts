@@ -33,6 +33,8 @@ export const loadProfiles = backend.loadProfiles;
 export const saveProfiles = backend.saveProfiles;
 export const loadCommandPresets = backend.loadCommandPresets;
 export const saveCommandPresets = backend.saveCommandPresets;
+export const loadCustomCommands = backend.loadCustomCommands;
+export const saveCustomCommands = backend.saveCustomCommands;
 export const loadUsageHistory = backend.loadUsageHistory;
 export const saveUsageHistory = backend.saveUsageHistory;
 export const loadSettings = backend.loadSettings;
@@ -41,6 +43,8 @@ export const loadWorkspaces = backend.loadWorkspaces;
 export const saveWorkspaces = backend.saveWorkspaces;
 export const loadGrid = backend.loadGrid;
 export const saveGrid = backend.saveGrid;
+export const loadWorkspacePresets = backend.loadWorkspacePresets;
+export const saveWorkspacePresets = backend.saveWorkspacePresets;
 export const fetchSubscriptionLimits = backend.fetchSubscriptionLimits;
 
 export type { PtyDataEvent, PtyExitEvent } from "./backend-types";

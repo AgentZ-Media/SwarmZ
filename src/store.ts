@@ -2,17 +2,21 @@ import { create } from "zustand";
 import { nanoid } from "nanoid";
 import {
   loadCommandPresets,
+  loadCustomCommands,
   loadGrid,
   loadProfiles,
   loadSettings,
   loadUsageHistory,
+  loadWorkspacePresets,
   loadWorkspaces,
   ptyHasChildren,
   saveCommandPresets,
+  saveCustomCommands,
   saveGrid,
   saveProfiles,
   saveSettings,
   saveUsageHistory,
+  saveWorkspacePresets,
   saveWorkspaces,
 } from "@/lib/transport";
 import type {
@@ -21,15 +25,21 @@ import type {
   AppSettings,
   ClaudeActivity,
   CommandPreset,
+  CustomCommand,
+  CustomCommandsData,
+  DictationState,
   FloatingTerminal,
   FolderCommands,
   GitInfo,
   LayoutNode,
+  OpenrouterKeyStatus,
   PersistedGrid,
+  PresetLayoutNode,
   Profile,
   SessionUsage,
   UsageHistoryEntry,
   Workspace,
+  WorkspacePreset,
 } from "@/types";
 import {
   collectPanes,
@@ -42,6 +52,11 @@ import {
   type DropZone,
 } from "@/lib/layout";
 import { destroyTerm, focusTerm } from "@/lib/term-host";
+import {
+  presetLayoutFromGrid,
+  presetNeedsFolder,
+  seedPresets,
+} from "@/lib/presets";
 import { folderName, pickColor } from "@/lib/utils";
 
 // Built-in fallback — the effective default is settings.defaultStartup (Settings dialog).
@@ -176,6 +191,8 @@ interface SwarmState {
   fleetOpen: boolean;
   /** command palette (⌘K) */
   paletteOpen: boolean;
+  /** insert-command picker (⌘⇧K) — pastes a custom command into the active pane */
+  commandPickerOpen: boolean;
   /** workspace pending close while it still contains agents */
   closeWorkspaceConfirm: string | null;
   /** tab highlighted as drop target while a pane is dragged over it */
@@ -183,6 +200,12 @@ interface SwarmState {
   /** focus mode: this agent's pane is enlarged as an overlay above the grid (in-memory) */
   focusedAgentId: string | null;
   profiles: Profile[];
+  /** named workspace blueprints, loadable from the empty-workspace screen (persisted) */
+  workspacePresets: WorkspacePreset[];
+  /** preset waiting for a folder choice before loading (LoadPresetDialog) */
+  loadPresetRequest: string | null;
+  /** "save workspace as preset" name dialog */
+  savePresetOpen: boolean;
   /** all-time usage of claude sessions launched inside SwarmZ, keyed by session id */
   usageHistory: Record<string, UsageHistoryEntry>;
   dashboardOpen: boolean;
@@ -197,6 +220,8 @@ interface SwarmState {
   floatingOrder: string[];
   /** quick-command customizations (presets + hidden detected), keyed by project folder (persisted) */
   commandPresets: Record<string, FolderCommands>;
+  /** custom prompt snippets for the insert picker — global + per folder (persisted) */
+  customCommands: CustomCommandsData;
   /** pending "close agent" that needs a decision about running floating terminals */
   closeConfirm: { agentId: string; termIds: string[] } | null;
   /** pending app-quit while these agents are still working (see lib/quit.ts) */
@@ -206,6 +231,10 @@ interface SwarmState {
    * drop zone under the cursor, null while hovering elsewhere (in-memory)
    */
   fileDrag: { targetId: string | null } | null;
+  /** voice dictation in flight (see lib/dictation.ts) — one at a time (in-memory) */
+  dictation: DictationState | null;
+  /** OpenRouter key state — null until the first check; gates all dictation UI (in-memory) */
+  openrouterStatus: OpenrouterKeyStatus | null;
 
   // derived helpers
   activeAgentId: () => string | null;
@@ -229,6 +258,7 @@ interface SwarmState {
   attentionJump: () => void;
   setFleetOpen: (open: boolean) => void;
   setPaletteOpen: (open: boolean) => void;
+  setCommandPickerOpen: (open: boolean) => void;
   setTabDropTarget: (id: string | null) => void;
 
   // lifecycle
@@ -270,6 +300,16 @@ interface SwarmState {
   hideDetectedCommand: (cwd: string | undefined, command: string) => void;
   /** bring back everything hidden in this folder */
   restoreHiddenCommands: (cwd: string | undefined) => void;
+
+  // custom commands (insert picker, ⌘⇧K)
+  /** create a snippet, or update one in place when `id` is given; folderKey null = global */
+  saveCustomCommand: (
+    folderKey: string | null,
+    label: string,
+    text: string,
+    id?: string,
+  ) => void;
+  deleteCustomCommand: (folderKey: string | null, id: string) => void;
   focusAgent: (agentId: string) => void;
   setActivePane: (paneId: string) => void;
   /** enter/leave focus mode (null = leave) */
@@ -304,10 +344,24 @@ interface SwarmState {
   saveProfile: (p: Omit<Profile, "id"> & { id?: string }) => void;
   deleteProfile: (id: string) => void;
 
+  // workspace presets
+  /** load a preset: asks for a folder first when a pane inherits its cwd */
+  requestLoadPreset: (presetId: string) => void;
+  /** spawn a preset's panes — into the active workspace if empty, else a new tab */
+  applyPreset: (presetId: string, folder?: string) => void;
+  setLoadPresetRequest: (presetId: string | null) => void;
+  setSavePresetOpen: (open: boolean) => void;
+  /** snapshot the active workspace's grid as a new preset */
+  saveWorkspacePreset: (name: string) => void;
+  updateWorkspacePreset: (preset: WorkspacePreset) => void;
+  deleteWorkspacePreset: (id: string) => void;
+
   // ui
   setDashboardOpen: (open: boolean) => void;
   setNewAgentOpen: (open: boolean) => void;
   setFileDrag: (drag: { targetId: string | null } | null) => void;
+  setDictation: (d: DictationState | null) => void;
+  setOpenrouterStatus: (status: OpenrouterKeyStatus | null) => void;
 }
 
 // the app always has at least one workspace — created synchronously so
@@ -324,10 +378,14 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   activePaneIds: { [initialWorkspace.id]: null },
   fleetOpen: false,
   paletteOpen: false,
+  commandPickerOpen: false,
   closeWorkspaceConfirm: null,
   tabDropTarget: null,
   focusedAgentId: null,
   profiles: [],
+  workspacePresets: [],
+  loadPresetRequest: null,
+  savePresetOpen: false,
   usageHistory: {},
   dashboardOpen: false,
   newAgentOpen: false,
@@ -338,9 +396,12 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   floatingTerminals: {},
   floatingOrder: [],
   commandPresets: {},
+  customCommands: { global: [], folders: {} },
   closeConfirm: null,
   quitConfirm: null,
   fileDrag: null,
+  dictation: null,
+  openrouterStatus: null,
 
   activeAgentId: () => {
     const { layouts, activePaneIds, activeWorkspaceId } = get();
@@ -501,6 +562,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   setFleetOpen: (open) =>
     set(open ? { fleetOpen: true, focusedAgentId: null } : { fleetOpen: false }),
   setPaletteOpen: (open) => set({ paletteOpen: open }),
+  setCommandPickerOpen: (open) => set({ commandPickerOpen: open }),
   setTabDropTarget: (id) => {
     if (get().tabDropTarget !== id) set({ tabDropTarget: id });
   },
@@ -568,7 +630,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       const grid = await loadGrid();
       const state = get();
       if (
-        state.settings.restoreAgents !== false &&
+        state.settings.restoreAgents === true &&
         state.order.length === 0 && // nothing spawned before hydrate resolved
         grid?.agents.length
       ) {
@@ -648,6 +710,30 @@ export const useSwarm = create<SwarmState>((set, get) => ({
             : value;
         }
         set({ commandPresets: normalized });
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      const cc = await loadCustomCommands();
+      if (cc) {
+        set({
+          customCommands: { global: cc.global ?? [], folders: cc.folders ?? {} },
+        });
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      // null = key never written → seed the starter grids; a saved empty
+      // list means the user deleted them all — don't resurrect
+      const presets = await loadWorkspacePresets();
+      if (presets) {
+        set({ workspacePresets: presets });
+      } else {
+        const seed = seedPresets();
+        set({ workspacePresets: seed });
+        void saveWorkspacePresets(seed);
       }
     } catch {
       /* ignore */
@@ -973,6 +1059,53 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     void saveCommandPresets(commandPresets);
   },
 
+  saveCustomCommand: (folderKey, label, text, id) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const state = get();
+    const list = folderKey
+      ? (state.customCommands.folders[folderKey] ?? [])
+      : state.customCommands.global;
+    const finalLabel = label.trim() || trimmed.split("\n")[0];
+    let next: CustomCommand[];
+    if (id && list.some((c) => c.id === id)) {
+      // edit in place — keeps the item's position
+      next = list.map((c) =>
+        c.id === id ? { ...c, label: finalLabel, text: trimmed } : c,
+      );
+    } else {
+      next = [...list, { id: nanoid(8), label: finalLabel, text: trimmed }];
+    }
+    const customCommands: CustomCommandsData = folderKey
+      ? {
+          ...state.customCommands,
+          folders: { ...state.customCommands.folders, [folderKey]: next },
+        }
+      : { ...state.customCommands, global: next };
+    set({ customCommands });
+    void saveCustomCommands(customCommands);
+  },
+
+  deleteCustomCommand: (folderKey, id) => {
+    const state = get();
+    let customCommands: CustomCommandsData;
+    if (folderKey) {
+      const list = (state.customCommands.folders[folderKey] ?? []).filter(
+        (c) => c.id !== id,
+      );
+      const folders = { ...state.customCommands.folders, [folderKey]: list };
+      if (list.length === 0) delete folders[folderKey];
+      customCommands = { ...state.customCommands, folders };
+    } else {
+      customCommands = {
+        ...state.customCommands,
+        global: state.customCommands.global.filter((c) => c.id !== id),
+      };
+    }
+    set({ customCommands });
+    void saveCustomCommands(customCommands);
+  },
+
   focusAgent: (agentId) => {
     const state = get();
     const agent = state.agents[agentId];
@@ -1238,6 +1371,132 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     void saveProfiles(profiles);
   },
 
+  requestLoadPreset: (presetId) => {
+    const preset = get().workspacePresets.find((p) => p.id === presetId);
+    if (!preset) return;
+    if (presetNeedsFolder(preset)) set({ loadPresetRequest: presetId });
+    else get().applyPreset(presetId);
+  },
+
+  applyPreset: (presetId, folder) => {
+    const preset = get().workspacePresets.find((p) => p.id === presetId);
+    if (!preset) return;
+    // fill the active workspace while it's still empty, otherwise open a new tab
+    let wsId = get().activeWorkspaceId;
+    if (get().layouts[wsId]) {
+      wsId = get().createWorkspace({ name: preset.name });
+    }
+    const state = get();
+
+    // one pass: spawn an agent per pane template and mirror the preset tree
+    // into a live layout (same shape, fresh ids)
+    let counter = state.agentCounter;
+    const agents = { ...state.agents };
+    const order = [...state.order];
+    const build = (node: PresetLayoutNode): LayoutNode => {
+      if (node.type === "split") {
+        return {
+          type: "split",
+          id: nanoid(8),
+          direction: node.direction,
+          sizes: [...node.sizes],
+          children: node.children.map(build),
+        };
+      }
+      const id = nanoid(10);
+      const n = ++counter;
+      agents[id] = {
+        id,
+        name: node.name?.trim() || `Agent ${n}`,
+        renamed: !!node.name?.trim(),
+        workspaceId: wsId,
+        cwd: node.cwd || folder,
+        startup:
+          node.startup ?? state.settings.defaultStartup ?? DEFAULT_STARTUP,
+        color: node.color || pickColor(n),
+        status: "starting",
+        attention: false,
+        createdAt: Date.now(),
+        // the template may reference a profile that's gone — drop it then
+        profileId: state.profiles.some((p) => p.id === node.profileId)
+          ? node.profileId
+          : undefined,
+      };
+      order.push(id);
+      return newPane(id);
+    };
+    const layout = build(preset.layout);
+    const firstPaneId = collectPanes(layout)[0]?.id ?? null;
+
+    // the tab takes the preset's name; the asked-for folder (or the first
+    // fixed one) becomes its default cwd like a first agent would
+    const ws = state.workspaces[wsId];
+    const defaultCwd =
+      ws?.defaultCwd ??
+      folder ??
+      order.map((id) => agents[id]).find((a) => a?.workspaceId === wsId && a.cwd)
+        ?.cwd;
+    const workspaces = ws
+      ? {
+          ...state.workspaces,
+          [wsId]: {
+            ...ws,
+            name: preset.name.trim() || ws.name,
+            renamed: true,
+            defaultCwd,
+          },
+        }
+      : state.workspaces;
+
+    set({
+      agents,
+      order,
+      workspaces,
+      layouts: { ...state.layouts, [wsId]: layout },
+      activePaneIds: { ...state.activePaneIds, [wsId]: firstPaneId },
+      agentCounter: counter,
+      activeWorkspaceId: wsId,
+      loadPresetRequest: null,
+      focusedAgentId: null,
+      fleetOpen: false,
+    });
+    schedulePersistWorkspaces();
+    schedulePersistGrid();
+    if (folder) get().updateSettings({ lastCwd: folder });
+  },
+
+  setLoadPresetRequest: (presetId) => set({ loadPresetRequest: presetId }),
+  setSavePresetOpen: (open) => set({ savePresetOpen: open }),
+
+  saveWorkspacePreset: (name) => {
+    const state = get();
+    const wsId = state.activeWorkspaceId;
+    const layout = state.layouts[wsId];
+    if (!layout) return;
+    const preset: WorkspacePreset = {
+      id: nanoid(8),
+      name: name.trim() || state.workspaces[wsId]?.name || "Preset",
+      layout: presetLayoutFromGrid(layout, state.agents),
+    };
+    const workspacePresets = [...state.workspacePresets, preset];
+    set({ workspacePresets, savePresetOpen: false });
+    void saveWorkspacePresets(workspacePresets);
+  },
+
+  updateWorkspacePreset: (preset) => {
+    const workspacePresets = get().workspacePresets.map((p) =>
+      p.id === preset.id ? preset : p,
+    );
+    set({ workspacePresets });
+    void saveWorkspacePresets(workspacePresets);
+  },
+
+  deleteWorkspacePreset: (id) => {
+    const workspacePresets = get().workspacePresets.filter((p) => p.id !== id);
+    set({ workspacePresets });
+    void saveWorkspacePresets(workspacePresets);
+  },
+
   setDashboardOpen: (open) => set({ dashboardOpen: open }),
   setNewAgentOpen: (open) =>
     set(open ? { newAgentOpen: true, newAgentPrefill: null } : { newAgentOpen: false }),
@@ -1247,6 +1506,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     if (!!cur === !!drag && cur?.targetId === drag?.targetId) return;
     set({ fileDrag: drag });
   },
+  setDictation: (d) => set({ dictation: d }),
+  setOpenrouterStatus: (status) => set({ openrouterStatus: status }),
 }));
 
 /**

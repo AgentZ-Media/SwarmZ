@@ -123,8 +123,57 @@ export interface AppSettings {
   claudePath?: string;
   /** absolute path to the git binary used for the read-only pane git status */
   gitPath?: string;
-  /** restore the last grid on launch and resume each pane's claude session (default on) */
+  /** restore the last grid on launch and resume each pane's claude session (default off) */
   restoreAgents?: boolean;
+  /** voice dictation hotkey behavior: hold ⌘⇧M like push-to-talk, or press to start/stop (default "hold") */
+  dictationHotkeyMode?: "hold" | "toggle";
+  /** submit the transcript with Enter right after pasting it (default off) */
+  dictationAutoSubmit?: boolean;
+  /** polish transcripts with an LLM after transcription (default off) */
+  dictationCleanup?: boolean;
+  /** OpenRouter model for the cleanup pass; unset = DEFAULT_CLEANUP_MODEL */
+  dictationCleanupModel?: string;
+  /** system prompt of the cleanup pass; unset = DEFAULT_CLEANUP_PROMPT (must never translate) */
+  dictationCleanupPrompt?: string;
+  /** OpenRouter speech-to-text model; unset = DEFAULT_STT_MODEL */
+  dictationSttModel?: string;
+}
+
+// ---- OpenRouter voice dictation ----
+
+/**
+ * State of the OpenRouter API key in the macOS Keychain. `valid: null` means
+ * "present but unverifiable right now" (offline/5xx) — dictation stays
+ * enabled then; only an explicit 401/403 rejection turns it off.
+ */
+export interface OpenrouterKeyStatus {
+  present: boolean;
+  valid: boolean | null;
+}
+
+/** One entry of OpenRouter's public model catalog (cleanup-model picker). */
+export interface OpenrouterModel {
+  id: string;
+  name: string;
+}
+
+/** Result of transcribing one audio segment. */
+export interface TranscriptionResult {
+  text: string;
+  /** duration of the input audio in seconds (what OpenRouter bills) */
+  seconds: number;
+  /** cost of the request in USD */
+  cost: number;
+}
+
+/** A voice dictation in flight, keyed to the pty it will paste into (in-memory). */
+export interface DictationState {
+  /** agent pane or floating terminal receiving the transcript */
+  targetId: string;
+  phase: "recording" | "transcribing" | "error";
+  /** epoch ms recording started — drives the elapsed readout in the pill */
+  startedAt: number;
+  error?: string;
 }
 
 /**
@@ -187,6 +236,44 @@ export interface Profile {
   color: string;
 }
 
+// ---- Workspace presets ----
+
+/** One pane template inside a workspace preset. */
+export interface PresetPaneNode {
+  type: "pane";
+  id: string;
+  /** fixed working directory; unset = inherit the folder asked for at load time */
+  cwd?: string;
+  /** startup command; unset = the configured default startup command, "" = plain shell */
+  startup?: string;
+  /** agent name; unset = auto ("Agent N" + captured terminal titles) */
+  name?: string;
+  profileId?: string;
+  color?: string;
+}
+
+export interface PresetSplitNode {
+  type: "split";
+  direction: "row" | "column";
+  /** flex-grow weights, one per child (same semantics as SplitNode) */
+  sizes: number[];
+  children: PresetLayoutNode[];
+}
+
+export type PresetLayoutNode = PresetPaneNode | PresetSplitNode;
+
+/**
+ * A reusable workspace blueprint: a tiling layout whose leaves are agent
+ * templates. Loaded from the empty-workspace screen — every pane spawns as a
+ * fresh agent. Persisted (store key `workspacePresets`); seeded with a few
+ * standard grids on first launch.
+ */
+export interface WorkspacePreset {
+  id: string;
+  name: string;
+  layout: PresetLayoutNode;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -243,6 +330,23 @@ export interface FolderCommands {
   presets: CommandPreset[];
   /** detected commands hidden by the user, matched by command string */
   hidden: string[];
+}
+
+/**
+ * One user-defined prompt/command snippet, inserted (pasted, not run) into
+ * the active agent pane via the insert picker (⌘⇧K). `text` may contain
+ * `{{…}}` placeholders, substituted at insert time (see lib/command-vars.ts).
+ */
+export interface CustomCommand {
+  id: string;
+  label: string;
+  text: string;
+}
+
+/** All custom commands: global ones plus per-project-folder lists (keyed by presetKey(cwd)). */
+export interface CustomCommandsData {
+  global: CustomCommand[];
+  folders: Record<string, CustomCommand[]>;
 }
 
 /**

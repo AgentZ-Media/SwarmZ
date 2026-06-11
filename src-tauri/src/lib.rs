@@ -1,5 +1,6 @@
 mod git;
 mod limits;
+mod openrouter;
 mod project;
 mod pty;
 mod usage;
@@ -93,6 +94,51 @@ fn usage_totals() -> UsageTotals {
 #[tauri::command]
 async fn subscription_limits() -> Result<Option<limits::SubscriptionLimits>, String> {
     limits::fetch_limits().await
+}
+
+#[tauri::command]
+async fn openrouter_key_status() -> openrouter::KeyStatus {
+    openrouter::key_status().await
+}
+
+#[tauri::command]
+async fn openrouter_set_key(key: String) -> Result<openrouter::KeyStatus, String> {
+    // subprocess work (security CLI) — keep it off the async runtime's core threads
+    tauri::async_runtime::spawn_blocking(move || openrouter::set_key(&key))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(openrouter::key_status().await)
+}
+
+#[tauri::command]
+async fn openrouter_clear_key() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(openrouter::clear_key)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn openrouter_models() -> Result<Vec<openrouter::ModelInfo>, String> {
+    openrouter::models().await
+}
+
+#[tauri::command]
+async fn openrouter_transcribe(
+    audio: String,
+    format: String,
+    model: String,
+    language: Option<String>,
+) -> Result<openrouter::TranscriptionResult, String> {
+    openrouter::transcribe(audio, format, model, language).await
+}
+
+#[tauri::command]
+async fn openrouter_cleanup(
+    text: String,
+    model: String,
+    prompt: String,
+) -> Result<String, String> {
+    openrouter::cleanup(text, model, prompt).await
 }
 
 #[tauri::command]
@@ -202,6 +248,12 @@ pub fn run() {
             usage_totals,
             subscription_limits,
             git_info,
+            openrouter_key_status,
+            openrouter_set_key,
+            openrouter_clear_key,
+            openrouter_models,
+            openrouter_transcribe,
+            openrouter_cleanup,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

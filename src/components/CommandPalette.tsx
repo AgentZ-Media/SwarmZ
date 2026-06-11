@@ -4,7 +4,9 @@ import {
   BarChart3,
   Bell,
   LayoutGrid,
+  LayoutTemplate,
   Plus,
+  ScrollText,
   Search,
   Settings,
   SlidersHorizontal,
@@ -51,6 +53,8 @@ export function CommandPalette({
     const a = agents[id];
     return a && (a.attention || a.activity === "waiting");
   }).length;
+
+  const activeHasGrid = useSwarm((s) => !!s.layouts[s.activeWorkspaceId]);
 
   return (
     <DialogPrimitive.Root open={open} onOpenChange={setOpen}>
@@ -165,6 +169,27 @@ export function CommandPalette({
                   <Shortcut>⌘⇧A</Shortcut>
                 </PaletteItem>
                 <PaletteItem
+                  value="insert custom command snippet prompt"
+                  onSelect={() =>
+                    run(() => useSwarm.getState().setCommandPickerOpen(true))
+                  }
+                >
+                  <ScrollText size={13} className="shrink-0 text-faint" />
+                  Insert command
+                  <Shortcut>⌘⇧K</Shortcut>
+                </PaletteItem>
+                {activeHasGrid && (
+                  <PaletteItem
+                    value="save workspace as preset layout"
+                    onSelect={() =>
+                      run(() => useSwarm.getState().setSavePresetOpen(true))
+                    }
+                  >
+                    <LayoutTemplate size={13} className="shrink-0 text-faint" />
+                    Save workspace as preset
+                  </PaletteItem>
+                )}
+                <PaletteItem
                   value="usage dashboard tokens cost"
                   onSelect={() =>
                     run(() => useSwarm.getState().setDashboardOpen(true))
@@ -197,7 +222,7 @@ export function CommandPalette({
   );
 }
 
-function PaletteGroup({
+export function PaletteGroup({
   heading,
   children,
 }: {
@@ -214,7 +239,7 @@ function PaletteGroup({
   );
 }
 
-function PaletteItem({
+export function PaletteItem({
   value,
   onSelect,
   children,
@@ -240,7 +265,7 @@ function PaletteItem({
   );
 }
 
-function Shortcut({ children }: { children: React.ReactNode }) {
+export function Shortcut({ children }: { children: React.ReactNode }) {
   return (
     <kbd className="ml-auto pl-3 font-mono text-[10px] tabular-nums text-faint">
       {children}
