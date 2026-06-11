@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { Command } from "cmdk";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import {
@@ -12,15 +13,19 @@ import {
   SlidersHorizontal,
   SquarePlus,
 } from "lucide-react";
-import { useSwarm } from "@/store";
+import { presetKey, useSwarm } from "@/store";
 import { focusTerm } from "@/lib/term-host";
+import { extractInputLabels } from "@/lib/command-vars";
+import { insertCommandText } from "@/lib/insert-command";
 import { cn, shortPath } from "@/lib/utils";
-import type { Agent } from "@/types";
+import type { Agent, CustomCommand } from "@/types";
 
 /**
  * ⌘K — fuzzy-jump to any agent or workspace and reach every global action
  * without the mouse. Built on cmdk; opens above everything, closes on Escape
- * or after running a command.
+ * or after running a command. Custom commands (⌘⇧K snippets) surface here too
+ * once a search is typed — same semantics as the insert picker (↵ pastes,
+ * ⌘↵ pastes & runs, {{input}} commands detour through the picker's form).
  */
 export function CommandPalette({
   onOpenProfiles,
@@ -35,11 +40,49 @@ export function CommandPalette({
   const order = useSwarm((s) => s.order);
   const workspaces = useSwarm((s) => s.workspaces);
   const workspaceOrder = useSwarm((s) => s.workspaceOrder);
+  const customCommands = useSwarm((s) => s.customCommands);
+  const targetId = useSwarm((s) => s.focusedAgentId ?? s.activeAgentId());
+
+  const [search, setSearch] = useState("");
+  // ⌘ state of the Enter keydown that triggered cmdk's onSelect (fired
+  // synchronously inside the same event) — mouse clicks leave it false
+  const submitRef = useRef(false);
+
+  useEffect(() => {
+    if (open) setSearch("");
+  }, [open]);
 
   /** close first, then act — actions may move focus into a terminal */
   const run = (action: () => void) => {
     setOpen(false);
     action();
+  };
+
+  const targetAgent = targetId ? agents[targetId] : undefined;
+  const folderKey = targetAgent ? presetKey(targetAgent.cwd) : null;
+  const folderCmds = folderKey
+    ? (customCommands.folders[folderKey] ?? [])
+    : [];
+  const globalCmds = customCommands.global;
+  // only while searching — the default palette view stays uncluttered
+  const showCommands =
+    search.trim().length > 0 &&
+    !!targetId &&
+    folderCmds.length + globalCmds.length > 0;
+
+  const runCommand = (cmd: CustomCommand) => {
+    const submit = submitRef.current;
+    submitRef.current = false;
+    if (!targetId) return;
+    setOpen(false);
+    if (extractInputLabels(cmd.text).length) {
+      // needs {{input}} values — detour through the insert picker's form
+      const s = useSwarm.getState();
+      s.setCommandPickerPreselect({ cmd, submit });
+      s.setCommandPickerOpen(true);
+    } else {
+      insertCommandText(targetId, cmd.text, submit);
+    }
   };
 
   const jumpToAgent = (id: string) => {
@@ -68,10 +111,18 @@ export function CommandPalette({
           <DialogPrimitive.Title className="sr-only">
             Command palette
           </DialogPrimitive.Title>
-          <Command label="Command palette" loop>
+          <Command
+            label="Command palette"
+            loop
+            onKeyDownCapture={(e) => {
+              if (e.key === "Enter") submitRef.current = e.metaKey;
+            }}
+          >
             <div className="flex items-center gap-2 border-b border-border px-3">
               <Search size={14} className="shrink-0 text-faint" />
               <Command.Input
+                value={search}
+                onValueChange={setSearch}
                 placeholder="Jump to an agent, workspace or action…"
                 className="h-11 w-full bg-transparent text-sm text-foreground outline-none placeholder:text-faint"
               />
@@ -135,6 +186,24 @@ export function CommandPalette({
                   <Shortcut>⌘⇧N</Shortcut>
                 </PaletteItem>
               </PaletteGroup>
+
+              {showCommands && (
+                <PaletteGroup heading="Commands · ↵ paste · ⌘↵ run">
+                  {[...folderCmds, ...globalCmds].map((c) => (
+                    <PaletteItem
+                      key={c.id}
+                      value={`command ${c.label} ${c.text} ${c.id}`}
+                      onSelect={() => runCommand(c)}
+                    >
+                      <ScrollText size={13} className="shrink-0 text-faint" />
+                      <span className="truncate text-foreground">{c.label}</span>
+                      <span className="ml-auto max-w-[45%] truncate pl-3 font-mono text-[10px] text-faint">
+                        {c.text.replace(/\s+/g, " ")}
+                      </span>
+                    </PaletteItem>
+                  ))}
+                </PaletteGroup>
+              )}
 
               <PaletteGroup heading="Actions">
                 <PaletteItem

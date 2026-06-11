@@ -32,6 +32,7 @@ import type {
   FolderCommands,
   GitInfo,
   LayoutNode,
+  LocalSttStatus,
   OpenrouterKeyStatus,
   PersistedGrid,
   PresetLayoutNode,
@@ -193,6 +194,8 @@ interface SwarmState {
   paletteOpen: boolean;
   /** insert-command picker (⌘⇧K) — pastes a custom command into the active pane */
   commandPickerOpen: boolean;
+  /** command picked in ⌘K that still needs its {{input}} values — consumed when the picker opens (in-memory) */
+  commandPickerPreselect: { cmd: CustomCommand; submit: boolean } | null;
   /** workspace pending close while it still contains agents */
   closeWorkspaceConfirm: string | null;
   /** tab highlighted as drop target while a pane is dragged over it */
@@ -235,6 +238,8 @@ interface SwarmState {
   dictation: DictationState | null;
   /** OpenRouter key state — null until the first check; gates all dictation UI (in-memory) */
   openrouterStatus: OpenrouterKeyStatus | null;
+  /** local speech model state — null until the first check; gates dictation UI when engine = "local" (in-memory) */
+  localSttStatus: LocalSttStatus | null;
 
   // derived helpers
   activeAgentId: () => string | null;
@@ -259,6 +264,9 @@ interface SwarmState {
   setFleetOpen: (open: boolean) => void;
   setPaletteOpen: (open: boolean) => void;
   setCommandPickerOpen: (open: boolean) => void;
+  setCommandPickerPreselect: (
+    pre: { cmd: CustomCommand; submit: boolean } | null,
+  ) => void;
   setTabDropTarget: (id: string | null) => void;
 
   // lifecycle
@@ -362,6 +370,7 @@ interface SwarmState {
   setFileDrag: (drag: { targetId: string | null } | null) => void;
   setDictation: (d: DictationState | null) => void;
   setOpenrouterStatus: (status: OpenrouterKeyStatus | null) => void;
+  setLocalSttStatus: (status: LocalSttStatus | null) => void;
 }
 
 // the app always has at least one workspace — created synchronously so
@@ -379,6 +388,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   fleetOpen: false,
   paletteOpen: false,
   commandPickerOpen: false,
+  commandPickerPreselect: null,
   closeWorkspaceConfirm: null,
   tabDropTarget: null,
   focusedAgentId: null,
@@ -402,6 +412,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   fileDrag: null,
   dictation: null,
   openrouterStatus: null,
+  localSttStatus: null,
 
   activeAgentId: () => {
     const { layouts, activePaneIds, activeWorkspaceId } = get();
@@ -563,6 +574,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     set(open ? { fleetOpen: true, focusedAgentId: null } : { fleetOpen: false }),
   setPaletteOpen: (open) => set({ paletteOpen: open }),
   setCommandPickerOpen: (open) => set({ commandPickerOpen: open }),
+  setCommandPickerPreselect: (pre) => set({ commandPickerPreselect: pre }),
   setTabDropTarget: (id) => {
     if (get().tabDropTarget !== id) set({ tabDropTarget: id });
   },
@@ -1508,6 +1520,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   },
   setDictation: (d) => set({ dictation: d }),
   setOpenrouterStatus: (status) => set({ openrouterStatus: status }),
+  setLocalSttStatus: (status) => set({ localSttStatus: status }),
 }));
 
 /**

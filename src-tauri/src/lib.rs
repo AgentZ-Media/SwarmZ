@@ -1,5 +1,6 @@
 mod git;
 mod limits;
+mod localstt;
 mod openrouter;
 mod project;
 mod pty;
@@ -142,6 +143,42 @@ async fn openrouter_cleanup(
 }
 
 #[tauri::command]
+fn local_stt_status() -> localstt::LocalSttStatus {
+    localstt::status()
+}
+
+#[tauri::command]
+async fn local_stt_download(app: AppHandle) -> Result<(), String> {
+    localstt::download(app).await
+}
+
+#[tauri::command]
+fn local_stt_cancel_download() {
+    localstt::cancel_download();
+}
+
+#[tauri::command]
+async fn local_stt_remove() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(localstt::remove)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn local_stt_unload() {
+    localstt::unload();
+}
+
+#[tauri::command]
+async fn local_stt_transcribe(audio: String) -> Result<openrouter::TranscriptionResult, String> {
+    // model load + inference are seconds of CPU work — keep them off the
+    // async runtime's core threads
+    tauri::async_runtime::spawn_blocking(move || localstt::transcribe(&audio))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn git_info(cwd: String, bin: Option<String>) -> Option<git::GitInfo> {
     // subprocess work — keep it off the async runtime's core threads
     tauri::async_runtime::spawn_blocking(move || git::git_info(&cwd, bin.as_deref()))
@@ -254,6 +291,12 @@ pub fn run() {
             openrouter_models,
             openrouter_transcribe,
             openrouter_cleanup,
+            local_stt_status,
+            local_stt_download,
+            local_stt_cancel_download,
+            local_stt_remove,
+            local_stt_unload,
+            local_stt_transcribe,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

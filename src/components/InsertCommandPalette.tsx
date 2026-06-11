@@ -3,9 +3,8 @@ import { Command } from "cmdk";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { Plus, ScrollText, Search } from "lucide-react";
 import { presetKey, useSwarm } from "@/store";
-import { ptyWrite } from "@/lib/transport";
-import { getTerm } from "@/lib/term-registry";
-import { extractInputLabels, substituteVars } from "@/lib/command-vars";
+import { extractInputLabels } from "@/lib/command-vars";
+import { insertCommandText } from "@/lib/insert-command";
 import { folderName } from "@/lib/utils";
 import { PaletteGroup, PaletteItem } from "./CommandPalette";
 import { Input, Label } from "./ui/input";
@@ -43,8 +42,21 @@ export function InsertCommandPalette() {
   // synchronously inside the same event) — mouse clicks leave it false
   const submitRef = useRef(false);
 
+  // a command picked in ⌘K that still needs {{input}} values lands directly
+  // on the inputs form; otherwise every open starts fresh at the list
   useEffect(() => {
-    if (open) setStep({ kind: "list" });
+    if (!open) return;
+    const s = useSwarm.getState();
+    const pre = s.commandPickerPreselect;
+    if (pre) {
+      s.setCommandPickerPreselect(null);
+      setStep({
+        kind: "inputs",
+        cmd: pre.cmd,
+        submit: pre.submit,
+        labels: extractInputLabels(pre.cmd.text),
+      });
+    } else setStep({ kind: "list" });
   }, [open]);
 
   const folderKey = agent ? presetKey(agent.cwd) : null;
@@ -61,24 +73,7 @@ export function InsertCommandPalette() {
   ) => {
     setOpen(false);
     if (!targetId) return;
-    const s = useSwarm.getState();
-    const a = s.agents[targetId];
-    const final = substituteVars(
-      text,
-      { cwd: a?.cwd, agentName: a?.name, branch: a?.git?.branch ?? null },
-      inputs,
-    );
-    const term = getTerm(targetId);
-    if (term) {
-      term.paste(final);
-      term.focus();
-      // submit as a SEPARATE write — inside the bracketed paste a \r would
-      // only be a literal newline in claude's input box
-      if (submit) setTimeout(() => void ptyWrite(targetId, "\r"), 20);
-    } else {
-      void ptyWrite(targetId, submit ? final + "\r" : final);
-    }
-    s.focusAgent(targetId);
+    insertCommandText(targetId, text, submit, inputs);
   };
 
   const handleSelect = (cmd: CustomCommand) => {

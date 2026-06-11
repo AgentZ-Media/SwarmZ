@@ -5,15 +5,17 @@ import { Tip } from "./ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
   getDictationAnalyser,
+  selectDictationReady,
   stopDictation,
   toggleDictation,
 } from "@/lib/dictation";
 
 /**
- * Mic button for pane / floating-terminal headers. Hidden until a working
- * OpenRouter key is stored (Settings → Voice); recording shows a pulsing
- * red icon, transcription a spinner. One dictation runs at a time, so the
- * button disables while another pane records.
+ * Mic button for pane / floating-terminal headers. Hidden until dictation is
+ * usable (Settings → Voice: a working OpenRouter key, or the local model
+ * downloaded when the engine is "local"); recording shows a pulsing red
+ * icon, transcription a spinner. One dictation runs at a time, so the button
+ * disables while another pane records.
  */
 export function DictationButton({
   targetId,
@@ -22,9 +24,7 @@ export function DictationButton({
   targetId: string;
   className?: string;
 }) {
-  const ready = useSwarm(
-    (s) => !!s.openrouterStatus?.present && s.openrouterStatus.valid !== false,
-  );
+  const ready = useSwarm(selectDictationReady);
   const phase = useSwarm((s) =>
     s.dictation?.targetId === targetId ? s.dictation.phase : null,
   );

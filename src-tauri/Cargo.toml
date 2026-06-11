@@ -1,6 +1,6 @@
 [package]
 name = "swarmz"
-version = "0.2.7"
+version = "0.2.8"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -38,8 +38,12 @@ chrono = { version = "0.4", features = ["serde"] }
 walkdir = "2"
 base64 = "0.22"
 # both already in the tree via tauri / tauri-plugin-updater
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }
 tokio = { version = "1", features = ["time"] }
+futures-util = "0.3"
+# local speech-to-text (Parakeet via ONNX Runtime) — "onnx" only, so no
+# whisper.cpp/cmake; ort pulls prebuilt onnxruntime binaries at build time
+transcribe-rs = { version = "0.3.11", default-features = false, features = ["onnx"] }
 
 [profile.release]
 codegen-units = 1

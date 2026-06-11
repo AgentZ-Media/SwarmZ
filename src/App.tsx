@@ -22,6 +22,7 @@ import { startGitPolling } from "./lib/git";
 import { startQuitGuard } from "./lib/quit";
 import { startFileDropListener } from "./lib/dnd";
 import { fetchKeyStatus } from "./lib/openrouter";
+import { fetchLocalSttStatus } from "./lib/local-stt";
 import {
   armHoldDictation,
   cancelHoldDictation,
@@ -66,8 +67,12 @@ export default function App() {
     const stopQuitGuard = startQuitGuard();
     const stopFileDrop = startFileDropListener();
     // dictation UI is hidden until a working OpenRouter key is found
+    // (or, with the local engine, the local speech model is installed)
     void fetchKeyStatus()
       .then((st) => useSwarm.getState().setOpenrouterStatus(st))
+      .catch(() => {});
+    void fetchLocalSttStatus()
+      .then((st) => useSwarm.getState().setLocalSttStatus(st))
       .catch(() => {});
     return () => {
       updates.stopBackgroundPolling();

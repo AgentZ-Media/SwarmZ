@@ -42,6 +42,18 @@ import {
   setOpenrouterKey,
 } from "@/lib/openrouter";
 import {
+  LOCAL_STT_DOWNLOAD_MB,
+  LOCAL_STT_MODEL_NAME,
+  LOCAL_STT_MODEL_URL,
+  LOCAL_STT_RAM_GB,
+  cancelLocalSttDownload,
+  downloadLocalSttModel,
+  fetchLocalSttStatus,
+  onLocalSttProgress,
+  removeLocalSttModel,
+  unloadLocalSttModel,
+} from "@/lib/local-stt";
+import {
   collectPresetPanes,
   removePresetPane,
   updatePresetPane,
@@ -792,17 +804,25 @@ function VoiceSection() {
     }
   };
 
+  const local = (settings.dictationEngine ?? "openrouter") === "local";
+
   const keyStatusLine = keyError ? (
     <span className="text-destructive">{keyError}</span>
   ) : !status?.present ? (
-    "No key set — the dictation mic stays hidden until one is added."
+    local
+      ? "No key set — optional with the local engine; only the cleanup pass uses OpenRouter."
+      : "No key set — the dictation mic stays hidden until one is added."
   ) : status.valid === true ? (
     <span className="text-success">
-      Key valid — voice dictation is enabled.
+      {local
+        ? "Key valid — transcript cleanup is available."
+        : "Key valid — voice dictation is enabled."}
     </span>
   ) : status.valid === false ? (
     <span className="text-destructive">
-      Key stored, but OpenRouter rejected it — dictation stays off.
+      {local
+        ? "Key stored, but OpenRouter rejected it — cleanup stays off."
+        : "Key stored, but OpenRouter rejected it — dictation stays off."}
     </span>
   ) : (
     "Key stored — couldn't verify it right now (offline?). Dictation stays enabled."
@@ -818,6 +838,32 @@ function VoiceSection() {
         title="Voice"
         sub="Dictate prompts into any pane — hold ⌘ (or click a pane's mic) and speak; the transcript is pasted into the terminal."
       />
+
+      <Row
+        label="Transcription engine"
+        help="Cloud sends the recording to OpenRouter (API key required). Local runs NVIDIA Parakeet fully on-device — nothing leaves the machine and no key is needed to transcribe."
+      >
+        <Segmented
+          value={local ? "local" : "openrouter"}
+          options={[
+            { value: "openrouter", label: "Cloud (OpenRouter)" },
+            { value: "local", label: "Local (Parakeet)" },
+          ]}
+          onChange={(v) => {
+            updateSettings({
+              dictationEngine: v === "openrouter" ? undefined : v,
+            });
+            // switching back to cloud frees the ~2 GB resident model
+            if (v === "openrouter")
+              void unloadLocalSttModel()
+                .then(() => fetchLocalSttStatus())
+                .then((st) => useSwarm.getState().setLocalSttStatus(st))
+                .catch(() => {});
+          }}
+        />
+      </Row>
+
+      {local && <LocalModelRow />}
 
       <StackedRow
         label="OpenRouter API key"
@@ -884,7 +930,11 @@ function VoiceSection() {
 
       <Row
         label="Clean up transcripts"
-        help="Polish the raw transcript with an LLM (filler words, punctuation) before pasting. Adds a little latency per dictation."
+        help={
+          local
+            ? "Polish the raw transcript with an LLM (filler words, punctuation) before pasting. Runs via OpenRouter — needs a key above even with the local engine."
+            : "Polish the raw transcript with an LLM (filler words, punctuation) before pasting. Adds a little latency per dictation."
+        }
       >
         <Switch
           checked={!!settings.dictationCleanup}
@@ -982,41 +1032,168 @@ function VoiceSection() {
         </>
       )}
 
-      <StackedRow
-        label="Transcription model"
-        help={
-          <>
-            OpenRouter speech-to-text model used for dictation.
-            {settings.dictationSttModel !== undefined && (
-              <>
-                {" "}
-                <button
-                  className="text-ring hover:underline"
-                  onClick={() => updateSettings({ dictationSttModel: undefined })}
-                >
-                  Reset to default
-                </button>
-              </>
-            )}
-          </>
-        }
-      >
-        <Input
-          value={settings.dictationSttModel ?? DEFAULT_STT_MODEL}
-          onChange={(e) =>
-            updateSettings({
-              dictationSttModel:
-                e.target.value === DEFAULT_STT_MODEL
-                  ? undefined
-                  : e.target.value,
-            })
+      {!local && (
+        <StackedRow
+          label="Transcription model"
+          help={
+            <>
+              OpenRouter speech-to-text model used for dictation.
+              {settings.dictationSttModel !== undefined && (
+                <>
+                  {" "}
+                  <button
+                    className="text-ring hover:underline"
+                    onClick={() =>
+                      updateSettings({ dictationSttModel: undefined })
+                    }
+                  >
+                    Reset to default
+                  </button>
+                </>
+              )}
+            </>
           }
-          className="font-mono text-xs"
-          placeholder={DEFAULT_STT_MODEL}
-          spellCheck={false}
-        />
-      </StackedRow>
+        >
+          <Input
+            value={settings.dictationSttModel ?? DEFAULT_STT_MODEL}
+            onChange={(e) =>
+              updateSettings({
+                dictationSttModel:
+                  e.target.value === DEFAULT_STT_MODEL
+                    ? undefined
+                    : e.target.value,
+              })
+            }
+            className="font-mono text-xs"
+            placeholder={DEFAULT_STT_MODEL}
+            spellCheck={false}
+          />
+        </StackedRow>
+      )}
     </>
+  );
+}
+
+/**
+ * Status / download card of the local speech model (engine "local"). The
+ * download streams from Hugging Face in Rust; progress arrives aggregated
+ * over all model files via `localstt://progress`.
+ */
+function LocalModelRow() {
+  const status = useSwarm((s) => s.localSttStatus);
+  const setLocalSttStatus = useSwarm((s) => s.setLocalSttStatus);
+  const [downloading, setDownloading] = useState(false);
+  const [progress, setProgress] = useState<{
+    downloaded: number;
+    total: number;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const unlisten = onLocalSttProgress(setProgress);
+    return () => void unlisten.then((f) => f());
+  }, []);
+
+  const refresh = () =>
+    fetchLocalSttStatus()
+      .then(setLocalSttStatus)
+      .catch(() => {});
+
+  // a download started earlier keeps running in Rust while this dialog is
+  // closed — re-sync on open so the row doesn't show a stale state
+  useEffect(() => void refresh(), []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const download = async () => {
+    setError(null);
+    setDownloading(true);
+    setProgress({ downloaded: 0, total: status?.totalBytes ?? 0 });
+    try {
+      await downloadLocalSttModel();
+    } catch (e) {
+      // a user-initiated cancel is not an error worth showing
+      if (!String(e).includes("cancelled")) setError(String(e));
+    } finally {
+      setDownloading(false);
+      setProgress(null);
+      void refresh();
+    }
+  };
+
+  const remove = async () => {
+    setError(null);
+    try {
+      await removeLocalSttModel();
+    } catch (e) {
+      setError(String(e));
+    }
+    void refresh();
+  };
+
+  const totalMb = Math.round((status?.totalBytes ?? 0) / 1e6) || LOCAL_STT_DOWNLOAD_MB;
+  const pct = progress?.total
+    ? Math.min(100, Math.round((progress.downloaded / progress.total) * 100))
+    : 0;
+
+  return (
+    <StackedRow
+      label="Local model"
+      help={
+        <>
+          <button
+            className="text-ring hover:underline"
+            onClick={() => void openUrl(LOCAL_STT_MODEL_URL)}
+          >
+            {LOCAL_STT_MODEL_NAME}
+          </button>{" "}
+          by NVIDIA — multilingual (25 languages), runs on-device via ONNX
+          Runtime; nothing to install besides the one-time {totalMb} MB
+          download. Transcribing takes roughly {LOCAL_STT_RAM_GB} GB of free
+          RAM; the model loads on the first dictation and stays in memory
+          until the engine is switched back to Cloud.
+          {error && (
+            <>
+              {" "}
+              <span className="text-destructive">{error}</span>
+            </>
+          )}
+        </>
+      }
+    >
+      {status?.installed ? (
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-success">
+            Installed ({totalMb} MB on disk)
+            {status.loaded ? " — loaded in RAM" : ""}
+          </span>
+          <Button size="sm" variant="outline" onClick={() => void remove()}>
+            Remove
+          </Button>
+        </div>
+      ) : downloading || status?.downloading ? (
+        <div className="flex items-center gap-3">
+          <div className="h-1.5 w-48 overflow-hidden rounded-full bg-secondary">
+            <div
+              className="h-full rounded-full bg-ring transition-[width] duration-300"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <span className="text-xs tabular-nums text-muted-foreground">
+            {pct}%
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void cancelLocalSttDownload()}
+          >
+            Cancel
+          </Button>
+        </div>
+      ) : (
+        <Button size="sm" onClick={() => void download()}>
+          Download model ({totalMb} MB)
+        </Button>
+      )}
+    </StackedRow>
   );
 }
 

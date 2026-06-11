@@ -137,6 +137,12 @@ export interface AppSettings {
   dictationCleanupPrompt?: string;
   /** OpenRouter speech-to-text model; unset = DEFAULT_STT_MODEL */
   dictationSttModel?: string;
+  /**
+   * transcription engine: "openrouter" = cloud via API key (default),
+   * "local" = on-device Parakeet model (no internet, needs the ~670 MB
+   * model downloaded in Settings)
+   */
+  dictationEngine?: "openrouter" | "local";
 }
 
 // ---- OpenRouter voice dictation ----
@@ -155,6 +161,19 @@ export interface OpenrouterKeyStatus {
 export interface OpenrouterModel {
   id: string;
   name: string;
+}
+
+/**
+ * State of the local speech-to-text model (Parakeet TDT 0.6b v3 int8) on
+ * disk and in RAM. Fetched at launch and after download/remove.
+ */
+export interface LocalSttStatus {
+  installed: boolean;
+  downloading: boolean;
+  /** model currently resident in RAM (~2 GB while loaded) */
+  loaded: boolean;
+  /** full download size in bytes (~670 MB) */
+  totalBytes: number;
 }
 
 /** Result of transcribing one audio segment. */

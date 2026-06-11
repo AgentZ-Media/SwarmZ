@@ -315,8 +315,10 @@ export const AgentPane = memo(function AgentPane({
       onMouseDown={() => focusAgent(agentId)}
     >
       {/* header — a container query root: as the pane narrows, secondary
-          info collapses away until only title, model and context donut remain
-          (everything stays reachable via tooltips, the stats popover and ⋯) */}
+          info collapses away (@max-xl: path/readout/split buttons, @max-lg:
+          model badge, @max-md: git chip/stats/mic/focus) until only status
+          dot, truncated title, context donut, ⋯ menu and close remain
+          (everything stays reachable via tooltips and the ⋯ menu) */}
       <div
         className={cn(
           "@container flex h-9 shrink-0 cursor-grab items-center gap-2 border-b px-2.5",
@@ -355,7 +357,7 @@ export const AgentPane = memo(function AgentPane({
           <div className="flex min-w-0 items-center gap-2">
             <span
               className={cn(
-                "shrink-0 truncate text-xs font-medium",
+                "min-w-0 truncate text-xs font-medium",
                 active ? "text-foreground" : "text-muted-foreground",
               )}
               onDoubleClick={(e) => {
@@ -378,15 +380,19 @@ export const AgentPane = memo(function AgentPane({
           </div>
         )}
 
-        {agent.attention && <Bell size={12} className="text-ring" />}
+        {agent.attention && <Bell size={12} className="shrink-0 text-ring" />}
 
-        <div className="ml-auto flex items-center gap-1.5">
-          {model && <Badge className="font-mono">{prettyModel(model)}</Badge>}
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {model && (
+            <Badge className="font-mono @max-lg:hidden">
+              {prettyModel(model)}
+            </Badge>
+          )}
           {usage && <ContextGauge usage={usage} />}
 
           <AgentStatsButton agent={agent} />
 
-          <DictationButton targetId={agentId} />
+          <DictationButton targetId={agentId} className="@max-md:hidden" />
 
           <Tip label="Floating terminal">
             <button
@@ -427,7 +433,7 @@ export const AgentPane = memo(function AgentPane({
 
           <Tip label={focused ? "Exit focus" : "Focus"}>
             <button
-              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
+              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-md:hidden"
               onClick={(e) => {
                 e.stopPropagation();
                 setFocusedAgent(focused ? null : agentId);

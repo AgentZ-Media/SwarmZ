@@ -1,6 +1,10 @@
 // Voice dictation manager — lives outside React like term-host.ts. Records
 // the mic in the webview (getUserMedia + MediaRecorder), transcribes via
-// OpenRouter (Rust side) and pastes the transcript into the target terminal.
+// OpenRouter or the local Parakeet model (both Rust side, per
+// settings.dictationEngine) and pastes the transcript into the target
+// terminal. For the local engine the compressed recording is decoded and
+// resampled to 16 kHz mono PCM here in the webview (OfflineAudioContext) —
+// the Rust side only ever sees raw samples.
 //
 // The transcription endpoint takes complete uploads only and recommends ≤60s
 // per request, so long dictations are recorded as rotating ~50s segments
@@ -16,6 +20,7 @@ import {
   cleanupTranscript,
   transcribeAudio,
 } from "./openrouter";
+import { transcribeAudioLocal } from "./local-stt";
 
 const MAX_MS = 5 * 60_000;
 const SEGMENT_MS = 50_000;
@@ -81,10 +86,23 @@ export function finishHoldDictation(): void {
   if (heldByHotkey) void stopDictation();
 }
 
-/** Key present and not explicitly rejected (unverified counts as usable). */
+/**
+ * Dictation is usable: local engine → model installed; OpenRouter engine →
+ * key present and not explicitly rejected (unverified counts as usable).
+ * Mirrored as a store selector by selectDictationReady (mic-button UI).
+ */
 export function dictationReady(): boolean {
-  const st = useSwarm.getState().openrouterStatus;
-  return !!st?.present && st.valid !== false;
+  return selectDictationReady(useSwarm.getState());
+}
+
+export function selectDictationReady(s: {
+  settings: { dictationEngine?: "openrouter" | "local" };
+  openrouterStatus: { present: boolean; valid: boolean | null } | null;
+  localSttStatus: { installed: boolean } | null;
+}): boolean {
+  if ((s.settings.dictationEngine ?? "openrouter") === "local")
+    return !!s.localSttStatus?.installed;
+  return !!s.openrouterStatus?.present && s.openrouterStatus.valid !== false;
 }
 
 function pickMime(): string {
@@ -166,6 +184,43 @@ function blobToBase64(blob: Blob): Promise<string> {
 }
 
 /**
+ * Decode a recorded segment (webm/opus or mp4/aac) and resample it to what
+ * the local Parakeet model expects: 16 kHz mono 16-bit PCM, base64-encoded
+ * without a WAV header. Decoding at the native rate first and rendering
+ * through an OfflineAudioContext is the resample path that works in WebKit.
+ */
+async function blobToPcm16k(blob: Blob): Promise<string> {
+  const RATE = 16000;
+  const probe = new AudioContext();
+  let decoded: AudioBuffer;
+  try {
+    decoded = await probe.decodeAudioData(await blob.arrayBuffer());
+  } finally {
+    void probe.close().catch(() => {});
+  }
+  const frames = Math.max(1, Math.ceil(decoded.duration * RATE));
+  const off = new OfflineAudioContext(1, frames, RATE);
+  const src = off.createBufferSource();
+  src.buffer = decoded;
+  src.connect(off.destination);
+  src.start();
+  const mono = (await off.startRendering()).getChannelData(0);
+  const pcm = new Int16Array(mono.length);
+  for (let i = 0; i < mono.length; i++) {
+    const v = Math.max(-1, Math.min(1, mono[i]));
+    pcm[i] = Math.round(v < 0 ? v * 32768 : v * 32767);
+  }
+  const bytes = new Uint8Array(pcm.buffer);
+  let bin = "";
+  // String.fromCharCode in bounded chunks — one call over minutes of audio
+  // would blow the argument limit
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+/**
  * Paste the transcript like the insert picker does: bracketed paste (claude
  * treats it as input, not keystrokes) plus a SEPARATE `\r` for auto-submit —
  * inside the paste it would only be a literal newline in claude's input box.
@@ -239,17 +294,25 @@ export async function stopDictation(cancel = false): Promise<void> {
   }
   useSwarm.getState().setDictation({ ...d, phase: "transcribing" });
   try {
-    const settings = useSwarm.getState().settings;
+    const state = useSwarm.getState();
+    const settings = state.settings;
+    const local = (settings.dictationEngine ?? "openrouter") === "local";
     const fmt = apiFormat(mime);
     const sttModel = settings.dictationSttModel?.trim() || DEFAULT_STT_MODEL;
     const texts: string[] = [];
     for (const seg of segs) {
-      const b64 = await blobToBase64(seg);
-      const r = await transcribeAudio(b64, fmt, sttModel);
+      const r = local
+        ? await transcribeAudioLocal(await blobToPcm16k(seg))
+        : await transcribeAudio(await blobToBase64(seg), fmt, sttModel);
       if (r.text.trim()) texts.push(r.text.trim());
     }
     let text = texts.join(" ").trim();
-    if (text && settings.dictationCleanup) {
+    // the cleanup pass always runs through OpenRouter — with the local
+    // engine it only applies when a usable key happens to be stored too
+    const cleanupUsable =
+      !local ||
+      (!!state.openrouterStatus?.present && state.openrouterStatus.valid !== false);
+    if (text && settings.dictationCleanup && cleanupUsable) {
       try {
         text = await cleanupTranscript(
           text,
