@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
-import { Folder, FolderOpen, X } from "lucide-react";
-import { pickDirectory } from "@/lib/transport";
+import { useEffect, useRef, useState } from "react";
+import { Dices, Folder, FolderGit2, FolderOpen, X } from "lucide-react";
+import { fetchGitInfo, IS_TAURI, pickDirectory } from "@/lib/transport";
+import { addWorktree, generateBranchName, removeWorktree } from "@/lib/worktree";
 import {
   Dialog,
   DialogContent,
@@ -17,6 +18,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./ui/select";
+import { Switch } from "./ui/switch";
+import { Tip } from "./ui/tooltip";
 import { DEFAULT_STARTUP, useSwarm } from "@/store";
 import { shortPath } from "@/lib/utils";
 
@@ -27,39 +30,91 @@ export function NewAgentDialog() {
   const createAgent = useSwarm((s) => s.createAgent);
   const prefill = useSwarm((s) => s.newAgentPrefill);
   const settings = useSwarm((s) => s.settings);
-  const workspace = useSwarm((s) => s.workspaces[s.activeWorkspaceId]);
 
   const [name, setName] = useState("");
   const [cwd, setCwd] = useState<string | undefined>();
   const [startup, setStartup] = useState(DEFAULT_STARTUP);
   const [profileId, setProfileId] = useState<string | undefined>();
 
-  // reset on open: inherit from the split-source pane if present, otherwise
-  // fall back to the profile's default cwd or the last used folder
+  // worktree toggle — only offered when the chosen folder is a git repo
+  // (repoName: undefined = still checking, null = not a repo)
+  const [repoName, setRepoName] = useState<string | null | undefined>();
+  const [worktree, setWorktree] = useState(false);
+  const [branch, setBranch] = useState("");
+  const branchEdited = useRef(false);
+  const [copyEnv, setCopyEnv] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // bumped on every open — lets an in-flight worktree creation detect that
+  // its dialog session ended (cancel, or cancel + reopen) and roll back
+  const openGen = useRef(0);
+
+  // reset ONLY on the opening edge: inherit from the split-source pane if
+  // present, otherwise fall back to the profile's default cwd or the last
+  // used folder. Everything is read via getState() so a background store
+  // write (settings prune, profile edit) landing while the dialog is open
+  // can never wipe what the user already typed.
   useEffect(() => {
     if (!open_) return;
+    openGen.current++;
+    const s = useSwarm.getState();
+    const pre = s.newAgentPrefill;
+    const ws = s.workspaces[s.activeWorkspaceId];
     setName("");
     const profile =
-      (prefill?.profileId &&
-        profiles.find((p) => p.id === prefill.profileId)) ||
-      profiles[0];
+      (pre?.profileId && s.profiles.find((p) => p.id === pre.profileId)) ||
+      s.profiles[0];
     setProfileId(profile?.id);
     // the configured default command beats the preselected profile's startup —
     // picking a profile by hand still overwrites the field (see onProfile)
     setStartup(
-      prefill?.startup ??
-        settings.defaultStartup ??
+      pre?.startup ??
+        s.settings.defaultStartup ??
         profile?.startup ??
         DEFAULT_STARTUP,
     );
     // workspace context wins over the generic profile/last-used fallbacks
     setCwd(
-      prefill?.cwd ??
-        workspace?.defaultCwd ??
-        profile?.defaultCwd ??
-        settings.lastCwd,
+      pre?.cwd ?? ws?.defaultCwd ?? profile?.defaultCwd ?? s.settings.lastCwd,
     );
-  }, [open_, prefill, profiles, settings, workspace]);
+    // splitting a worktree pane preselects the toggle (fresh branch below)
+    setWorktree(!!pre?.worktree);
+    setBranch("");
+    branchEdited.current = false;
+    setCopyEnv(true);
+    setCreating(false);
+    setError(null);
+  }, [open_]);
+
+  // is the chosen folder a git repo? (gates the worktree section; the repo
+  // root's folder name also prefixes the generated branch names)
+  useEffect(() => {
+    if (!open_ || !IS_TAURI) return;
+    if (!cwd) {
+      setRepoName(null);
+      return;
+    }
+    let stale = false;
+    setRepoName(undefined);
+    fetchGitInfo(cwd, settings.gitPath?.trim() || undefined)
+      .then((info) => {
+        if (!stale) setRepoName(info?.repo ?? null);
+      })
+      .catch(() => {
+        if (!stale) setRepoName(null);
+      });
+    return () => {
+      stale = true;
+    };
+  }, [open_, cwd, settings.gitPath]);
+
+  // a fresh random branch whenever the toggle goes on / the repo changes —
+  // unless the user already typed their own name
+  useEffect(() => {
+    if (!open_ || !worktree || !repoName || branchEdited.current) return;
+    setBranch(generateBranchName(repoName));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open_, worktree, repoName]);
 
   const pickFolder = async () => {
     const selected = await pickDirectory();
@@ -75,8 +130,67 @@ export function NewAgentDialog() {
     }
   };
 
+  const reroll = () => {
+    if (!repoName) return;
+    branchEdited.current = false;
+    setBranch(generateBranchName(repoName));
+  };
+
   const submit = () => {
-    createAgent({ name, cwd, startup, profileId }, prefill?.direction ?? "row");
+    if (creating) return;
+    // repo check still in flight: a submit now would silently downgrade the
+    // requested worktree to a plain pane on the main checkout — wait
+    if (worktree && repoName === undefined && cwd) return;
+    if (!worktree || !repoName || !cwd) {
+      createAgent({ name, cwd, startup, profileId }, prefill?.direction ?? "row");
+      return;
+    }
+    // worktree flow: create it first, then spawn the agent inside it
+    setCreating(true);
+    setError(null);
+    const gitBin = settings.gitPath?.trim() || undefined;
+    const gen = openGen.current;
+    void (async () => {
+      // "still this dialog session": open, and not closed + reopened while
+      // the worktree was being created (a fresh session must not receive a
+      // stale agent with the old inputs)
+      const sameSession = () =>
+        useSwarm.getState().newAgentOpen && openGen.current === gen;
+      try {
+        const info = await addWorktree({
+          cwd,
+          branch: branch.trim(),
+          copyEnv,
+          gitBin,
+        });
+        // the user may have cancelled while the worktree was being created —
+        // don't spawn a pane they no longer want, clean the worktree up again
+        if (!sameSession()) {
+          void removeWorktree({
+            root: info.root,
+            path: info.path,
+            branch: info.branch,
+            gitBin,
+          }).catch(() => {});
+          return;
+        }
+        createAgent(
+          {
+            name,
+            cwd: info.path,
+            startup,
+            profileId,
+            worktree: { root: info.root, branch: info.branch },
+          },
+          prefill?.direction ?? "row",
+        );
+      } catch (e) {
+        if (sameSession()) {
+          setError(String(e));
+          setCreating(false);
+        }
+      }
+    })();
   };
 
   const title =
@@ -164,6 +278,75 @@ export function NewAgentDialog() {
             </div>
           </div>
 
+          {/* worktree section — only when the folder is inside a git repo */}
+          {IS_TAURI && !!repoName && (
+            <div className="rounded-md border border-border bg-secondary/40 px-3 py-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex items-center gap-2 text-sm text-foreground">
+                  <FolderGit2 size={14} className="shrink-0 text-muted-foreground" />
+                  Work in a git worktree
+                </span>
+                <Switch
+                  checked={worktree}
+                  onCheckedChange={setWorktree}
+                  label="Work in a git worktree"
+                />
+              </div>
+              <p className="mt-1 text-[11px] text-faint">
+                Own branch + folder under{" "}
+                <code className="font-mono text-muted-foreground">
+                  {repoName}/.worktrees/
+                </code>{" "}
+                — several agents can change the same repo in parallel.
+              </p>
+
+              {worktree && (
+                <div className="mt-3 space-y-3">
+                  <div>
+                    <Label>Branch</Label>
+                    <div className="flex items-center gap-1.5">
+                      <Input
+                        value={branch}
+                        onChange={(e) => {
+                          branchEdited.current = true;
+                          setBranch(e.target.value);
+                        }}
+                        className="font-mono text-xs"
+                        placeholder="branch name"
+                        onKeyDown={(e) => e.key === "Enter" && submit()}
+                      />
+                      <Tip label="New random name">
+                        <button
+                          onClick={reroll}
+                          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border text-faint transition-colors hover:border-input hover:text-foreground"
+                        >
+                          <Dices size={14} />
+                        </button>
+                      </Tip>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <span className="text-sm text-foreground">
+                        Copy environment
+                      </span>
+                      <p className="text-[11px] text-faint">
+                        Brings untracked files (.env, local configs, …) along.
+                        Caches like node_modules are skipped.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={copyEnv}
+                      onCheckedChange={setCopyEnv}
+                      label="Copy environment"
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           <div>
             <Label>Startup command</Label>
             <Input
@@ -179,13 +362,29 @@ export function NewAgentDialog() {
               binary.
             </p>
           </div>
+
+          {error && (
+            <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-[11px] text-destructive">
+              {error}
+            </p>
+          )}
         </div>
 
         <div className="mt-5 flex justify-end gap-2">
           <Button variant="ghost" onClick={() => setOpen(false)}>
             Cancel
           </Button>
-          <Button onClick={submit}>Launch agent</Button>
+          <Button
+            onClick={submit}
+            disabled={
+              creating ||
+              // repo check in flight with the toggle on — see submit()
+              (worktree && repoName === undefined && !!cwd) ||
+              (worktree && !!repoName && !branch.trim())
+            }
+          >
+            {creating ? "Creating worktree…" : "Launch agent"}
+          </Button>
         </div>
       </DialogContent>
     </Dialog>

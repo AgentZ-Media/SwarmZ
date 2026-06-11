@@ -238,7 +238,18 @@ function create(id: string, container: HTMLElement, opts: TermSpawnOpts): HostEn
     startup: opts.startup,
     cols: term.cols,
     rows: term.rows,
-  }).then(() => entry.handlers.onStatus?.("running"));
+  })
+    .then(() => entry.handlers.onStatus?.("running"))
+    .catch((e) => {
+      // spawn can fail for real (cwd deleted — e.g. a restored pane whose
+      // folder is gone, or a removed worktree). Without this the pane would
+      // sit on "starting" forever with a black terminal.
+      term.write(
+        `\r\n\x1b[31m[ failed to start: ${String(e)} ]\x1b[0m\r\n` +
+          `\x1b[2mClose this pane and open a new one.\x1b[0m\r\n`,
+      );
+      entry.handlers.onStatus?.("exited");
+    });
 
   return entry;
 }

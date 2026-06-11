@@ -48,6 +48,19 @@ let stopping = false;
 let heldByHotkey = false;
 /** pending plain-⌘ arm delay (see ARM_DELAY_MS) */
 let armTimer: ReturnType<typeof setTimeout> | null = null;
+/** generation of the current push-to-talk hold — bumped on every release/
+ * cancel, so a startDictation still awaiting getUserMedia can detect that ⌘
+ * was let go in the meantime and must not start recording (the mic would
+ * stay hot for up to 5 minutes otherwise) */
+let holdGen = 0;
+/** in-flight 50s segment rotation — stopDictation awaits it so the rotating
+ * segment can't be pushed into an already-discarded array */
+let rotating: Promise<void> | null = null;
+/** generation of the running transcription — bumped by cancelTranscription
+ * (and by every new transcription), so an abandoned loop's awaits can detect
+ * they're stale at every bail point. A plain boolean would be un-cancelled
+ * by the next dictation and paste the discarded transcript after all. */
+let transcribeGen = 0;
 
 /** Live analyser of the running recording — the waveform pill reads it per frame. */
 export function getDictationAnalyser(): AnalyserNode | null {
@@ -61,15 +74,17 @@ export function getDictationAnalyser(): AnalyserNode | null {
  */
 export function armHoldDictation(getTarget: () => string | null): void {
   if (armTimer || useSwarm.getState().dictation || !dictationReady()) return;
+  const gen = holdGen;
   armTimer = setTimeout(() => {
     armTimer = null;
     const target = getTarget();
-    if (target) void startDictation(target, { viaHotkey: true });
+    if (target) void startDictation(target, { viaHotkey: true, holdGen: gen });
   }, ARM_DELAY_MS);
 }
 
 /** A second key while armed/recording = a shortcut, not speech — abort silently. */
 export function cancelHoldDictation(): void {
+  holdGen++;
   if (armTimer) {
     clearTimeout(armTimer);
     armTimer = null;
@@ -79,6 +94,7 @@ export function cancelHoldDictation(): void {
 
 /** ⌘ released (or the window blurred): transcribe what was held down. */
 export function finishHoldDictation(): void {
+  holdGen++;
   if (armTimer) {
     clearTimeout(armTimer);
     armTimer = null;
@@ -241,7 +257,7 @@ function deliver(targetId: string, text: string, submit: boolean) {
 
 export async function startDictation(
   targetId: string,
-  opts?: { viaHotkey?: boolean },
+  opts?: { viaHotkey?: boolean; holdGen?: number },
 ): Promise<void> {
   const s = useSwarm.getState();
   if (s.dictation || !dictationReady()) return;
@@ -259,6 +275,13 @@ export async function startDictation(
     mic.getTracks().forEach((t) => t.stop());
     return;
   }
+  // push-to-talk: ⌘ may have been released while getUserMedia resolved
+  // (slow permission prompt) — starting now would leave the mic hot with
+  // nothing left to stop it
+  if (opts?.viaHotkey && opts.holdGen !== holdGen) {
+    mic.getTracks().forEach((t) => t.stop());
+    return;
+  }
   stream = mic;
   stopping = false;
   heldByHotkey = !!opts?.viaHotkey;
@@ -269,7 +292,11 @@ export async function startDictation(
   analyser.fftSize = 512;
   audioCtx.createMediaStreamSource(stream).connect(analyser);
   startRecorder();
-  rotateTimer = setInterval(() => void rotateSegment(), SEGMENT_MS);
+  rotateTimer = setInterval(() => {
+    rotating = rotateSegment().finally(() => {
+      rotating = null;
+    });
+  }, SEGMENT_MS);
   capTimer = setTimeout(() => void stopDictation(), MAX_MS);
   useSwarm
     .getState()
@@ -280,6 +307,9 @@ export async function stopDictation(cancel = false): Promise<void> {
   const d = useSwarm.getState().dictation;
   if (!d || d.phase !== "recording" || stopping) return;
   stopping = true;
+  // a segment rotation may be mid-flight at the 50s boundary — wait for it,
+  // or its segment would be pushed into the discarded array below
+  if (rotating) await rotating.catch(() => {});
   const last = await finishRecorder();
   if (last) segments.push(last);
   teardownAudio();
@@ -293,6 +323,7 @@ export async function stopDictation(cancel = false): Promise<void> {
     return;
   }
   useSwarm.getState().setDictation({ ...d, phase: "transcribing" });
+  const gen = ++transcribeGen;
   try {
     const state = useSwarm.getState();
     const settings = state.settings;
@@ -301,6 +332,9 @@ export async function stopDictation(cancel = false): Promise<void> {
     const sttModel = settings.dictationSttModel?.trim() || DEFAULT_STT_MODEL;
     const texts: string[] = [];
     for (const seg of segs) {
+      // a long dictation transcribes minutes of segments sequentially —
+      // the user can bail out instead of being locked out of the mic
+      if (gen !== transcribeGen) return;
       const r = local
         ? await transcribeAudioLocal(await blobToPcm16k(seg))
         : await transcribeAudio(await blobToBase64(seg), fmt, sttModel);
@@ -325,14 +359,24 @@ export async function stopDictation(cancel = false): Promise<void> {
         console.warn("dictation cleanup failed, pasting raw transcript:", e);
       }
     }
+    if (gen !== transcribeGen) return;
     if (text) deliver(d.targetId, text, !!settings.dictationAutoSubmit);
     useSwarm.getState().setDictation(null);
   } catch (e) {
-    fail(d.targetId, d.startedAt, String(e));
+    if (gen === transcribeGen) fail(d.targetId, d.startedAt, String(e));
   }
 }
 
-/** Mic-button click: start for this pane, or stop the recording it owns. */
+/** Abandon an in-flight transcription — the transcript is discarded. */
+export function cancelTranscription(): void {
+  const d = useSwarm.getState().dictation;
+  if (d?.phase !== "transcribing") return;
+  transcribeGen++;
+  useSwarm.getState().setDictation(null);
+}
+
+/** Mic-button click: start for this pane, stop the recording it owns, or
+ * cancel a transcription that's taking too long. */
 export function toggleDictation(targetId: string): void {
   const s = useSwarm.getState();
   const d = s.dictation;
@@ -344,5 +388,7 @@ export function toggleDictation(targetId: string): void {
     void startDictation(targetId);
   } else if (d.phase === "recording" && d.targetId === targetId) {
     void stopDictation();
+  } else if (d.phase === "transcribing" && d.targetId === targetId) {
+    cancelTranscription();
   }
 }

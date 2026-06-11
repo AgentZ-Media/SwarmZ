@@ -33,6 +33,11 @@ import {
 } from "@/store";
 import { useUpdates } from "@/lib/updates";
 import { IS_TAURI, openUrl, pickDirectory } from "@/lib/transport";
+import { invoke } from "@tauri-apps/api/core";
+
+// native-only direct invoke (like lib/openrouter.ts) — validates the binary
+// path overrides below
+const pathIsFile = (path: string) => invoke<boolean>("path_is_file", { path });
 import {
   DEFAULT_CLEANUP_MODEL,
   DEFAULT_CLEANUP_PROMPT,
@@ -398,6 +403,11 @@ function PresetEditor({
         <Input
           value={preset.name}
           onChange={(e) => onChange({ ...preset, name: e.target.value })}
+          onBlur={(e) => {
+            // a preset must keep an identifiable name — empty would leave a
+            // blank card on the empty-workspace screen
+            if (!e.target.value.trim()) onChange({ ...preset, name: "Preset" });
+          }}
           className="h-8 max-w-48 text-xs"
         />
         <span className="ml-auto shrink-0 font-mono text-[10px] text-faint">
@@ -1286,6 +1296,67 @@ function UpdatesSection() {
 
 // ---- Paths ----
 
+/**
+ * Binary-path override input: edits stay local until blur/Enter (a half-typed
+ * path must never reach the live 7s git polling), and the persisted value is
+ * stat'ed via the backend — a typo'd path silently degrades several features
+ * at once, so it gets an inline error instead.
+ */
+function BinaryPathInput({
+  value,
+  placeholder,
+  onCommit,
+}: {
+  value: string;
+  placeholder: string;
+  onCommit: (v: string | undefined) => void;
+}) {
+  const [text, setText] = useState(value);
+  const [status, setStatus] = useState<"ok" | "missing" | null>(null);
+  // re-sync when the persisted value changes from elsewhere
+  useEffect(() => setText(value), [value]);
+  useEffect(() => {
+    const v = value.trim();
+    if (!v || !IS_TAURI) {
+      setStatus(null);
+      return;
+    }
+    let stale = false;
+    void pathIsFile(v)
+      .then((ok) => {
+        if (!stale) setStatus(ok ? "ok" : "missing");
+      })
+      .catch(() => {
+        if (!stale) setStatus(null);
+      });
+    return () => {
+      stale = true;
+    };
+  }, [value]);
+  const commit = () => onCommit(text.trim() || undefined);
+  return (
+    <div>
+      <Input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => e.key === "Enter" && commit()}
+        className="font-mono text-xs"
+        placeholder={placeholder}
+        spellCheck={false}
+      />
+      {status === "missing" && (
+        <p className="mt-1 text-[11px] text-destructive">
+          No file at this path — fix it or clear the field.
+        </p>
+      )}
+      {status === "ok" && (
+        <p className="mt-1 text-[11px] text-success">Found.</p>
+      )}
+    </div>
+  );
+}
+
 function PathsSection() {
   const settings = useSwarm((s) => s.settings);
   const updateSettings = useSwarm((s) => s.updateSettings);
@@ -1309,14 +1380,10 @@ function PathsSection() {
           </>
         }
       >
-        <Input
+        <BinaryPathInput
           value={settings.claudePath ?? ""}
-          onChange={(e) =>
-            updateSettings({ claudePath: e.target.value || undefined })
-          }
-          className="font-mono text-xs"
           placeholder="claude — resolved by your login shell"
-          spellCheck={false}
+          onCommit={(v) => updateSettings({ claudePath: v })}
         />
       </StackedRow>
 
@@ -1324,14 +1391,10 @@ function PathsSection() {
         label="Git binary"
         help="Used for the read-only git status in pane headers (branch, ±lines, untracked)."
       >
-        <Input
+        <BinaryPathInput
           value={settings.gitPath ?? ""}
-          onChange={(e) =>
-            updateSettings({ gitPath: e.target.value || undefined })
-          }
-          className="font-mono text-xs"
           placeholder="/usr/bin/git"
-          spellCheck={false}
+          onCommit={(v) => updateSettings({ gitPath: v })}
         />
       </StackedRow>
     </>

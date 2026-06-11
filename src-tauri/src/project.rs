@@ -27,6 +27,18 @@ fn is_simple_target(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// package.json script names are arbitrary JSON keys. The detected command
+/// is written into the shell verbatim on a button click, so a name with an
+/// embedded newline (`"dev\nrm -rf ~"`) would render as a harmless-looking
+/// button whose click runs a hidden second line. Allow the characters real
+/// script names use; everything else is dropped.
+fn is_safe_script_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.' | '@' | '/')
+        })
+}
+
 pub fn detect(cwd: &str) -> Vec<DetectedCommand> {
     let dir = Path::new(cwd);
     let mut out: Vec<DetectedCommand> = Vec::new();
@@ -44,7 +56,11 @@ pub fn detect(cwd: &str) -> Vec<DetectedCommand> {
                 "npm"
             };
             if let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object()) {
-                for (name, _) in scripts.iter().take(MAX_PER_SOURCE) {
+                for (name, _) in scripts
+                    .iter()
+                    .filter(|(name, _)| is_safe_script_name(name))
+                    .take(MAX_PER_SOURCE)
+                {
                     let command = if pm == "yarn" {
                         format!("yarn {}", name)
                     } else {

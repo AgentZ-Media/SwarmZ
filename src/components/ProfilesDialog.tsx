@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { FolderOpen, Plus, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { FolderOpen, Plus, Trash2, X } from "lucide-react";
 import { pickDirectory } from "@/lib/transport";
 import {
   Dialog,
@@ -11,7 +11,7 @@ import {
 import { Button } from "./ui/button";
 import { Input, Label } from "./ui/input";
 import { useSwarm } from "@/store";
-import { AGENT_COLORS, shortPath } from "@/lib/utils";
+import { AGENT_COLORS, cn, shortPath } from "@/lib/utils";
 import type { Profile } from "@/types";
 
 export function ProfilesDialog({
@@ -25,6 +25,15 @@ export function ProfilesDialog({
   const saveProfile = useSwarm((s) => s.saveProfile);
   const deleteProfile = useSwarm((s) => s.deleteProfile);
   const [editing, setEditing] = useState<Profile | null>(null);
+  // deleting needs a second click on the armed trash button; auto-disarms
+  // after a moment or on pointer-leave
+  const [armDelete, setArmDelete] = useState<string | null>(null);
+  const disarmTimer = useRef<number | undefined>(undefined);
+  const disarm = () => {
+    window.clearTimeout(disarmTimer.current);
+    setArmDelete(null);
+  };
+  useEffect(() => () => window.clearTimeout(disarmTimer.current), []);
 
   const blank = (): Profile => ({
     id: "",
@@ -66,8 +75,33 @@ export function ProfilesDialog({
                   Edit
                 </Button>
                 <button
-                  className="flex h-7 w-7 items-center justify-center rounded-md text-faint hover:bg-destructive/15 hover:text-destructive"
-                  onClick={() => deleteProfile(p.id)}
+                  className={cn(
+                    "flex h-7 w-7 items-center justify-center rounded-md transition-colors",
+                    armDelete === p.id
+                      ? "bg-destructive/15 text-destructive"
+                      : "text-faint hover:bg-destructive/15 hover:text-destructive",
+                  )}
+                  title={
+                    armDelete === p.id
+                      ? "Click again to delete"
+                      : "Delete profile"
+                  }
+                  onClick={() => {
+                    if (armDelete !== p.id) {
+                      setArmDelete(p.id);
+                      window.clearTimeout(disarmTimer.current);
+                      disarmTimer.current = window.setTimeout(
+                        () => setArmDelete(null),
+                        4000,
+                      );
+                      return;
+                    }
+                    disarm();
+                    deleteProfile(p.id);
+                  }}
+                  onPointerLeave={() => {
+                    if (armDelete === p.id) disarm();
+                  }}
                 >
                   <Trash2 size={14} />
                 </button>
@@ -104,18 +138,31 @@ export function ProfilesDialog({
             </div>
             <div>
               <Label>Default working directory (optional)</Label>
-              <button
-                onClick={async () => {
-                  const sel = await pickDirectory();
-                  if (sel) setEditing({ ...current, defaultCwd: sel });
-                }}
-                className="flex h-9 w-full items-center gap-2 rounded-md border border-border bg-secondary/60 px-3 text-sm transition-colors hover:border-input"
-              >
-                <FolderOpen size={14} className="text-faint" />
-                <span className="truncate font-mono text-xs">
-                  {current.defaultCwd ? shortPath(current.defaultCwd) : "None"}
-                </span>
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={async () => {
+                    const sel = await pickDirectory();
+                    if (sel) setEditing({ ...current, defaultCwd: sel });
+                  }}
+                  className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-secondary/60 px-3 text-sm transition-colors hover:border-input"
+                >
+                  <FolderOpen size={14} className="text-faint" />
+                  <span className="truncate font-mono text-xs">
+                    {current.defaultCwd ? shortPath(current.defaultCwd) : "None"}
+                  </span>
+                </button>
+                {current.defaultCwd && (
+                  <button
+                    onClick={() =>
+                      setEditing({ ...current, defaultCwd: undefined })
+                    }
+                    title="Clear default directory"
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border text-faint transition-colors hover:border-input hover:text-foreground"
+                  >
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
             </div>
             <div>
               <Label>Color</Label>

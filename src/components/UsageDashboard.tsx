@@ -1,8 +1,9 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { History, Trash2, X } from "lucide-react";
 import { useSwarm } from "@/store";
 import { ScrollArea, Stat } from "./ui/misc";
 import {
+  cn,
   formatTokens,
   formatUsd,
   modelAccent,
@@ -109,6 +110,25 @@ export function UsageDashboard() {
   const usageHistory = useSwarm((s) => s.usageHistory);
   const clearUsageHistory = useSwarm((s) => s.clearUsageHistory);
   const [scope, setScope] = useState<Scope>("session");
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // Escape closes the drawer; capture + stopPropagation so window-level
+  // handlers (fleet exit in WorkspaceLayer) don't react to the same press
+  useEffect(() => {
+    if (!open) return;
+    panelRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // a real dialog stacked above the drawer (Settings via the title bar)
+      // owns Escape — don't steal it and close the drawer underneath
+      if (document.querySelector('[role="dialog"]:not([aria-label="Usage"])'))
+        return;
+      e.stopPropagation();
+      setOpen(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, setOpen]);
 
   // "session": ONLY what was produced inside SwarmZ since this app start —
   // the sum of each open agent's own session usage.
@@ -148,7 +168,13 @@ export function UsageDashboard() {
         className="fixed inset-0 z-30 bg-black/40"
         onClick={() => setOpen(false)}
       />
-      <div className="animate-slide-in-right fixed right-0 top-0 z-40 flex h-full w-[420px] flex-col border-l border-border bg-background shadow-[-24px_0_48px_-24px_rgba(0,0,0,0.6)]">
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-label="Usage"
+        tabIndex={-1}
+        className="animate-slide-in-right fixed right-0 top-0 z-40 flex h-full w-[420px] flex-col border-l border-border bg-background shadow-[-24px_0_48px_-24px_rgba(0,0,0,0.6)] outline-none"
+      >
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
           <div>
             <h2 className="text-sm font-semibold tracking-tight">Usage</h2>
@@ -336,6 +362,15 @@ function HistoryList({
   onClear: () => void;
 }) {
   const recent = entries.slice(0, 30);
+  // resetting needs a second click on the armed button (window.confirm is a
+  // no-op in WKWebView); auto-disarms after a moment or on pointer-leave
+  const [armed, setArmed] = useState(false);
+  const disarmTimer = useRef<number | undefined>(undefined);
+  const disarm = () => {
+    window.clearTimeout(disarmTimer.current);
+    setArmed(false);
+  };
+  useEffect(() => () => window.clearTimeout(disarmTimer.current), []);
   return (
     <div>
       <div className="mb-2 flex items-center justify-between">
@@ -345,12 +380,32 @@ function HistoryList({
         {entries.length > 0 && (
           <button
             onClick={() => {
-              if (window.confirm("Reset all-time usage statistics?")) onClear();
+              if (!armed) {
+                setArmed(true);
+                window.clearTimeout(disarmTimer.current);
+                disarmTimer.current = window.setTimeout(
+                  () => setArmed(false),
+                  4000,
+                );
+                return;
+              }
+              disarm();
+              onClear();
             }}
-            className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-faint hover:bg-accent hover:text-foreground"
-            title="Reset all-time usage statistics"
+            onPointerLeave={disarm}
+            className={cn(
+              "flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] transition-colors",
+              armed
+                ? "bg-destructive/15 text-destructive"
+                : "text-faint hover:bg-accent hover:text-foreground",
+            )}
+            title={
+              armed
+                ? "Click again to reset"
+                : "Reset all-time usage statistics"
+            }
           >
-            <Trash2 size={11} /> Reset
+            <Trash2 size={11} /> {armed ? "Reset all-time stats?" : "Reset"}
           </button>
         )}
       </div>

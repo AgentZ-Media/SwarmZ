@@ -3,8 +3,10 @@
 //! sync with the web engine's `/api/git` in `server/index.mjs`.
 
 use serde::Serialize;
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 #[derive(Serialize, Clone, Debug)]
 pub struct GitInfo {
@@ -24,7 +26,7 @@ pub struct GitInfo {
 
 /// Settings override wins; GUI apps on macOS launch with a minimal PATH,
 /// so otherwise prefer the stock path.
-fn git_bin(overridden: Option<&str>) -> &str {
+pub(crate) fn git_bin(overridden: Option<&str>) -> &str {
     match overridden.map(str::trim) {
         Some(b) if !b.is_empty() => b,
         _ if Path::new("/usr/bin/git").exists() => "/usr/bin/git",
@@ -32,13 +34,83 @@ fn git_bin(overridden: Option<&str>) -> &str {
     }
 }
 
+/// `Command::output()` with a hard deadline. A repo on a disconnected
+/// network volume / FUSE mount makes git hang indefinitely — without a
+/// timeout one such hang wedges the 7 s status poll (and the worktree
+/// scans) for the rest of the app's lifetime.
+pub(crate) fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<Output> {
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    // drain the pipes on threads into shared buffers — a chatty child would
+    // otherwise deadlock against a full pipe while we only poll try_wait,
+    // and shared buffers let us return whatever arrived without joining
+    // (a grandchild inheriting the pipe — hooks, daemons — would keep it
+    // open past the child's own exit and block a join forever)
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Arc<Mutex<Vec<u8>>> {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        if let Some(mut p) = pipe {
+            let b = Arc::clone(&buf);
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match p.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => b.lock().extend_from_slice(&chunk[..n]),
+                    }
+                }
+            });
+        }
+        buf
+    }
+    let out_buf = drain(child.stdout.take());
+    let err_buf = drain(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            // grace period for the readers to hit EOF (strong_count == 1
+            // means the drain thread finished and dropped its clone)
+            let grace = Instant::now() + Duration::from_secs(2);
+            while (Arc::strong_count(&out_buf) > 1 || Arc::strong_count(&err_buf) > 1)
+                && Instant::now() < grace
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let stdout = std::mem::take(&mut *out_buf.lock());
+            let stderr = std::mem::take(&mut *err_buf.lock());
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "git timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Deadline for the quick read-only status queries below.
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn git(bin: &str, cwd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(bin)
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = output_with_timeout(
+        Command::new(bin).arg("-C").arg(cwd).args(args),
+        GIT_TIMEOUT,
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }

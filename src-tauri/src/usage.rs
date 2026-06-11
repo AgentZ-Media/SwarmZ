@@ -62,7 +62,9 @@ fn normalize_model_id(id: &str) -> String {
         s = stripped.to_string();
     }
     // date-suffixed snapshot ids, e.g. `claude-haiku-4-5-20251001`
-    if s.len() > 9 {
+    // (boundary check: the id comes from arbitrary jsonl content — a
+    // multi-byte char at the split point must not panic the parser)
+    if s.len() > 9 && s.is_char_boundary(s.len() - 9) {
         let (head, tail) = s.split_at(s.len() - 9);
         if tail.starts_with('-') && tail[1..].chars().all(|c| c.is_ascii_digit()) {
             return head.to_string();
@@ -514,6 +516,10 @@ pub fn usage_totals() -> UsageTotals {
         _ => return totals,
     };
 
+    // every jsonl seen this walk — used below to evict cache entries of
+    // deleted/rotated files (the cache would otherwise grow forever)
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
     for entry in WalkDir::new(&root)
         .into_iter()
         .filter_map(Result::ok)
@@ -523,6 +529,7 @@ pub fn usage_totals() -> UsageTotals {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
+        seen.insert(path.to_path_buf());
         let session = parse_file(path, None);
 
         if session.message_count == 0 {
@@ -549,6 +556,9 @@ pub fn usage_totals() -> UsageTotals {
             e.cost_usd += m.cost_usd;
         }
     }
+
+    // evict parse states of files that no longer exist on disk
+    CACHE.lock().retain(|(path, _), _| seen.contains(path));
 
     let mut by_model: Vec<ModelUsage> = models.into_values().collect();
     by_model.sort_by(|a, b| {

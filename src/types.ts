@@ -109,6 +109,65 @@ export interface GitInfo {
   remote_url: string | null;
 }
 
+// ---- Git worktrees ----
+
+/**
+ * Marks an agent as living in a SwarmZ-managed git worktree (the agent's cwd
+ * IS the worktree folder under `<root>/.worktrees/`). Drives the pane badge,
+ * the split prefill and the close-time cleanup.
+ */
+export interface WorktreeMeta {
+  /** main repo root the worktree belongs to */
+  root: string;
+  branch: string;
+}
+
+/** Result of creating a worktree (`worktree_add` in Rust). */
+export interface WorktreeInfo {
+  /** main repo root the worktree belongs to */
+  root: string;
+  /** absolute path of the new worktree (the agent's cwd) */
+  path: string;
+  branch: string;
+  /** untracked/ignored files copied over by the environment transfer */
+  copied: number;
+}
+
+/** Would closing this worktree lose work? Produced by `worktree_status` (Rust). */
+export interface WorktreeStatus {
+  /** false when the folder vanished (deleted by hand) — nothing left to lose */
+  exists: boolean;
+  /** uncommitted changes in tracked files or new (non-ignored) files */
+  dirty: boolean;
+  /** commits reachable only from this branch — deleting it would lose them */
+  ahead: number;
+  branch: string | null;
+}
+
+/** One SwarmZ worktree found on disk — feeds the title-bar management panel. */
+export interface WorktreeEntry {
+  root: string;
+  /** repo root folder name, for grouping in the panel */
+  repo: string;
+  path: string;
+  branch: string;
+  dirty: boolean;
+  ahead: number;
+  /** registered with git but the folder is gone (prunable) */
+  missing: boolean;
+}
+
+/**
+ * Result of a worktree scan (`worktree_list` in Rust). `scanned` lists the
+ * repo roots whose scan actually succeeded — registry pruning must only
+ * consider those, so a root on an unmounted volume (or a broken git
+ * override) is never mistaken for "no worktrees left".
+ */
+export interface WorktreeScan {
+  entries: WorktreeEntry[];
+  scanned: string[];
+}
+
 /** Small app-wide preferences, persisted across restarts. Edited in the Settings dialog. */
 export interface AppSettings {
   /** last working directory an agent was launched in — prefilled in the New Agent dialog */
@@ -143,6 +202,12 @@ export interface AppSettings {
    * model downloaded in Settings)
    */
   dictationEngine?: "openrouter" | "local";
+  /**
+   * repo roots that ever had a SwarmZ worktree — scanned for the title-bar
+   * worktree panel (so orphans survive restarts); roots with no worktrees
+   * left are pruned again on refresh
+   */
+  worktreeRepos?: string[];
 }
 
 // ---- OpenRouter voice dictation ----
@@ -231,6 +296,8 @@ export interface PersistedAgent {
   fontSize?: number;
   /** claude session to resume when this pane is restored */
   sessionId?: string;
+  /** set when the pane lives in a SwarmZ-managed git worktree */
+  worktree?: WorktreeMeta;
 }
 
 /**
@@ -240,6 +307,9 @@ export interface PersistedAgent {
  * terminals are plain shells without a session — they are not captured.
  */
 export interface PersistedGrid {
+  /** snapshot shape version — bump when the persisted shape changes so a
+   * future reader can migrate instead of guessing (missing = 1) */
+  version?: number;
   agents: PersistedAgent[];
   /** tiling tree per workspace id — pane nodes reference agent ids above */
   layouts: Record<string, LayoutNode | null>;
@@ -329,6 +399,8 @@ export interface Agent {
   fontSize?: number;
   /** live git snapshot of the cwd; null = checked and not inside a repo */
   git?: GitInfo | null;
+  /** set when the pane lives in a SwarmZ-managed git worktree (cwd = worktree path) */
+  worktree?: WorktreeMeta;
 }
 
 // ---- Floating terminals & quick commands ----

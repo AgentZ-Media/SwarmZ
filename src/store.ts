@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { nanoid } from "nanoid";
 import {
+  IS_TAURI,
   loadCommandPresets,
   loadCustomCommands,
   loadGrid,
@@ -41,7 +42,11 @@ import type {
   UsageHistoryEntry,
   Workspace,
   WorkspacePreset,
+  WorktreeEntry,
+  WorktreeMeta,
+  WorktreeStatus,
 } from "@/types";
+import { listWorktrees, removeWorktree, worktreeStatus } from "@/lib/worktree";
 import {
   collectPanes,
   findPaneByAgent,
@@ -118,6 +123,7 @@ function schedulePersistWorkspaces() {
 function snapshotGrid(): PersistedGrid {
   const s = useSwarm.getState();
   return {
+    version: 1,
     agents: s.order
       .map((id) => s.agents[id])
       .filter((a): a is Agent => !!a)
@@ -132,6 +138,7 @@ function snapshotGrid(): PersistedGrid {
         profileId: a.profileId,
         fontSize: a.fontSize,
         sessionId: a.sessionId,
+        worktree: a.worktree,
       })),
     layouts: s.layouts,
     activePaneIds: s.activePaneIds,
@@ -147,14 +154,42 @@ function schedulePersistGrid() {
   }, 500);
 }
 
-/** Write the grid snapshot NOW — quit must not lose the debounce window. */
-export async function flushPersistGrid(): Promise<void> {
+/**
+ * Write every debounced slice NOW — quit must not lose any debounce window.
+ * The grid alone isn't enough: a tab renamed (or a workspace created) right
+ * before ⌘Q would otherwise leave a grid snapshot referencing a workspace
+ * that never made it into the `workspaces` key, and the restore would
+ * silently drop those panes.
+ */
+export async function flushAllPersists(): Promise<void> {
   if (persistGridTimer) {
     clearTimeout(persistGridTimer);
     persistGridTimer = null;
   }
+  if (persistWorkspacesTimer) {
+    clearTimeout(persistWorkspacesTimer);
+    persistWorkspacesTimer = null;
+  }
+  if (persistHistoryTimer) {
+    clearTimeout(persistHistoryTimer);
+    persistHistoryTimer = null;
+  }
+  const s = useSwarm.getState();
   try {
-    await saveGrid(snapshotGrid());
+    await Promise.all([
+      saveGrid(snapshotGrid()),
+      saveWorkspaces({
+        workspaces: s.workspaceOrder
+          .map((id) => s.workspaces[id])
+          .filter((w): w is Workspace => !!w),
+        activeId: s.activeWorkspaceId,
+      }),
+      saveUsageHistory(
+        Object.values(s.usageHistory)
+          .sort((a, b) => b.last_updated - a.last_updated)
+          .slice(0, MAX_HISTORY_ENTRIES),
+      ),
+    ]);
   } catch {
     /* never block quitting on a failed write */
   }
@@ -166,6 +201,8 @@ interface CreateAgentOpts {
   startup?: string;
   profileId?: string;
   color?: string;
+  /** the pane lives in this SwarmZ-managed worktree (cwd = worktree path) */
+  worktree?: WorktreeMeta;
 }
 
 /** Values the New Agent dialog opens with (e.g. inherited from the pane being split). */
@@ -175,7 +212,26 @@ export interface NewAgentPrefill {
   startup?: string;
   /** set when the dialog was opened via a split button — the new pane splits in this direction */
   direction?: "row" | "column";
+  /** preselect the worktree toggle (split from a worktree pane) */
+  worktree?: boolean;
 }
+
+/**
+ * Worktrees scheduled for deletion once their pane actually closes — decided
+ * in requestRemoveAgent (clean) or the CloseWorktreeDialog (user picked
+ * delete), executed in removeAgent. Module-level so a cancel anywhere in the
+ * close flow (e.g. the floating-terminal dialog) can drop the entry again.
+ */
+const pendingWorktreeCleanup = new Map<
+  string,
+  WorktreeMeta & {
+    path: string;
+    /** true = the user explicitly chose "delete" in the dialog; false = a
+     * silent clean-at-decision-time verdict, which removeAgent re-checks
+     * right before executing (the decision may be minutes old by then) */
+    confirmed: boolean;
+  }
+>();
 
 interface SwarmState {
   agents: Record<string, Agent>;
@@ -240,6 +296,12 @@ interface SwarmState {
   openrouterStatus: OpenrouterKeyStatus | null;
   /** local speech model state — null until the first check; gates dictation UI when engine = "local" (in-memory) */
   localSttStatus: LocalSttStatus | null;
+  /** SwarmZ worktrees on disk (title-bar panel + icon visibility) — refreshed on demand (in-memory) */
+  worktrees: WorktreeEntry[];
+  /** pane close waiting on a keep-vs-delete decision for its worktree */
+  closeWorktreeConfirm: { agentId: string; status: WorktreeStatus } | null;
+  /** pane close waiting on confirmation because claude is still working in it */
+  closeBusyConfirm: string | null;
 
   // derived helpers
   activeAgentId: () => string | null;
@@ -281,8 +343,20 @@ interface SwarmState {
   requestRemoveAgent: (agentId: string) => void;
   /** resolve the pending close-confirm: kill the terminals, detach them, or cancel */
   resolveCloseConfirm: (choice: "kill" | "detach" | "cancel") => void;
+  /** resolve the busy-pane close warning (true = close anyway) */
+  resolveCloseBusy: (close: boolean) => void;
   /** open/close the quit warning (busy agent ids; null = dismissed) */
   setQuitConfirm: (agentIds: string[] | null) => void;
+
+  // git worktrees
+  /** resolve the keep-vs-delete decision of a closing worktree pane */
+  resolveCloseWorktree: (choice: "keep" | "delete" | "cancel") => void;
+  /** rescan all known repos for SwarmZ worktrees (panel + icon visibility) */
+  refreshWorktrees: () => Promise<void>;
+  /** remember a repo root for the worktree scan (persisted in settings) */
+  registerWorktreeRepo: (root: string) => void;
+  /** delete a worktree from the management panel (folder + branch) */
+  deleteWorktree: (entry: WorktreeEntry) => Promise<void>;
 
   // floating terminals
   createFloatingTerminal: (agentId: string) => void;
@@ -413,6 +487,9 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   dictation: null,
   openrouterStatus: null,
   localSttStatus: null,
+  worktrees: [],
+  closeWorktreeConfirm: null,
+  closeBusyConfirm: null,
 
   activeAgentId: () => {
     const { layouts, activePaneIds, activeWorkspaceId } = get();
@@ -644,9 +721,30 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       if (
         state.settings.restoreAgents === true &&
         state.order.length === 0 && // nothing spawned before hydrate resolved
-        grid?.agents.length
+        grid?.agents?.length
       ) {
-        const saved = new Map(grid.agents.map((a) => [a.id, a]));
+        // field-level hardening: one malformed entry (older build, partial
+        // corruption) must only cost that entry, never the whole restore —
+        // entries without a usable id/workspaceId are skipped, everything
+        // else gets a safe default
+        const saved = new Map(
+          grid.agents
+            .filter(
+              (a) =>
+                a &&
+                typeof a.id === "string" &&
+                typeof a.workspaceId === "string",
+            )
+            .map((a) => [
+              a.id,
+              {
+                ...a,
+                name: typeof a.name === "string" ? a.name : "Agent",
+                startup: typeof a.startup === "string" ? a.startup : "",
+                color: typeof a.color === "string" ? a.color : pickColor(0),
+              },
+            ]),
+        );
         const agents: Record<string, Agent> = {};
         const order: string[] = [];
         const layouts = { ...state.layouts };
@@ -655,37 +753,47 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         // make it back are pruned, agents in no pane are dropped, so even a
         // torn snapshot restores to something consistent
         for (const wsId of state.workspaceOrder) {
-          let layout = grid.layouts[wsId] ?? null;
-          for (const pane of collectPanes(layout)) {
-            const p = saved.get(pane.agentId);
-            if (!p || p.workspaceId !== wsId || agents[p.id]) {
-              layout = removePaneByAgent(layout, pane.agentId);
-              continue;
+          // per-workspace guard: a corrupt tree skips this workspace only
+          try {
+            let layout = grid.layouts?.[wsId] ?? null;
+            for (const pane of collectPanes(layout)) {
+              const p = saved.get(pane.agentId);
+              if (!p || p.workspaceId !== wsId || agents[p.id]) {
+                layout = removePaneByAgent(layout, pane.agentId);
+                continue;
+              }
+              agents[p.id] = {
+                id: p.id,
+                name: p.name,
+                renamed: p.renamed,
+                workspaceId: wsId,
+                cwd: p.cwd,
+                startup: p.startup,
+                color: p.color,
+                status: "starting",
+                attention: false,
+                createdAt: Date.now(),
+                profileId: p.profileId,
+                fontSize: p.fontSize,
+                // the pane IS that session again — usage latches right back on
+                sessionId: p.sessionId,
+                resume: p.sessionId,
+                worktree: p.worktree,
+              };
+              order.push(p.id);
             }
-            agents[p.id] = {
-              id: p.id,
-              name: p.name,
-              renamed: p.renamed,
-              workspaceId: wsId,
-              cwd: p.cwd,
-              startup: p.startup,
-              color: p.color,
-              status: "starting",
-              attention: false,
-              createdAt: Date.now(),
-              profileId: p.profileId,
-              fontSize: p.fontSize,
-              // the pane IS that session again — usage latches right back on
-              sessionId: p.sessionId,
-              resume: p.sessionId,
-            };
-            order.push(p.id);
+            const panes = collectPanes(layout);
+            // a tree whose panes were all pruned must become null — a
+            // zero-pane layout would otherwise swallow future createAgent
+            // calls (no target pane → invisible orphan agents)
+            layouts[wsId] = panes.length ? layout : null;
+            const active = grid.activePaneIds?.[wsId];
+            activePaneIds[wsId] =
+              panes.find((pn) => pn.id === active)?.id ?? panes[0]?.id ?? null;
+          } catch {
+            layouts[wsId] = null;
+            activePaneIds[wsId] = null;
           }
-          layouts[wsId] = layout;
-          const panes = collectPanes(layout);
-          const active = grid.activePaneIds?.[wsId];
-          activePaneIds[wsId] =
-            panes.find((pn) => pn.id === active)?.id ?? panes[0]?.id ?? null;
         }
         if (order.length) {
           // keep default names unique after the restore ("Agent 3" twice)
@@ -750,6 +858,9 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     } catch {
       /* ignore */
     }
+    // initial worktree scan — restores the title-bar panel/icon (also for
+    // orphans whose pane never came back)
+    void get().refreshWorktrees();
     try {
       const saved = await loadProfiles();
       if (saved && saved.length) {
@@ -808,7 +919,11 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       attention: false,
       createdAt: Date.now(),
       profileId: opts.profileId,
+      worktree: opts.worktree,
     };
+    // for tab naming / default cwd / last-used folder, a worktree pane
+    // counts as its main repo — never the .worktrees/<slug> path
+    const projectCwd = agent.worktree?.root ?? agent.cwd;
 
     let layout = state.layouts[wsId] ?? null;
     let activePaneId = state.activePaneIds[wsId] ?? null;
@@ -832,13 +947,13 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     // (until the user renames the workspace / a defaultCwd exists)
     let workspaces = state.workspaces;
     const ws = state.workspaces[wsId];
-    if (ws && agent.cwd && !ws.defaultCwd) {
+    if (ws && projectCwd && !ws.defaultCwd) {
       workspaces = {
         ...workspaces,
         [wsId]: {
           ...ws,
-          defaultCwd: agent.cwd,
-          ...(ws.renamed ? {} : { name: folderName(agent.cwd) }),
+          defaultCwd: projectCwd,
+          ...(ws.renamed ? {} : { name: folderName(projectCwd) }),
         },
       };
     }
@@ -858,7 +973,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     });
     if (workspaces !== state.workspaces) schedulePersistWorkspaces();
     schedulePersistGrid();
-    if (agent.cwd) get().updateSettings({ lastCwd: agent.cwd });
+    if (projectCwd) get().updateSettings({ lastCwd: projectCwd });
+    if (agent.worktree) get().registerWorktreeRepo(agent.worktree.root);
     return id;
   },
 
@@ -866,8 +982,37 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const state = get();
     const agent = state.agents[agentId];
     if (!agent) return;
-    // panes only detach on unmount — the terminal + PTY die here
+    // a worktree marked for cleanup dies with its pane (folder + branch)
+    const cleanup = pendingWorktreeCleanup.get(agentId);
+    pendingWorktreeCleanup.delete(agentId);
+    // panes only detach on unmount — the terminal + PTY die here (before the
+    // cleanup below, so nothing can write into the worktree anymore)
     destroyTerm(agentId);
+    if (cleanup) {
+      const gitBin = state.settings.gitPath?.trim() || undefined;
+      void (async () => {
+        try {
+          if (!cleanup.confirmed) {
+            // the silent "clean" verdict may be minutes old — confirm
+            // dialogs can sit open while claude keeps writing. Re-check,
+            // and on doubt keep the worktree (it shows up as unattached
+            // in the panel instead of being force-deleted)
+            const st = await worktreeStatus(cleanup.path, gitBin);
+            if (st.exists && (st.dirty || st.ahead > 0)) return;
+          }
+          await removeWorktree({
+            root: cleanup.root,
+            path: cleanup.path,
+            branch: cleanup.branch,
+            gitBin,
+          });
+        } catch {
+          /* can't tell / removal failed — keep the worktree */
+        } finally {
+          void get().refreshWorktrees();
+        }
+      })();
+    }
     const wsId = agent.workspaceId;
     const layout = removePaneByAgent(state.layouts[wsId] ?? null, agentId);
     const { [agentId]: _removed, ...rest } = state.agents;
@@ -884,43 +1029,142 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       activePaneIds: { ...state.activePaneIds, [wsId]: activePaneId },
       focusedAgentId:
         state.focusedAgentId === agentId ? null : state.focusedAgentId,
+      // confirm dialogs must not outlive their target — their buttons would
+      // resolve against a dead id and silently no-op
+      closeConfirm:
+        state.closeConfirm?.agentId === agentId ? null : state.closeConfirm,
+      closeWorktreeConfirm:
+        state.closeWorktreeConfirm?.agentId === agentId
+          ? null
+          : state.closeWorktreeConfirm,
+      closeBusyConfirm:
+        state.closeBusyConfirm === agentId ? null : state.closeBusyConfirm,
     });
     schedulePersistGrid();
   },
 
   requestRemoveAgent: (agentId) => {
     const state = get();
-    const termIds = state.floatingOrder.filter(
-      (tid) => state.floatingTerminals[tid]?.agentId === agentId,
-    );
-    if (termIds.length === 0) {
-      get().removeAgent(agentId);
+    const agent = state.agents[agentId];
+    if (!agent) return;
+    // a misclick on ✕/⌘W must not interrupt a running claude job — ask
+    // first (the quit guard exists for exactly the same reason)
+    if (agent.activity === "busy" && agent.status !== "exited") {
+      set({ closeBusyConfirm: agentId });
       return;
     }
-    void (async () => {
-      // a floating terminal blocks the close only while something actually
-      // runs in it — exited/idle shells are closed along with the pane
-      const busy: string[] = [];
-      await Promise.all(
-        termIds.map(async (tid) => {
-          if (get().floatingTerminals[tid]?.status === "exited") return;
-          if (await ptyHasChildren(tid)) busy.push(tid);
-        }),
+    proceedRemoveAgent(agentId);
+  },
+
+  resolveCloseBusy: (close) => {
+    const agentId = get().closeBusyConfirm;
+    set({ closeBusyConfirm: null });
+    if (!close || !agentId) return;
+    proceedRemoveAgent(agentId);
+  },
+
+  resolveCloseWorktree: (choice) => {
+    const confirm = get().closeWorktreeConfirm;
+    if (!confirm) return;
+    set({ closeWorktreeConfirm: null });
+    if (choice === "cancel") return;
+    const agent = get().agents[confirm.agentId];
+    if (!agent) return;
+    if (choice === "delete" && agent.worktree && agent.cwd) {
+      // explicit user decision — removeAgent executes it without a re-check
+      pendingWorktreeCleanup.set(confirm.agentId, {
+        ...agent.worktree,
+        path: agent.cwd,
+        confirmed: true,
+      });
+    }
+    // "keep" closes the pane and leaves the worktree on disk — it shows up
+    // as unattached in the title-bar worktree panel
+    continueRemoveAgent(confirm.agentId);
+  },
+
+  refreshWorktrees: async () => {
+    if (!IS_TAURI) return;
+    const state = get();
+    // persisted registry ∪ roots of live worktree panes (covers a fresh
+    // worktree whose settings write hasn't landed yet)
+    const roots = new Set(state.settings.worktreeRepos ?? []);
+    for (const id of state.order) {
+      const root = state.agents[id]?.worktree?.root;
+      if (root) roots.add(root);
+    }
+    if (roots.size === 0) {
+      if (get().worktrees.length) set({ worktrees: [] });
+      return;
+    }
+    try {
+      const scan = await listWorktrees(
+        [...roots],
+        state.settings.gitPath?.trim() || undefined,
       );
-      if (busy.length > 0) {
-        set({ closeConfirm: { agentId, termIds: busy } });
-      } else {
-        for (const tid of termIds) get().removeFloatingTerminal(tid);
-        get().removeAgent(agentId);
+      set({ worktrees: scan.entries });
+      // prune registry roots with nothing left — the title-bar icon
+      // disappears again once every worktree is gone. Only roots whose
+      // scan actually succeeded may be pruned (an unmounted volume or a
+      // broken git override is not "no worktrees"), and the prune is
+      // computed against the *current* registry, not the pre-await
+      // snapshot — a root registered while the scan ran must survive.
+      const live = new Set(scan.entries.map((e) => e.root));
+      for (const id of get().order) {
+        const root = get().agents[id]?.worktree?.root;
+        if (root) live.add(root);
       }
-    })();
+      const scanned = new Set(scan.scanned);
+      const current = get().settings.worktreeRepos ?? [];
+      const kept = current.filter(
+        (r) => live.has(r) || !scanned.has(r) || !roots.has(r),
+      );
+      if (kept.length !== current.length) {
+        get().updateSettings({ worktreeRepos: kept });
+      }
+    } catch {
+      /* scan failed (no git?) — keep the last known list */
+    }
+  },
+
+  registerWorktreeRepo: (root) => {
+    const repos = get().settings.worktreeRepos ?? [];
+    if (!repos.includes(root)) {
+      get().updateSettings({ worktreeRepos: [...repos, root] });
+    }
+    void get().refreshWorktrees();
+  },
+
+  deleteWorktree: async (entry) => {
+    try {
+      await removeWorktree({
+        root: entry.root,
+        path: entry.path,
+        branch: entry.branch,
+        gitBin: get().settings.gitPath?.trim() || undefined,
+      });
+    } catch {
+      /* the refresh below shows what actually happened */
+    } finally {
+      void get().refreshWorktrees();
+    }
   },
 
   resolveCloseConfirm: (choice) => {
     const confirm = get().closeConfirm;
     if (!confirm) return;
     set({ closeConfirm: null });
-    if (choice === "cancel") return;
+    if (choice === "cancel") {
+      // also forget a worktree cleanup decided earlier in this close flow
+      pendingWorktreeCleanup.delete(confirm.agentId);
+      return;
+    }
+    if (choice === "detach") {
+      // the kept process keeps the worktree as its cwd — deleting the
+      // folder under a detached dev server would break it with ENOENT
+      // noise. The worktree stays and shows as unattached in the panel.
+      pendingWorktreeCleanup.delete(confirm.agentId);
+    }
     const state = get();
     const termIds = state.floatingOrder.filter(
       (tid) => state.floatingTerminals[tid]?.agentId === confirm.agentId,
@@ -1351,14 +1595,17 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const state = get();
     const activeId = state.activeAgentId();
     const agent = activeId ? state.agents[activeId] : undefined;
-    // open the New Agent dialog inheriting the split-source pane's setup
+    // open the New Agent dialog inheriting the split-source pane's setup.
+    // Splitting a worktree pane preselects the worktree toggle on the MAIN
+    // repo — "another parallel worker on this project", on a fresh branch
     set({
       newAgentOpen: true,
       newAgentPrefill: {
-        cwd: agent?.cwd,
+        cwd: agent?.worktree?.root ?? agent?.cwd,
         profileId: agent?.profileId,
         startup: agent?.startup,
         direction,
+        worktree: !!agent?.worktree,
       },
     });
   },
@@ -1524,10 +1771,86 @@ export const useSwarm = create<SwarmState>((set, get) => ({
 }));
 
 /**
+ * First stage of closing a pane (after the busy-confirm gate): worktree
+ * panes decide the worktree's fate — clean → silent cleanup with the pane,
+ * dirty/unmerged → keep-vs-delete dialog.
+ */
+function proceedRemoveAgent(agentId: string) {
+  const get = useSwarm.getState;
+  const agent = get().agents[agentId];
+  if (!agent) return;
+  if (agent.worktree && agent.cwd && IS_TAURI) {
+    const path = agent.cwd;
+    const meta = agent.worktree;
+    void (async () => {
+      let status: WorktreeStatus | null = null;
+      try {
+        status = await worktreeStatus(
+          path,
+          get().settings.gitPath?.trim() || undefined,
+        );
+      } catch {
+        // can't tell → keep the worktree, never silent-delete
+      }
+      // the pane may have been removed while the status check ran (double
+      // close, workspace close) — don't resurrect a cleanup entry for it
+      if (!get().agents[agentId]) return;
+      if (status?.exists && !status.dirty && status.ahead === 0) {
+        pendingWorktreeCleanup.set(agentId, { ...meta, path, confirmed: false });
+        continueRemoveAgent(agentId);
+      } else if (status?.exists) {
+        useSwarm.setState({ closeWorktreeConfirm: { agentId, status } });
+      } else {
+        // folder gone (or unreadable) — close the pane, touch nothing
+        continueRemoveAgent(agentId);
+      }
+    })();
+    return;
+  }
+  continueRemoveAgent(agentId);
+}
+
+/**
+ * Second stage of closing a pane, after any worktree decision was made:
+ * floating terminals with a running process raise the close-confirm dialog
+ * (kill vs detach); idle ones are closed along with the pane.
+ */
+function continueRemoveAgent(agentId: string) {
+  const store = useSwarm.getState();
+  const termIds = store.floatingOrder.filter(
+    (tid) => store.floatingTerminals[tid]?.agentId === agentId,
+  );
+  if (termIds.length === 0) {
+    store.removeAgent(agentId);
+    return;
+  }
+  void (async () => {
+    // a floating terminal blocks the close only while something actually
+    // runs in it — exited/idle shells are closed along with the pane
+    const busy: string[] = [];
+    await Promise.all(
+      termIds.map(async (tid) => {
+        if (useSwarm.getState().floatingTerminals[tid]?.status === "exited")
+          return;
+        if (await ptyHasChildren(tid)) busy.push(tid);
+      }),
+    );
+    if (busy.length > 0) {
+      useSwarm.setState({ closeConfirm: { agentId, termIds: busy } });
+    } else {
+      const s = useSwarm.getState();
+      for (const tid of termIds) s.removeFloatingTerminal(tid);
+      s.removeAgent(agentId);
+    }
+  })();
+}
+
+/**
  * Tear a workspace down: kill its agents (terminals + their floating
  * terminals; detached floats survive), drop its layout, and keep the app in a
  * valid state — at least one workspace always exists, and closing the active
- * tab activates its neighbour.
+ * tab activates its neighbour. Worktrees of the closed agents stay on disk
+ * (no status checks here) — they remain reachable in the worktree panel.
  */
 function closeWorkspace(id: string) {
   const store = useSwarm.getState();
@@ -1543,7 +1866,11 @@ function closeWorkspace(id: string) {
       store.removeFloatingTerminal(tid);
     }
   }
-  for (const aid of agentIds) destroyTerm(aid);
+  for (const aid of agentIds) {
+    destroyTerm(aid);
+    // their worktrees stay on disk — drop any stale cleanup decision
+    pendingWorktreeCleanup.delete(aid);
+  }
 
   const state = useSwarm.getState();
   const agents = { ...state.agents };
@@ -1589,6 +1916,21 @@ function closeWorkspace(id: string) {
       state.focusedAgentId && agentIds.includes(state.focusedAgentId)
         ? null
         : state.focusedAgentId,
+    // confirm dialogs targeting a removed agent must not survive the close —
+    // they'd sit there looking actionable while their buttons no-op
+    closeConfirm:
+      state.closeConfirm && agentIds.includes(state.closeConfirm.agentId)
+        ? null
+        : state.closeConfirm,
+    closeWorktreeConfirm:
+      state.closeWorktreeConfirm &&
+      agentIds.includes(state.closeWorktreeConfirm.agentId)
+        ? null
+        : state.closeWorktreeConfirm,
+    closeBusyConfirm:
+      state.closeBusyConfirm && agentIds.includes(state.closeBusyConfirm)
+        ? null
+        : state.closeBusyConfirm,
   });
   schedulePersistWorkspaces();
   schedulePersistGrid();

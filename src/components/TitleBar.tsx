@@ -13,6 +13,7 @@ import { useShallow } from "zustand/react/shallow";
 import { useSwarm } from "@/store";
 import { useUpdates } from "@/lib/updates";
 import { useLimits } from "@/lib/limits";
+import { WorktreesButton } from "./WorktreePanel";
 import { Button } from "./ui/button";
 import { Tip } from "./ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -84,6 +85,9 @@ export function TitleBar({
             <SlidersHorizontal size={15} />
           </Button>
         </Tip>
+
+        {/* appears only once at least one git worktree exists */}
+        <WorktreesButton />
 
         <Tip label="Settings">
           <Button
@@ -244,7 +248,7 @@ function WorkspaceTab({
         // middle-click closes, like browser tabs
         if (e.button === 1) requestCloseWorkspace(id);
       }}
-      title={`${name} — ⌘${index + 1}`}
+      title={index <= 8 ? `${name} — ⌘${index + 1}` : name}
       className={cn(
         "group/tab flex h-7 max-w-44 shrink-0 items-center gap-1.5 rounded-md border px-2 transition-colors",
         active

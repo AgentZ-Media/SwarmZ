@@ -4,6 +4,7 @@ import { useSwarm } from "@/store";
 import { Tip } from "./ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
+  cancelTranscription,
   getDictationAnalyser,
   selectDictationReady,
   stopDictation,
@@ -45,7 +46,7 @@ export function DictationButton({
         recording
           ? "Stop dictation"
           : phase === "transcribing"
-            ? "Transcribing…"
+            ? "Transcribing… (click to cancel)"
             : `Dictate (${hotkeyHint})`
       }
     >
@@ -58,7 +59,7 @@ export function DictationButton({
           busyElsewhere && "cursor-not-allowed opacity-40",
           className,
         )}
-        disabled={busyElsewhere || phase === "transcribing"}
+        disabled={busyElsewhere}
         onClick={(e) => {
           e.stopPropagation();
           toggleDictation(targetId);
@@ -115,6 +116,13 @@ export function DictationOverlay({ targetId }: { targetId: string }) {
               <span className="text-xs text-muted-foreground">
                 Transcribing…
               </span>
+              <button
+                className="text-xs text-faint hover:text-foreground"
+                onClick={() => cancelTranscription()}
+                title="Cancel transcription"
+              >
+                Cancel
+              </button>
             </>
           ) : (
             <span className="max-w-72 truncate text-xs text-destructive">

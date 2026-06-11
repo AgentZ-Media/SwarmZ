@@ -4,7 +4,9 @@ import { TitleBar } from "./components/TitleBar";
 import { WorkspaceLayer } from "./components/WorkspaceLayer";
 import { FloatingTerminals } from "./components/FloatingTerminals";
 import { CloseAgentDialog } from "./components/CloseAgentDialog";
+import { CloseBusyDialog } from "./components/CloseBusyDialog";
 import { CloseWorkspaceDialog } from "./components/CloseWorkspaceDialog";
+import { CloseWorktreeDialog } from "./components/CloseWorktreeDialog";
 import { CommandPalette } from "./components/CommandPalette";
 import { InsertCommandPalette } from "./components/InsertCommandPalette";
 import { QuitConfirmDialog } from "./components/QuitConfirmDialog";
@@ -202,12 +204,29 @@ export default function App() {
       if (!(e.metaKey || e.ctrlKey)) return;
       const k = e.key.toLowerCase();
       const s = useSwarm.getState();
+      // Radix dialogs trap focus but keydown still bubbles to the window —
+      // shortcuts must not act on the app underneath an open dialog (a
+      // habitual ⌘W would kill the pane *behind* Settings)
+      const dialogOpen = !!document.querySelector('[role="dialog"]');
       if (k === "meta") {
         // plain ⌘ is the push-to-talk key (hold mode): recording arms after a
-        // short delay so ⌘-shortcuts never open the mic
+        // short delay so ⌘-shortcuts never open the mic. Never arm while a
+        // dialog is open or the user is typing in a real text field — the
+        // transcript would be pasted into a pane they aren't looking at.
+        // (xterm's hidden helper textarea is exactly where dictation SHOULD
+        // work, so it doesn't count as a text field.)
+        const t = e.target as HTMLElement | null;
+        const editing =
+          !!t &&
+          (t.tagName === "INPUT" ||
+            t.tagName === "TEXTAREA" ||
+            t.isContentEditable) &&
+          !t.closest(".xterm");
         if (
           (s.settings.dictationHotkeyMode ?? "hold") === "hold" &&
-          !e.repeat
+          !e.repeat &&
+          !dialogOpen &&
+          !editing
         ) {
           armHoldDictation(() => {
             const st = useSwarm.getState();
@@ -219,6 +238,22 @@ export default function App() {
       // any other key while plain-⌘ dictation is armed/recording means a
       // shortcut, not speech — abort silently, then handle the shortcut
       cancelHoldDictation();
+      if (dialogOpen) {
+        // the palettes own their toggles — ⌘K/⌘⇧K may still close them;
+        // nothing else reaches the app while a dialog is up. ⌘W/⌘⇧W are
+        // still claimed (no-op): unprevented they'd reach the native
+        // menu's Close Window item and quit the app from under the dialog.
+        if (k === "k" && e.shiftKey && s.commandPickerOpen) {
+          e.preventDefault();
+          s.setCommandPickerOpen(false);
+        } else if (k === "k" && !e.shiftKey && s.paletteOpen) {
+          e.preventDefault();
+          s.setPaletteOpen(false);
+        } else if (k === "w") {
+          e.preventDefault();
+        }
+        return;
+      }
       if (k === "t") {
         e.preventDefault();
         setNewAgentOpen(true);
@@ -250,11 +285,11 @@ export default function App() {
         e.preventDefault();
         s.requestCloseWorkspace(s.activeWorkspaceId);
       } else if (k === "w") {
+        // always claim ⌘W: unhandled it falls through to the native menu's
+        // Close Window item and closes the whole app from an empty workspace
+        e.preventDefault();
         const id = s.activeAgentId();
-        if (id) {
-          e.preventDefault();
-          requestRemoveAgent(id);
-        }
+        if (id) requestRemoveAgent(id);
       } else if (k === "j") {
         // floating terminal for the active pane
         const id = s.activeAgentId();
@@ -337,7 +372,9 @@ export default function App() {
       </div>
 
       <CloseAgentDialog />
+      <CloseBusyDialog />
       <CloseWorkspaceDialog />
+      <CloseWorktreeDialog />
       <QuitConfirmDialog />
       <NewAgentDialog />
       <LoadPresetDialog />

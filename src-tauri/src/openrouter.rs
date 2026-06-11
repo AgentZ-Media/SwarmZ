@@ -2,10 +2,17 @@
 //! transcription endpoint, optional transcript cleanup via chat completions
 //! (structured output), and the live model catalog for the Settings picker.
 //!
-//! The API key lives in the macOS Keychain (service "SwarmZ-OpenRouter").
-//! Both writes and reads go through the `security` CLI so the keychain item's
-//! ACL stays consistent (same pattern as the Claude credentials in limits.rs).
+//! The API key lives in the macOS Keychain (service "SwarmZ-OpenRouter"),
+//! accessed through the Security framework: the key never appears in a
+//! subprocess argv (the old `security` CLI write left it readable via `ps`
+//! and gave the item an ACL that let any process read it back silently),
+//! and items created this way are ACLed to the SwarmZ binary. Items written
+//! by older builds via the CLI still resolve — reading them just raises the
+//! one-time macOS consent prompt.
 
+use security_framework::passwords::{
+    delete_generic_password, get_generic_password, set_generic_password,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -15,21 +22,8 @@ const KEYCHAIN_SERVICE: &str = "SwarmZ-OpenRouter";
 const KEYCHAIN_ACCOUNT: &str = "openrouter";
 
 fn read_key() -> Option<String> {
-    let out = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            KEYCHAIN_ACCOUNT,
-            "-w",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8(out.stdout).ok()?;
+    let bytes = get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).ok()?;
+    let s = String::from_utf8(bytes).ok()?;
     let s = s.trim();
     (!s.is_empty()).then(|| s.to_string())
 }
@@ -39,45 +33,17 @@ pub fn set_key(key: &str) -> Result<(), String> {
     if key.is_empty() {
         return Err("empty key".into());
     }
-    // -U updates an existing item in place
-    let out = std::process::Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            KEYCHAIN_ACCOUNT,
-            "-w",
-            key,
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    Ok(())
+    set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key.as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 pub fn clear_key() -> Result<(), String> {
-    let out = std::process::Command::new("security")
-        .args([
-            "delete-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            KEYCHAIN_ACCOUNT,
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
-    // "not found" counts as cleared
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        if !err.contains("could not be found") {
-            return Err(err.trim().to_string());
-        }
+    match delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+        Ok(()) => Ok(()),
+        // "not found" counts as cleared (errSecItemNotFound)
+        Err(e) if e.code() == -25300 => Ok(()),
+        Err(e) => Err(e.to_string()),
     }
-    Ok(())
 }
 
 /// `valid: None` = key present but verification failed for a transient reason
@@ -89,8 +55,17 @@ pub struct KeyStatus {
     pub valid: Option<bool>,
 }
 
+/// `read_key` for async contexts — the keychain call can block on the
+/// one-time macOS consent prompt, so it must not pin a runtime core thread.
+async fn read_key_blocking() -> Option<String> {
+    tauri::async_runtime::spawn_blocking(read_key)
+        .await
+        .ok()
+        .flatten()
+}
+
 pub async fn key_status() -> KeyStatus {
-    let Some(key) = read_key() else {
+    let Some(key) = read_key_blocking().await else {
         return KeyStatus {
             present: false,
             valid: Some(false),
@@ -141,7 +116,7 @@ pub async fn transcribe(
     model: String,
     language: Option<String>,
 ) -> Result<TranscriptionResult, String> {
-    let key = read_key().ok_or("No OpenRouter API key set")?;
+    let key = read_key_blocking().await.ok_or("No OpenRouter API key set")?;
     let mut body = json!({
         "model": model,
         "input_audio": { "data": audio_b64, "format": format },
@@ -218,7 +193,7 @@ async fn cleanup_request(key: &str, body: &Value) -> Result<String, String> {
 /// mandatory … cannot be disabled"). Models that don't know "minimal" get one
 /// retry without the reasoning field at their default behavior.
 pub async fn cleanup(text: String, model: String, prompt: String) -> Result<String, String> {
-    let key = read_key().ok_or("No OpenRouter API key set")?;
+    let key = read_key_blocking().await.ok_or("No OpenRouter API key set")?;
     let mut body = json!({
         "model": model,
         "messages": [
@@ -243,9 +218,23 @@ pub async fn cleanup(text: String, model: String, prompt: String) -> Result<Stri
     });
     match cleanup_request(&key, &body).await {
         Ok(cleaned) => Ok(cleaned),
-        Err(_) => {
-            body.as_object_mut().unwrap().remove("reasoning");
-            cleanup_request(&key, &body).await
+        // retry without the reasoning field only when the model plausibly
+        // rejected it (provider wording varies: "reasoning", "effort",
+        // "unsupported value: 'minimal'", "unknown parameter") — repeating
+        // a timeout/429/5xx would double the worst-case latency and mask
+        // the real error
+        Err(e) => {
+            let msg = e.to_ascii_lowercase();
+            if msg.contains("reasoning")
+                || msg.contains("parameter")
+                || msg.contains("effort")
+                || msg.contains("minimal")
+            {
+                body.as_object_mut().unwrap().remove("reasoning");
+                cleanup_request(&key, &body).await
+            } else {
+                Err(e)
+            }
         }
     }
 }

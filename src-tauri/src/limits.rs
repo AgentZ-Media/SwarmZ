@@ -47,11 +47,18 @@ fn read_credentials_file() -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// `Ok(None)` means "no Claude login on this machine" (UI hides the meters);
-/// transient problems (network, non-2xx, parse) are `Err` so the frontend can
-/// keep showing the last known values instead of blanking out.
+/// `Ok(None)` means "no usable Claude login on this machine" (UI hides the
+/// meters) — that covers both missing credentials and an expired/revoked
+/// token (401/403): showing stale utilization forever would be worse than
+/// hiding. Transient problems (network, 5xx, parse) are `Err` so the
+/// frontend can keep showing the last known values instead of blanking out.
 pub async fn fetch_limits() -> Result<Option<SubscriptionLimits>, String> {
-    let Some(token) = read_access_token() else {
+    // keychain read shells out to `security` (and can raise the macOS
+    // consent prompt) — keep it off the async runtime's core threads
+    let token = tauri::async_runtime::spawn_blocking(read_access_token)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(token) = token else {
         return Ok(None);
     };
     let client = reqwest::Client::new();
@@ -64,8 +71,12 @@ pub async fn fetch_limits() -> Result<Option<SubscriptionLimits>, String> {
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("usage endpoint returned {}", resp.status()));
+    let status = resp.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("usage endpoint returned {status}"));
     }
     resp.json::<SubscriptionLimits>()
         .await

@@ -18,11 +18,20 @@ import {
 export function QuitConfirmDialog() {
   const quitConfirm = useSwarm((s) => s.quitConfirm);
   const agents = useSwarm((s) => s.agents);
+  const floats = useSwarm((s) => s.floatingTerminals);
 
+  // blocker ids are agent panes or floating terminals (floats block when a
+  // process still runs in them — they are never restored)
   const listed = (quitConfirm ?? [])
-    .map((id) => agents[id])
-    .filter((a): a is NonNullable<typeof a> => !!a);
-  const busyCount = listed.filter(agentIsBusy).length;
+    .map((id) => {
+      const a = agents[id];
+      if (a) return { id, name: a.name, cwd: a.cwd, busy: agentIsBusy(a) };
+      const f = floats[id];
+      if (f) return { id, name: f.name, cwd: f.cwd, busy: true };
+      return null;
+    })
+    .filter((e): e is NonNullable<typeof e> => !!e);
+  const busyCount = listed.filter((e) => e.busy).length;
 
   return (
     <Dialog
@@ -51,7 +60,7 @@ export function QuitConfirmDialog() {
               key={a.id}
               className="flex items-center gap-2 rounded-md border border-border bg-secondary/40 px-2 py-1.5 font-mono text-[11px] text-foreground"
             >
-              {agentIsBusy(a) ? (
+              {a.busy ? (
                 <Loader2
                   size={12}
                   className="shrink-0 animate-spin text-warning"

@@ -8,12 +8,14 @@ use std::sync::Arc;
 use std::thread;
 use tauri::{AppHandle, Emitter};
 
-type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
-
 /// A single live PTY-backed terminal session.
 struct PtySession {
     master: Box<dyn MasterPty + Send>,
-    writer: SharedWriter,
+    /// input queue, drained by the per-session writer thread. Writing into
+    /// the PTY directly could block the caller for as long as the foreground
+    /// process stops reading (Ctrl-S, hung TUI) — a channel send never does,
+    /// and a single consumer keeps the byte order intact.
+    write_tx: std::sync::mpsc::Sender<Vec<u8>>,
     child: Box<dyn Child + Send + Sync>,
     /// pid of the spawned shell — used for the has-children check
     pid: Option<u32>,
@@ -85,27 +87,35 @@ impl PtyManager {
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-        let writer: SharedWriter =
-            Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| e.to_string())?));
+        let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+
+        // Writer thread: single consumer of the input queue. Exits when the
+        // session is dropped (channel disconnects) or the PTY write fails.
+        let (write_tx, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            while let Ok(data) = write_rx.recv() {
+                if writer.write_all(&data).is_err() || writer.flush().is_err() {
+                    break;
+                }
+            }
+        });
 
         // Type the startup command into the shell once the prompt is ready.
         // `clear` wipes the screen + scrollback so the pane boots straight into
         // the program (no shell prompt / typed-command echo left visible).
         if let Some(line) = startup.filter(|s| !s.trim().is_empty()) {
-            let w = Arc::clone(&writer);
+            let tx = write_tx.clone();
             let line = format!("clear; {}\r", line);
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(700));
-                let mut guard = w.lock();
-                let _ = guard.write_all(line.as_bytes());
-                let _ = guard.flush();
+                let _ = tx.send(line.into_bytes());
             });
         }
 
         let pid = child.process_id();
         let session = PtySession {
             master: pair.master,
-            writer,
+            write_tx,
             child,
             pid,
         };
@@ -169,9 +179,10 @@ impl PtyManager {
     pub fn write(&self, id: &str, data: &str) -> Result<(), String> {
         let guard = self.sessions.lock();
         let session = guard.get(id).ok_or("no such session")?;
-        let mut w = session.writer.lock();
-        w.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
-        w.flush().map_err(|e| e.to_string())
+        session
+            .write_tx
+            .send(data.as_bytes().to_vec())
+            .map_err(|_| "terminal input closed".to_string())
     }
 
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
@@ -206,18 +217,35 @@ impl PtyManager {
     }
 
     pub fn kill(&self, id: &str) -> Result<(), String> {
-        let mut guard = self.sessions.lock();
-        if let Some(mut session) = guard.remove(id) {
-            let _ = session.child.kill();
+        // take the session out under the lock, kill outside it — kill() can
+        // sleep up to ~250 ms (SIGHUP grace) and must not stall other panes
+        let session = self.sessions.lock().remove(id);
+        if let Some(session) = session {
+            Self::kill_and_reap(session);
         }
         Ok(())
     }
 
     pub fn kill_all(&self) {
-        let mut guard = self.sessions.lock();
-        for (_, mut session) in guard.drain() {
-            let _ = session.child.kill();
+        let sessions: Vec<PtySession> = {
+            let mut guard = self.sessions.lock();
+            guard.drain().map(|(_, s)| s).collect()
+        };
+        for session in sessions {
+            Self::kill_and_reap(session);
         }
+    }
+
+    /// Kill the shell, then reap it on a detached thread — without the
+    /// wait() a shell that survives the SIGHUP grace period and gets
+    /// SIGKILLed lingers as a <defunct> entry in the process table. The
+    /// kill itself stays synchronous so kill_all at window teardown is
+    /// guaranteed to fire before the process exits.
+    fn kill_and_reap(mut session: PtySession) {
+        let _ = session.child.kill();
+        thread::spawn(move || {
+            let _ = session.child.wait();
+        });
     }
 }
 

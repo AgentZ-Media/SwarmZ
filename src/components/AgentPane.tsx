@@ -5,6 +5,7 @@ import {
   Columns2,
   ExternalLink,
   Folder,
+  FolderGit2,
   GitBranch,
   Maximize2,
   Minimize2,
@@ -24,10 +25,14 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
 import {
   cn,
+  folderName,
   formatTokens,
   formatUsd,
   prettyModel,
@@ -142,14 +147,6 @@ function StatRow({ k, v }: { k: string; v: ReactNode }) {
 
 /** Per-pane stats: everything tracked for this agent, on demand. */
 function AgentStatsButton({ agent }: { agent: Agent }) {
-  const u = agent.usage;
-  const git = agent.git;
-  const totalTokens = u
-    ? u.input_tokens +
-      u.output_tokens +
-      u.cache_creation_tokens +
-      u.cache_read_tokens
-    : 0;
   return (
     <DropdownMenu>
       <Tip label="Agent stats">
@@ -160,7 +157,25 @@ function AgentStatsButton({ agent }: { agent: Agent }) {
         </DropdownMenuTrigger>
       </Tip>
       <DropdownMenuContent align="end" className="w-72">
-        <div className="space-y-2.5 px-2 py-1.5">
+        <AgentStatsBody agent={agent} />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** Shared body of the stats popover — also lives in the ⋯ menu's "Stats"
+ * submenu so the numbers stay reachable when narrow panes hide the button. */
+function AgentStatsBody({ agent }: { agent: Agent }) {
+  const u = agent.usage;
+  const git = agent.git;
+  const totalTokens = u
+    ? u.input_tokens +
+      u.output_tokens +
+      u.cache_creation_tokens +
+      u.cache_read_tokens
+    : 0;
+  return (
+    <div className="space-y-2.5 px-2 py-1.5">
           <div className="flex items-center justify-between gap-2">
             <span className="truncate text-xs font-medium text-foreground">
               {agent.name}
@@ -208,7 +223,14 @@ function AgentStatsButton({ agent }: { agent: Agent }) {
                 <StatRow k="Est. API cost" v={formatUsd(u.cost_usd)} />
               </div>
               <div className="space-y-1 border-t border-border pt-2">
-                {git && <StatRow k="Repo" v={git.repo} />}
+                {agent.worktree ? (
+                  <StatRow
+                    k="Worktree of"
+                    v={folderName(agent.worktree.root)}
+                  />
+                ) : (
+                  git && <StatRow k="Repo" v={git.repo} />
+                )}
                 {(git?.branch || u.git_branch) && (
                   <StatRow k="Branch" v={git?.branch ?? u.git_branch} />
                 )}
@@ -239,9 +261,7 @@ function AgentStatsButton({ agent }: { agent: Agent }) {
               </div>
             </>
           )}
-        </div>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    </div>
   );
 }
 
@@ -376,6 +396,21 @@ export const AgentPane = memo(function AgentPane({
                 </span>
               </Tip>
             )}
+            {agent.worktree && (
+              <Tip
+                label={
+                  <span className="font-mono text-[11px]">
+                    Worktree of {folderName(agent.worktree.root)} ·{" "}
+                    {agent.worktree.branch}
+                  </span>
+                }
+              >
+                <span className="flex shrink-0 items-center gap-1 rounded bg-secondary px-1 font-mono text-[10px] text-faint @max-md:hidden">
+                  <FolderGit2 size={10} className="shrink-0" />
+                  worktree
+                </span>
+              </Tip>
+            )}
             {agent.git && <GitChip git={agent.git} />}
           </div>
         )}
@@ -460,6 +495,14 @@ export const AgentPane = memo(function AgentPane({
                     </span>
                   </div>
                 )}
+                {agent.worktree && (
+                  <div className="mt-1 flex items-center gap-1 text-faint">
+                    <FolderGit2 size={10} className="shrink-0" />
+                    <span className="truncate">
+                      worktree of {folderName(agent.worktree.root)}
+                    </span>
+                  </div>
+                )}
               </div>
               <DropdownMenuSeparator />
               {agent.git?.remote_url && (
@@ -487,6 +530,16 @@ export const AgentPane = memo(function AgentPane({
               <DropdownMenuItem onSelect={() => createFloatingTerminal(agentId)}>
                 <SquareTerminal /> Floating terminal
               </DropdownMenuItem>
+              {/* narrow panes hide the header stats button — keep the
+                  numbers reachable from here, as documented */}
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <BarChart3 /> Stats
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="w-72">
+                  <AgentStatsBody agent={agent} />
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
               <DropdownMenuSeparator />
               <DropdownMenuItem danger onSelect={() => requestRemoveAgent(agentId)}>
                 <X /> Close agent
