@@ -121,6 +121,34 @@ export function selectDictationReady(s: {
   return !!s.openrouterStatus?.present && s.openrouterStatus.valid !== false;
 }
 
+/**
+ * Audio input devices for the Settings mic picker. WebKit hides device
+ * labels (and may blank ids) until a capture session has run, so if the
+ * first enumeration comes back unlabeled the mic is opened for a moment to
+ * unlock them and released right away — callers should only invoke this on
+ * explicit user interaction (opening the picker), never on mount.
+ */
+export async function listMicrophones(): Promise<
+  { deviceId: string; label: string }[]
+> {
+  const pick = (devs: MediaDeviceInfo[]) =>
+    devs.filter((d) => d.kind === "audioinput" && d.deviceId);
+  let mics = pick(await navigator.mediaDevices.enumerateDevices());
+  if (!mics.length || mics.some((m) => !m.label)) {
+    try {
+      const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mics = pick(await navigator.mediaDevices.enumerateDevices());
+      probe.getTracks().forEach((t) => t.stop());
+    } catch {
+      // permission denied — return whatever enumeration alone produced
+    }
+  }
+  return mics.map((m, i) => ({
+    deviceId: m.deviceId,
+    label: m.label || `Microphone ${i + 1}`,
+  }));
+}
+
 function pickMime(): string {
   // WKWebView's MediaRecorder produces AAC-in-MP4 ("m4a" for the API);
   // opus/webm is preferred where available
@@ -262,9 +290,16 @@ export async function startDictation(
   const s = useSwarm.getState();
   if (s.dictation || !dictationReady()) return;
   let mic: MediaStream;
+  const micId = s.settings.dictationMicId;
   try {
     mic = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true },
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        // "ideal", not "exact" — a saved mic that's unplugged falls back to
+        // the system default instead of failing the recording
+        ...(micId ? { deviceId: { ideal: micId } } : {}),
+      },
     });
   } catch {
     fail(targetId, Date.now(), "Microphone access denied");

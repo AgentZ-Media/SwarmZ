@@ -197,6 +197,14 @@ export interface AppSettings {
   /** OpenRouter speech-to-text model; unset = DEFAULT_STT_MODEL */
   dictationSttModel?: string;
   /**
+   * preferred recording device (getUserMedia deviceId); unset = system
+   * default. Applied as an "ideal" constraint, so an unplugged device falls
+   * back to the default instead of erroring
+   */
+  dictationMicId?: string;
+  /** human label of the preferred mic — persisted so Settings can show the selection without opening the mic to re-enumerate */
+  dictationMicLabel?: string;
+  /**
    * transcription engine: "openrouter" = cloud via API key (default),
    * "local" = on-device Parakeet model (no internet, needs the ~670 MB
    * model downloaded in Settings)

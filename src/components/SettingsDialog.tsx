@@ -21,6 +21,13 @@ import {
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./ui/select";
 import { Switch } from "./ui/switch";
 import { Textarea } from "./ui/textarea";
 import {
@@ -46,6 +53,7 @@ import {
   fetchOpenrouterModels,
   setOpenrouterKey,
 } from "@/lib/openrouter";
+import { listMicrophones } from "@/lib/dictation";
 import {
   LOCAL_STT_DOWNLOAD_MB,
   LOCAL_STT_MODEL_NAME,
@@ -767,6 +775,11 @@ function VoiceSection() {
   const [keyInput, setKeyInput] = useState("");
   const [saving, setSaving] = useState(false);
   const [keyError, setKeyError] = useState<string | null>(null);
+  // null until the picker was opened — enumerating may open the mic for a
+  // moment (WebKit label unlock), so it only happens on explicit interaction
+  const [mics, setMics] = useState<
+    { deviceId: string; label: string }[] | null
+  >(null);
   const [models, setModels] = useState<OpenrouterModel[] | null>(null);
 
   // the catalog is public (no key needed) and cached for an hour in Rust
@@ -842,6 +855,26 @@ function VoiceSection() {
   const cleanupPrompt =
     settings.dictationCleanupPrompt ?? DEFAULT_CLEANUP_PROMPT;
 
+  // until the list is loaded the saved selection still needs an item to
+  // resolve against; once loaded, an unplugged saved mic keeps an entry so
+  // the selection stays visible instead of silently jumping to default
+  const micId = settings.dictationMicId;
+  const savedMic = micId
+    ? {
+        deviceId: micId,
+        label: settings.dictationMicLabel || "Saved microphone",
+        missing: !!mics && !mics.some((m) => m.deviceId === micId),
+      }
+    : null;
+  const micOptions: { deviceId: string; label: string; missing?: boolean }[] =
+    mics
+      ? savedMic?.missing
+        ? [...mics, savedMic]
+        : mics
+      : savedMic
+        ? [savedMic]
+        : [];
+
   return (
     <>
       <SectionHeader
@@ -912,6 +945,45 @@ function VoiceSection() {
           )}
         </div>
       </StackedRow>
+
+      <Row
+        label="Microphone"
+        help="Input device used for recordings. System default follows the input selected in macOS Sound settings; an unplugged device falls back to the default."
+      >
+        <Select
+          value={micId ?? "default"}
+          onValueChange={(v) => {
+            if (v === "default")
+              updateSettings({
+                dictationMicId: undefined,
+                dictationMicLabel: undefined,
+              });
+            else
+              updateSettings({
+                dictationMicId: v,
+                dictationMicLabel: micOptions.find((m) => m.deviceId === v)
+                  ?.label,
+              });
+          }}
+          onOpenChange={(o) => {
+            // re-enumerate on every open so newly plugged mics show up
+            if (o) void listMicrophones().then(setMics, () => setMics([]));
+          }}
+        >
+          <SelectTrigger className="w-56 text-xs [&>span]:truncate">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="default">System default</SelectItem>
+            {micOptions.map((m) => (
+              <SelectItem key={m.deviceId} value={m.deviceId}>
+                {m.label}
+                {m.missing ? " (not connected)" : ""}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </Row>
 
       <Row
         label="Hotkey behavior"
