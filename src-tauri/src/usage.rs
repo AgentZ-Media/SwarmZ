@@ -447,6 +447,15 @@ fn file_created_ms(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+fn file_modified_ms(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// The session file in `dir` created at/after `since_ms` (i.e. born during this
 /// agent's life). With several agents in the same folder, multiple files
 /// qualify — the agent's own session is the EARLIEST-born one (later births
@@ -476,8 +485,41 @@ fn pick_new_session(dir: &Path, since_ms: u64, exclude: &[String]) -> Option<Pat
     oldest.map(|(_, p)| p)
 }
 
+/// Fallback for manually resumed sessions: `claude --resume` appends to the
+/// pre-existing jsonl (same session id, old birth time), so `pick_new_session`
+/// never sees it. Match the non-excluded file most recently MODIFIED at/after
+/// `since_ms` instead — it only becomes a candidate once the resumed session
+/// actually writes new turns inside this pane's lifetime. A concurrently
+/// active external session in the same folder could in principle be matched
+/// too; the exclude list and the mtime floor keep that window small.
+fn pick_resumed_session(dir: &Path, since_ms: u64, exclude: &[String]) -> Option<PathBuf> {
+    let floor = since_ms.saturating_sub(3000); // small clock-skew tolerance
+    let mut newest: Option<(u64, PathBuf)> = None;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            if exclude.iter().any(|e| e == stem) {
+                continue; // another agent's session
+            }
+        }
+        let modified = file_modified_ms(&p);
+        if modified < floor {
+            continue; // idle since before this pane went busy — not ours
+        }
+        if newest.as_ref().map(|(m, _)| modified > *m).unwrap_or(true) {
+            newest = Some((modified, p));
+        }
+    }
+    newest.map(|(_, p)| p)
+}
+
 /// Usage for a single SwarmZ-launched session only. Latches onto `session_id`
-/// once known; otherwise discovers the session file born after `since_ms`.
+/// once known; otherwise discovers the session file born after `since_ms` —
+/// or, as a fallback for manual `claude --resume` in a fresh pane, the
+/// pre-existing file modified after `since_ms` (see `pick_resumed_session`).
 /// A latched file is parsed WITHOUT the since-filter: the whole file is this
 /// pane's session, and after a restart + `--resume` the pre-restart turns must
 /// still count (stats popover, context donut) even though the agent's
@@ -492,16 +534,20 @@ pub fn usage_for_session(
     if !dir.is_dir() {
         return None;
     }
+    let discover = || {
+        pick_new_session(&dir, since_ms, exclude)
+            .or_else(|| pick_resumed_session(&dir, since_ms, exclude))
+    };
     let (path, since) = match session_id.filter(|s| !s.is_empty()) {
         Some(sid) => {
             let p = dir.join(format!("{}.jsonl", sid));
             if p.is_file() {
                 (p, None)
             } else {
-                (pick_new_session(&dir, since_ms, exclude)?, Some(since_ms))
+                (discover()?, Some(since_ms))
             }
         }
-        None => (pick_new_session(&dir, since_ms, exclude)?, Some(since_ms)),
+        None => (discover()?, Some(since_ms)),
     };
     Some(parse_file(&path, since))
 }
