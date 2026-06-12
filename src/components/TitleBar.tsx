@@ -7,6 +7,7 @@ import {
   Plus,
   Settings,
   SlidersHorizontal,
+  StickyNote,
   X,
 } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
@@ -32,6 +33,8 @@ export function TitleBar({
   const dashboardOpen = useSwarm((s) => s.dashboardOpen);
   const fleetOpen = useSwarm((s) => s.fleetOpen);
   const setFleetOpen = useSwarm((s) => s.setFleetOpen);
+  const notesOpen = useSwarm((s) => s.notesOpen);
+  const setNotesOpen = useSwarm((s) => s.setNotesOpen);
 
   return (
     <header
@@ -72,6 +75,17 @@ export function TitleBar({
             onClick={() => setDashboardOpen(!dashboardOpen)}
           >
             <BarChart3 size={15} />
+          </Button>
+        </Tip>
+
+        <Tip label="Quick notes (⌘N)">
+          <Button
+            size="icon"
+            variant={notesOpen ? "secondary" : "ghost"}
+            className="no-drag"
+            onClick={() => setNotesOpen(!notesOpen)}
+          >
+            <StickyNote size={15} />
           </Button>
         </Tip>
 

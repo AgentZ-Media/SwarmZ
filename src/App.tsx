@@ -15,6 +15,7 @@ import { LoadPresetDialog } from "./components/LoadPresetDialog";
 import { SavePresetDialog } from "./components/SavePresetDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { QuickNotesPanel } from "./components/QuickNotesPanel";
 import { UsageDashboard } from "./components/UsageDashboard";
 import { WebDirectoryPicker } from "./components/WebDirectoryPicker";
 import { useSwarm } from "./store";
@@ -249,6 +250,10 @@ export default function App() {
         } else if (k === "k" && !e.shiftKey && s.paletteOpen) {
           e.preventDefault();
           s.setPaletteOpen(false);
+        } else if (k === "n" && !e.shiftKey && s.notesOpen) {
+          // the notes drawer counts as a dialog — ⌘N may still toggle it shut
+          e.preventDefault();
+          s.setNotesOpen(false);
         } else if (k === "w") {
           e.preventDefault();
         }
@@ -278,6 +283,10 @@ export default function App() {
       } else if (k === "n" && e.shiftKey) {
         e.preventDefault();
         s.createWorkspace();
+      } else if (k === "n") {
+        // quick notes drawer (closing while open is handled in the dialog branch)
+        e.preventDefault();
+        s.setNotesOpen(true);
       } else if (k === "d") {
         e.preventDefault();
         splitActive(e.shiftKey ? "column" : "row");
@@ -387,6 +396,7 @@ export default function App() {
       <ProfilesDialog open={profilesOpen} onOpenChange={setProfilesOpen} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       <UsageDashboard />
+      <QuickNotesPanel />
       <WebDirectoryPicker />
     </TooltipProvider>
   );

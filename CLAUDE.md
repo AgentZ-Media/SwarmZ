@@ -17,7 +17,7 @@ Frontend (`src/`):
 - `lib/transport.ts` → `backend-types.ts` / `backend-tauri.ts` — backend interface; native-only features may skip it and `invoke` directly (`lib/dnd.ts`, `lib/openrouter.ts`, `lib/worktree.ts`)
 - `lib/term-host.ts` — xterm + PTY per id, **outside React**; `lib/term-registry.ts` exposes the xterm instances
 - `lib/quit.ts` — quit guard; `lib/git.ts` — 7s status poll; `lib/limits.ts` — subscription meters; `lib/updates.ts` — auto-updater; `lib/dictation.ts` — voice recording; `lib/presets.ts` — workspace presets; `lib/layout.ts` — tiling trees; `lib/insert-command.ts` / `lib/command-vars.ts` — paste/submit + placeholders
-- `components/` — `App.tsx` (global shortcuts, dialog mounts), `WorkspaceLayer`/`TilingGrid`/`AgentPane`/`Terminal` (grid + panes), `TitleBar` (tabs, meters, panel buttons), `FloatingTerminals`, `CommandPalette` (⌘K) / `InsertCommandPalette` (⌘⇧K), `NewAgentDialog`, `SettingsDialog`, `UsageDashboard`, `WorktreePanel`, the `Close*Dialog`s, `Dictation`
+- `components/` — `App.tsx` (global shortcuts, dialog mounts), `WorkspaceLayer`/`TilingGrid`/`AgentPane`/`Terminal` (grid + panes), `TitleBar` (tabs, meters, panel buttons), `FloatingTerminals`, `CommandPalette` (⌘K) / `InsertCommandPalette` (⌘⇧K), `NewAgentDialog`, `SettingsDialog`, `UsageDashboard`, `QuickNotesPanel` (⌘N, global + per-project checklists), `WorktreePanel`, the `Close*Dialog`s, `Dictation`
 
 Backend (`src-tauri/src/`):
 

@@ -403,6 +403,27 @@ export interface Agent {
   worktree?: WorktreeMeta;
 }
 
+// ---- Quick notes ----
+
+/** One line in a quick-notes list — a checkable item or a plain text note. */
+export interface NoteItem {
+  id: string;
+  text: string;
+  /** checked off (rendered struck-through and dimmed) */
+  done: boolean;
+  /** render as plain text without a checkbox (idea / heading-ish line) */
+  plain?: boolean;
+}
+
+/**
+ * All quick notes: a global list plus per-project lists keyed by repo root
+ * (worktree agents resolve to their main repo, never the .worktrees path).
+ */
+export interface QuickNotesData {
+  global: NoteItem[];
+  folders: Record<string, NoteItem[]>;
+}
+
 // ---- Floating terminals & quick commands ----
 
 /** One saved quick command. Stored per project folder, keyed by cwd. */

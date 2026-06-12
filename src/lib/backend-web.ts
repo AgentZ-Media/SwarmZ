@@ -217,6 +217,8 @@ export const webBackend: Backend = {
   // web mode is abandoned — dead stubs only
   loadCustomCommands: async () => null,
   saveCustomCommands: async () => {},
+  loadQuickNotes: async () => null,
+  saveQuickNotes: async () => {},
 
   loadUsageHistory: async () => {
     try {

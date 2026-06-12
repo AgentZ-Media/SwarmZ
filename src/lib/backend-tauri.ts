@@ -18,6 +18,7 @@ import type {
   PersistedGrid,
   PersistedWorkspaces,
   Profile,
+  QuickNotesData,
   SessionUsage,
   SubscriptionLimits,
   UsageHistoryEntry,
@@ -122,6 +123,18 @@ export const tauriBackend: Backend = {
   },
   saveCustomCommands: async (data) => {
     await store.set("customCommands", data);
+    await store.save();
+  },
+
+  loadQuickNotes: async () => {
+    try {
+      return (await store.get<QuickNotesData>("quickNotes")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveQuickNotes: async (data) => {
+    await store.set("quickNotes", data);
     await store.save();
   },
 

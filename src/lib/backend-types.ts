@@ -7,6 +7,7 @@ import type {
   PersistedGrid,
   PersistedWorkspaces,
   Profile,
+  QuickNotesData,
   SessionUsage,
   SubscriptionLimits,
   UsageHistoryEntry,
@@ -88,6 +89,10 @@ export interface Backend {
   /** Custom prompt snippets for the insert picker — global + per folder (cwd). */
   loadCustomCommands(): Promise<CustomCommandsData | null>;
   saveCustomCommands(data: CustomCommandsData): Promise<void>;
+
+  /** Quick notes (checklists) — global + per project folder (repo root). */
+  loadQuickNotes(): Promise<QuickNotesData | null>;
+  saveQuickNotes(data: QuickNotesData): Promise<void>;
 
   loadUsageHistory(): Promise<UsageHistoryEntry[] | null>;
   saveUsageHistory(entries: UsageHistoryEntry[]): Promise<void>;

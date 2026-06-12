@@ -6,6 +6,7 @@ import {
   loadCustomCommands,
   loadGrid,
   loadProfiles,
+  loadQuickNotes,
   loadSettings,
   loadUsageHistory,
   loadWorkspacePresets,
@@ -15,6 +16,7 @@ import {
   saveCustomCommands,
   saveGrid,
   saveProfiles,
+  saveQuickNotes,
   saveSettings,
   saveUsageHistory,
   saveWorkspacePresets,
@@ -34,10 +36,12 @@ import type {
   GitInfo,
   LayoutNode,
   LocalSttStatus,
+  NoteItem,
   OpenrouterKeyStatus,
   PersistedGrid,
   PresetLayoutNode,
   Profile,
+  QuickNotesData,
   SessionUsage,
   UsageHistoryEntry,
   Workspace,
@@ -97,6 +101,18 @@ const FLOAT_DEFAULT_H = 340;
 /** Command presets are keyed by project folder; agents without a cwd share "~". */
 export function presetKey(cwd?: string): string {
   return cwd || "~";
+}
+
+/** Replace one quick-notes list; emptied folder lists drop their key. */
+function withNoteList(
+  data: QuickNotesData,
+  folderKey: string | null,
+  list: NoteItem[],
+): QuickNotesData {
+  if (!folderKey) return { ...data, global: list };
+  const folders = { ...data.folders, [folderKey]: list };
+  if (list.length === 0) delete folders[folderKey];
+  return { ...data, folders };
 }
 
 // Workspace tabs persist (name/order/defaultCwd) — debounced like the history.
@@ -281,6 +297,10 @@ interface SwarmState {
   commandPresets: Record<string, FolderCommands>;
   /** custom prompt snippets for the insert picker — global + per folder (persisted) */
   customCommands: CustomCommandsData;
+  /** quick notes (checklists) — global + per project folder (persisted) */
+  quickNotes: QuickNotesData;
+  /** quick-notes drawer (title bar / ⌘N) */
+  notesOpen: boolean;
   /** pending "close agent" that needs a decision about running floating terminals */
   closeConfirm: { agentId: string; termIds: string[] } | null;
   /** pending app-quit while these agents are still working (see lib/quit.ts) */
@@ -305,6 +325,8 @@ interface SwarmState {
 
   // derived helpers
   activeAgentId: () => string | null;
+  /** project root of the active pane (worktree → main repo), or the workspace default */
+  activeProjectRoot: () => string | null;
 
   // workspaces
   createWorkspace: (opts?: {
@@ -392,6 +414,21 @@ interface SwarmState {
     id?: string,
   ) => void;
   deleteCustomCommand: (folderKey: string | null, id: string) => void;
+
+  // quick notes (title-bar drawer, ⌘N) — folderKey null = global
+  setNotesOpen: (open: boolean) => void;
+  addNote: (folderKey: string | null, text: string) => void;
+  updateNote: (
+    folderKey: string | null,
+    id: string,
+    patch: Partial<Omit<NoteItem, "id">>,
+  ) => void;
+  deleteNote: (folderKey: string | null, id: string) => void;
+  /** reorder within a list: move note `id` to position `toIndex` */
+  moveNote: (folderKey: string | null, id: string, toIndex: number) => void;
+  /** drop every checked-off item of a list */
+  clearDoneNotes: (folderKey: string | null) => void;
+
   focusAgent: (agentId: string) => void;
   setActivePane: (paneId: string) => void;
   /** enter/leave focus mode (null = leave) */
@@ -481,6 +518,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   floatingOrder: [],
   commandPresets: {},
   customCommands: { global: [], folders: {} },
+  quickNotes: { global: [], folders: {} },
+  notesOpen: false,
   closeConfirm: null,
   quitConfirm: null,
   fileDrag: null,
@@ -499,6 +538,20 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       (p) => p.id === paneId,
     );
     return pane?.agentId ?? null;
+  },
+
+  activeProjectRoot: () => {
+    const s = get();
+    const id = s.activeAgentId();
+    const agent = id ? s.agents[id] : undefined;
+    // a worktree pane counts as its main repo — notes belong to the project,
+    // not the throwaway .worktrees/<slug> folder
+    return (
+      agent?.worktree?.root ??
+      agent?.cwd ??
+      s.workspaces[s.activeWorkspaceId]?.defaultCwd ??
+      null
+    );
   },
 
   createWorkspace: (opts = {}) => {
@@ -839,6 +892,16 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       if (cc) {
         set({
           customCommands: { global: cc.global ?? [], folders: cc.folders ?? {} },
+        });
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      const notes = await loadQuickNotes();
+      if (notes) {
+        set({
+          quickNotes: { global: notes.global ?? [], folders: notes.folders ?? {} },
         });
       }
     } catch {
@@ -1360,6 +1423,79 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     }
     set({ customCommands });
     void saveCustomCommands(customCommands);
+  },
+
+  setNotesOpen: (open) => set({ notesOpen: open }),
+
+  addNote: (folderKey, text) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const state = get();
+    const list = folderKey
+      ? (state.quickNotes.folders[folderKey] ?? [])
+      : state.quickNotes.global;
+    const quickNotes = withNoteList(state.quickNotes, folderKey, [
+      ...list,
+      { id: nanoid(8), text: trimmed, done: false },
+    ]);
+    set({ quickNotes });
+    void saveQuickNotes(quickNotes);
+  },
+
+  updateNote: (folderKey, id, patch) => {
+    const state = get();
+    const list = folderKey
+      ? (state.quickNotes.folders[folderKey] ?? [])
+      : state.quickNotes.global;
+    if (!list.some((n) => n.id === id)) return;
+    const quickNotes = withNoteList(
+      state.quickNotes,
+      folderKey,
+      list.map((n) => (n.id === id ? { ...n, ...patch, id } : n)),
+    );
+    set({ quickNotes });
+    void saveQuickNotes(quickNotes);
+  },
+
+  deleteNote: (folderKey, id) => {
+    const state = get();
+    const list = folderKey
+      ? (state.quickNotes.folders[folderKey] ?? [])
+      : state.quickNotes.global;
+    const next = list.filter((n) => n.id !== id);
+    if (next.length === list.length) return;
+    const quickNotes = withNoteList(state.quickNotes, folderKey, next);
+    set({ quickNotes });
+    void saveQuickNotes(quickNotes);
+  },
+
+  moveNote: (folderKey, id, toIndex) => {
+    const state = get();
+    const list = folderKey
+      ? (state.quickNotes.folders[folderKey] ?? [])
+      : state.quickNotes.global;
+    const from = list.findIndex((n) => n.id === id);
+    if (from < 0) return;
+    const to = Math.max(0, Math.min(list.length - 1, toIndex));
+    if (from === to) return;
+    const next = [...list];
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    const quickNotes = withNoteList(state.quickNotes, folderKey, next);
+    set({ quickNotes });
+    void saveQuickNotes(quickNotes);
+  },
+
+  clearDoneNotes: (folderKey) => {
+    const state = get();
+    const list = folderKey
+      ? (state.quickNotes.folders[folderKey] ?? [])
+      : state.quickNotes.global;
+    const next = list.filter((n) => !n.done);
+    if (next.length === list.length) return;
+    const quickNotes = withNoteList(state.quickNotes, folderKey, next);
+    set({ quickNotes });
+    void saveQuickNotes(quickNotes);
   },
 
   focusAgent: (agentId) => {
