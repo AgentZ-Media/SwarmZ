@@ -159,6 +159,14 @@ function Waveform() {
     const data = new Uint8Array(512);
     let last = 0;
     let raf = 0;
+    // adaptive reference level: the recording runs with the WebRTC processing
+    // disabled (see lib/dictation.ts) for instant capture, so the raw signal is
+    // ~10-30x quieter than an AGC'd one and a fixed gain would barely move the
+    // bars. Normalize against a slowly-decaying running peak instead — keeps the
+    // waveform responsive on any mic. The floor stops silence from being
+    // amplified into a full-height jitter.
+    const PEAK_FLOOR = 0.02;
+    let peak = PEAK_FLOOR;
 
     const frame = (t: number) => {
       raf = requestAnimationFrame(frame);
@@ -172,7 +180,9 @@ function Waveform() {
           const v = (data[i] - 128) / 128;
           sum += v * v;
         }
-        bars.push(Math.min(1, Math.sqrt(sum / data.length) * 4));
+        const rms = Math.sqrt(sum / data.length);
+        peak = Math.max(rms, peak * 0.97, PEAK_FLOOR);
+        bars.push(Math.min(1, rms / peak));
         if (bars.length > BAR_COUNT) bars.shift();
       }
       ctx.clearRect(0, 0, WAVE_W, WAVE_H);

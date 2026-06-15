@@ -294,8 +294,16 @@ export async function startDictation(
   try {
     mic = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
+        // Processing OFF on purpose. WKWebView's WebRTC audio pipeline
+        // (echoCancellation + noiseSuppression) ramps up for ~0.6-1s after the
+        // track opens, delivering pure silence at the start — so push-to-talk
+        // swallowed the first word. Disabling it makes real samples flow within
+        // ~150ms. autoGainControl is off too: it has no effect once the APM
+        // chain is bypassed, and the raw signal transcribes fine (the quieter
+        // level is handled purely in the waveform's adaptive gain, not here).
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
         // "ideal", not "exact" — a saved mic that's unplugged falls back to
         // the system default instead of failing the recording
         ...(micId ? { deviceId: { ideal: micId } } : {}),
