@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -9,8 +9,9 @@ use walkdir::WalkDir;
 
 /// The JSONL stores the bare model id even for 1M-context sessions, so the
 /// window size has to be inferred: explicit `[1m]` suffix, the user's global
-/// default model being the `[1m]` variant of this model, or an observed
-/// context that simply doesn't fit into 200k.
+/// default model being the `[1m]` variant of this model, the model having
+/// actually been run at 1M before (recorded in `~/.claude.json`), or an
+/// observed context that simply doesn't fit into 200k.
 fn read_settings_model() -> Option<String> {
     let p = dirs::home_dir()?.join(".claude").join("settings.json");
     let s = fs::read_to_string(p).ok()?;
@@ -18,7 +19,54 @@ fn read_settings_model() -> Option<String> {
     v.get("model").and_then(|m| m.as_str()).map(String::from)
 }
 
-fn context_limit(model: &str, settings_model: Option<&str>, context_tokens: u64) -> u64 {
+/// Bare model ids the user has actually run with the 1M window, harvested from
+/// `~/.claude.json` → `projects.*.lastModelUsage` keys carrying a `[1m]` suffix
+/// (e.g. `claude-opus-4-8[1m]` → `claude-opus-4-8`). The session JSONL only ever
+/// stores the bare id and `~/.claude/settings.json` is usually empty (the model
+/// is picked via `/model`, not written there), so without this the donut could
+/// only flip to 1M *after* a session already crossed 200k. Cached against the
+/// file's mtime — re-parsed only when `~/.claude.json` actually changes.
+static ONEM_MODELS: Lazy<Mutex<(u64, HashSet<String>)>> =
+    Lazy::new(|| Mutex::new((0, HashSet::new())));
+
+fn onem_models() -> HashSet<String> {
+    let Some(path) = dirs::home_dir().map(|h| h.join(".claude.json")) else {
+        return HashSet::new();
+    };
+    let mtime = mtime_of(&path);
+    {
+        let guard = ONEM_MODELS.lock();
+        if mtime != 0 && guard.0 == mtime {
+            return guard.1.clone();
+        }
+    }
+    let mut set = HashSet::new();
+    if let Ok(s) = fs::read_to_string(&path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+            if let Some(projects) = v.get("projects").and_then(|p| p.as_object()) {
+                for cfg in projects.values() {
+                    let Some(lmu) = cfg.get("lastModelUsage").and_then(|m| m.as_object()) else {
+                        continue;
+                    };
+                    for key in lmu.keys() {
+                        if let Some(base) = key.strip_suffix("[1m]") {
+                            set.insert(base.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    *ONEM_MODELS.lock() = (mtime, set.clone());
+    set
+}
+
+fn context_limit(
+    model: &str,
+    settings_model: Option<&str>,
+    onem_models: &HashSet<String>,
+    context_tokens: u64,
+) -> u64 {
     if model.contains("[1m]") {
         return 1_000_000;
     }
@@ -26,6 +74,11 @@ fn context_limit(model: &str, settings_model: Option<&str>, context_tokens: u64)
         if s.contains("[1m]") && s.starts_with(model) {
             return 1_000_000;
         }
+    }
+    // the user has actually run this exact model at 1M (per ~/.claude.json) — the
+    // reliable below-200k signal, since the JSONL drops the [1m] suffix.
+    if onem_models.contains(model) {
+        return 1_000_000;
     }
     if context_tokens > 200_000 {
         return 1_000_000;
@@ -262,6 +315,7 @@ fn process_line(
     models: &mut HashMap<String, ModelUsage>,
     since_ms: Option<u64>,
     settings_model: Option<&str>,
+    onem_models: &HashSet<String>,
     force_context: bool,
 ) {
     let v: serde_json::Value = match serde_json::from_slice(line) {
@@ -339,7 +393,8 @@ fn process_line(
     // subagent (every line sidechain) so its own window is tracked.
     if force_context || v.get("isSidechain").and_then(|s| s.as_bool()) != Some(true) {
         session.context_tokens = inp + cc + cr;
-        session.context_limit = context_limit(&model, settings_model, session.context_tokens);
+        session.context_limit =
+            context_limit(&model, settings_model, onem_models, session.context_tokens);
     }
 
     session.input_tokens += inp;
@@ -430,6 +485,7 @@ fn parse_file(path: &Path, since_ms: Option<u64>, force_context: bool) -> Sessio
                 // is picked up on a later call once its newline arrives
                 if let Some(last_nl) = bytes.iter().rposition(|&b| b == b'\n') {
                     let settings_model = read_settings_model();
+                    let onem = onem_models();
                     for line in bytes[..=last_nl].split(|&b| b == b'\n') {
                         if line.is_empty() {
                             continue;
@@ -440,6 +496,7 @@ fn parse_file(path: &Path, since_ms: Option<u64>, force_context: bool) -> Sessio
                             models,
                             since_ms,
                             settings_model.as_deref(),
+                            &onem,
                             force_context,
                         );
                     }
