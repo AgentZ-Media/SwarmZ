@@ -162,6 +162,9 @@ pub struct SessionUsage {
     pub service_tier: Option<String>,
     pub git_branch: Option<String>,
     pub last_activity: Option<String>,
+    /// `attributionAgent` for subagent files (e.g. "Explore"); `None` for the
+    /// main session.
+    pub agent_type: Option<String>,
     /// current context occupancy = full prompt of the latest main-chain turn
     pub context_tokens: u64,
     /// context window of the model that served that turn (200k, or 1m variants)
@@ -173,6 +176,33 @@ pub struct SessionUsage {
     pub cache_read_tokens: u64,
     pub cost_usd: f64,
     pub by_model: Vec<ModelUsage>,
+    /// Subagents (Task tool) spawned by this session, each with its own context
+    /// window. Only populated by `usage_for_session`; empty otherwise.
+    #[serde(default)]
+    pub subagents: Vec<SubagentUsage>,
+}
+
+/// One subagent (Task tool) run, parsed from
+/// `<project>/<session>/subagents/agent-<id>.jsonl`. Every line there is
+/// `isSidechain:true`, so context is computed by forcing the context gate open.
+#[derive(Clone, Serialize, Default)]
+pub struct SubagentUsage {
+    pub agent_id: String,
+    /// agent type from `attributionAgent`, e.g. "Explore" / "general-purpose"
+    pub agent_type: Option<String>,
+    pub model: Option<String>,
+    /// this subagent's own current context occupancy + its model's window
+    pub context_tokens: u64,
+    pub context_limit: u64,
+    pub message_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_usd: f64,
+    pub last_activity: Option<String>,
+    /// heuristic: the subagent file was modified within the last few seconds
+    pub running: bool,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -232,11 +262,21 @@ fn process_line(
     models: &mut HashMap<String, ModelUsage>,
     since_ms: Option<u64>,
     settings_model: Option<&str>,
+    force_context: bool,
 ) {
     let v: serde_json::Value = match serde_json::from_slice(line) {
         Ok(v) => v,
         Err(_) => return,
     };
+    // `attributionAgent` is present on every line of a subagent file; capture it
+    // once so subagents can be labelled by their type (e.g. "Explore").
+    if session.agent_type.is_none() {
+        if let Some(a) = v.get("attributionAgent").and_then(|a| a.as_str()) {
+            if !a.is_empty() {
+                session.agent_type = Some(a.to_string());
+            }
+        }
+    }
     if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
         // still capture cwd / branch from any line that has them
         if session.cwd.is_none() {
@@ -294,8 +334,10 @@ fn process_line(
     entry.message_count += 1;
 
     // context occupancy: full prompt of the latest main-chain turn.
-    // Sidechain (subagent) turns run in their own, smaller context.
-    if v.get("isSidechain").and_then(|s| s.as_bool()) != Some(true) {
+    // Sidechain (subagent) turns run in their own, smaller context — skipped for
+    // the main session, but `force_context` opens the gate when this file IS a
+    // subagent (every line sidechain) so its own window is tracked.
+    if force_context || v.get("isSidechain").and_then(|s| s.as_bool()) != Some(true) {
         session.context_tokens = inp + cc + cr;
         session.context_limit = context_limit(&model, settings_model, session.context_tokens);
     }
@@ -345,7 +387,7 @@ fn finalize(state: &ParseState) -> SessionUsage {
 /// Parse a session file. When `since_ms` is `Some`, only assistant messages with
 /// a timestamp at/after that instant are counted (used to scope usage to a single
 /// SwarmZ-launched session rather than the whole history).
-fn parse_file(path: &Path, since_ms: Option<u64>) -> SessionUsage {
+fn parse_file(path: &Path, since_ms: Option<u64>, force_context: bool) -> SessionUsage {
     let new_session = || SessionUsage {
         session_id: path
             .file_stem()
@@ -392,7 +434,14 @@ fn parse_file(path: &Path, since_ms: Option<u64>) -> SessionUsage {
                         if line.is_empty() {
                             continue;
                         }
-                        process_line(line, session, models, since_ms, settings_model.as_deref());
+                        process_line(
+                            line,
+                            session,
+                            models,
+                            since_ms,
+                            settings_model.as_deref(),
+                            force_context,
+                        );
                     }
                     *offset += (last_nl + 1) as u64;
                 }
@@ -435,7 +484,7 @@ pub fn newest_session_for_dir(cwd: &str) -> Option<PathBuf> {
 
 pub fn usage_for_dir(cwd: &str) -> Option<SessionUsage> {
     let path = newest_session_for_dir(cwd)?;
-    Some(parse_file(&path, None))
+    Some(parse_file(&path, None, false))
 }
 
 fn file_created_ms(path: &Path) -> u64 {
@@ -516,6 +565,63 @@ fn pick_resumed_session(dir: &Path, since_ms: u64, exclude: &[String]) -> Option
     newest.map(|(_, p)| p)
 }
 
+/// Subagents (Task tool) of a session live in a sibling directory:
+/// `<project>/<session_id>/subagents/agent-<id>.jsonl`. Each file is one
+/// subagent with its OWN context window — every line there is sidechain, so we
+/// parse with `force_context` to track that window (the normal gate would leave
+/// it at 0). Reuses `parse_file`'s incremental cache, so polling stays cheap.
+fn subagents_for_session_file(session_path: &Path) -> Vec<SubagentUsage> {
+    let Some(stem) = session_path.file_stem().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    let dir = match session_path.parent() {
+        Some(p) => p.join(stem).join("subagents"),
+        None => return Vec::new(),
+    };
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let s = parse_file(&p, None, true);
+        if s.message_count == 0 {
+            continue;
+        }
+        let fstem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("");
+        let agent_id = fstem.strip_prefix("agent-").unwrap_or(fstem).to_string();
+        out.push(SubagentUsage {
+            agent_id,
+            agent_type: s.agent_type.clone(),
+            model: s.primary_model.clone(),
+            context_tokens: s.context_tokens,
+            context_limit: s.context_limit,
+            message_count: s.message_count,
+            input_tokens: s.input_tokens,
+            output_tokens: s.output_tokens,
+            cache_creation_tokens: s.cache_creation_tokens,
+            cache_read_tokens: s.cache_read_tokens,
+            cost_usd: s.cost_usd,
+            last_activity: s.last_activity.clone(),
+            running: now.saturating_sub(file_modified_ms(&p)) < 8000,
+        });
+    }
+    // running first, then most-recently active
+    out.sort_by(|a, b| {
+        b.running
+            .cmp(&a.running)
+            .then(b.last_activity.cmp(&a.last_activity))
+    });
+    out
+}
+
 /// Usage for a single SwarmZ-launched session only. Latches onto `session_id`
 /// once known; otherwise discovers the session file born after `since_ms` —
 /// or, as a fallback for manual `claude --resume` in a fresh pane, the
@@ -549,7 +655,9 @@ pub fn usage_for_session(
         }
         None => (discover()?, Some(since_ms)),
     };
-    Some(parse_file(&path, since))
+    let mut session = parse_file(&path, since, false);
+    session.subagents = subagents_for_session_file(&path);
+    Some(session)
 }
 
 // ---- Aggregate totals (parse_file's incremental cache keeps this cheap) ----
@@ -576,7 +684,7 @@ pub fn usage_totals() -> UsageTotals {
             continue;
         }
         seen.insert(path.to_path_buf());
-        let session = parse_file(path, None);
+        let session = parse_file(path, None, false);
 
         if session.message_count == 0 {
             continue;

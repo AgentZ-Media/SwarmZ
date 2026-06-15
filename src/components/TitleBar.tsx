@@ -142,14 +142,17 @@ function WorkspaceTabs() {
   return (
     <div
       ref={stripRef}
-      className="no-drag no-scrollbar flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
+      // NOT no-drag: the strip spans the middle of the title bar (flex-1), so
+      // its empty area must stay draggable — only the tabs and the + button
+      // opt out (otherwise the whole title bar middle becomes undraggable).
+      className="no-scrollbar flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
     >
       {workspaceOrder.map((id, i) => (
         <WorkspaceTab key={id} id={id} index={i} stripRef={stripRef} />
       ))}
       <Tip label="New workspace (⌘⇧N)">
         <button
-          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
+          className="no-drag flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
           onClick={() => createWorkspace()}
         >
           <Plus size={14} />
@@ -264,7 +267,7 @@ function WorkspaceTab({
       }}
       title={index <= 8 ? `${name} — ⌘${index + 1}` : name}
       className={cn(
-        "group/tab flex h-7 max-w-44 shrink-0 items-center gap-1.5 rounded-md border px-2 transition-colors",
+        "no-drag group/tab flex h-7 max-w-44 shrink-0 items-center gap-1.5 rounded-md border px-2 transition-colors",
         active
           ? "border-border bg-card text-foreground"
           : "border-transparent text-muted-foreground hover:bg-accent hover:text-foreground",

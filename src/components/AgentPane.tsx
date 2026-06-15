@@ -2,6 +2,7 @@ import { memo, useState, type ReactNode } from "react";
 import {
   BarChart3,
   Bell,
+  Bot,
   Columns2,
   ExternalLink,
   Folder,
@@ -39,7 +40,7 @@ import {
   shortPath,
 } from "@/lib/utils";
 import { openUrl } from "@/lib/transport";
-import type { Agent, GitInfo, SessionUsage } from "@/types";
+import type { Agent, GitInfo, SessionUsage, SubagentUsage } from "@/types";
 
 /** Branch + dirty counters (±lines, untracked) for the pane header. */
 function GitChip({ git }: { git: GitInfo }) {
@@ -133,6 +134,83 @@ function ContextGauge({ usage }: { usage: SessionUsage }) {
   );
 }
 
+/** One subagent (Task tool) chip: own mini context bar + run state, full
+ * breakdown on hover. Subagents run in their own context window, so this is
+ * kept separate from the parent's ContextGauge. */
+function SubagentChip({ sub }: { sub: SubagentUsage }) {
+  const pct =
+    sub.context_limit > 0
+      ? Math.min(sub.context_tokens / sub.context_limit, 1)
+      : 0;
+  const color =
+    pct >= 0.85
+      ? "var(--destructive)"
+      : pct >= 0.65
+        ? "var(--warning)"
+        : "var(--ring)";
+  const label = sub.agent_type || "subagent";
+  return (
+    <Tip
+      label={
+        <span className="block font-mono text-[11px] leading-relaxed">
+          <span className="font-medium">{label}</span>
+          {sub.model && (
+            <span className="text-faint"> · {prettyModel(sub.model)}</span>
+          )}
+          {sub.running && <span className="text-success"> · running</span>}
+          <br />
+          Context: {formatTokens(sub.context_tokens)} used ·{" "}
+          {formatTokens(Math.max(sub.context_limit - sub.context_tokens, 0))} free
+          of {formatTokens(sub.context_limit)} ({Math.round(pct * 100)}%)
+          <br />
+          In {formatTokens(sub.input_tokens)} · Out{" "}
+          {formatTokens(sub.output_tokens)} · Cache{" "}
+          {formatTokens(sub.cache_creation_tokens + sub.cache_read_tokens)}
+          <br />
+          {sub.message_count} msg · {formatUsd(sub.cost_usd)}
+        </span>
+      }
+    >
+      <span className="flex shrink-0 items-center gap-1.5 rounded bg-secondary/60 px-1.5 py-0.5 font-mono text-[10px] tabular-nums">
+        <span
+          className={cn(
+            "h-1.5 w-1.5 shrink-0 rounded-full",
+            sub.running ? "animate-pulse bg-success" : "bg-faint/60",
+          )}
+        />
+        <span className="max-w-24 truncate text-muted-foreground">{label}</span>
+        <span className="relative h-1 w-8 overflow-hidden rounded-full bg-border">
+          <span
+            className="absolute inset-y-0 left-0 rounded-full"
+            style={{ width: `${pct * 100}%`, background: color }}
+          />
+        </span>
+        <span className="text-faint">{Math.round(pct * 100)}%</span>
+      </span>
+    </Tip>
+  );
+}
+
+/** Thin strip under the pane header listing this agent's subagents. */
+function SubagentStrip({ subagents }: { subagents: SubagentUsage[] }) {
+  if (subagents.length === 0) return null;
+  return (
+    <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b border-border bg-card/60 px-2.5 py-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      <Tip label="Subagents spawned by this session (own context windows)">
+        <span className="flex shrink-0 items-center gap-1 text-faint">
+          <Bot size={11} className="shrink-0" />
+          <span className="font-mono text-[10px] @max-md:hidden">
+            {subagents.length}
+          </span>
+        </span>
+      </Tip>
+      {subagents.map((s) => (
+        <SubagentChip key={s.agent_id} sub={s} />
+      ))}
+    </div>
+  );
+}
+
 /** One key/value line inside the per-agent stats popover. */
 function StatRow({ k, v }: { k: string; v: ReactNode }) {
   return (
@@ -222,6 +300,22 @@ function AgentStatsBody({ agent }: { agent: Agent }) {
                 <StatRow k="Total tokens" v={formatTokens(totalTokens)} />
                 <StatRow k="Est. API cost" v={formatUsd(u.cost_usd)} />
               </div>
+              {u.subagents && u.subagents.length > 0 && (
+                <div className="space-y-1 border-t border-border pt-2">
+                  <div className="flex items-center gap-1.5 text-[11px] text-faint">
+                    <Bot size={11} /> Subagents ({u.subagents.length})
+                  </div>
+                  {u.subagents.map((s) => (
+                    <StatRow
+                      key={s.agent_id}
+                      k={s.agent_type || "subagent"}
+                      v={`${formatTokens(s.context_tokens)}/${formatTokens(
+                        s.context_limit,
+                      )} · ${formatUsd(s.cost_usd)}${s.running ? " · ●" : ""}`}
+                    />
+                  ))}
+                </div>
+              )}
               <div className="space-y-1 border-t border-border pt-2">
                 {agent.worktree ? (
                   <StatRow
@@ -560,6 +654,10 @@ export const AgentPane = memo(function AgentPane({
           </Tip>
         </div>
       </div>
+
+      {usage?.subagents && usage.subagents.length > 0 && (
+        <SubagentStrip subagents={usage.subagents} />
+      )}
 
       {/* terminal — also an OS-file drop zone (see lib/dnd.ts) */}
       <div className="relative min-h-0 flex-1" data-file-drop={agentId}>

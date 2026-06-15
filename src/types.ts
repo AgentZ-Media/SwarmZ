@@ -36,6 +36,30 @@ export interface SessionUsage {
   cache_read_tokens: number;
   cost_usd: number;
   by_model: ModelUsage[];
+  /** subagents (Task tool) spawned by this session, each with its own context */
+  subagents?: SubagentUsage[];
+}
+
+/**
+ * One subagent (Task tool) run, parsed from its own jsonl in
+ * `<project>/<session>/subagents/`. Has its own context window.
+ */
+export interface SubagentUsage {
+  agent_id: string;
+  /** agent type from `attributionAgent`, e.g. "Explore" / "general-purpose" */
+  agent_type: string | null;
+  model: string | null;
+  context_tokens: number;
+  context_limit: number;
+  message_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  last_activity: string | null;
+  /** the subagent file was modified within the last few seconds */
+  running: boolean;
 }
 
 /**
