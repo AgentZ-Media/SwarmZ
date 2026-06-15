@@ -37,6 +37,7 @@ Backend (`src-tauri/src/`):
 - Global shortcuts early-return while a dialog is open (⌘K/⌘⇧K may close their palettes); ⌘W is always `preventDefault`ed; the ⌘⇧K branch stays before plain ⌘K.
 - Sync Tauri commands run on the main thread — anything blocking (subprocesses, file walks, keychain, inference) must be async + `spawn_blocking`. `pty_write`/`pty_spawn`/`pty_resize` stay sync on purpose (ordering); writes are non-blocking via the per-session writer channel.
 - Quit flushes **all** debounced persists (`flushAllPersists`); the quit/close choreography in `lib/quit.ts` + `lib.rs` looks redundant but every leg is load-bearing (window-state save, updater restart code).
+- Title-bar dragging relies **only** on `data-tauri-drag-region="deep"` on the `<header>` in `TitleBar.tsx` — WKWebView ignores `-webkit-app-region`, so the `drag-region`/`no-drag` CSS classes are no-ops on macOS. `"deep"` makes the whole subtree draggable; Tauri's `drag.js` auto-excludes real `<button>`/`<input>`/`role` elements. Don't switch back to bare `data-tauri-drag-region` (drags only direct hits on the header itself = just the flex gaps).
 
 ## Releases & updates
 

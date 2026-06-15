@@ -38,8 +38,13 @@ export function TitleBar({
 
   return (
     <header
-      data-tauri-drag-region
-      className="drag-region flex h-11 shrink-0 items-center gap-2 border-b border-border bg-background pr-3"
+      // "deep" = the whole title-bar subtree is draggable, not just direct hits
+      // on the bare <header> (which is all the flex gaps amount to). Tauri's
+      // drag.js still auto-excludes real <button>/<input>/role elements, so the
+      // action buttons and tabs keep working. WKWebView ignores -webkit-app-region,
+      // so this attribute — not the CSS — is what actually drags on macOS.
+      data-tauri-drag-region="deep"
+      className="flex h-11 shrink-0 items-center gap-2 border-b border-border bg-background pr-3"
       style={{ paddingLeft: IS_TAURI ? 80 : 16 }}
     >
       <img
@@ -142,9 +147,9 @@ function WorkspaceTabs() {
   return (
     <div
       ref={stripRef}
-      // NOT no-drag: the strip spans the middle of the title bar (flex-1), so
-      // its empty area must stay draggable — only the tabs and the + button
-      // opt out (otherwise the whole title bar middle becomes undraggable).
+      // The strip spans the middle of the title bar (flex-1); its empty area
+      // stays draggable for free via the header's data-tauri-drag-region="deep"
+      // (Tauri auto-excludes the tab <button>s and the + button).
       className="no-scrollbar flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
     >
       {workspaceOrder.map((id, i) => (
