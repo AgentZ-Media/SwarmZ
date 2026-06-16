@@ -42,7 +42,17 @@ export const useUpdates = create<UpdatesState>((set, get) => {
   async function poll(opts: { manual: boolean }): Promise<void> {
     if (!IS_TAURI || inFlight) return;
     const s = get().stage;
-    if (s === "downloading" || s === "ready") return;
+    // An update is already found / downloading / installed-pending-restart.
+    // Re-running the native check() here is at best pointless and at worst
+    // re-enters the updater while it holds a downloaded artifact, so bail —
+    // but quit the spinner so a manual click never looks like a freeze.
+    if (s === "available" || s === "downloading" || s === "ready") {
+      if (opts.manual) {
+        if (manualResetTimer) clearTimeout(manualResetTimer);
+        set({ manualCheck: null });
+      }
+      return;
+    }
     inFlight = true;
     if (opts.manual) {
       if (manualResetTimer) clearTimeout(manualResetTimer);

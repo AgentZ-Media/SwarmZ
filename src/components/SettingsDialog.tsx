@@ -1352,7 +1352,15 @@ function UpdatesSection() {
         <Button
           size="sm"
           variant="outline"
-          disabled={manualCheck === "checking" || stage === "downloading"}
+          // Once an update is found, downloaded or installing, checking again is
+          // pointless — and in the "ready"/"downloading" states poll() is a
+          // no-op anyway, so an enabled button would just feel like a freeze.
+          disabled={
+            manualCheck === "checking" ||
+            stage === "available" ||
+            stage === "downloading" ||
+            stage === "ready"
+          }
           onClick={() => void checkNow()}
         >
           <RefreshCw
