@@ -19,7 +19,7 @@ import { Button } from "./ui/button";
 import { Tip } from "./ui/tooltip";
 import { cn } from "@/lib/utils";
 import { IS_TAURI } from "@/lib/transport";
-import type { RateLimitWindow } from "@/types";
+import type { CodexRateLimits, RateLimitWindow } from "@/types";
 
 export function TitleBar({
   onManageProfiles,
@@ -401,30 +401,40 @@ function LimitMeter({
   );
 }
 
-/**
- * Usage limits of the Claude subscription logged in on this machine
- * (5-hour session window + weekly windows). Hidden when no login is found.
- */
+/** Usage limits from Claude credentials plus active Codex session events. */
 function LimitsPill() {
   const limits = useLimits((s) => s.limits);
-  if (!limits) return null;
+  const codexLimits = useSwarm((s) => latestCodexLimits(s.order, s.agents));
+  if (!limits && !codexLimits) return null;
 
   const meters: { label: string; tip: string; win: RateLimitWindow }[] = [];
-  if (limits.five_hour)
-    meters.push({ label: "5h", tip: "5-hour session limit", win: limits.five_hour });
-  if (limits.seven_day)
-    meters.push({ label: "wk", tip: "Weekly limit (all models)", win: limits.seven_day });
-  if (limits.seven_day_sonnet?.utilization)
+  if (limits?.five_hour)
+    meters.push({ label: "cl 5h", tip: "Claude 5-hour session limit", win: limits.five_hour });
+  if (limits?.seven_day)
+    meters.push({ label: "cl wk", tip: "Claude weekly limit", win: limits.seven_day });
+  if (limits?.seven_day_sonnet?.utilization)
     meters.push({
       label: "son",
-      tip: "Weekly Sonnet limit",
+      tip: "Claude weekly Sonnet limit",
       win: limits.seven_day_sonnet,
     });
-  if (limits.seven_day_opus?.utilization)
+  if (limits?.seven_day_opus?.utilization)
     meters.push({
       label: "opus",
-      tip: "Weekly Opus limit",
+      tip: "Claude weekly Opus limit",
       win: limits.seven_day_opus,
+    });
+  if (codexLimits?.primary)
+    meters.push({
+      label: "cx 5h",
+      tip: `Codex ${codexLimits.plan_type ?? "plan"} primary limit`,
+      win: codexLimits.primary,
+    });
+  if (codexLimits?.secondary)
+    meters.push({
+      label: "cx wk",
+      tip: `Codex ${codexLimits.plan_type ?? "plan"} weekly limit`,
+      win: codexLimits.secondary,
     });
   if (meters.length === 0) return null;
 
@@ -439,6 +449,17 @@ function LimitsPill() {
       ))}
     </div>
   );
+}
+
+function latestCodexLimits(
+  order: string[],
+  agents: ReturnType<typeof useSwarm.getState>["agents"],
+): CodexRateLimits | null {
+  for (const id of [...order].reverse()) {
+    const limits = agents[id]?.usage?.codex_limits;
+    if (limits?.primary || limits?.secondary) return limits;
+  }
+  return null;
 }
 
 /** Shows only when an update is live: available → downloading → ready. */

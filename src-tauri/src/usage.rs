@@ -192,6 +192,8 @@ pub struct ModelUsage {
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub reasoning_output_tokens: u64,
     pub message_count: u64,
     pub cost_usd: f64,
 }
@@ -209,10 +211,16 @@ impl ModelUsage {
 
 #[derive(Clone, Serialize, Default)]
 pub struct SessionUsage {
+    #[serde(default)]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub activity: Option<String>,
     pub session_id: String,
     pub cwd: Option<String>,
     pub primary_model: Option<String>,
     pub service_tier: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
     pub git_branch: Option<String>,
     pub last_activity: Option<String>,
     /// `attributionAgent` for subagent files (e.g. "Explore"); `None` for the
@@ -227,12 +235,30 @@ pub struct SessionUsage {
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub reasoning_output_tokens: u64,
     pub cost_usd: f64,
     pub by_model: Vec<ModelUsage>,
+    #[serde(default)]
+    pub codex_limits: Option<CodexRateLimits>,
     /// Subagents (Task tool) spawned by this session, each with its own context
     /// window. Only populated by `usage_for_session`; empty otherwise.
     #[serde(default)]
     pub subagents: Vec<SubagentUsage>,
+}
+
+#[derive(Clone, Serialize, Default)]
+pub struct CodexRateLimitWindow {
+    pub utilization: Option<f64>,
+    pub resets_at: Option<String>,
+    pub window_minutes: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Default)]
+pub struct CodexRateLimits {
+    pub primary: Option<CodexRateLimitWindow>,
+    pub secondary: Option<CodexRateLimitWindow>,
+    pub plan_type: Option<String>,
 }
 
 /// One subagent (Task tool) run, parsed from
@@ -260,11 +286,15 @@ pub struct SubagentUsage {
 
 #[derive(Clone, Serialize, Default)]
 pub struct UsageTotals {
+    #[serde(default)]
+    pub runtime: Option<String>,
     pub total_cost_usd: f64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub reasoning_output_tokens: u64,
     pub message_count: u64,
     pub session_count: u64,
     pub by_model: Vec<ModelUsage>,
@@ -444,6 +474,7 @@ fn finalize(state: &ParseState) -> SessionUsage {
 /// SwarmZ-launched session rather than the whole history).
 fn parse_file(path: &Path, since_ms: Option<u64>, force_context: bool) -> SessionUsage {
     let new_session = || SessionUsage {
+        runtime: Some("claude".to_string()),
         session_id: path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -720,7 +751,10 @@ pub fn usage_for_session(
 // ---- Aggregate totals (parse_file's incremental cache keeps this cheap) ----
 
 pub fn usage_totals() -> UsageTotals {
-    let mut totals = UsageTotals::default();
+    let mut totals = UsageTotals {
+        runtime: Some("claude".to_string()),
+        ..Default::default()
+    };
     let mut models: HashMap<String, ModelUsage> = HashMap::new();
     let root = match claude_projects_dir() {
         Some(r) if r.is_dir() => r,

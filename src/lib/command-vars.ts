@@ -39,7 +39,7 @@ export function extractInputLabels(text: string): string[] {
 
 /**
  * Replace built-in and input placeholders. A known variable without a value
- * (e.g. {{branch}} outside a repo) becomes "" — an empty hole confuses claude
+ * (e.g. {{branch}} outside a repo) becomes "" — an empty hole confuses agents
  * less than a leftover mustache. Unknown tokens are returned literally.
  */
 export function substituteVars(

@@ -5,9 +5,9 @@ import { substituteVars } from "@/lib/command-vars";
 
 /**
  * Paste a custom command into an agent pane — shared by the ⌘⇧K insert picker
- * and the ⌘K command palette. Pastes via term.paste() (bracketed paste — claude
- * treats it as input, not keystrokes); `submit` sends a SEPARATE `\r` because a
- * `\r` inside the paste would only be a literal newline in claude's input box.
+ * and the ⌘K command palette. Pastes via term.paste() (bracketed paste — agent
+ * CLIs treat it as input, not keystrokes); `submit` sends a SEPARATE `\r`
+ * because a `\r` inside the paste would only be a literal newline.
  */
 export function insertCommandText(
   targetId: string,

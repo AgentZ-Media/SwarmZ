@@ -10,9 +10,22 @@ import {
 } from "./ui/dialog";
 import { Button } from "./ui/button";
 import { Input, Label } from "./ui/input";
-import { useSwarm } from "@/store";
-import { AGENT_COLORS, cn, shortPath } from "@/lib/utils";
-import type { Profile } from "@/types";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./ui/select";
+import { DEFAULT_CODEX_STARTUP, DEFAULT_STARTUP, useSwarm } from "@/store";
+import { AGENT_COLORS, cn, runtimeFromStartup, shortPath } from "@/lib/utils";
+import type { AgentRuntime, Profile } from "@/types";
+
+function runtimeLabel(runtime: AgentRuntime): string {
+  if (runtime === "codex") return "Codex";
+  if (runtime === "claude") return "Claude";
+  return "Shell";
+}
 
 export function ProfilesDialog({
   open,
@@ -38,7 +51,8 @@ export function ProfilesDialog({
   const blank = (): Profile => ({
     id: "",
     name: "",
-    startup: "claude --dangerously-skip-permissions",
+    runtime: "claude",
+    startup: DEFAULT_STARTUP,
     color: AGENT_COLORS[profiles.length % AGENT_COLORS.length],
   });
 
@@ -68,6 +82,7 @@ export function ProfilesDialog({
                 <div className="flex-1 overflow-hidden">
                   <div className="truncate text-sm font-medium">{p.name}</div>
                   <div className="truncate font-mono text-[11px] text-faint">
+                    {runtimeLabel(p.runtime ?? runtimeFromStartup(p.startup))} ·{" "}
                     {p.startup || "(plain shell)"}
                   </div>
                 </div>
@@ -126,14 +141,46 @@ export function ProfilesDialog({
               />
             </div>
             <div>
+              <Label>Agent runtime</Label>
+              <Select
+                value={current.runtime ?? runtimeFromStartup(current.startup)}
+                onValueChange={(v) => {
+                  const runtime = v as AgentRuntime;
+                  setEditing({
+                    ...current,
+                    runtime,
+                    startup:
+                      runtime === "codex"
+                        ? DEFAULT_CODEX_STARTUP
+                        : runtime === "claude"
+                          ? DEFAULT_STARTUP
+                          : "",
+                  });
+                }}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="claude">Claude Code</SelectItem>
+                  <SelectItem value="codex">ChatGPT Codex CLI</SelectItem>
+                  <SelectItem value="shell">Plain shell</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
               <Label>Startup command</Label>
               <Input
                 className="font-mono text-xs"
                 value={current.startup}
                 onChange={(e) =>
-                  setEditing({ ...current, startup: e.target.value })
+                  setEditing({
+                    ...current,
+                    startup: e.target.value,
+                    runtime: runtimeFromStartup(e.target.value),
+                  })
                 }
-                placeholder="claude --dangerously-skip-permissions"
+                placeholder="claude, codex, or a shell command"
               />
             </div>
             <div>

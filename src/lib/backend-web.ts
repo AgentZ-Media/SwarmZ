@@ -110,9 +110,9 @@ export const webBackend: Backend = {
     return subscribe(exitCbs, id, cb);
   },
 
-  fetchUsageForDir: (cwd) =>
+  fetchUsageForDir: (cwd, _runtime) =>
     getJson(`/api/usage/dir?cwd=${encodeURIComponent(cwd)}`),
-  fetchUsageForSession: (cwd, sinceMs, sessionId, excludeSessionIds) => {
+  fetchUsageForSession: (cwd, sinceMs, sessionId, excludeSessionIds, _runtime) => {
     const sid = sessionId ? `&sid=${encodeURIComponent(sessionId)}` : "";
     const ex = excludeSessionIds?.length
       ? `&exclude=${encodeURIComponent(excludeSessionIds.join(","))}`

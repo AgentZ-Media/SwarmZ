@@ -47,13 +47,14 @@ export interface Backend {
   onPtyData(id: string, cb: (e: PtyDataEvent) => void): Promise<Unlisten>;
   onPtyExit(id: string, cb: (e: PtyExitEvent) => void): Promise<Unlisten>;
 
-  fetchUsageForDir(cwd: string): Promise<SessionUsage | null>;
+  fetchUsageForDir(cwd: string, runtime?: string): Promise<SessionUsage | null>;
   fetchUsageForSession(
     cwd: string,
     sinceMs: number,
     sessionId?: string,
     /** session ids already claimed by other agents — never match these */
     excludeSessionIds?: string[],
+    runtime?: string,
   ): Promise<SessionUsage | null>;
   fetchUsageTotals(): Promise<UsageTotals>;
   /**

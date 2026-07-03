@@ -19,10 +19,10 @@ type Step =
 
 /**
  * ⌘⇧K — insert a custom command (prompt snippet) into the active agent pane.
- * Selection PASTES via term.paste() (bracketed paste — claude treats it as
+ * Selection PASTES via term.paste() (bracketed paste — agent CLIs treat it as
  * input, not keystrokes) without submitting; ⌘Enter additionally sends a
  * separate `\r` to submit (a `\r` inside the paste would only be a literal
- * newline in claude's input box). Commands with {{input:Label}} placeholders
+ * newline in an agent input box). Commands with {{input:Label}} placeholders
  * ask for values first; built-ins ({{folder}}, {{cwd}}, {{branch}}, {{agent}})
  * fill from the target pane. Agent panes only — floating terminals have no
  * focus tracking in the store; `insert()` only needs a pty id, so extending

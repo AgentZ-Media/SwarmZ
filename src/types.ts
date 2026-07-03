@@ -1,10 +1,9 @@
 export type AgentStatus = "starting" | "running" | "attention" | "exited";
+export type AgentRuntime = "claude" | "codex" | "shell";
 
 /**
- * Claude Code's own working state, captured from terminal escape sequences:
- * OSC 9;4 progress reporting (busy/idle, emitted because SwarmZ advertises
- * support via ConEmuANSI=ON) and the OSC 21337 tab-status protocol
- * (idle/busy/waiting — dormant in current Claude Code builds, pre-wired here).
+ * Agent working state. Claude reports this through terminal escape sequences;
+ * Codex reports it through rollout events.
  */
 export type ClaudeActivity = "busy" | "idle" | "waiting";
 
@@ -14,15 +13,19 @@ export interface ModelUsage {
   output_tokens: number;
   cache_creation_tokens: number;
   cache_read_tokens: number;
+  reasoning_output_tokens?: number;
   message_count: number;
   cost_usd: number;
 }
 
 export interface SessionUsage {
+  runtime?: AgentRuntime;
+  activity?: ClaudeActivity;
   session_id: string;
   cwd: string | null;
   primary_model: string | null;
   service_tier: string | null;
+  title?: string | null;
   git_branch: string | null;
   last_activity: string | null;
   /** current context occupancy = full prompt of the latest main-chain turn */
@@ -34,10 +37,22 @@ export interface SessionUsage {
   output_tokens: number;
   cache_creation_tokens: number;
   cache_read_tokens: number;
+  reasoning_output_tokens?: number;
   cost_usd: number;
   by_model: ModelUsage[];
+  codex_limits?: CodexRateLimits | null;
   /** subagents (Task tool) spawned by this session, each with its own context */
   subagents?: SubagentUsage[];
+}
+
+export interface CodexRateLimitWindow extends RateLimitWindow {
+  window_minutes: number | null;
+}
+
+export interface CodexRateLimits {
+  primary: CodexRateLimitWindow | null;
+  secondary: CodexRateLimitWindow | null;
+  plan_type: string | null;
 }
 
 /**
@@ -63,11 +78,12 @@ export interface SubagentUsage {
 }
 
 /**
- * Persisted snapshot of one claude session launched inside SwarmZ.
+ * Persisted snapshot of one tracked agent session launched inside SwarmZ.
  * Survives app restarts so global usage stats cover all-time activity,
  * independent of the ~/.claude JSONL files still existing.
  */
 export interface UsageHistoryEntry {
+  runtime?: AgentRuntime;
   session_id: string;
   agent_name: string;
   cwd: string | null;
@@ -78,16 +94,19 @@ export interface UsageHistoryEntry {
   output_tokens: number;
   cache_creation_tokens: number;
   cache_read_tokens: number;
+  reasoning_output_tokens?: number;
   cost_usd: number;
   by_model: ModelUsage[];
 }
 
 export interface UsageTotals {
+  runtime?: AgentRuntime;
   total_cost_usd: number;
   input_tokens: number;
   output_tokens: number;
   cache_creation_tokens: number;
   cache_read_tokens: number;
+  reasoning_output_tokens?: number;
   message_count: number;
   session_count: number;
   by_model: ModelUsage[];
@@ -204,9 +223,11 @@ export interface AppSettings {
   defaultStartup?: string;
   /** absolute path used instead of `claude` at the start of startup commands */
   claudePath?: string;
+  /** absolute path used instead of `codex` at the start of startup commands */
+  codexPath?: string;
   /** absolute path to the git binary used for the read-only pane git status */
   gitPath?: string;
-  /** restore the last grid on launch and resume each pane's claude session (default off) */
+  /** restore the last grid on launch and resume each tracked pane's session (default off) */
   restoreAgents?: boolean;
   /** voice dictation hotkey behavior: hold ⌘⇧M like push-to-talk, or press to start/stop (default "hold") */
   dictationHotkeyMode?: "hold" | "toggle";
@@ -317,6 +338,7 @@ export interface PersistedWorkspaces {
 /** Restore-relevant slice of an Agent, snapshotted into the persisted grid. */
 export interface PersistedAgent {
   id: string;
+  runtime?: AgentRuntime;
   name: string;
   renamed?: boolean;
   workspaceId: string;
@@ -326,7 +348,7 @@ export interface PersistedAgent {
   color: string;
   profileId?: string;
   fontSize?: number;
-  /** claude session to resume when this pane is restored */
+  /** agent session to resume when this pane is restored */
   sessionId?: string;
   /** set when the pane lives in a SwarmZ-managed git worktree */
   worktree?: WorktreeMeta;
@@ -335,8 +357,8 @@ export interface PersistedAgent {
 /**
  * Continuously persisted snapshot of the live grid: every agent pane plus the
  * tiling trees referencing them. Restored on launch (settings.restoreAgents)
- * by respawning each pane with `claude --resume <sessionId>`. Floating
- * terminals are plain shells without a session — they are not captured.
+ * by respawning each pane with runtime-specific resume. Floating terminals are
+ * plain shells without a session — they are not captured.
  */
 export interface PersistedGrid {
   /** snapshot shape version — bump when the persisted shape changes so a
@@ -351,6 +373,7 @@ export interface PersistedGrid {
 export interface Profile {
   id: string;
   name: string;
+  runtime?: AgentRuntime;
   /** command typed into the shell on spawn, e.g. `claude --dangerously-skip-permissions` */
   startup: string;
   defaultCwd?: string;
@@ -363,6 +386,7 @@ export interface Profile {
 export interface PresetPaneNode {
   type: "pane";
   id: string;
+  runtime?: AgentRuntime;
   /** fixed working directory; unset = inherit the folder asked for at load time */
   cwd?: string;
   /** startup command; unset = the configured default startup command, "" = plain shell */
@@ -397,6 +421,7 @@ export interface WorkspacePreset {
 
 export interface Agent {
   id: string;
+  runtime?: AgentRuntime;
   name: string;
   /** workspace this agent's pane lives in */
   workspaceId: string;
@@ -408,23 +433,23 @@ export interface Agent {
   createdAt: number;
   profileId?: string;
   usage?: SessionUsage;
-  /** latched once this agent's own claude session file is discovered */
+  /** latched once this agent's own session file is discovered */
   sessionId?: string;
   /**
-   * claude session this restored pane should reopen — applied at PTY spawn
-   * (`--resume`), kept off `startup` so splits/persistence see the clean command
+   * agent session this restored pane should reopen — applied at PTY spawn,
+   * kept off `startup` so splits/persistence see the clean command
    */
   resume?: string;
-  /** last terminal title captured from the PTY (claude's auto-generated topic) */
+  /** last terminal title captured from the PTY (for runtimes that emit one) */
   title?: string;
   /** true once the user named the agent themselves — captured titles stop renaming it */
   renamed?: boolean;
-  /** claude's working state, if it reported one (see ClaudeActivity) */
+  /** agent working state, if reported (see ClaudeActivity) */
   activity?: ClaudeActivity;
   /**
-   * epoch ms of the first "busy" report — proof this pane's claude actually
-   * worked. Session discovery is gated on it: a pane that never did anything
-   * must not latch (and later resume) a sibling session from the same folder
+   * epoch ms of the first Claude "busy" report. Claude session discovery is
+   * gated on it: a pane that never did anything must not latch (and later
+   * resume) a sibling session from the same folder.
    */
   firstBusyAt?: number;
   /** per-pane terminal font size override (⌘+/⌘− zoom); unset = default */

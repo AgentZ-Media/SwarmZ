@@ -103,26 +103,37 @@ export default function App() {
         order.map(async (id) => {
           const a = agents[id];
           if (!a) return;
+          const runtime = a.runtime ?? "claude";
+          if (runtime === "shell") return;
           const dir = a.cwd || homeRef.current;
           if (!dir) return;
-          // session discovery is gated on real activity: a pane whose claude
+          // Claude session discovery is gated on real activity: a pane whose CLI
           // never went busy has no session file of its own and would latch
           // (and later resume) a sibling session born in the same folder
-          if (!a.sessionId && !a.firstBusyAt) return;
+          if (!a.sessionId && runtime === "claude" && !a.firstBusyAt) return;
           // discovery floor: only files born around the first activity match,
           // not anything since pane creation (5s + backend skew). A latched
           // session parses the whole file — the backend ignores `since` then
           const since = a.sessionId
             ? a.createdAt
-            : Math.max(a.createdAt, a.firstBusyAt! - 5000);
+            : runtime === "claude"
+              ? Math.max(a.createdAt, a.firstBusyAt! - 5000)
+              : a.createdAt;
           // sessions other agents have latched onto — with several agents in
           // the same folder, an unlatched pane must never match a sibling's file
           const exclude = order
             .filter((oid) => oid !== id)
+            .filter((oid) => (agents[oid]?.runtime ?? "claude") === runtime)
             .map((oid) => agents[oid]?.sessionId)
             .filter((s): s is string => !!s);
           try {
-            const u = await fetchUsageForSession(dir, since, a.sessionId, exclude);
+            const u = await fetchUsageForSession(
+              dir,
+              since,
+              a.sessionId,
+              exclude,
+              runtime,
+            );
             if (alive && u) setUsage(id, u);
           } catch {
             /* ignore */
@@ -150,8 +161,8 @@ export default function App() {
     void refresh();
     const interval = setInterval(schedule, 4000);
     const unlistenP = onUsageChanged((changedDirs) => {
-      // ignore changes from sessions we're not displaying (other Claude
-      // instances writing to ~/.claude/projects); empty = unknown → refresh
+      // ignore Claude changes from sessions we're not displaying; Codex
+      // watcher events use empty = unknown → refresh all
       if (changedDirs && changedDirs.length > 0) {
         const { agents, order } = useSwarm.getState();
         const watched = new Set(

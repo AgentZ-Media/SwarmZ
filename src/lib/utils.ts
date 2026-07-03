@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import type { AgentRuntime } from "@/types";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -8,6 +9,13 @@ export function cn(...inputs: ClassValue[]) {
 /** Claude encodes a cwd as the project dir name by replacing every `/` and `.` with `-`. */
 export function encodeProjectDir(cwd: string): string {
   return cwd.replace(/[/.]/g, "-");
+}
+
+export function runtimeFromStartup(startup: string | undefined): AgentRuntime {
+  const cmd = (startup ?? "").trimStart();
+  if (cmd === "codex" || cmd.startsWith("codex ")) return "codex";
+  if (cmd === "claude" || cmd.startsWith("claude ")) return "claude";
+  return "shell";
 }
 
 export function formatTokens(n: number): string {
@@ -24,10 +32,11 @@ export function formatUsd(n: number): string {
   return "$" + n.toFixed(2);
 }
 
-/** Turn `claude-opus-4-7` into `Opus 4.7`, `claude-fable-5` into `Fable 5`. */
+/** Turn `claude-opus-4-7` into `Opus 4.7`, `gpt-5.5` into `GPT-5.5`. */
 export function prettyModel(model: string | null | undefined): string {
   if (!model) return "—";
   const m = model.toLowerCase();
+  if (m.startsWith("gpt-")) return model.replace(/^gpt-/i, "GPT-");
   let family = "";
   if (m.includes("fable")) family = "Fable";
   else if (m.includes("opus")) family = "Opus";
@@ -49,6 +58,7 @@ export function modelAccent(model: string | null | undefined): string {
   if (m.includes("opus")) return "var(--chart-2)";
   if (m.includes("sonnet")) return "var(--chart-3)";
   if (m.includes("haiku")) return "var(--chart-4)";
+  if (m.startsWith("gpt-")) return "var(--chart-1)";
   return "var(--chart-5)";
 }
 
@@ -95,6 +105,21 @@ export function applyClaudePath(startup: string, claudePath?: string): string {
   return `"${bin}"` + cmd.slice("claude".length);
 }
 
+export function applyRuntimePath(
+  startup: string,
+  runtime: AgentRuntime | undefined,
+  paths: { claudePath?: string; codexPath?: string },
+): string {
+  const resolved = runtime ?? runtimeFromStartup(startup);
+  if (resolved === "claude") return applyClaudePath(startup, paths.claudePath);
+  if (resolved !== "codex") return startup;
+  const bin = paths.codexPath?.trim();
+  if (!bin) return startup;
+  const cmd = startup.trimStart();
+  if (cmd !== "codex" && !cmd.startsWith("codex ")) return startup;
+  return `"${bin}"` + cmd.slice("codex".length);
+}
+
 /**
  * Rewrite a claude startup command so a restored pane reopens its previous
  * conversation: `--resume <sessionId>` is appended to a leading `claude`
@@ -108,6 +133,21 @@ export function resumeStartup(startup: string, sessionId?: string): string {
   if (cmd !== "claude" && !cmd.startsWith("claude ")) return startup;
   if (/\s--(resume|continue)\b/.test(cmd) || /[;&|]/.test(cmd)) return startup;
   return `${startup} --resume ${sessionId}`;
+}
+
+export function resumeRuntimeStartup(
+  startup: string,
+  sessionId: string | undefined,
+  runtime: AgentRuntime | undefined,
+): string {
+  if (!sessionId) return startup;
+  const resolved = runtime ?? runtimeFromStartup(startup);
+  if (resolved === "claude") return resumeStartup(startup, sessionId);
+  if (resolved !== "codex") return startup;
+  const cmd = startup.trimStart();
+  if (cmd !== "codex" && !cmd.startsWith("codex ")) return startup;
+  if (/^codex\s+resume(?:\s|$)/.test(cmd) || /[;&|]/.test(cmd)) return startup;
+  return `${startup.replace(/^(\s*)codex\b/, "$1codex resume")} ${sessionId}`;
 }
 
 /**

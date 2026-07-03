@@ -245,10 +245,14 @@ function TerminalSection() {
         label="Restore agents on launch"
         help={
           <>
-            Reopen the last grid on start and resume each pane's Claude
+            Reopen the last grid on start and resume each pane's agent
             conversation (
             <code className="font-mono text-muted-foreground">
               claude --resume
+            </code>{" "}
+            or{" "}
+            <code className="font-mono text-muted-foreground">
+              codex resume
             </code>
             ). Floating terminals don't come back.
           </>
@@ -1468,6 +1472,25 @@ function PathsSection() {
       </StackedRow>
 
       <StackedRow
+        label="Codex binary"
+        help={
+          <>
+            Absolute path to the{" "}
+            <code className="font-mono text-muted-foreground">codex</code>{" "}
+            binary. When set, it replaces a leading{" "}
+            <code className="font-mono text-muted-foreground">codex</code> in
+            startup commands — other commands are untouched.
+          </>
+        }
+      >
+        <BinaryPathInput
+          value={settings.codexPath ?? ""}
+          placeholder="codex — resolved by your login shell"
+          onCommit={(v) => updateSettings({ codexPath: v })}
+        />
+      </StackedRow>
+
+      <StackedRow
         label="Git binary"
         help="Used for the read-only git status in pane headers (branch, ±lines, untracked)."
       >
@@ -1520,7 +1543,7 @@ function AboutSection() {
             </span>
           </div>
           <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-            Run, tile and monitor a swarm of Claude Code agents — real
+            Run, tile and monitor a swarm of Claude Code and Codex agents — real
             terminals, live tokens &amp; cost. 100% local.
           </p>
         </div>

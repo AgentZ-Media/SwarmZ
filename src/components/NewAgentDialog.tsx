@@ -20,8 +20,9 @@ import {
 } from "./ui/select";
 import { Switch } from "./ui/switch";
 import { Tip } from "./ui/tooltip";
-import { DEFAULT_STARTUP, useSwarm } from "@/store";
-import { shortPath } from "@/lib/utils";
+import { DEFAULT_CODEX_STARTUP, DEFAULT_STARTUP, useSwarm } from "@/store";
+import { runtimeFromStartup, shortPath } from "@/lib/utils";
+import type { AgentRuntime } from "@/types";
 
 export function NewAgentDialog() {
   const open_ = useSwarm((s) => s.newAgentOpen);
@@ -33,6 +34,7 @@ export function NewAgentDialog() {
 
   const [name, setName] = useState("");
   const [cwd, setCwd] = useState<string | undefined>();
+  const [runtime, setRuntime] = useState<AgentRuntime>("claude");
   const [startup, setStartup] = useState(DEFAULT_STARTUP);
   const [profileId, setProfileId] = useState<string | undefined>();
 
@@ -65,14 +67,15 @@ export function NewAgentDialog() {
       (pre?.profileId && s.profiles.find((p) => p.id === pre.profileId)) ||
       s.profiles[0];
     setProfileId(profile?.id);
+    const nextStartup =
+      pre?.startup ??
+      s.settings.defaultStartup ??
+      profile?.startup ??
+      DEFAULT_STARTUP;
+    setRuntime(pre?.runtime ?? profile?.runtime ?? runtimeFromStartup(nextStartup));
     // the configured default command beats the preselected profile's startup —
     // picking a profile by hand still overwrites the field (see onProfile)
-    setStartup(
-      pre?.startup ??
-        s.settings.defaultStartup ??
-        profile?.startup ??
-        DEFAULT_STARTUP,
-    );
+    setStartup(nextStartup);
     // workspace context wins over the generic profile/last-used fallbacks
     setCwd(
       pre?.cwd ?? ws?.defaultCwd ?? profile?.defaultCwd ?? s.settings.lastCwd,
@@ -125,8 +128,29 @@ export function NewAgentDialog() {
     setProfileId(id);
     const p = profiles.find((x) => x.id === id);
     if (p) {
+      setRuntime(p.runtime ?? runtimeFromStartup(p.startup));
       setStartup(p.startup);
       if (p.defaultCwd) setCwd(p.defaultCwd);
+    }
+  };
+
+  const onRuntime = (next: AgentRuntime) => {
+    setRuntime(next);
+    setProfileId(undefined);
+    const currentRuntime = runtimeFromStartup(startup);
+    if (
+      !startup.trim() ||
+      startup === DEFAULT_STARTUP ||
+      startup === DEFAULT_CODEX_STARTUP ||
+      currentRuntime !== next
+    ) {
+      setStartup(
+        next === "codex"
+          ? DEFAULT_CODEX_STARTUP
+          : next === "claude"
+            ? DEFAULT_STARTUP
+            : "",
+      );
     }
   };
 
@@ -142,7 +166,7 @@ export function NewAgentDialog() {
     // requested worktree to a plain pane on the main checkout — wait
     if (worktree && repoName === undefined && cwd) return;
     if (!worktree || !repoName || !cwd) {
-      createAgent({ name, cwd, startup, profileId }, prefill?.direction ?? "row");
+      createAgent({ name, runtime, cwd, startup, profileId }, prefill?.direction ?? "row");
       return;
     }
     // worktree flow: create it first, then spawn the agent inside it
@@ -179,6 +203,7 @@ export function NewAgentDialog() {
             name,
             cwd: info.path,
             startup,
+            runtime,
             profileId,
             worktree: { root: info.root, branch: info.branch },
           },
@@ -206,7 +231,7 @@ export function NewAgentDialog() {
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>
-            Spawn a terminal running Claude with the chosen profile.
+            Spawn a terminal running the chosen agent profile.
           </DialogDescription>
         </DialogHeader>
 
@@ -219,6 +244,20 @@ export function NewAgentDialog() {
               onChange={(e) => setName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit()}
             />
+          </div>
+
+          <div>
+            <Label>Agent runtime</Label>
+            <Select value={runtime} onValueChange={(v) => onRuntime(v as AgentRuntime)}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="claude">Claude Code</SelectItem>
+                <SelectItem value="codex">ChatGPT Codex CLI</SelectItem>
+                <SelectItem value="shell">Plain shell</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
 
           <div>
@@ -351,15 +390,21 @@ export function NewAgentDialog() {
             <Label>Startup command</Label>
             <Input
               value={startup}
-              onChange={(e) => setStartup(e.target.value)}
+              onChange={(e) => {
+                const value = e.target.value;
+                setStartup(value);
+                setRuntime(runtimeFromStartup(value));
+                setProfileId(undefined);
+              }}
               className="font-mono text-xs"
               placeholder="(leave empty for a plain shell)"
               onKeyDown={(e) => e.key === "Enter" && submit()}
             />
             <p className="mt-1.5 text-[11px] text-faint">
-              Typed into a login shell on launch. Uses your system{" "}
+              Typed into a login shell on launch. Runtime path overrides apply
+              to leading{" "}
               <code className="font-mono text-muted-foreground">claude</code>{" "}
-              binary.
+              or <code className="font-mono text-muted-foreground">codex</code>.
             </p>
           </div>
 

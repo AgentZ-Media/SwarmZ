@@ -33,6 +33,7 @@ export function presetLayoutFromGrid(
     return {
       type: "pane",
       id: nanoid(6),
+      runtime: a?.runtime,
       cwd: a?.cwd,
       startup: a?.startup ?? "",
       name: a?.renamed ? a.name : undefined,

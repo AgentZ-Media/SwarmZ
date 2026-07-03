@@ -1,6 +1,6 @@
 [package]
 name = "swarmz"
-version = "0.3.8"
+version = "0.3.9"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -55,4 +55,3 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
-

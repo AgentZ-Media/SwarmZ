@@ -266,7 +266,7 @@ function EmptyState({ onNew }: { onNew: () => void }) {
             Empty workspace
           </h1>
           <p className="mt-1.5 max-w-xs text-sm leading-relaxed text-muted-foreground">
-            Spawn parallel Claude agents, tile them into a grid, and watch
+            Spawn parallel Claude or Codex agents, tile them into a grid, and watch
             tokens &amp; cost in real time.
           </p>
         </div>

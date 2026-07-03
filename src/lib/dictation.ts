@@ -265,9 +265,9 @@ async function blobToPcm16k(blob: Blob): Promise<string> {
 }
 
 /**
- * Paste the transcript like the insert picker does: bracketed paste (claude
- * treats it as input, not keystrokes) plus a SEPARATE `\r` for auto-submit —
- * inside the paste it would only be a literal newline in claude's input box.
+ * Paste the transcript like the insert picker does: bracketed paste (agent CLIs
+ * treat it as input, not keystrokes) plus a SEPARATE `\r` for auto-submit —
+ * inside the paste it would only be a literal newline in the input box.
  */
 function deliver(targetId: string, text: string, submit: boolean) {
   const term = getTerm(targetId);

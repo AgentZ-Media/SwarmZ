@@ -47,14 +47,15 @@ export const tauriBackend: Backend = {
   onPtyExit: (id: string, cb: (e: PtyExitEvent) => void) =>
     listen<PtyExitEvent>(`pty://exit/${id}`, (ev) => cb(ev.payload)),
 
-  fetchUsageForDir: (cwd) =>
-    invoke<SessionUsage | null>("usage_for_dir", { cwd }),
-  fetchUsageForSession: (cwd, sinceMs, sessionId, excludeSessionIds) =>
+  fetchUsageForDir: (cwd, runtime) =>
+    invoke<SessionUsage | null>("usage_for_dir", { cwd, runtime }),
+  fetchUsageForSession: (cwd, sinceMs, sessionId, excludeSessionIds, runtime) =>
     invoke<SessionUsage | null>("usage_for_session", {
       cwd,
       since: sinceMs,
       session: sessionId,
       exclude: excludeSessionIds,
+      runtime,
     }),
   fetchUsageTotals: () => invoke<UsageTotals>("usage_totals"),
   onUsageChanged: (cb) =>

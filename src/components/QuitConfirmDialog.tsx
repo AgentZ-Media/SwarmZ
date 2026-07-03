@@ -12,7 +12,7 @@ import {
 
 /**
  * Raised when the app is about to close while quitting would lose something:
- * Claude still working in one or more panes (the run gets interrupted), or —
+ * An agent still working in one or more panes (the run gets interrupted), or —
  * with restore-on-launch disabled — terminals that are simply still open.
  */
 export function QuitConfirmDialog() {

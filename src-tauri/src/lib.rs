@@ -1,3 +1,4 @@
+mod codex_usage;
 mod git;
 mod limits;
 mod localstt;
@@ -81,11 +82,14 @@ async fn project_commands(cwd: String) -> Vec<project::DetectedCommand> {
 // cheap in steady state, but the *first* call after launch parses the whole
 // backlog under ~/.claude/projects — easily hundreds of MB for heavy users.
 #[tauri::command]
-async fn usage_for_dir(cwd: String) -> Option<SessionUsage> {
-    tauri::async_runtime::spawn_blocking(move || usage::usage_for_dir(&cwd))
-        .await
-        .ok()
-        .flatten()
+async fn usage_for_dir(cwd: String, runtime: Option<String>) -> Option<SessionUsage> {
+    tauri::async_runtime::spawn_blocking(move || match runtime.as_deref() {
+        Some("codex") => codex_usage::usage_for_dir(&cwd),
+        _ => usage::usage_for_dir(&cwd),
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[tauri::command]
@@ -94,14 +98,21 @@ async fn usage_for_session(
     since: f64,
     session: Option<String>,
     exclude: Option<Vec<String>>,
+    runtime: Option<String>,
 ) -> Option<SessionUsage> {
-    tauri::async_runtime::spawn_blocking(move || {
-        usage::usage_for_session(
+    tauri::async_runtime::spawn_blocking(move || match runtime.as_deref() {
+        Some("codex") => codex_usage::usage_for_session(
             &cwd,
             since as u64,
             session.as_deref(),
             exclude.as_deref().unwrap_or(&[]),
-        )
+        ),
+        _ => usage::usage_for_session(
+            &cwd,
+            since as u64,
+            session.as_deref(),
+            exclude.as_deref().unwrap_or(&[]),
+        ),
     })
     .await
     .ok()
@@ -110,7 +121,33 @@ async fn usage_for_session(
 
 #[tauri::command]
 async fn usage_totals() -> Result<UsageTotals, String> {
-    tauri::async_runtime::spawn_blocking(usage::usage_totals)
+    tauri::async_runtime::spawn_blocking(|| {
+        let mut totals = usage::usage_totals();
+        let codex = codex_usage::usage_totals();
+        totals.runtime = None;
+        totals.total_cost_usd += codex.total_cost_usd;
+        totals.input_tokens += codex.input_tokens;
+        totals.output_tokens += codex.output_tokens;
+        totals.cache_creation_tokens += codex.cache_creation_tokens;
+        totals.cache_read_tokens += codex.cache_read_tokens;
+        totals.reasoning_output_tokens += codex.reasoning_output_tokens;
+        totals.message_count += codex.message_count;
+        totals.session_count += codex.session_count;
+        for cm in codex.by_model {
+            if let Some(existing) = totals.by_model.iter_mut().find(|m| m.model == cm.model) {
+                existing.input_tokens += cm.input_tokens;
+                existing.output_tokens += cm.output_tokens;
+                existing.cache_creation_tokens += cm.cache_creation_tokens;
+                existing.cache_read_tokens += cm.cache_read_tokens;
+                existing.reasoning_output_tokens += cm.reasoning_output_tokens;
+                existing.message_count += cm.message_count;
+                existing.cost_usd += cm.cost_usd;
+            } else {
+                totals.by_model.push(cm);
+            }
+        }
+        totals
+    })
         .await
         .map_err(|e| e.to_string())
 }
@@ -267,22 +304,28 @@ async fn worktree_list(
 }
 
 fn start_usage_watcher(app: AppHandle) {
-    let dir = match usage::claude_projects_dir() {
-        Some(d) if d.exists() => d,
-        _ => return,
-    };
+    let claude_dir = usage::claude_projects_dir().filter(|d| d.exists());
+    let codex_dir = dirs::home_dir()
+        .map(|h| h.join(".codex").join("sessions"))
+        .filter(|d| d.exists());
+    let mut roots = Vec::new();
+    if let Some(d) = claude_dir.clone() {
+        roots.push(d);
+    }
+    if let Some(d) = codex_dir {
+        roots.push(d);
+    }
+    if roots.is_empty() {
+        return;
+    }
     std::thread::spawn(move || {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut debouncer = match new_debouncer(Duration::from_millis(600), tx) {
             Ok(d) => d,
             Err(_) => return,
         };
-        if debouncer
-            .watcher()
-            .watch(&dir, RecursiveMode::Recursive)
-            .is_err()
-        {
-            return;
+        for root in &roots {
+            let _ = debouncer.watcher().watch(root, RecursiveMode::Recursive);
         }
         // keep the debouncer alive for the lifetime of this thread.
         // Emit the *project dir names* that changed so the frontend can skip
@@ -293,8 +336,9 @@ fn start_usage_watcher(app: AppHandle) {
                 let mut dirs: Vec<String> = events
                     .iter()
                     .filter_map(|e| {
+                        let dir = claude_dir.as_ref()?;
                         e.path
-                            .strip_prefix(&dir)
+                            .strip_prefix(dir)
                             .ok()?
                             .components()
                             .next()
@@ -303,9 +347,7 @@ fn start_usage_watcher(app: AppHandle) {
                     .collect();
                 dirs.sort();
                 dirs.dedup();
-                if !dirs.is_empty() {
-                    let _ = app.emit("usage://changed", dirs);
-                }
+                let _ = app.emit("usage://changed", dirs);
             }
         }
         drop(debouncer);

@@ -24,6 +24,7 @@ import {
 } from "@/lib/transport";
 import type {
   Agent,
+  AgentRuntime,
   AgentStatus,
   AppSettings,
   ClaudeActivity,
@@ -67,10 +68,12 @@ import {
   presetNeedsFolder,
   seedPresets,
 } from "@/lib/presets";
-import { folderName, pickColor } from "@/lib/utils";
+import { folderName, pickColor, runtimeFromStartup } from "@/lib/utils";
 
 // Built-in fallback — the effective default is settings.defaultStartup (Settings dialog).
 export const DEFAULT_STARTUP = "claude --dangerously-skip-permissions";
+export const DEFAULT_CODEX_STARTUP =
+  "codex --sandbox workspace-write --ask-for-approval on-request --no-alt-screen";
 
 // Per-pane terminal zoom (⌘+/⌘−). The effective default is settings.defaultFontSize.
 export const DEFAULT_FONT_SIZE = 12.5;
@@ -79,6 +82,14 @@ export const MAX_FONT_SIZE = 28;
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
+
+function runtimeOf(startup: string | undefined, runtime?: AgentRuntime): AgentRuntime {
+  return runtime ?? runtimeFromStartup(startup);
+}
+
+function usageHistoryKey(runtime: AgentRuntime | undefined, sessionId: string): string {
+  return `${runtime ?? "claude"}:${sessionId}`;
+}
 
 // Usage refreshes arrive every few seconds per agent — batch disk writes.
 let persistHistoryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -134,7 +145,7 @@ function schedulePersistWorkspaces() {
 /**
  * Restore-relevant snapshot of the live grid: agent panes + tiling trees.
  * Persisted continuously (debounced) and flushed on quit (lib/quit.ts), so a
- * restart — or a crash — can respawn every pane and resume its claude session.
+ * restart — or a crash — can respawn every pane and resume its agent session.
  */
 function snapshotGrid(): PersistedGrid {
   const s = useSwarm.getState();
@@ -145,6 +156,7 @@ function snapshotGrid(): PersistedGrid {
       .filter((a): a is Agent => !!a)
       .map((a) => ({
         id: a.id,
+        runtime: a.runtime,
         name: a.name,
         renamed: a.renamed,
         workspaceId: a.workspaceId,
@@ -213,6 +225,7 @@ export async function flushAllPersists(): Promise<void> {
 
 interface CreateAgentOpts {
   name?: string;
+  runtime?: AgentRuntime;
   cwd?: string;
   startup?: string;
   profileId?: string;
@@ -223,6 +236,7 @@ interface CreateAgentOpts {
 
 /** Values the New Agent dialog opens with (e.g. inherited from the pane being split). */
 export interface NewAgentPrefill {
+  runtime?: AgentRuntime;
   cwd?: string;
   profileId?: string;
   startup?: string;
@@ -281,7 +295,7 @@ interface SwarmState {
   loadPresetRequest: string | null;
   /** "save workspace as preset" name dialog */
   savePresetOpen: boolean;
-  /** all-time usage of claude sessions launched inside SwarmZ, keyed by session id */
+  /** all-time usage of agent sessions launched inside SwarmZ, keyed by runtime+session id */
   usageHistory: Record<string, UsageHistoryEntry>;
   dashboardOpen: boolean;
   newAgentOpen: boolean;
@@ -320,7 +334,7 @@ interface SwarmState {
   worktrees: WorktreeEntry[];
   /** pane close waiting on a keep-vs-delete decision for its worktree */
   closeWorktreeConfirm: { agentId: string; status: WorktreeStatus } | null;
-  /** pane close waiting on confirmation because claude is still working in it */
+  /** pane close waiting on confirmation because an agent is still working in it */
   closeBusyConfirm: string | null;
 
   // derived helpers
@@ -768,7 +782,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     try {
       // restore the last grid: rebuild every persisted pane — mounting them
       // spawns the PTYs, and TerminalView appends `--resume` (agent.resume)
-      // so each claude pane reopens its previous conversation
+      // so each tracked agent pane reopens its previous conversation
       const grid = await loadGrid();
       const state = get();
       if (
@@ -817,6 +831,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
               }
               agents[p.id] = {
                 id: p.id,
+                runtime: runtimeOf(p.startup, p.runtime),
                 name: p.name,
                 renamed: p.renamed,
                 workspaceId: wsId,
@@ -865,7 +880,9 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       const history = await loadUsageHistory();
       if (history?.length) {
         const map: Record<string, UsageHistoryEntry> = {};
-        for (const e of history) map[e.session_id] = e;
+        for (const e of history) {
+          map[usageHistoryKey(e.runtime ?? "claude", e.session_id)] = e;
+        }
         set({ usageHistory: map });
       }
     } catch {
@@ -927,7 +944,12 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     try {
       const saved = await loadProfiles();
       if (saved && saved.length) {
-        set({ profiles: saved });
+        set({
+          profiles: saved.map((p) => ({
+            ...p,
+            runtime: runtimeOf(p.startup, p.runtime),
+          })),
+        });
         return;
       }
     } catch {
@@ -937,18 +959,36 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       {
         id: nanoid(8),
         name: "Claude · skip permissions",
+        runtime: "claude",
         startup: DEFAULT_STARTUP,
         color: pickColor(0),
       },
       {
         id: nanoid(8),
         name: "Claude · plain",
+        runtime: "claude",
         startup: "claude",
         color: pickColor(2),
       },
       {
         id: nanoid(8),
+        name: "Codex · workspace",
+        runtime: "codex",
+        startup: DEFAULT_CODEX_STARTUP,
+        color: pickColor(4),
+      },
+      {
+        id: nanoid(8),
+        name: "Codex · full access",
+        runtime: "codex",
+        startup:
+          "codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen",
+        color: pickColor(6),
+      },
+      {
+        id: nanoid(8),
         name: "Shell",
+        runtime: "shell",
         startup: "",
         color: pickColor(5),
       },
@@ -965,18 +1005,21 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const profile = opts.profileId
       ? state.profiles.find((p) => p.id === opts.profileId)
       : undefined;
+    const startup =
+      opts.startup ??
+      profile?.startup ??
+      state.settings.defaultStartup ??
+      DEFAULT_STARTUP;
+    const runtime = runtimeOf(startup, opts.runtime ?? profile?.runtime);
     const agent: Agent = {
       id,
+      runtime,
       name: opts.name?.trim() || `Agent ${n}`,
       workspaceId: wsId,
       // a name typed in the dialog wins over captured terminal titles
       renamed: !!opts.name?.trim(),
       cwd: opts.cwd || profile?.defaultCwd,
-      startup:
-        opts.startup ??
-        profile?.startup ??
-        state.settings.defaultStartup ??
-        DEFAULT_STARTUP,
+      startup,
       color: opts.color || profile?.color || pickColor(n),
       status: "starting",
       attention: false,
@@ -1057,7 +1100,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         try {
           if (!cleanup.confirmed) {
             // the silent "clean" verdict may be minutes old — confirm
-            // dialogs can sit open while claude keeps writing. Re-check,
+            // dialogs can sit open while an agent keeps writing. Re-check,
             // and on doubt keep the worktree (it shows up as unattached
             // in the panel instead of being force-deleted)
             const st = await worktreeStatus(cleanup.path, gitBin);
@@ -1110,7 +1153,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const state = get();
     const agent = state.agents[agentId];
     if (!agent) return;
-    // a misclick on ✕/⌘W must not interrupt a running claude job — ask
+    // a misclick on ✕/⌘W must not interrupt a running agent job — ask
     // first (the quit guard exists for exactly the same reason)
     if (agent.activity === "busy" && agent.status !== "exited") {
       set({ closeBusyConfirm: agentId });
@@ -1578,10 +1621,12 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       (usage.message_count > 0 ? usage.session_id ?? undefined : undefined);
 
     // mirror the session into the persistent all-time history; sessions with
-    // no claude activity (plain shells, dev servers, …) never get an entry
+    // no agent activity (plain shells, dev servers, …) never get an entry
     let usageHistory = state.usageHistory;
     if (usage.message_count > 0 && usage.session_id) {
-      const prev = usageHistory[usage.session_id];
+      const runtime = agent.runtime ?? usage.runtime ?? "claude";
+      const key = usageHistoryKey(runtime, usage.session_id);
+      const prev = usageHistory[key];
       const changed =
         !prev ||
         prev.message_count !== usage.message_count ||
@@ -1590,11 +1635,13 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         prev.output_tokens !== usage.output_tokens ||
         prev.cache_creation_tokens !== usage.cache_creation_tokens ||
         prev.cache_read_tokens !== usage.cache_read_tokens ||
+        prev.reasoning_output_tokens !== usage.reasoning_output_tokens ||
         prev.agent_name !== agent.name;
       if (changed) {
         usageHistory = {
           ...usageHistory,
-          [usage.session_id]: {
+          [key]: {
+            runtime,
             session_id: usage.session_id,
             agent_name: agent.name,
             cwd: usage.cwd ?? agent.cwd ?? null,
@@ -1605,6 +1652,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
             output_tokens: usage.output_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             cache_read_tokens: usage.cache_read_tokens,
+            reasoning_output_tokens: usage.reasoning_output_tokens,
             cost_usd: usage.cost_usd,
             by_model: usage.by_model,
           },
@@ -1613,8 +1661,20 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       }
     }
 
+    const titlePatch =
+      usage.title && !agent.renamed ? { name: usage.title, title: usage.title } : {};
+    const activityPatch = usage.activity ? { activity: usage.activity } : {};
     set({
-      agents: { ...state.agents, [agentId]: { ...agent, usage, sessionId } },
+      agents: {
+        ...state.agents,
+        [agentId]: {
+          ...agent,
+          ...titlePatch,
+          ...activityPatch,
+          usage,
+          sessionId,
+        },
+      },
       usageHistory,
     });
     // a freshly latched session id is what makes this pane resumable
@@ -1737,6 +1797,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     set({
       newAgentOpen: true,
       newAgentPrefill: {
+        runtime: agent?.runtime,
         cwd: agent?.worktree?.root ?? agent?.cwd,
         profileId: agent?.profileId,
         startup: agent?.startup,
@@ -1748,13 +1809,17 @@ export const useSwarm = create<SwarmState>((set, get) => ({
 
   saveProfile: (p) => {
     const state = get();
+    const normalized = {
+      ...p,
+      runtime: runtimeOf(p.startup, p.runtime),
+    };
     let profiles: Profile[];
     if (p.id) {
       profiles = state.profiles.map((x) =>
-        x.id === p.id ? ({ ...x, ...p, id: p.id! } as Profile) : x,
+        x.id === p.id ? ({ ...x, ...normalized, id: p.id! } as Profile) : x,
       );
     } else {
-      profiles = [...state.profiles, { ...p, id: nanoid(8) } as Profile];
+      profiles = [...state.profiles, { ...normalized, id: nanoid(8) } as Profile];
     }
     set({ profiles });
     void saveProfiles(profiles);
@@ -1800,22 +1865,23 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       }
       const id = nanoid(10);
       const n = ++counter;
+      const profile = state.profiles.find((p) => p.id === node.profileId);
+      const startup = node.startup ?? state.settings.defaultStartup ?? DEFAULT_STARTUP;
+      const profileId = profile ? node.profileId : undefined;
       agents[id] = {
         id,
+        runtime: runtimeOf(startup, node.runtime ?? profile?.runtime),
         name: node.name?.trim() || `Agent ${n}`,
         renamed: !!node.name?.trim(),
         workspaceId: wsId,
         cwd: node.cwd || folder,
-        startup:
-          node.startup ?? state.settings.defaultStartup ?? DEFAULT_STARTUP,
+        startup,
         color: node.color || pickColor(n),
         status: "starting",
         attention: false,
         createdAt: Date.now(),
         // the template may reference a profile that's gone — drop it then
-        profileId: state.profiles.some((p) => p.id === node.profileId)
-          ? node.profileId
-          : undefined,
+        profileId,
       };
       order.push(id);
       return newPane(id);

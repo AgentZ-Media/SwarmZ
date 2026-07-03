@@ -4,8 +4,7 @@ import type { Terminal } from "@xterm/xterm";
  * Live xterm instances by pty id (agent panes + floating terminals),
  * registered by `TerminalView` for callers that need terminal-level APIs
  * rather than the raw PTY — e.g. dnd.ts pastes dropped paths via
- * `term.paste()` so they arrive bracketed-paste-wrapped like in iTerm
- * (Claude Code only attaches image paths that come in as a paste).
+ * `term.paste()` so they arrive bracketed-paste-wrapped like in iTerm.
  */
 const terms = new Map<string, Terminal>();
 

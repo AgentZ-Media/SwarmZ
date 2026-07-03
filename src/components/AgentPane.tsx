@@ -264,7 +264,7 @@ function AgentStatsBody({ agent }: { agent: Agent }) {
           </div>
 
           {!u || u.message_count === 0 ? (
-            <p className="pb-1 text-[11px] text-faint">No Claude activity yet.</p>
+            <p className="pb-1 text-[11px] text-faint">No tracked activity yet.</p>
           ) : (
             <>
               {u.context_tokens > 0 && u.context_limit > 0 && (
@@ -292,6 +292,12 @@ function AgentStatsBody({ agent }: { agent: Agent }) {
                 <StatRow k="Messages" v={u.message_count} />
                 <StatRow k="Input tokens" v={formatTokens(u.input_tokens)} />
                 <StatRow k="Output tokens" v={formatTokens(u.output_tokens)} />
+                {!!u.reasoning_output_tokens && (
+                  <StatRow
+                    k="Reasoning tokens"
+                    v={formatTokens(u.reasoning_output_tokens)}
+                  />
+                )}
                 <StatRow
                   k="Cache write"
                   v={formatTokens(u.cache_creation_tokens)}
@@ -360,7 +366,7 @@ function AgentStatsBody({ agent }: { agent: Agent }) {
 }
 
 function StatusDot({ agent }: { agent: Agent }) {
-  // claude's reported activity refines the coarse pty status while running
+  // Agent-reported activity refines the coarse PTY status while running.
   const state =
     agent.status === "running" && agent.activity
       ? agent.activity === "waiting"

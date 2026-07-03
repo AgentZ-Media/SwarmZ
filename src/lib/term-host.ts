@@ -68,7 +68,7 @@ export interface TermHandlers {
 
 export interface TermSpawnOpts {
   cwd?: string;
-  /** startup command, already path-resolved (applyClaudePath) */
+  /** startup command, already path-resolved (applyRuntimePath) */
   startup: string;
   fontSize: number;
   handlers: TermHandlers;

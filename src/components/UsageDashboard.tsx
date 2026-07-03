@@ -9,27 +9,31 @@ import {
   modelAccent,
   prettyModel,
 } from "@/lib/utils";
-import type { ModelUsage, UsageHistoryEntry } from "@/types";
+import type { AgentRuntime, ModelUsage, UsageHistoryEntry } from "@/types";
 
 type Scope = "session" | "alltime";
 
 interface UsageSource {
+  runtime?: AgentRuntime;
   message_count: number;
   input_tokens: number;
   output_tokens: number;
   cache_creation_tokens: number;
   cache_read_tokens: number;
+  reasoning_output_tokens?: number;
   cost_usd: number;
   by_model: ModelUsage[];
 }
 
 function aggregate(sources: UsageSource[]) {
   const models = new Map<string, ModelUsage>();
+  const runtimes = new Map<AgentRuntime, number>();
   let cost = 0,
     input = 0,
     output = 0,
     cacheWrite = 0,
     cacheRead = 0,
+    reasoning = 0,
     messages = 0,
     sessions = 0;
   for (const u of sources) {
@@ -40,7 +44,10 @@ function aggregate(sources: UsageSource[]) {
     output += u.output_tokens;
     cacheWrite += u.cache_creation_tokens;
     cacheRead += u.cache_read_tokens;
+    reasoning += u.reasoning_output_tokens ?? 0;
     messages += u.message_count;
+    const runtime = u.runtime ?? "claude";
+    runtimes.set(runtime, (runtimes.get(runtime) ?? 0) + 1);
     for (const bm of u.by_model) {
       const e =
         models.get(bm.model) ??
@@ -50,6 +57,7 @@ function aggregate(sources: UsageSource[]) {
           output_tokens: 0,
           cache_creation_tokens: 0,
           cache_read_tokens: 0,
+          reasoning_output_tokens: 0,
           message_count: 0,
           cost_usd: 0,
         } as ModelUsage);
@@ -57,6 +65,8 @@ function aggregate(sources: UsageSource[]) {
       e.output_tokens += bm.output_tokens;
       e.cache_creation_tokens += bm.cache_creation_tokens;
       e.cache_read_tokens += bm.cache_read_tokens;
+      e.reasoning_output_tokens =
+        (e.reasoning_output_tokens ?? 0) + (bm.reasoning_output_tokens ?? 0);
       e.message_count += bm.message_count;
       e.cost_usd += bm.cost_usd;
       models.set(bm.model, e);
@@ -77,10 +87,18 @@ function aggregate(sources: UsageSource[]) {
     tokens: input + output + cacheWrite + cacheRead,
     output,
     cacheRead,
+    reasoning,
     messages,
     sessions,
     byModel,
+    byRuntime: [...runtimes.entries()].sort((a, b) => b[1] - a[1]),
   };
+}
+
+function runtimeLabel(runtime: AgentRuntime): string {
+  if (runtime === "codex") return "Codex";
+  if (runtime === "claude") return "Claude";
+  return "Shell";
 }
 
 function formatDay(ms: number) {
@@ -218,7 +236,7 @@ export function UsageDashboard() {
           <div className="space-y-6 p-4">
             <div className="grid grid-cols-2 gap-2.5">
               <Stat
-                label={scope === "session" ? "Session cost" : "Total cost"}
+                label="Tracked cost"
                 value={formatUsd(agg.cost)}
                 sub={`${agg.sessions} session${agg.sessions === 1 ? "" : "s"}`}
               />
@@ -233,11 +251,24 @@ export function UsageDashboard() {
                 accent="var(--chart-2)"
               />
               <Stat
-                label="Cache read"
-                value={formatTokens(agg.cacheRead)}
-                sub="90% cheaper"
+                label={agg.reasoning > 0 ? "Reasoning" : "Cache read"}
+                value={formatTokens(agg.reasoning > 0 ? agg.reasoning : agg.cacheRead)}
+                sub={agg.reasoning > 0 ? "Codex output" : "Claude cache"}
               />
             </div>
+
+            {agg.byRuntime.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {agg.byRuntime.map(([runtime, count]) => (
+                  <span
+                    key={runtime}
+                    className="rounded-md border border-border bg-card px-2 py-1 text-[11px] text-muted-foreground"
+                  >
+                    {runtimeLabel(runtime)} · {count}
+                  </span>
+                ))}
+              </div>
+            )}
 
             {/* per-model breakdown */}
             <div>
@@ -340,6 +371,9 @@ function SessionAgentList() {
                 style={{ backgroundColor: a.color }}
               />
               <span className="flex-1 truncate text-xs">{a.name}</span>
+              <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] text-faint">
+                {runtimeLabel(a.runtime ?? "claude")}
+              </span>
               <span className="shrink-0 whitespace-nowrap font-mono text-[10px] tabular-nums text-muted-foreground">
                 {formatTokens(tok)}
               </span>
@@ -421,12 +455,15 @@ function HistoryList({
             e.cache_read_tokens;
           return (
             <div
-              key={e.session_id}
+              key={`${e.runtime ?? "claude"}:${e.session_id}`}
               className="flex items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1.5"
             >
               <History size={11} className="shrink-0 text-faint" />
               <span className="flex-1 truncate text-xs" title={e.cwd ?? undefined}>
                 {e.agent_name}
+              </span>
+              <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] text-faint">
+                {runtimeLabel(e.runtime ?? "claude")}
               </span>
               <span className="shrink-0 whitespace-nowrap font-mono text-[10px] tabular-nums text-faint">
                 {formatDay(e.last_updated)}

@@ -10,9 +10,9 @@ import {
 } from "./ui/dialog";
 
 /**
- * Raised when a pane is closed while claude is actively working in it (OSC
- * 9;4 busy): a misclick on the header ✕ or a habitual ⌘W must not interrupt
- * a long-running job without asking. Idle panes close without this dialog.
+ * Raised when a pane is closed while an agent is actively working: a misclick
+ * on the header ✕ or a habitual ⌘W must not interrupt a long-running job
+ * without asking. Idle panes close without this dialog.
  */
 export function CloseBusyDialog() {
   const agentId = useSwarm((s) => s.closeBusyConfirm);
@@ -32,7 +32,7 @@ export function CloseBusyDialog() {
         <DialogHeader>
           <DialogTitle>Close {agent?.name ?? "agent"}?</DialogTitle>
           <DialogDescription>
-            Claude is still working in this pane — closing it will interrupt
+            This agent is still working in this pane — closing it will interrupt
             the run.
           </DialogDescription>
         </DialogHeader>
