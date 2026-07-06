@@ -72,7 +72,7 @@ export function addWorktree(args: {
   });
 }
 
-/** Would closing this worktree lose work? (dirty files / unmerged commits) */
+/** Would closing this worktree lose work? (dirty files / local-only commits) */
 export function worktreeStatus(
   path: string,
   gitBin?: string,

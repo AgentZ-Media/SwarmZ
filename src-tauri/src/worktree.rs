@@ -305,7 +305,7 @@ pub fn status(path: &str, bin_override: Option<&str>) -> WorktreeStatus {
 }
 
 /// Remove the worktree folder and delete its branch. `force` discards
-/// uncommitted changes / unmerged commits — callers gate it on `status` or an
+/// uncommitted changes / local-only commits — callers gate it on `status` or an
 /// explicit user confirmation. A hand-deleted folder is pruned instead.
 pub fn remove(
     root: &str,
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(scan.entries[0].branch, "test/brave-falcon-7341");
         assert_eq!(scan.entries[0].ahead, 1);
 
-        // remove deletes folder + branch even with unmerged work (force)
+        // remove deletes folder + branch even with local-only work (force)
         remove(&cwd, &info.path, &info.branch, None).unwrap();
         assert!(!Path::new(&info.path).exists());
         assert!(run(
@@ -480,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_folder_still_reports_unmerged_commits_as_ahead() {
+    fn missing_folder_still_reports_local_only_commits_as_ahead() {
         let repo = temp_repo();
         let cwd = repo.to_string_lossy().into_owned();
         let info = add(&cwd, "test/orphan", false, None).unwrap();

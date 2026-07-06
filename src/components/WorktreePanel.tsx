@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { FolderGit2, FolderOpen, Plus, Trash2 } from "lucide-react";
+import { CheckCircle2, FolderGit2, FolderOpen, Plus, Trash2 } from "lucide-react";
 import { useSwarm } from "@/store";
 import { Button } from "./ui/button";
 import { Tip } from "./ui/tooltip";
@@ -22,7 +22,16 @@ import type { WorktreeEntry } from "@/types";
 export function WorktreesButton() {
   const [open, setOpen] = useState(false);
   const refreshWorktrees = useSwarm((s) => s.refreshWorktrees);
+  const cleanupSafeWorktrees = useSwarm((s) => s.cleanupSafeWorktrees);
   const worktrees = useSwarm((s) => s.worktrees);
+  const openPaths = useSwarm(
+    (s) =>
+      new Set(
+        s.order
+          .map((id) => s.agents[id]?.cwd)
+          .filter((cwd): cwd is string => !!cwd),
+      ),
+  );
   const visible = useSwarm(
     (s) =>
       s.worktrees.length > 0 ||
@@ -38,6 +47,9 @@ export function WorktreesButton() {
     if (g) g.entries.push(e);
     else groups.push({ root: e.root, repo: e.repo, entries: [e] });
   }
+  const safeCount = worktrees.filter(
+    (e) => !openPaths.has(e.path) && !e.dirty && e.ahead === 0,
+  ).length;
 
   return (
     <DropdownMenu
@@ -58,7 +70,26 @@ export function WorktreesButton() {
           </Button>
         </DropdownMenuTrigger>
       </Tip>
-      <DropdownMenuContent align="end" className="w-80">
+      <DropdownMenuContent align="end" className="w-96">
+        {safeCount > 0 && (
+          <div className="mb-1 flex items-center justify-between gap-3 rounded-md bg-secondary/35 px-2 py-1.5">
+            <div className="min-w-0">
+              <div className="text-xs text-foreground">Safe cleanup ready</div>
+              <div className="truncate text-[10px] text-faint">
+                {safeCount} clean unattached worktree{safeCount === 1 ? "" : "s"}
+              </div>
+            </div>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="h-7 shrink-0 px-2 text-[11px]"
+              onClick={() => void cleanupSafeWorktrees()}
+            >
+              <CheckCircle2 size={13} />
+              Clean up safe
+            </Button>
+          </div>
+        )}
         {groups.length === 0 ? (
           <p className="px-2 py-1.5 text-[11px] text-faint">
             No worktrees found.
@@ -94,7 +125,7 @@ function WorktreeRow({
   const openAgentId = useSwarm(
     (s) => s.order.find((id) => s.agents[id]?.cwd === entry.path) ?? null,
   );
-  // deleting work (dirty/unmerged) needs a second click on the armed button
+  // deleting work (dirty/local-only commits) needs a second click on the armed button
   const [armed, setArmed] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
@@ -156,7 +187,7 @@ function WorktreeRow({
               )}
               {entry.ahead > 0 && (
                 <span className="rounded bg-secondary px-1">
-                  ↑{entry.ahead} unmerged
+                  ↑{entry.ahead} local-only
                 </span>
               )}
               {!entry.dirty && entry.ahead === 0 && <span>clean</span>}
@@ -192,9 +223,11 @@ function WorktreeRow({
               ? "Close the pane first"
               : armed
                 ? "Click again — deletes folder AND branch"
-                : entry.missing
-                  ? "Clean up (folder is already gone)"
-                  : "Delete worktree & branch"
+                : risky
+                  ? "Delete worktree & branch"
+                  : entry.missing
+                    ? "Clean up (folder is already gone)"
+                    : "Finish and remove worktree"
           }
         >
           <button
@@ -207,7 +240,7 @@ function WorktreeRow({
                 : "text-faint hover:bg-destructive/15 hover:text-destructive",
             )}
           >
-            <Trash2 size={13} />
+            {risky ? <Trash2 size={13} /> : <CheckCircle2 size={13} />}
           </button>
         </Tip>
       </div>

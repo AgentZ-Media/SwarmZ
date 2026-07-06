@@ -1,6 +1,6 @@
 # AGENTS.md
 
-SwarmZ — run, tile and monitor multiple Claude Code and ChatGPT Codex CLI agents in parallel. React frontend + native macOS app (Tauri 2 / Rust). Deep per-subsystem details live in `docs/ARCHITECTURE.md` — read the relevant section there (or the code) before changing a subsystem, and keep it in sync.
+SwarmZ — run, tile and monitor multiple Claude Code agents in parallel. React frontend + native macOS app (Tauri 2 / Rust). Deep per-subsystem details live in `docs/ARCHITECTURE.md` — read the relevant section there (or the code) before changing a subsystem, and keep it in sync.
 
 **Web mode is abandoned.** `server/`, `src/lib/backend-web.ts`, `pnpm dev:web` — ignore completely, no parity work. New features are native-only; remove stale web-mode references from docs when you touch them.
 
@@ -13,7 +13,7 @@ SwarmZ — run, tile and monitor multiple Claude Code and ChatGPT Codex CLI agen
 
 Frontend (`src/`):
 
-- `store.ts` — all app state + persistence (Tauri store `swarmz.json`; settings always via `updateSettings`) + the runtime-aware agent/workspace/worktree lifecycle actions
+- `store.ts` — all app state + persistence (Tauri store `swarmz.json`; settings always via `updateSettings`) + the agent/workspace/worktree lifecycle actions
 - `lib/transport.ts` → `backend-types.ts` / `backend-tauri.ts` — backend interface; native-only features may skip it and `invoke` directly (`lib/dnd.ts`, `lib/openrouter.ts`, `lib/worktree.ts`)
 - `lib/term-host.ts` — xterm + PTY per id, **outside React**; `lib/term-registry.ts` exposes the xterm instances
 - `lib/quit.ts` — quit guard; `lib/git.ts` — 7s status poll; `lib/limits.ts` — subscription meters; `lib/updates.ts` — auto-updater; `lib/dictation.ts` — voice recording; `lib/presets.ts` — workspace presets; `lib/layout.ts` — tiling trees; `lib/insert-command.ts` / `lib/command-vars.ts` — paste/submit + placeholders
@@ -22,7 +22,7 @@ Frontend (`src/`):
 Backend (`src-tauri/src/`):
 
 - `pty.rs` — PTY sessions (writer thread per session, coalesced output events) · `lib.rs` — commands, watchers, quit/exit handling, store rescue at setup
-- `usage.rs` — Claude JSONL usage parsing + live pricing · `codex_usage.rs` — Codex rollout JSONL usage/context/limit parsing · `limits.rs` — Anthropic OAuth limits
+- `usage.rs` — incremental jsonl usage parsing + live pricing · `limits.rs` — Anthropic OAuth limits
 - `git.rs` — read-only git status (with subprocess timeouts) · `worktree.rs` — worktree create/status/remove/list (the only git-writing module)
 - `openrouter.rs` — dictation cloud engine + keychain key · `localstt.rs` — local Parakeet STT (pinned + hash-verified model download)
 - `project.rs` — auto-detected quick commands · `storefile.rs` — swarmz.json backup/rescue
@@ -30,10 +30,10 @@ Backend (`src-tauri/src/`):
 ## Load-bearing invariants (don't break these)
 
 - PTYs die exactly on store removal (`removeAgent`/`removeFloatingTerminal` → `destroyTerm`), **never** on React unmount — that's what lets panes remount across workspaces. All grids stay mounted; inactive ones are `visibility:hidden`.
-- Into-terminal text (drops, dictation, command inserts) goes through `term.paste()`, never raw `ptyWrite` — bracketed paste is what makes agent CLIs treat file paths and multiline prompts correctly; submit is a **separate** `\r` write.
+- Into-terminal text (drops, dictation, command inserts) goes through `term.paste()`, never raw `ptyWrite` — bracketed paste is what makes Claude attach image paths; submit is a **separate** `\r` write.
 - `ConEmuANSI=ON` in the PTY env is the OSC 9;4 opt-in (status dots); don't remove. OSC 21337 is pre-wired but dormant.
-- Persistence distinctions: `workspacePresets` `null` = seed, `[]` = stays empty · limits `null` = no usable login (hide meters) vs reject = transient (keep last values) · `Agent.resume` is transient, runtime-specific resume (`claude --resume`, `codex resume`) is injected only at PTY spawn.
-- Worktree deletion is gated: silent cleanup only after a re-check at execution time (`pendingWorktreeCleanup`, `confirmed` flag); "detach"/"cancel" abort it; workspace close never deletes worktrees.
+- Persistence distinctions: `workspacePresets` `null` = seed, `[]` = stays empty · limits `null` = no usable login (hide meters) vs reject = transient (keep last values) · `Agent.resume` is transient, `--resume` is injected only at PTY spawn.
+- Worktree deletion is gated: silent cleanup only after a re-check at execution time (`pendingWorktreeCleanup`, `confirmed` flag); "detach"/"cancel" abort it. Workspace close keeps worktrees by default, but its explicit "clean safe" path removes only worktrees that re-check clean/no-local-only-commits.
 - Global shortcuts early-return while a dialog is open (⌘K/⌘⇧K may close their palettes); ⌘W is always `preventDefault`ed; the ⌘⇧K branch stays before plain ⌘K.
 - Sync Tauri commands run on the main thread — anything blocking (subprocesses, file walks, keychain, inference) must be async + `spawn_blocking`. `pty_write`/`pty_spawn`/`pty_resize` stay sync on purpose (ordering); writes are non-blocking via the per-session writer channel.
 - Quit flushes **all** debounced persists (`flushAllPersists`); the quit/close choreography in `lib/quit.ts` + `lib.rs` looks redundant but every leg is load-bearing (window-state save, updater restart code).

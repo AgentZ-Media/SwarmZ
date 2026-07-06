@@ -283,7 +283,7 @@ interface SwarmState {
   /** command picked in ⌘K that still needs its {{input}} values — consumed when the picker opens (in-memory) */
   commandPickerPreselect: { cmd: CustomCommand; submit: boolean } | null;
   /** workspace pending close while it still contains agents */
-  closeWorkspaceConfirm: string | null;
+  closeWorkspaceConfirm: { id: string } | null;
   /** tab highlighted as drop target while a pane is dragged over it */
   tabDropTarget: string | null;
   /** focus mode: this agent's pane is enlarged as an overlay above the grid (in-memory) */
@@ -354,7 +354,7 @@ interface SwarmState {
   moveWorkspace: (id: string, toIndex: number) => void;
   /** close a workspace; with agents inside it raises the confirm dialog first */
   requestCloseWorkspace: (id: string) => void;
-  resolveCloseWorkspace: (confirmed: boolean) => void;
+  resolveCloseWorkspace: (choice: "cancel" | "close" | "cleanup-safe") => void;
   /** move an agent's pane into another workspace (splits its active pane) */
   moveAgentToWorkspace: (agentId: string, workspaceId: string) => void;
   /** jump to the next agent that needs attention, across all workspaces (⌘⇧A) */
@@ -393,6 +393,8 @@ interface SwarmState {
   registerWorktreeRepo: (root: string) => void;
   /** delete a worktree from the management panel (folder + branch) */
   deleteWorktree: (entry: WorktreeEntry) => Promise<void>;
+  /** delete every safe, unattached worktree currently shown in the panel */
+  cleanupSafeWorktrees: (root?: string) => Promise<void>;
 
   // floating terminals
   createFloatingTerminal: (agentId: string) => void;
@@ -640,14 +642,14 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const hasAgents = state.order.some(
       (aid) => state.agents[aid]?.workspaceId === id,
     );
-    if (hasAgents) set({ closeWorkspaceConfirm: id });
+    if (hasAgents) set({ closeWorkspaceConfirm: { id } });
     else closeWorkspace(id);
   },
 
-  resolveCloseWorkspace: (confirmed) => {
-    const id = get().closeWorkspaceConfirm;
+  resolveCloseWorkspace: (choice) => {
+    const id = get().closeWorkspaceConfirm?.id;
     set({ closeWorkspaceConfirm: null });
-    if (confirmed && id) closeWorkspace(id);
+    if (choice !== "cancel" && id) closeWorkspace(id, choice === "cleanup-safe");
   },
 
   moveAgentToWorkspace: (agentId, workspaceId) => {
@@ -1254,6 +1256,41 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     } finally {
       void get().refreshWorktrees();
     }
+  },
+
+  cleanupSafeWorktrees: async (root) => {
+    const state = get();
+    const openPaths = new Set(
+      state.order
+        .map((id) => state.agents[id]?.cwd)
+        .filter((cwd): cwd is string => !!cwd),
+    );
+    const entries = state.worktrees.filter(
+      (entry) =>
+        (!root || entry.root === root) &&
+        !openPaths.has(entry.path) &&
+        !entry.dirty &&
+        entry.ahead === 0,
+    );
+    if (entries.length === 0) return;
+    const gitBin = state.settings.gitPath?.trim() || undefined;
+    await Promise.allSettled(
+      entries.map(async (entry) => {
+        try {
+          const st = await worktreeStatus(entry.path, gitBin);
+          if (st.exists && (st.dirty || st.ahead > 0)) return;
+          await removeWorktree({
+            root: entry.root,
+            path: entry.path,
+            branch: entry.branch,
+            gitBin,
+          });
+        } catch {
+          /* on doubt keep the worktree */
+        }
+      }),
+    );
+    void get().refreshWorktrees();
   },
 
   resolveCloseConfirm: (choice) => {
@@ -1975,7 +2012,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
 /**
  * First stage of closing a pane (after the busy-confirm gate): worktree
  * panes decide the worktree's fate — clean → silent cleanup with the pane,
- * dirty/unmerged → keep-vs-delete dialog.
+ * dirty/local-only → keep-vs-delete dialog.
  */
 function proceedRemoveAgent(agentId: string) {
   const get = useSwarm.getState;
@@ -2051,15 +2088,25 @@ function continueRemoveAgent(agentId: string) {
  * Tear a workspace down: kill its agents (terminals + their floating
  * terminals; detached floats survive), drop its layout, and keep the app in a
  * valid state — at least one workspace always exists, and closing the active
- * tab activates its neighbour. Worktrees of the closed agents stay on disk
- * (no status checks here) — they remain reachable in the worktree panel.
+ * tab activates its neighbour. By default worktrees of the closed agents stay
+ * on disk; the optional cleanup removes only those still clean after the
+ * terminals are gone.
  */
-function closeWorkspace(id: string) {
+function closeWorkspace(id: string, cleanupSafeWorktrees = false) {
   const store = useSwarm.getState();
   if (!store.workspaces[id]) return;
   const agentIds = store.order.filter(
     (aid) => store.agents[aid]?.workspaceId === id,
   );
+  const cleanupCandidates = cleanupSafeWorktrees
+    ? agentIds
+        .map((aid) => {
+          const agent = store.agents[aid];
+          if (!agent?.worktree || !agent.cwd) return null;
+          return { ...agent.worktree, path: agent.cwd };
+        })
+        .filter((c): c is WorktreeMeta & { path: string } => !!c)
+    : [];
 
   // owned floating terminals die with their agents (this also kills their PTYs)
   for (const tid of [...store.floatingOrder]) {
@@ -2072,6 +2119,28 @@ function closeWorkspace(id: string) {
     destroyTerm(aid);
     // their worktrees stay on disk — drop any stale cleanup decision
     pendingWorktreeCleanup.delete(aid);
+  }
+  if (cleanupCandidates.length > 0) {
+    const gitBin = store.settings.gitPath?.trim() || undefined;
+    void (async () => {
+      await Promise.allSettled(
+        cleanupCandidates.map(async (candidate) => {
+          try {
+            const st = await worktreeStatus(candidate.path, gitBin);
+            if (st.exists && (st.dirty || st.ahead > 0)) return;
+            await removeWorktree({
+              root: candidate.root,
+              path: candidate.path,
+              branch: candidate.branch,
+              gitBin,
+            });
+          } catch {
+            /* on doubt keep the worktree */
+          }
+        }),
+      );
+      void useSwarm.getState().refreshWorktrees();
+    })();
   }
 
   const state = useSwarm.getState();

@@ -3,6 +3,7 @@ import {
   BarChart3,
   Bell,
   Bot,
+  CheckCircle2,
   Columns2,
   ExternalLink,
   Folder,
@@ -630,6 +631,11 @@ export const AgentPane = memo(function AgentPane({
               <DropdownMenuItem onSelect={() => createFloatingTerminal(agentId)}>
                 <SquareTerminal /> Floating terminal
               </DropdownMenuItem>
+              {agent.worktree && (
+                <DropdownMenuItem onSelect={() => requestRemoveAgent(agentId)}>
+                  <CheckCircle2 /> Finish worktree
+                </DropdownMenuItem>
+              )}
               {/* narrow panes hide the header stats button — keep the
                   numbers reachable from here, as documented */}
               <DropdownMenuSub>

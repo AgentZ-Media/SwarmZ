@@ -32,7 +32,7 @@ jobs:
           NOTES_FILE="docs/release-notes/${GITHUB_REF_NAME}.md"
           FOOTER_FILE="docs/release-notes/_install_footer.md"
           if [ ! -f "$NOTES_FILE" ]; then
-            echo "::error::Missing $NOTES_FILE - create it before tagging (see CLAUDE.md release checklist)."
+            echo "::error::Missing $NOTES_FILE - create it before tagging (see AGENTS.md release checklist)."
             exit 1
           fi
           if [ ! -f "$FOOTER_FILE" ]; then
