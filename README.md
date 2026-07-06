@@ -41,7 +41,7 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 - 🔔 **Notifications** — when an agent rings the terminal bell or asks for attention, the pane pulses and a native notification fires.
 - 🎛️ **Profiles** — presets for runtime, startup command, flags and default working directory, persisted across restarts. New agents prefill the profile's default folder, or the last folder you used.
 - 🔄 **Auto-updates** — the native app checks GitHub Releases in the background and updates in-app; manual check and an automatic-download toggle live in Settings.
-- ⚙️ **Settings** — `⌘,` (or the gear in the title bar) opens a settings window: session restore, workspace presets, custom commands, voice dictation (engine cloud/local incl. local-model download, OpenRouter key, hotkey mode, auto-submit, cleanup model & prompt), default app for new panes (fresh installs default to Codex), default terminal font size, default startup command, path overrides for the `claude`, `codex` and `git` binaries, update controls and an About panel.
+- ⚙️ **Settings** — `⌘,` (or the gear in the title bar) opens a settings window: session restore, workspace presets, custom commands, voice dictation (engine cloud/local incl. local-model download, OpenRouter key, hotkey mode, auto-submit, cleanup model & prompt), default app for new panes (fresh installs default to Codex full-access/YOLO mode), default terminal font size, default startup command, path overrides for the `claude`, `codex` and `git` binaries, update controls and an About panel.
 
 ## 📦 Download
 

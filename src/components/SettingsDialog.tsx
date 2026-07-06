@@ -274,7 +274,7 @@ function TerminalSection() {
 
       <Row
         label="Default app"
-        help="Preselected when creating a new pane. Profiles and manual command edits can still override it per pane."
+        help="Preselected when creating a new pane. Changing it resets the default startup command to that app's built-in command; profiles and manual edits can still override it per pane."
       >
         <Select
           value={defaultRuntime}

@@ -98,6 +98,20 @@ function runtimeOf(startup: string | undefined, runtime?: AgentRuntime): AgentRu
   return runtime ?? runtimeFromStartup(startup);
 }
 
+function normalizeLoadedSettings(settings: AppSettings): AppSettings {
+  if (settings.defaultRuntime !== undefined) return settings;
+  if (settings.defaultStartup !== undefined) {
+    return {
+      ...settings,
+      defaultRuntime: runtimeFromStartup(settings.defaultStartup),
+    };
+  }
+  return {
+    ...settings,
+    defaultRuntime: "claude",
+  };
+}
+
 function usageHistoryKey(runtime: AgentRuntime | undefined, sessionId: string): string {
   return `${runtime ?? "claude"}:${sessionId}`;
 }
@@ -739,7 +753,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   hydrate: async () => {
     try {
       const settings = await loadSettings();
-      if (settings) set({ settings });
+      if (settings) set({ settings: normalizeLoadedSettings(settings) });
     } catch {
       /* ignore */
     }
@@ -1755,6 +1769,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
 
   updateSettings: (patch) => {
     const settings = { ...get().settings, ...patch };
+    settings.defaultRuntime ??= DEFAULT_RUNTIME;
     set({ settings });
     void saveSettings(settings);
   },

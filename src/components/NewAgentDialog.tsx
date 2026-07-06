@@ -70,16 +70,28 @@ export function NewAgentDialog() {
     const ws = s.workspaces[s.activeWorkspaceId];
     setName("");
     const defaultRuntime = pre?.runtime ?? s.settings.defaultRuntime ?? DEFAULT_RUNTIME;
-    const profile =
-      (pre?.profileId && s.profiles.find((p) => p.id === pre.profileId)) ||
-      s.profiles.find((p) => (p.runtime ?? runtimeFromStartup(p.startup)) === defaultRuntime) ||
-      s.profiles[0];
-    setProfileId(profile?.id);
+    const hasExplicitStartup =
+      pre?.startup !== undefined || s.settings.defaultStartup !== undefined;
     const nextStartup =
       pre?.startup ??
       s.settings.defaultStartup ??
       defaultStartupForRuntime(defaultRuntime);
-    setRuntime(defaultRuntime);
+    const nextRuntime =
+      pre?.runtime ?? (hasExplicitStartup ? runtimeFromStartup(nextStartup) : defaultRuntime);
+    const profile =
+      (pre?.profileId && s.profiles.find((p) => p.id === pre.profileId)) ||
+      s.profiles.find(
+        (p) =>
+          p.startup === nextStartup &&
+          (p.runtime ?? runtimeFromStartup(p.startup)) === nextRuntime,
+      ) ||
+      (!hasExplicitStartup
+        ? s.profiles.find(
+            (p) => (p.runtime ?? runtimeFromStartup(p.startup)) === nextRuntime,
+          )
+        : undefined);
+    setProfileId(profile?.id);
+    setRuntime(nextRuntime);
     // the configured default command beats the preselected profile's startup —
     // picking a profile by hand still overwrites the field (see onProfile)
     setStartup(nextStartup);
