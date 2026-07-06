@@ -17,7 +17,6 @@ import { ProfilesDialog } from "./components/ProfilesDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { QuickNotesPanel } from "./components/QuickNotesPanel";
 import { UsageDashboard } from "./components/UsageDashboard";
-import { WebDirectoryPicker } from "./components/WebDirectoryPicker";
 import { useSwarm } from "./store";
 import { useUpdates } from "./lib/updates";
 import { useLimits } from "./lib/limits";
@@ -408,7 +407,6 @@ export default function App() {
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       <UsageDashboard />
       <QuickNotesPanel />
-      <WebDirectoryPicker />
     </TooltipProvider>
   );
 }

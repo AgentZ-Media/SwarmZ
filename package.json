@@ -8,10 +8,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri",
-    "engine": "node server/index.mjs",
-    "dev:web": "concurrently -k -n engine,vite -c magenta,cyan \"node server/index.mjs\" \"vite\"",
-    "postinstall": "node scripts/fix-pty-perms.mjs"
+    "tauri": "tauri"
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.2.8",
@@ -36,14 +33,11 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
-    "express": "^5.2.1",
     "lucide-react": "^1.17.0",
     "nanoid": "^5.1.11",
-    "node-pty": "^1.1.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "tailwind-merge": "^3.6.0",
-    "ws": "^8.21.0",
     "zustand": "^5.0.14"
   },
   "devDependencies": {

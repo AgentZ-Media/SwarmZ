@@ -1,8 +1,8 @@
 # AGENTS.md
 
-SwarmZ — run, tile and monitor multiple Claude Code agents in parallel. React frontend + native macOS app (Tauri 2 / Rust). Deep per-subsystem details live in `docs/ARCHITECTURE.md` — read the relevant section there (or the code) before changing a subsystem, and keep it in sync.
+SwarmZ — run, tile and monitor multiple Claude Code, Codex and shell agents in parallel. React frontend + native macOS app (Tauri 2 / Rust). Deep per-subsystem details live in `docs/ARCHITECTURE.md` — read the relevant section there (or the code) before changing a subsystem, and keep it in sync.
 
-**Web mode is abandoned.** `server/`, `src/lib/backend-web.ts`, `pnpm dev:web` — ignore completely, no parity work. New features are native-only; remove stale web-mode references from docs when you touch them.
+**Native-only app.** The old browser/Node web mode has been removed. New features are native-only; use Tauri/Rust commands for backend capabilities and do not reintroduce web-mode parity paths.
 
 ## Stack & commands
 
@@ -13,7 +13,7 @@ SwarmZ — run, tile and monitor multiple Claude Code agents in parallel. React 
 
 Frontend (`src/`):
 
-- `store.ts` — all app state + persistence (Tauri store `swarmz.json`; settings always via `updateSettings`) + the agent/workspace/worktree lifecycle actions
+- `store.ts` — all app state + persistence (Tauri store `swarmz.json`; settings always via `updateSettings`) + the agent/workspace/worktree lifecycle actions. Fresh installs default new panes to Codex in full-access mode.
 - `lib/transport.ts` → `backend-types.ts` / `backend-tauri.ts` — backend interface; native-only features may skip it and `invoke` directly (`lib/dnd.ts`, `lib/openrouter.ts`, `lib/worktree.ts`)
 - `lib/term-host.ts` — xterm + PTY per id, **outside React**; `lib/term-registry.ts` exposes the xterm instances
 - `lib/quit.ts` — quit guard; `lib/git.ts` — 7s status poll; `lib/limits.ts` — subscription meters; `lib/updates.ts` — auto-updater; `lib/dictation.ts` — voice recording; `lib/presets.ts` — workspace presets; `lib/layout.ts` — tiling trees; `lib/insert-command.ts` / `lib/command-vars.ts` — paste/submit + placeholders

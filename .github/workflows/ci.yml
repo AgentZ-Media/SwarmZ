@@ -7,11 +7,14 @@ on:
 
 jobs:
   check:
-    name: Type-check & build frontend
+    name: Type-check, build & test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Setup pnpm
         # Version comes from packageManager in package.json, so local and
@@ -29,3 +32,7 @@ jobs:
 
       - name: Type-check + build
         run: pnpm build
+
+      - name: Rust tests
+        run: cargo test
+        working-directory: src-tauri

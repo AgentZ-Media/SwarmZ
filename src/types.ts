@@ -134,8 +134,7 @@ export interface SubscriptionLimits {
 
 /**
  * Read-only git snapshot of an agent's working directory, polled every few
- * seconds. Produced by `git_info` (Rust) / `/api/git` (web) — both shell out
- * to the git binary and must stay in sync.
+ * seconds. Produced by `git_info` (Rust), which shells out to the git binary.
  */
 export interface GitInfo {
   /** repo root folder name */
@@ -221,6 +220,8 @@ export interface AppSettings {
   defaultFontSize?: number;
   /** startup command the New Agent dialog opens with; unset = built-in default, "" = plain shell */
   defaultStartup?: string;
+  /** runtime preselected for new agent panes; unset = Codex */
+  defaultRuntime?: AgentRuntime;
   /** absolute path used instead of `claude` at the start of startup commands */
   claudePath?: string;
   /** absolute path used instead of `codex` at the start of startup commands */

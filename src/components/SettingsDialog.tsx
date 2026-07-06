@@ -31,10 +31,12 @@ import {
 import { Switch } from "./ui/switch";
 import { Textarea } from "./ui/textarea";
 import {
+  DEFAULT_CODEX_STARTUP,
   DEFAULT_FONT_SIZE,
-  DEFAULT_STARTUP,
+  DEFAULT_RUNTIME,
   MAX_FONT_SIZE,
   MIN_FONT_SIZE,
+  defaultStartupForRuntime,
   presetKey,
   useSwarm,
 } from "@/store";
@@ -78,6 +80,7 @@ import type {
   OpenrouterModel,
   PresetPaneNode,
   WorkspacePreset,
+  AgentRuntime,
 } from "@/types";
 
 const REPO_URL = "https://github.com/AgentZ-Media/SwarmZ";
@@ -232,7 +235,11 @@ function TerminalSection() {
       ),
     });
 
-  const startup = settings.defaultStartup ?? DEFAULT_STARTUP;
+  const defaultRuntime = settings.defaultRuntime ?? DEFAULT_RUNTIME;
+  const startup =
+    settings.defaultStartup ?? defaultStartupForRuntime(defaultRuntime);
+  const setDefaultRuntime = (runtime: AgentRuntime) =>
+    updateSettings({ defaultRuntime: runtime, defaultStartup: undefined });
 
   return (
     <>
@@ -263,6 +270,25 @@ function TerminalSection() {
           onCheckedChange={(v) => updateSettings({ restoreAgents: v })}
           label="Restore agents on launch"
         />
+      </Row>
+
+      <Row
+        label="Default app"
+        help="Preselected when creating a new pane. Profiles and manual command edits can still override it per pane."
+      >
+        <Select
+          value={defaultRuntime}
+          onValueChange={(v) => setDefaultRuntime(v as AgentRuntime)}
+        >
+          <SelectTrigger className="w-44">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="codex">Codex</SelectItem>
+            <SelectItem value="claude">Claude Code</SelectItem>
+            <SelectItem value="shell">Plain shell</SelectItem>
+          </SelectContent>
+        </Select>
       </Row>
 
       <Row
@@ -308,8 +334,13 @@ function TerminalSection() {
         label="Default startup command"
         help={
           <>
-            Prefilled in the New Agent dialog; picking a profile there still
-            overrides it. Leave empty for a plain shell.
+            Prefilled in the New Agent dialog for the selected default app;
+            picking a profile there still overrides it. Leave empty for a plain
+            shell. Codex defaults to full-access mode (
+            <code className="font-mono text-muted-foreground">
+              dangerously-bypass-approvals-and-sandbox
+            </code>
+            ).
             {settings.defaultStartup !== undefined && (
               <>
                 {" "}
@@ -330,12 +361,19 @@ function TerminalSection() {
             updateSettings({
               // typing the built-in default back restores the "unset" state
               defaultStartup:
-                e.target.value === DEFAULT_STARTUP ? undefined : e.target.value,
+                e.target.value === defaultStartupForRuntime(defaultRuntime)
+                  ? undefined
+                  : e.target.value,
             })
           }
           className="font-mono text-xs"
           placeholder="(leave empty for a plain shell)"
         />
+        {defaultRuntime === "codex" && startup !== DEFAULT_CODEX_STARTUP && (
+          <p className="mt-1.5 text-[11px] text-warning">
+            This custom command overrides the built-in Codex YOLO default.
+          </p>
+        )}
       </StackedRow>
     </>
   );

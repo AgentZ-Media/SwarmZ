@@ -70,10 +70,21 @@ import {
 } from "@/lib/presets";
 import { folderName, pickColor, runtimeFromStartup } from "@/lib/utils";
 
-// Built-in fallback — the effective default is settings.defaultStartup (Settings dialog).
+// Built-in fallbacks — the effective defaults are settings.defaultRuntime +
+// settings.defaultStartup (Settings dialog). Fresh installs default to Codex
+// in full-access mode so new panes are ready for unattended agent work.
+export const DEFAULT_RUNTIME: AgentRuntime = "codex";
 export const DEFAULT_STARTUP = "claude --dangerously-skip-permissions";
 export const DEFAULT_CODEX_STARTUP =
+  "codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen";
+export const CODEX_WORKSPACE_STARTUP =
   "codex --sandbox workspace-write --ask-for-approval on-request --no-alt-screen";
+
+export function defaultStartupForRuntime(runtime: AgentRuntime): string {
+  if (runtime === "codex") return DEFAULT_CODEX_STARTUP;
+  if (runtime === "claude") return DEFAULT_STARTUP;
+  return "";
+}
 
 // Per-pane terminal zoom (⌘+/⌘−). The effective default is settings.defaultFontSize.
 export const DEFAULT_FONT_SIZE = 12.5;
@@ -960,6 +971,20 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const seed: Profile[] = [
       {
         id: nanoid(8),
+        name: "Codex · YOLO",
+        runtime: "codex",
+        startup: DEFAULT_CODEX_STARTUP,
+        color: pickColor(4),
+      },
+      {
+        id: nanoid(8),
+        name: "Codex · workspace",
+        runtime: "codex",
+        startup: CODEX_WORKSPACE_STARTUP,
+        color: pickColor(3),
+      },
+      {
+        id: nanoid(8),
         name: "Claude · skip permissions",
         runtime: "claude",
         startup: DEFAULT_STARTUP,
@@ -970,21 +995,6 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         name: "Claude · plain",
         runtime: "claude",
         startup: "claude",
-        color: pickColor(2),
-      },
-      {
-        id: nanoid(8),
-        name: "Codex · workspace",
-        runtime: "codex",
-        startup: DEFAULT_CODEX_STARTUP,
-        color: pickColor(4),
-      },
-      {
-        id: nanoid(8),
-        name: "Codex · full access",
-        runtime: "codex",
-        startup:
-          "codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen",
         color: pickColor(6),
       },
       {
@@ -1011,7 +1021,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       opts.startup ??
       profile?.startup ??
       state.settings.defaultStartup ??
-      DEFAULT_STARTUP;
+      defaultStartupForRuntime(state.settings.defaultRuntime ?? DEFAULT_RUNTIME);
     const runtime = runtimeOf(startup, opts.runtime ?? profile?.runtime);
     const agent: Agent = {
       id,
@@ -1903,7 +1913,10 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       const id = nanoid(10);
       const n = ++counter;
       const profile = state.profiles.find((p) => p.id === node.profileId);
-      const startup = node.startup ?? state.settings.defaultStartup ?? DEFAULT_STARTUP;
+      const startup =
+        node.startup ??
+        state.settings.defaultStartup ??
+        defaultStartupForRuntime(state.settings.defaultRuntime ?? DEFAULT_RUNTIME);
       const profileId = profile ? node.profileId : undefined;
       agents[id] = {
         id,
