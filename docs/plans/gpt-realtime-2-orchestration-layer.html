@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SwarmZ Orchestration Layer Plan</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0c0c0e;
+        --panel: #111114;
+        --panel-2: #17171a;
+        --ink: #ededef;
+        --muted: #9b9ba3;
+        --faint: #6f6f77;
+        --line: #28282d;
+        --blue: #5b8def;
+        --green: #4cae6e;
+        --yellow: #d6a243;
+        --red: #e5544d;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family:
+          Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        line-height: 1.55;
+      }
+      main {
+        width: min(1180px, calc(100vw - 40px));
+        margin: 0 auto;
+        padding: 42px 0 72px;
+      }
+      header {
+        display: grid;
+        grid-template-columns: 1.2fr 0.8fr;
+        gap: 28px;
+        align-items: end;
+        padding-bottom: 28px;
+        border-bottom: 1px solid var(--line);
+      }
+      h1,
+      h2,
+      h3 {
+        margin: 0;
+        letter-spacing: 0;
+        line-height: 1.12;
+      }
+      h1 {
+        max-width: 780px;
+        font-size: 42px;
+      }
+      h2 {
+        margin-top: 42px;
+        font-size: 24px;
+      }
+      h3 {
+        margin-top: 22px;
+        font-size: 16px;
+      }
+      p {
+        margin: 10px 0 0;
+        color: var(--muted);
+      }
+      .lead {
+        max-width: 720px;
+        font-size: 16px;
+      }
+      .meta {
+        display: grid;
+        gap: 8px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        padding: 14px;
+        border-radius: 8px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .pill {
+        display: inline-flex;
+        width: max-content;
+        align-items: center;
+        gap: 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 3px 9px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+        background: var(--blue);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 12px;
+        margin-top: 16px;
+      }
+      .card {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        border-radius: 8px;
+        padding: 16px;
+      }
+      .card strong {
+        display: block;
+        margin-bottom: 7px;
+      }
+      .tag {
+        color: var(--faint);
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 11px;
+      }
+      .flow {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 10px;
+        margin-top: 18px;
+      }
+      .flow .step {
+        min-height: 112px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        border-radius: 8px;
+        padding: 13px;
+        position: relative;
+      }
+      .flow .step:not(:last-child)::after {
+        content: "";
+        position: absolute;
+        top: 50%;
+        right: -10px;
+        width: 10px;
+        border-top: 1px solid var(--blue);
+      }
+      table {
+        width: 100%;
+        margin-top: 14px;
+        border-collapse: collapse;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        font-size: 13px;
+      }
+      th,
+      td {
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        background: var(--panel-2);
+        color: var(--ink);
+      }
+      td {
+        color: var(--muted);
+      }
+      tr:last-child td {
+        border-bottom: 0;
+      }
+      code,
+      pre {
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+      }
+      pre {
+        margin: 14px 0 0;
+        padding: 14px;
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #09090b;
+        color: #d9d9df;
+        font-size: 12px;
+      }
+      .lane {
+        margin-top: 16px;
+        display: grid;
+        grid-template-columns: 170px 1fr;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      .lane-label {
+        background: var(--panel-2);
+        padding: 14px;
+        font-weight: 650;
+      }
+      .lane-body {
+        padding: 14px;
+        background: var(--panel);
+      }
+      .risk {
+        border-left: 3px solid var(--yellow);
+      }
+      .ok {
+        border-left: 3px solid var(--green);
+      }
+      .danger {
+        border-left: 3px solid var(--red);
+      }
+      a {
+        color: #8ab4f8;
+      }
+      @media (max-width: 820px) {
+        header,
+        .flow,
+        .lane {
+          grid-template-columns: 1fr;
+        }
+        .flow .step::after {
+          display: none;
+        }
+        h1 {
+          font-size: 32px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <span class="pill"><span class="dot"></span> Product plan</span>
+          <h1>GPT Realtime 2 Orchestration Layer for SwarmZ</h1>
+          <p class="lead">
+            Ziel: SwarmZ wird von einem Terminal-Tiler zu einer lokalen
+            Agenten-Leitstelle. Der Nutzer spricht ein Ziel aus; der
+            Orchestrator kennt alle Fenster, liest Kontext, verteilt Arbeit,
+            sendet Prompts, stoppt riskante Aktionen und konsolidiert Ergebnisse.
+          </p>
+        </div>
+        <div class="meta">
+          <div><strong>Surface</strong> Voice + chat overlay above all panes</div>
+          <div><strong>Model</strong> GPT Realtime 2 for low-latency speech and tool calls</div>
+          <div><strong>Trust model</strong> Local-first state, explicit approvals for destructive actions</div>
+          <div><strong>First milestone</strong> Read-only commander, then controlled write actions</div>
+        </div>
+      </header>
+
+      <h2>North Star</h2>
+      <div class="grid">
+        <div class="card ok">
+          <strong>No more prompt wrangling</strong>
+          <p>The user says the outcome. SwarmZ turns it into scoped agent instructions.</p>
+        </div>
+        <div class="card ok">
+          <strong>Every pane has context</strong>
+          <p>Each agent pane exposes runtime, cwd, git state, usage, terminal summary, last prompt and risk state.</p>
+        </div>
+        <div class="card ok">
+          <strong>One commander, many agents</strong>
+          <p>The orchestrator can spawn panes, send prompts, read outputs, pause, close and request review.</p>
+        </div>
+        <div class="card risk">
+          <strong>Safety stays visible</strong>
+          <p>Yolo agent execution is allowed, but destructive app-level actions still flow through an approval lane.</p>
+        </div>
+      </div>
+
+      <h2>Product Flow</h2>
+      <div class="flow">
+        <div class="step">
+          <span class="tag">1. Speak</span>
+          <strong>Goal capture</strong>
+          <p>"Build X, split it across three agents, review before PR."</p>
+        </div>
+        <div class="step">
+          <span class="tag">2. Plan</span>
+          <strong>Task graph</strong>
+          <p>Orchestrator proposes workers, scopes, branches and acceptance checks.</p>
+        </div>
+        <div class="step">
+          <span class="tag">3. Act</span>
+          <strong>Tool calls</strong>
+          <p>Create panes, worktrees, prompts, pauses, reads and close requests.</p>
+        </div>
+        <div class="step">
+          <span class="tag">4. Observe</span>
+          <strong>Live context</strong>
+          <p>Terminal streams are summarized into per-pane and global memory.</p>
+        </div>
+        <div class="step">
+          <span class="tag">5. Decide</span>
+          <strong>Review lane</strong>
+          <p>User approves risky operations, PR creation and final cleanup.</p>
+        </div>
+      </div>
+
+      <h2>Context Model</h2>
+      <p>
+        The hard part is not sending prompts. The hard part is keeping a compact,
+        truthful model of what every terminal is doing without flooding Realtime
+        context. SwarmZ should store raw terminal scrollback locally, but send the
+        model only a distilled state object plus targeted excerpts on demand.
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>Layer</th>
+            <th>Stored locally</th>
+            <th>Sent to Realtime</th>
+            <th>Update trigger</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Pane identity</td>
+            <td>agent id, workspace, cwd, runtime, branch, worktree metadata</td>
+            <td>always in compact state</td>
+            <td>pane create/move/close</td>
+          </tr>
+          <tr>
+            <td>Terminal activity</td>
+            <td>raw chunks + parsed recent lines ring buffer</td>
+            <td>status, last command, last assistant/user prompt, error flags</td>
+            <td>PTY output debounce</td>
+          </tr>
+          <tr>
+            <td>Semantic summary</td>
+            <td>rolling summary per pane and per workspace</td>
+            <td>summary + open questions + next action</td>
+            <td>idle transition, large output, explicit read</td>
+          </tr>
+          <tr>
+            <td>Code state</td>
+            <td>git status, changed files, diff stats, local-only commits</td>
+            <td>file list + high-risk diff excerpts on demand</td>
+            <td>git poll / worktree events</td>
+          </tr>
+          <tr>
+            <td>Global memory</td>
+            <td>task graph, decisions, approvals, rejected actions</td>
+            <td>active objective + current graph + constraints</td>
+            <td>every orchestration action</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>Tool Surface For The Orchestrator</h2>
+      <pre>{
+  "list_panes": "return compact state for every visible and hidden pane",
+  "read_pane": "return recent terminal excerpt or semantic summary",
+  "create_agent": "runtime, cwd, profile, startup, worktree options",
+  "send_prompt": "paste text into a pane; optional submit",
+  "interrupt_agent": "send Ctrl-C or escape sequence",
+  "close_agent": "request normal close flow, never force-delete silently",
+  "focus_pane": "switch workspace and focus pane",
+  "create_worktree": "explicit branch/copy-env action",
+  "git_snapshot": "repo status, changed files, ahead/dirty risk",
+  "request_approval": "ask user before destructive or irreversible action"
+}</pre>
+
+      <h2>Implementation Architecture</h2>
+      <div class="lane">
+        <div class="lane-label">Frontend</div>
+        <div class="lane-body">
+          <strong>Commander overlay</strong>
+          <p>
+            A slim global overlay in the title-bar layer with push-to-talk,
+            transcript, suggested plan, active task graph and approval prompts.
+            It should not cover terminal work unless the user opens the full view.
+          </p>
+        </div>
+      </div>
+      <div class="lane">
+        <div class="lane-label">State</div>
+        <div class="lane-body">
+          <strong>orchestration slice</strong>
+          <p>
+            Store `taskGraph`, `paneSummaries`, `approvals`, `commanderSession`,
+            and `toolCallLog` outside the core agent lifecycle to avoid bloating
+            `store.ts` further.
+          </p>
+        </div>
+      </div>
+      <div class="lane">
+        <div class="lane-label">Backend</div>
+        <div class="lane-body">
+          <strong>Realtime session bridge</strong>
+          <p>
+            Rust owns API keys and websocket/session setup. JS sends local tool
+            results and audio frames; Rust brokers model events, transcripts and
+            tool-call requests back to the app.
+          </p>
+        </div>
+      </div>
+      <div class="lane">
+        <div class="lane-label">Context</div>
+        <div class="lane-body">
+          <strong>terminal summarizer</strong>
+          <p>
+            Capture recent lines in `term-host`, classify blocks as user input,
+            assistant output, shell command, test output, error, or permission
+            prompt. Summaries update only when the pane goes idle or output crosses
+            a size threshold.
+          </p>
+        </div>
+      </div>
+
+      <h2>Phased Delivery</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Phase</th>
+            <th>Scope</th>
+            <th>Definition of done</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>MVP 0: context inventory</td>
+            <td>Expose pane list, recent lines, summaries, git state</td>
+            <td>Debug drawer shows what the commander would know</td>
+          </tr>
+          <tr>
+            <td>MVP 1: read-only voice commander</td>
+            <td>Realtime voice, answer questions about current panes</td>
+            <td>"What is agent 2 doing?" works without sending prompts</td>
+          </tr>
+          <tr>
+            <td>MVP 2: controlled actions</td>
+            <td>Create panes, focus panes, paste prompts, no destructive actions</td>
+            <td>User can say "ask Codex in a new worktree to review this branch"</td>
+          </tr>
+          <tr>
+            <td>MVP 3: task graph</td>
+            <td>Planner creates worker/reviewer/tester nodes and tracks completion</td>
+            <td>Fleet overview shows orchestration status, not just terminal status</td>
+          </tr>
+          <tr>
+            <td>MVP 4: PR workflow</td>
+            <td>Diff review, test execution, PR draft creation, cleanup proposal</td>
+            <td>Orchestrator can prepare a PR but asks before push/cleanup</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>Safety Rules</h2>
+      <div class="grid">
+        <div class="card danger">
+          <strong>Always ask</strong>
+          <p>Delete worktree, kill busy pane, push, force-remove branch, clear history, overwrite settings.</p>
+        </div>
+        <div class="card risk">
+          <strong>Ask when uncertain</strong>
+          <p>Prompt submission to the wrong pane, huge paste, command that mentions secrets, network credentials.</p>
+        </div>
+        <div class="card ok">
+          <strong>Allowed directly</strong>
+          <p>Read pane summaries, focus panes, create plain panes, create clean worktrees, paste draft prompts.</p>
+        </div>
+      </div>
+
+      <h2>Open Questions</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Question</th>
+            <th>Recommended answer</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Can Realtime read raw terminal scrollback?</td>
+            <td>No by default. It gets compact summaries and can request excerpts from a named pane.</td>
+          </tr>
+          <tr>
+            <td>Where do summaries live?</td>
+            <td>Tauri store for resumable commander memory; raw scrollback remains xterm/local only.</td>
+          </tr>
+          <tr>
+            <td>Does the commander use MCP?</td>
+            <td>Yes for external tools; app-internal control should be native tools first, MCP-exportable later.</td>
+          </tr>
+          <tr>
+            <td>Can agents spawned manually be discovered?</td>
+            <td>Yes. The orchestration state subscribes to the existing store, so every pane is visible.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>References</h2>
+      <p>
+        This plan aligns with MCP as the tool/context integration layer
+        (<a href="https://modelcontextprotocol.io/specification/2025-06-18">specification</a>),
+        OpenAI's guidance for app-owned orchestration and tool execution
+        (<a href="https://developers.openai.com/api/docs/guides/agents">Agents SDK</a>),
+        and Claude Code's hooks/subagents/statusline surfaces for coordinating
+        agent work.
+      </p>
+    </main>
+  </body>
+</html>

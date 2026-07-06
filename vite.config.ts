@@ -39,10 +39,5 @@ export default defineConfig(async () => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
-    // Browser (web) mode talks to the Node engine; proxy API + the PTY socket.
-    proxy: {
-      "/api": { target: "http://localhost:4178", changeOrigin: true },
-      "/ws": { target: "http://localhost:4178", ws: true },
-    },
   },
 }));

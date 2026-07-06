@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  check:
+  frontend:
     name: Type-check & build frontend
     runs-on: ubuntu-latest
     steps:
@@ -29,3 +29,17 @@ jobs:
 
       - name: Type-check + build
         run: pnpm build
+
+  rust:
+    name: Rust tests
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust tests
+        run: cargo test
+        working-directory: src-tauri

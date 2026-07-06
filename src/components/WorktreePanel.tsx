@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { CheckCircle2, FolderGit2, FolderOpen, Plus, Trash2 } from "lucide-react";
 import { useSwarm } from "@/store";
@@ -24,14 +24,8 @@ export function WorktreesButton() {
   const refreshWorktrees = useSwarm((s) => s.refreshWorktrees);
   const cleanupSafeWorktrees = useSwarm((s) => s.cleanupSafeWorktrees);
   const worktrees = useSwarm((s) => s.worktrees);
-  const openPaths = useSwarm(
-    (s) =>
-      new Set(
-        s.order
-          .map((id) => s.agents[id]?.cwd)
-          .filter((cwd): cwd is string => !!cwd),
-      ),
-  );
+  const order = useSwarm((s) => s.order);
+  const agents = useSwarm((s) => s.agents);
   const visible = useSwarm(
     (s) =>
       s.worktrees.length > 0 ||
@@ -41,6 +35,15 @@ export function WorktreesButton() {
   if (!visible) return null;
 
   // group per repo, keeping the scan order
+  const openPaths = useMemo(
+    () =>
+      new Set(
+        order
+          .map((id) => agents[id]?.cwd)
+          .filter((cwd): cwd is string => !!cwd),
+      ),
+    [agents, order],
+  );
   const groups: { root: string; repo: string; entries: WorktreeEntry[] }[] = [];
   for (const e of worktrees) {
     const g = groups.find((x) => x.root === e.root);

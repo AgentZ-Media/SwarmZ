@@ -17,7 +17,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./ui/select";
-import { DEFAULT_CODEX_STARTUP, DEFAULT_STARTUP, useSwarm } from "@/store";
+import {
+  DEFAULT_CODEX_STARTUP,
+  DEFAULT_RUNTIME,
+  DEFAULT_STARTUP,
+  defaultStartupForRuntime,
+  useSwarm,
+} from "@/store";
 import { AGENT_COLORS, cn, runtimeFromStartup, shortPath } from "@/lib/utils";
 import type { AgentRuntime, Profile } from "@/types";
 
@@ -35,6 +41,7 @@ export function ProfilesDialog({
   onOpenChange: (v: boolean) => void;
 }) {
   const profiles = useSwarm((s) => s.profiles);
+  const settings = useSwarm((s) => s.settings);
   const saveProfile = useSwarm((s) => s.saveProfile);
   const deleteProfile = useSwarm((s) => s.deleteProfile);
   const [editing, setEditing] = useState<Profile | null>(null);
@@ -48,13 +55,19 @@ export function ProfilesDialog({
   };
   useEffect(() => () => window.clearTimeout(disarmTimer.current), []);
 
-  const blank = (): Profile => ({
-    id: "",
-    name: "",
-    runtime: "claude",
-    startup: DEFAULT_STARTUP,
-    color: AGENT_COLORS[profiles.length % AGENT_COLORS.length],
-  });
+  const blank = (): Profile => {
+    const runtime =
+      settings.defaultStartup !== undefined
+        ? runtimeFromStartup(settings.defaultStartup)
+        : settings.defaultRuntime ?? DEFAULT_RUNTIME;
+    return {
+      id: "",
+      name: "",
+      runtime,
+      startup: settings.defaultStartup ?? defaultStartupForRuntime(runtime),
+      color: AGENT_COLORS[profiles.length % AGENT_COLORS.length],
+    };
+  };
 
   const current = editing;
 

@@ -1,15 +1,14 @@
 import type { Backend } from "./backend-types";
 import { tauriBackend } from "./backend-tauri";
-import { webBackend } from "./backend-web";
 
 export const IS_TAURI =
   typeof window !== "undefined" &&
   ("__TAURI_INTERNALS__" in window || "__TAURI__" in window);
 
-// Pick the backend once. Tauri webview → Rust commands; a plain browser on
-// localhost → the Node engine over WebSocket/HTTP. Both are bundled; module
-// import has no side effects, so selecting at runtime is safe.
-const backend: Backend = IS_TAURI ? tauriBackend : webBackend;
+// Native-only: SwarmZ runs through Tauri and the Rust backend. Keeping this
+// indirection preserves the frontend call sites while avoiding the abandoned
+// browser/Node engine in production bundles.
+const backend: Backend = tauriBackend;
 
 export const ptySpawn = backend.ptySpawn;
 export const ptyWrite = backend.ptyWrite;

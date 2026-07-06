@@ -20,7 +20,13 @@ import {
 } from "./ui/select";
 import { Switch } from "./ui/switch";
 import { Tip } from "./ui/tooltip";
-import { DEFAULT_CODEX_STARTUP, DEFAULT_STARTUP, useSwarm } from "@/store";
+import {
+  DEFAULT_CODEX_STARTUP,
+  DEFAULT_RUNTIME,
+  DEFAULT_STARTUP,
+  defaultStartupForRuntime,
+  useSwarm,
+} from "@/store";
 import { runtimeFromStartup, shortPath } from "@/lib/utils";
 import type { AgentRuntime } from "@/types";
 
@@ -63,16 +69,29 @@ export function NewAgentDialog() {
     const pre = s.newAgentPrefill;
     const ws = s.workspaces[s.activeWorkspaceId];
     setName("");
-    const profile =
-      (pre?.profileId && s.profiles.find((p) => p.id === pre.profileId)) ||
-      s.profiles[0];
-    setProfileId(profile?.id);
+    const defaultRuntime = pre?.runtime ?? s.settings.defaultRuntime ?? DEFAULT_RUNTIME;
+    const hasExplicitStartup =
+      pre?.startup !== undefined || s.settings.defaultStartup !== undefined;
     const nextStartup =
       pre?.startup ??
       s.settings.defaultStartup ??
-      profile?.startup ??
-      DEFAULT_STARTUP;
-    setRuntime(pre?.runtime ?? profile?.runtime ?? runtimeFromStartup(nextStartup));
+      defaultStartupForRuntime(defaultRuntime);
+    const nextRuntime =
+      pre?.runtime ?? (hasExplicitStartup ? runtimeFromStartup(nextStartup) : defaultRuntime);
+    const profile =
+      (pre?.profileId && s.profiles.find((p) => p.id === pre.profileId)) ||
+      s.profiles.find(
+        (p) =>
+          p.startup === nextStartup &&
+          (p.runtime ?? runtimeFromStartup(p.startup)) === nextRuntime,
+      ) ||
+      (!hasExplicitStartup
+        ? s.profiles.find(
+            (p) => (p.runtime ?? runtimeFromStartup(p.startup)) === nextRuntime,
+          )
+        : undefined);
+    setProfileId(profile?.id);
+    setRuntime(nextRuntime);
     // the configured default command beats the preselected profile's startup —
     // picking a profile by hand still overwrites the field (see onProfile)
     setStartup(nextStartup);
@@ -145,11 +164,7 @@ export function NewAgentDialog() {
       currentRuntime !== next
     ) {
       setStartup(
-        next === "codex"
-          ? DEFAULT_CODEX_STARTUP
-          : next === "claude"
-            ? DEFAULT_STARTUP
-            : "",
+        defaultStartupForRuntime(next),
       );
     }
   };

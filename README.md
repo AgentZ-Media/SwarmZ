@@ -39,9 +39,9 @@ Built with **React 19 + TypeScript + Tailwind v4**. Dark mode only — by design
 - 🏷️ **Auto-naming** — Claude terminal titles and Codex thread names are captured automatically. Rename a pane yourself and the auto-title backs off; clear the name to hand it back.
 - 🚦 **Live status** — the pane status dot mirrors what the agent is doing: amber while it's working, green when idle, blue when it waits for input. Claude status comes from terminal progress reporting; Codex status comes from its local session events. Every workspace tab sums up its agents live (`2/4` busy), and quitting the app raises a warning first whenever it would lose something — agents still working, or open terminals that wouldn't be restored.
 - 🔔 **Notifications** — when an agent rings the terminal bell or asks for attention, the pane pulses and a native notification fires.
-- 🎛️ **Profiles** — presets for runtime, startup command, flags and default working directory, persisted across restarts. New agents prefill the profile's default folder, or the last folder you used.
+- 🎛️ **Profiles** — presets for runtime, startup command, flags and default working directory, persisted across restarts. Codex ships with standard YOLO/full-access, workspace and read-only profiles; new agents prefill the profile's default folder, or the last folder you used.
 - 🔄 **Auto-updates** — the native app checks GitHub Releases in the background and updates in-app; manual check and an automatic-download toggle live in Settings.
-- ⚙️ **Settings** — `⌘,` (or the gear in the title bar) opens a settings window: session restore, workspace presets, custom commands, voice dictation (engine cloud/local incl. local-model download, OpenRouter key, hotkey mode, auto-submit, cleanup model & prompt), default terminal font size, default startup command, path overrides for the `claude`, `codex` and `git` binaries, update controls and an About panel.
+- ⚙️ **Settings** — `⌘,` (or the gear in the title bar) opens a settings window: session restore, workspace presets, custom commands, voice dictation (engine cloud/local incl. local-model download, OpenRouter key, hotkey mode, auto-submit, cleanup model & prompt), default app for new panes (fresh installs default to Codex full-access/YOLO mode), default terminal font size, default startup command, path overrides for the `claude`, `codex` and `git` binaries, update controls and an About panel.
 
 ## 📦 Download
 
@@ -144,7 +144,7 @@ Claude per-model pricing (USD / 1M tokens, incl. cache write/read) is fetched li
 | Usage history (all-time stats) | ✅ | Tauri store (`swarmz.json`) |
 | Command presets (per project folder) | ✅ | Tauri store (`swarmz.json`) |
 | Custom commands (global + per project folder) | ✅ | Tauri store (`swarmz.json`) |
-| App settings (Settings window: last used folder, font size, default command, binary paths, auto-update, dictation preferences) | ✅ | Tauri store (`swarmz.json`) |
+| App settings (Settings window: last used folder, default app, font size, default command, binary paths, auto-update, dictation preferences) | ✅ | Tauri store (`swarmz.json`) |
 | OpenRouter API key (voice dictation) | ✅ | macOS Keychain (`SwarmZ-OpenRouter`) |
 | Workspace tabs (name, order, default folder, active tab) | ✅ | Tauri store (`swarmz.json`) |
 | Workspace presets (layouts + pane templates) | ✅ | Tauri store (`swarmz.json`) |
