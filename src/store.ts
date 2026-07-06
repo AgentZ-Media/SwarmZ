@@ -79,6 +79,8 @@ export const DEFAULT_CODEX_STARTUP =
   "codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen";
 export const CODEX_WORKSPACE_STARTUP =
   "codex --sandbox workspace-write --ask-for-approval on-request --no-alt-screen";
+export const CODEX_READONLY_STARTUP =
+  "codex --sandbox read-only --ask-for-approval on-request --no-alt-screen";
 
 export function defaultStartupForRuntime(runtime: AgentRuntime): string {
   if (runtime === "codex") return DEFAULT_CODEX_STARTUP;
@@ -110,6 +112,40 @@ function normalizeLoadedSettings(settings: AppSettings): AppSettings {
     ...settings,
     defaultRuntime: "claude",
   };
+}
+
+function codexStandardProfiles(): Profile[] {
+  return [
+    {
+      id: nanoid(8),
+      name: "Codex · YOLO",
+      runtime: "codex",
+      startup: DEFAULT_CODEX_STARTUP,
+      color: pickColor(4),
+    },
+    {
+      id: nanoid(8),
+      name: "Codex · workspace",
+      runtime: "codex",
+      startup: CODEX_WORKSPACE_STARTUP,
+      color: pickColor(3),
+    },
+    {
+      id: nanoid(8),
+      name: "Codex · read-only",
+      runtime: "codex",
+      startup: CODEX_READONLY_STARTUP,
+      color: pickColor(2),
+    },
+  ];
+}
+
+function withCodexStandardProfiles(profiles: Profile[]): Profile[] {
+  const existingStartups = new Set(profiles.map((p) => p.startup.trim()));
+  const missing = codexStandardProfiles().filter(
+    (p) => !existingStartups.has(p.startup),
+  );
+  return missing.length ? [...profiles, ...missing] : profiles;
 }
 
 function usageHistoryKey(runtime: AgentRuntime | undefined, sessionId: string): string {
@@ -971,32 +1007,21 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     try {
       const saved = await loadProfiles();
       if (saved && saved.length) {
-        set({
-          profiles: saved.map((p) => ({
+        const profiles = withCodexStandardProfiles(
+          saved.map((p) => ({
             ...p,
             runtime: runtimeOf(p.startup, p.runtime),
           })),
-        });
+        );
+        set({ profiles });
+        if (profiles.length !== saved.length) void saveProfiles(profiles);
         return;
       }
     } catch {
       /* ignore */
     }
     const seed: Profile[] = [
-      {
-        id: nanoid(8),
-        name: "Codex · YOLO",
-        runtime: "codex",
-        startup: DEFAULT_CODEX_STARTUP,
-        color: pickColor(4),
-      },
-      {
-        id: nanoid(8),
-        name: "Codex · workspace",
-        runtime: "codex",
-        startup: CODEX_WORKSPACE_STARTUP,
-        color: pickColor(3),
-      },
+      ...codexStandardProfiles(),
       {
         id: nanoid(8),
         name: "Claude · skip permissions",
