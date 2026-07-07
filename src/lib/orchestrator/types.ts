@@ -76,7 +76,25 @@ export const ORCHESTRATOR_TOOL_NAMES = [
   "prompt_pane",
   "create_panes",
   "create_workspace",
+  "remember",
 ] as const;
+
+/** One curated memory entry (`orchestrator_memory_read` / `_remove`). */
+export interface OrchestratorMemoryEntry {
+  /** ISO date the entry was stored (may be empty for hand-edited lines) */
+  date: string;
+  text: string;
+}
+
+/** Result of `orchestrator_memory_append` (the `remember` tool). */
+export interface OrchestratorMemoryAppend {
+  stored: boolean;
+  /** how many oldest entries the cap dropped */
+  dropped: number;
+  total: number;
+  /** human-readable note surfaced to the model */
+  note: string;
+}
 
 export type OrchestratorToolName = (typeof ORCHESTRATOR_TOOL_NAMES)[number];
 
@@ -91,8 +109,9 @@ export interface OrchestratorToolDefinition {
 
 /**
  * Response of `orchestrator_tools`: the single-source system instructions
- * (ORCHESTRATOR_INSTRUCTIONS in appserver.rs) plus the tool catalog — the
- * OpenRouter loop consumes both, the dev hook exposes the whole object.
+ * (compiled by `persona::build_instructions` — persona + memory + operative
+ * core) plus the tool catalog — the OpenRouter loop consumes both, the dev
+ * hook exposes the whole object.
  */
 export interface OrchestratorToolsResponse {
   instructions: string;
@@ -137,6 +156,8 @@ export interface PromptPaneResult {
 /** One pane request inside `create_panes`. */
 export interface CreatePaneSpec {
   cwd: string;
+  /** create a native Vibe-Mode Codex session instead of a terminal pane */
+  native?: boolean;
   runtime?: "claude" | "codex" | "shell";
   profile_id?: string;
   /** model id appended to the startup (claude: --model, codex: -m); omit = default config */
@@ -150,6 +171,9 @@ export interface CreatePaneSpec {
   worktree?: boolean;
   /** worktree branch; omitted = generated */
   branch?: string;
+  /** place this pane next to an existing one (targeted split; ignores
+   * arrangement/workspace distribution). Not applicable to native sessions. */
+  beside?: { pane_id: string; direction?: "right" | "below" };
 }
 
 /** Per-pane outcome of `create_panes` — errors never abort the batch. */
@@ -159,6 +183,11 @@ export interface CreatePaneResult {
   name?: string | null;
   cwd?: string | null;
   worktree?: { root: string; branch: string } | null;
+  /** true when this entry created a native Vibe session (not a terminal pane) */
+  native?: boolean;
+  /** the workspace this pane landed in (terminal panes only) */
+  workspace_id?: string;
+  workspace_name?: string;
   /** prompt delivery note (e.g. the pane never became ready) */
   warning?: string;
   /** set when this pane failed (worktree creation, unknown profile, …) */
@@ -166,6 +195,9 @@ export interface CreatePaneResult {
 }
 
 export interface CreatePanesResult {
+  /** primary target workspace (the first bucket) */
   workspace_id: string;
   panes: CreatePaneResult[];
+  /** honest, human-readable account of where panes landed and any overflow */
+  summary?: string;
 }

@@ -7,6 +7,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useSwarm } from "@/store";
+import { currentPersonaWire, type PersonaWire } from "./persona";
 
 /** Identifies one chat: the in-process id + the persistent thread id. */
 export interface OrchestratorChatRef {
@@ -21,6 +22,7 @@ export type OrchestratorChatEventKind =
   | "message"
   | "tool_call"
   | "tool_done"
+  | "token_usage"
   | "turn_completed"
   | "turn_failed"
   | "warning";
@@ -32,8 +34,8 @@ export interface OrchestratorChatEvent {
   /**
    * kind-specific, kept small: delta/message `{text}` · tool_call
    * `{tool, args_summary}` · tool_done `{tool, ok}` · turn_started
-   * `{turn_id}` · turn_completed `{status}` · turn_failed `{error}` ·
-   * warning `{message}`
+   * `{turn_id}` · token_usage `{total, last, modelContextWindow}` ·
+   * turn_completed `{status}` · turn_failed `{error}` · warning `{message}`
    */
   data: Record<string, unknown>;
 }
@@ -65,10 +67,16 @@ function codexPath(): string {
   return useSwarm.getState().settings.codexPath ?? "";
 }
 
+/** The current persona (voice) reduced to the wire shape Rust compiles. */
+function persona(): PersonaWire {
+  return currentPersonaWire(useSwarm.getState().settings.orchestratorPersona);
+}
+
 /** Start a fresh orchestrator chat (spawns the app-server lazily). */
 export function chatStart(): Promise<OrchestratorChatRef> {
   return invoke<OrchestratorChatRef>("orchestrator_chat_start", {
     codexPath: codexPath(),
+    persona: persona(),
   });
 }
 
@@ -80,10 +88,15 @@ export function chatStart(): Promise<OrchestratorChatRef> {
 export function chatSend(
   chatId: string,
   text: string,
+  /** per-turn overrides (codex chats) — omitted = the user's default config */
+  model?: string,
+  effort?: string,
 ): Promise<OrchestratorChatSendResult> {
   return invoke<OrchestratorChatSendResult>("orchestrator_chat_send", {
     chatId,
     text,
+    model: model ?? null,
+    effort: effort ?? null,
   });
 }
 
@@ -94,7 +107,10 @@ export function chatInterrupt(chatId: string): Promise<void> {
 
 /** Reopen a persisted app-server thread as a chat (across app restarts). */
 export function chatResume(threadId: string): Promise<OrchestratorChatRef> {
-  return invoke<OrchestratorChatRef>("orchestrator_chat_resume", { threadId });
+  return invoke<OrchestratorChatRef>("orchestrator_chat_resume", {
+    threadId,
+    persona: persona(),
+  });
 }
 
 /** Liveness + codex version + account summary. Never rejects for a dead

@@ -223,7 +223,13 @@ export interface WorktreeScan {
 }
 
 /** Small app-wide preferences, persisted across restarts. Edited in the Settings dialog. */
+/** The two app-wide views (title-bar switch, ⌘⇧V) — grid = the tiling
+ * terminal wall, vibe = the native Codex session view. */
+export type UiMode = "grid" | "vibe";
+
 export interface AppSettings {
+  /** which top-level view the app opens in (grid tiling wall vs vibe sessions) */
+  uiMode?: UiMode;
   /** last working directory an agent was launched in — prefilled in the New Agent dialog */
   lastCwd?: string;
   /** download updates in the background as soon as they're found (native only; installing still needs a restart) */
@@ -284,6 +290,14 @@ export interface AppSettings {
   /** OpenRouter model id for orchestrator chats; unset = DEFAULT_ORCHESTRATOR_MODEL */
   orchestratorModel?: string;
   /**
+   * Default model + reasoning effort NEW codex orchestrator chats are stamped
+   * with (a per-chat override the model picker can then change). Unset = the
+   * user's plain codex default. Distinct from `orchestratorModel`, which is the
+   * OpenRouter default.
+   */
+  orchestratorCodexModel?: string;
+  orchestratorCodexEffort?: string;
+  /**
    * let the orchestrator press Enter on prompts it types into panes
    * (default on). Off = review mode: prompt_pane and create_panes startup
    * prompts paste but never submit — the user submits manually.
@@ -297,6 +311,32 @@ export interface AppSettings {
   orchestratorBusyPolicy?: "deliver" | "refuse";
   /** default scan roots for the orchestrator's list_projects when the model passes none */
   orchestratorScanRoots?: string[];
+  /**
+   * the orchestrator's persona (voice/self-image only — never its tools or
+   * safety rules, those are hard-wired in the operative core). Unset = the
+   * "Maestro" default seed; edited in Settings → Orchestrator. Only
+   * name/role/tone/principles reach the backend; emoji/accent are UI-only.
+   */
+  orchestratorPersona?: OrchestratorPersona;
+}
+
+/**
+ * The orchestrator persona. `name`/`role`/`tone`/`principles` are compiled
+ * into the system instructions (Rust `build_instructions`); `emoji`/`accent`
+ * are UI-only (Conductor card, panel header, composer placeholder).
+ */
+export interface OrchestratorPersona {
+  name: string;
+  /** one-sentence self-image, compiled after "You are {name} — " */
+  role: string;
+  /** voice/directness, e.g. "Calm, precise, leading." */
+  tone: string;
+  /** 1–6 short principles */
+  principles: string[];
+  /** UI avatar emoji (Conductor dot / panel header) */
+  emoji?: string;
+  /** UI accent tint (optional dot color) */
+  accent?: string;
 }
 
 // ---- OpenRouter voice dictation ----
@@ -632,8 +672,14 @@ export interface OrchestratorChat {
   /** the brain behind this chat — fixed for the chat's lifetime */
   provider?: "codex" | "openrouter";
   threadId: string | null;
-  /** OpenRouter model id, captured at creation (openrouter chats only) */
+  /**
+   * Provider model: the OpenRouter model id (openrouter chats, captured at
+   * creation) OR the codex model override (codex chats — a per-turn override,
+   * editable mid-chat via the model picker). Unset codex = the user's default.
+   */
   model?: string;
+  /** codex reasoning-effort override (codex chats only), e.g. "high". Unset = default. */
+  effort?: string;
   /** OpenRouter wire history, capped (openrouter chats only) */
   wire?: OrchestratorWireMessage[];
   title: string;
@@ -653,6 +699,134 @@ export interface PersistedOrchestratorChats {
   activeId: string | null;
   panelOpen?: boolean;
   panelWidth?: number;
+}
+
+// ---- Vibe Mode: native Codex sessions ----
+
+/** How much a Vibe session's Codex agent may touch the machine. */
+export type VibeAccess = "workspace" | "full";
+
+/**
+ * One Vibe session (a native Codex agent driven over the app-server). `id` is
+ * assigned frontend-side and keys the backend session too; `threadId` is the
+ * codex thread behind it — persisted so the session reconnects across restarts
+ * (vibe_session_resume), null until the first turn. `access` maps to the
+ * sandbox/approval policy in Rust.
+ */
+export interface VibeSession {
+  id: string;
+  name: string;
+  /** the project directory the session runs in (thread cwd) */
+  projectDir: string;
+  /** codex model id (unset = the user's codex default) */
+  model?: string;
+  /** reasoning effort (codex only), e.g. "low" | "medium" | "high" */
+  effort?: string;
+  access: VibeAccess;
+  /** app-server thread id — survives restarts; null until the first turn */
+  threadId: string | null;
+  createdAt: number;
+}
+
+/** Status of an approval item over its lifetime. */
+export type VibeApprovalStatus =
+  | "pending"
+  | "accepted"
+  | "acceptedForSession"
+  | "declined"
+  | "cancelled";
+
+/** One change inside a fileChange item (the `add` diff is the raw new content). */
+export interface VibeFileChange {
+  path: string;
+  /** tagged PatchChangeKind, e.g. `{ type: "add" }` */
+  kind: unknown;
+  diff: string;
+}
+
+/** One step of a turn plan (turn/plan/updated). */
+export interface VibePlanStep {
+  step: string;
+  status: string;
+}
+
+/**
+ * One item in a Vibe session's transcript — the normalized-by-id domain unit
+ * (t3code lesson: a delta replaces only its own item object, never the others).
+ * `command.output` is the (capped) aggregatedOutput; `approval.payload` is the
+ * raw request (itemId links a fileChange approval to its fileChange item).
+ */
+export type VibeItem =
+  | { id: string; at: number; kind: "user"; text: string }
+  | {
+      id: string;
+      at: number;
+      kind: "assistant";
+      text: string;
+      /** transient while deltas arrive — never restored on hydrate */
+      streaming?: boolean;
+      phase?: string | null;
+    }
+  | {
+      id: string;
+      at: number;
+      kind: "command";
+      command: string;
+      cwd?: string;
+      status: string;
+      exitCode?: number | null;
+      /** aggregatedOutput, capped */
+      output: string;
+    }
+  | {
+      id: string;
+      at: number;
+      kind: "fileChange";
+      status: string;
+      changes: VibeFileChange[];
+    }
+  | {
+      id: string;
+      at: number;
+      kind: "plan";
+      explanation?: string | null;
+      steps: VibePlanStep[];
+    }
+  | { id: string; at: number; kind: "webSearch"; query: string; action?: unknown }
+  | {
+      id: string;
+      at: number;
+      kind: "approval";
+      approvalKind: "command" | "fileChange";
+      status: VibeApprovalStatus;
+      /** the raw request params (itemId, reason, command, cwd, …) */
+      payload: Record<string, unknown>;
+    }
+  | { id: string; at: number; kind: "warning"; text: string };
+
+/** Per-turn token accounting (thread/tokenUsage/updated). */
+export interface VibeTokenUsage {
+  total?: Record<string, number> | null;
+  last?: Record<string, number> | null;
+  modelContextWindow?: number | null;
+}
+
+/**
+ * One persisted Vibe session: its meta + the normalized transcript. Items are
+ * kept as a map + order (identity-preserving delta updates); runtime-only
+ * fields (busy, turnId, diff, plan, tokenUsage) are NOT persisted.
+ */
+export interface PersistedVibeSession {
+  session: VibeSession;
+  items: VibeItem[];
+}
+
+/** Persisted shape of the Vibe sidebar (store key `vibeSessions`). */
+export interface PersistedVibeSessions {
+  /** shape version — bump when the persisted shape changes (missing = 1) */
+  version?: number;
+  sessions: PersistedVibeSession[];
+  activeId: string | null;
 }
 
 // ---- Floating terminals & quick commands ----

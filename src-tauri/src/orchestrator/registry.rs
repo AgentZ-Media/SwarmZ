@@ -34,17 +34,17 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "fleet_snapshot",
-            description: "Current state of the whole fleet: every workspace with its agent panes (runtime, project, branch, busy/idle/waiting activity, model, context usage) plus a one-line summary. Cheap — call this first to orient yourself and to learn valid pane ids.",
+            description: "Current state of the whole fleet: every workspace with its agent panes (runtime, project, branch, busy/idle/waiting activity, model, context usage), a `sessions` section listing the native Vibe-Mode Codex sessions (exact status working/idle/pending-approval), `ui_mode` (\"grid\" or \"vibe\" — the view the user is currently in) and a one-line summary. Cheap — call this first to orient yourself and to learn valid pane and session ids.",
             parameters: empty_params(),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
         ToolDefinition {
             name: "read_transcript",
-            description: "Read the conversation tail of one agent pane's session: user/assistant messages, one-line tool summaries, compaction summaries, and optionally the session's first user prompt. Fails for shell panes and panes whose session has not been discovered yet.",
+            description: "Read the conversation tail of one agent pane's session OR one native Vibe session: user/assistant messages, one-line tool summaries, compaction summaries, and optionally the session's first user prompt. For a native session id it renders the structured steps ($ command → exit N, file changes +N −M, approvals, plan). Fails for shell panes and panes whose session has not been discovered yet.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "agent pane id (from fleet_snapshot)" },
+                    "pane_id": { "type": "string", "description": "agent pane id or native session id (from fleet_snapshot)" },
                     "tail_messages": { "type": "integer", "description": "return only the last N messages (default 20)" },
                     "include_first_user_message": { "type": "boolean", "description": "also return the session's original first user prompt (default true)" }
                 },
@@ -54,11 +54,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "read_project_docs",
-            description: "README.md / AGENTS.md / CLAUDE.md of a project root, content capped. Pass EXACTLY ONE of pane_id (the pane's project root; worktree panes resolve to their main repo) or path (an absolute folder).",
+            description: "README.md / AGENTS.md / CLAUDE.md of a project root, content capped. Pass EXACTLY ONE of pane_id (a pane's project root — worktree panes resolve to their main repo — OR a native Vibe session id, whose project folder is read) or path (an absolute folder).",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "agent pane id — reads the docs of that pane's project root" },
+                    "pane_id": { "type": "string", "description": "agent pane id OR native session id — reads the docs of that pane/session's project root" },
                     "path": { "type": "string", "description": "absolute path of a project folder" }
                 }
             }),
@@ -105,11 +105,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "prompt_pane",
-            description: "Type a prompt into an agent pane's terminal (bracketed paste) and optionally submit it with Enter. Works on running panes only. A busy pane still receives the text — it queues in the CLI's input — and the response carries a warning then.",
+            description: "Send a prompt to an agent pane OR a native Vibe session (accepts either id — panes are checked first, then sessions). For a pane: bracketed-paste the text into its terminal and optionally submit with Enter (a busy pane still receives the text — it queues in the CLI's input — and the response carries a warning). For a native session: submit one turn to it; a busy session refuses (wait for it to finish).",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "agent pane id (from fleet_snapshot)" },
+                    "pane_id": { "type": "string", "description": "agent pane id or native session id (from fleet_snapshot)" },
                     "text": { "type": "string", "description": "the prompt/command text to deliver" },
                     "submit": { "type": "boolean", "description": "press Enter after pasting (default true)" }
                 },
@@ -119,11 +119,13 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "create_panes",
-            description: "Create 1–8 new agent panes in a workspace. Each pane gets a working directory, optionally a runtime or profile, a model override (omit = the user's default configuration), a name, an initial prompt (delivered once the agent CLI is ready), and optionally a fresh git worktree (own branch + folder under <repo>/.worktrees/). A worktree request on a non-repo folder FAILS for that pane — it is never silently downgraded to a plain pane. Per-pane errors do not abort the batch.",
+            description: "Create 1–8 new agents in a workspace. Each entry gets a working directory, optionally a runtime or profile, a model override (omit = the user's default configuration), a name, an initial prompt (delivered once the agent is ready), and optionally a fresh git worktree (own branch + folder under <repo>/.worktrees/). New panes are laid out with EQUAL sizes (the system owns the geometry — no manual sizing) and the system OVERFLOWS into a fresh workspace automatically if the target can't hold them above a readable minimum (~380×240 px), so you never have to compute whether panes fit. Use `workspace` to target a workspace, `arrangement` to shape the new panes, and per-pane `beside` for contextual placement next to an existing pane; consult fleet_snapshot's layout section (grid size + effective pane px) first. Set native:true to create a native Vibe-Mode Codex session instead of a terminal pane (prefer this when the user works in Vibe Mode / ui_mode is \"vibe\"); native sessions ignore runtime/profile/worktree AND all layout params (workspace/arrangement/beside). A worktree request on a non-repo folder FAILS for that pane — it is never silently downgraded to a plain pane. Per-entry errors do not abort the batch.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "workspace_id": { "type": "string", "description": "target workspace id (default: the active workspace)" },
+                    "workspace": { "type": "string", "description": "where the new terminal panes go: \"current\" (default), \"new\" (a fresh workspace), or the NAME of an existing workspace (case-insensitive; unknown name → error). Ignored for native sessions" },
+                    "workspace_id": { "type": "string", "description": "legacy id-based target (used only when `workspace` is omitted; default: the active workspace). Prefer `workspace`. Ignored for native sessions" },
+                    "arrangement": { "type": "string", "enum": ["auto", "rows", "columns", "grid"], "description": "how to arrange the NEW panes among themselves: \"auto\" (default — tiles by count and screen shape), \"rows\" (stacked), \"columns\" (side by side), \"grid\". Existing panes keep their layout. Ignored for native sessions and for panes with `beside`" },
                     "panes": {
                         "type": "array",
                         "minItems": 1,
@@ -131,15 +133,25 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "cwd": { "type": "string", "description": "absolute working directory for the pane" },
-                                "runtime": { "type": "string", "enum": ["claude", "codex", "shell"], "description": "agent CLI to launch (default: the app's default runtime)" },
-                                "profile_id": { "type": "string", "description": "launch profile id (from list_blueprints) — sets runtime + startup command" },
-                                "model": { "type": "string", "description": "model id for the agent CLI (claude: --model, codex: -m). Use ids from list_blueprints runtimes.*.recently_used_models when the user names a model; OMIT for the user's default configuration" },
+                                "cwd": { "type": "string", "description": "absolute working directory for the pane / native session" },
+                                "native": { "type": "boolean", "description": "create a native Vibe-Mode Codex session instead of a terminal pane. Native sessions have structured transcripts and an exact status, and prompt_pane can prompt them directly by id. runtime/profile/worktree/branch and all layout params do NOT apply to native sessions (V1); cwd, model, reasoning, name and prompt do" },
+                                "runtime": { "type": "string", "enum": ["claude", "codex", "shell"], "description": "agent CLI to launch (default: the app's default runtime). Ignored when native:true (always codex)" },
+                                "profile_id": { "type": "string", "description": "launch profile id (from list_blueprints) — sets runtime + startup command. Ignored when native:true" },
+                                "model": { "type": "string", "description": "model id for the agent (claude: --model, codex: -m; native: the session model). Use ids from list_blueprints runtimes.*.recently_used_models when the user names a model; OMIT for the user's default configuration" },
                                 "reasoning": { "type": "string", "enum": ["minimal", "low", "medium", "high", "xhigh"], "description": "codex only: model_reasoning_effort — omit unless the user asks for it" },
-                                "name": { "type": "string", "description": "pane name (default: auto)" },
+                                "name": { "type": "string", "description": "pane / session name (default: auto)" },
                                 "prompt": { "type": "string", "description": "initial prompt, submitted once the agent is ready" },
-                                "worktree": { "type": "boolean", "description": "create a fresh git worktree off the repo at cwd and run the pane inside it" },
-                                "branch": { "type": "string", "description": "worktree branch name (default: a generated one)" }
+                                "worktree": { "type": "boolean", "description": "create a fresh git worktree off the repo at cwd and run the pane inside it. NOT applicable to native sessions (V1)" },
+                                "branch": { "type": "string", "description": "worktree branch name (default: a generated one)" },
+                                "beside": {
+                                    "type": "object",
+                                    "description": "place this pane next to an existing one (a targeted split; ignores workspace/arrangement distribution and lands in the target pane's workspace). Not applicable to native sessions",
+                                    "properties": {
+                                        "pane_id": { "type": "string", "description": "id of the existing pane to split off (from fleet_snapshot)" },
+                                        "direction": { "type": "string", "enum": ["right", "below"], "description": "which side of the target pane (default: right)" }
+                                    },
+                                    "required": ["pane_id"]
+                                }
                             },
                             "required": ["cwd"]
                         }
@@ -158,6 +170,18 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "name": { "type": "string", "description": "tab name (default: auto-numbered / named after the first project)" },
                     "default_cwd": { "type": "string", "description": "default working directory prefilled for new panes in this workspace" }
                 }
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "remember",
+            description: "Add one durable, user-relevant fact to your persistent memory (a small curated list injected into every future session). Store ONLY things worth keeping across sessions: stable user preferences, corrections you were given, model choices per task type, recurring workflows, and project facts that are NOT written in the repo. Do NOT store ephemeral fleet state (that lives in fleet_snapshot), repo documentation (use read_project_docs), secrets, or whole transcripts. If you are unsure whether a fact is worth remembering, do not call this — propose it to the user first and only store it after they confirm. The memory is capped; when it is full the oldest entry is dropped and the result says so.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "the single fact to remember, as one concise sentence" }
+                },
+                "required": ["text"]
             }),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
@@ -257,7 +281,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_all_ten_tools_and_serializes() {
+    fn catalog_has_all_eleven_tools_and_serializes() {
         let defs = tool_definitions();
         let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
         for expected in [
@@ -271,10 +295,11 @@ mod tests {
             "prompt_pane",
             "create_panes",
             "create_workspace",
+            "remember",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
-        assert_eq!(defs.len(), 10);
+        assert_eq!(defs.len(), 11);
         // serializable — this exact shape is handed to Codex dynamicTools later
         let json = serde_json::to_value(&defs).expect("serialize");
         for def in json.as_array().unwrap() {
@@ -283,6 +308,14 @@ mod tests {
             assert!(def["parameters"]["type"] == "object");
             assert!(def["timeout_ms"].is_u64());
         }
+    }
+
+    #[test]
+    fn remember_requires_text() {
+        let def = find_tool("remember").unwrap();
+        let err = validate_args(&def, &json!({})).unwrap_err();
+        assert!(err.contains("text"), "unexpected error: {err}");
+        assert!(validate_args(&def, &json!({ "text": "reviews go to Opus" })).is_ok());
     }
 
     #[test]
@@ -321,6 +354,72 @@ mod tests {
         assert!(validate_args(
             &def,
             &json!({ "panes": [{ "cwd": "/tmp/x", "runtime": "codex", "worktree": true }] })
+        )
+        .is_ok());
+        // native sessions are a first-class per-pane option (Phase 5)
+        assert!(validate_args(
+            &def,
+            &json!({ "panes": [{ "cwd": "/tmp/x", "native": true, "model": "gpt-5-codex" }] })
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn create_panes_exposes_the_native_session_flag() {
+        let def = find_tool("create_panes").unwrap();
+        let item_props =
+            &def.parameters["properties"]["panes"]["items"]["properties"];
+        assert_eq!(item_props["native"]["type"], "boolean", "native flag missing");
+        assert!(def.description.contains("native"), "description omits native sessions");
+    }
+
+    #[test]
+    fn create_panes_exposes_layout_params() {
+        let def = find_tool("create_panes").unwrap();
+        let props = &def.parameters["properties"];
+        // top-level workspace + arrangement
+        assert_eq!(props["workspace"]["type"], "string", "workspace param missing");
+        let arr = props["arrangement"]["enum"].as_array().unwrap();
+        for want in ["auto", "rows", "columns", "grid"] {
+            assert!(
+                arr.iter().any(|v| v == want),
+                "arrangement enum missing {want}"
+            );
+        }
+        // per-pane beside { pane_id, direction }
+        let beside = &props["panes"]["items"]["properties"]["beside"];
+        assert_eq!(beside["type"], "object", "beside param missing");
+        assert_eq!(beside["properties"]["pane_id"]["type"], "string");
+        let dir = beside["properties"]["direction"]["enum"].as_array().unwrap();
+        assert!(dir.iter().any(|v| v == "right") && dir.iter().any(|v| v == "below"));
+        assert!(def.description.contains("overflow") || def.description.contains("OVERFLOW"));
+    }
+
+    #[test]
+    fn create_panes_validates_new_params() {
+        let def = find_tool("create_panes").unwrap();
+        // arrangement enum enforced
+        let err = validate_args(
+            &def,
+            &json!({ "arrangement": "diagonal", "panes": [{ "cwd": "/tmp/x" }] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+        // beside requires pane_id
+        let err = validate_args(
+            &def,
+            &json!({ "panes": [{ "cwd": "/tmp/x", "beside": { "direction": "right" } }] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("pane_id"), "unexpected error: {err}");
+        // a fully-specified layout call passes
+        assert!(validate_args(
+            &def,
+            &json!({
+                "workspace": "current",
+                "arrangement": "grid",
+                "panes": [{ "cwd": "/tmp/x", "beside": { "pane_id": "abc", "direction": "below" } }]
+            })
         )
         .is_ok());
     }

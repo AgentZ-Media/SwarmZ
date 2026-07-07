@@ -13,6 +13,7 @@ import {
 import { useShallow } from "zustand/react/shallow";
 import { useSwarm } from "@/store";
 import { useOrchestrator } from "@/lib/orchestrator/chat-store";
+import { useVibeUi } from "@/lib/vibe/ui-store";
 import { useUpdates } from "@/lib/updates";
 import { WorktreesButton } from "./WorktreePanel";
 import { Button } from "./ui/button";
@@ -36,6 +37,8 @@ export function TitleBar({
   const setNotesOpen = useSwarm((s) => s.setNotesOpen);
   const orchestratorOpen = useOrchestrator((s) => s.panelOpen);
   const toggleOrchestrator = useOrchestrator((s) => s.togglePanel);
+  const uiMode = useSwarm((s) => s.settings.uiMode ?? "grid");
+  const stageMode = useVibeUi((s) => s.stageMode);
 
   return (
     <header
@@ -54,6 +57,8 @@ export function TitleBar({
         draggable={false}
         className="pointer-events-none h-7 w-7 shrink-0"
       />
+
+      <ModeSwitch />
 
       <WorkspaceTabs />
 
@@ -95,12 +100,22 @@ export function TitleBar({
           </Button>
         </Tip>
 
-        <Tip label="Orchestrator (⌘⇧O)">
+        <Tip label={uiMode === "vibe" ? "Conductor (⌘⇧O)" : "Orchestrator (⌘⇧O)"}>
           <Button
             size="icon"
-            variant={orchestratorOpen ? "secondary" : "ghost"}
+            variant={
+              (uiMode === "vibe" ? stageMode === "conductor" : orchestratorOpen)
+                ? "secondary"
+                : "ghost"
+            }
             className="no-drag"
-            onClick={toggleOrchestrator}
+            onClick={
+              // in Vibe Mode the Conductor stage IS the orchestrator surface —
+              // the sidebar would duplicate it (same routing as ⌘⇧O)
+              uiMode === "vibe"
+                ? () => useVibeUi.getState().setStageMode("conductor")
+                : toggleOrchestrator
+            }
           >
             <Bot size={15} />
           </Button>
@@ -140,6 +155,43 @@ export function TitleBar({
         </Button>
       </div>
     </header>
+  );
+}
+
+// ---- Mode switch (grid ↔ vibe) ----
+
+/**
+ * The app-wide view switch. Real <button>s, so Tauri's drag.js auto-excludes
+ * them from the header's "deep" drag region — no extra opt-out needed.
+ */
+function ModeSwitch() {
+  const uiMode = useSwarm((s) => s.settings.uiMode ?? "grid");
+  const setUiMode = useSwarm((s) => s.setUiMode);
+  return (
+    <div className="flex shrink-0 items-center rounded-md border border-border bg-secondary p-0.5 font-mono text-[10px]">
+      {(["grid", "vibe"] as const).map((m) => (
+        <Tip
+          key={m}
+          label={
+            m === "grid"
+              ? "Grid — the tiling terminal wall (⌘⇧V)"
+              : "Vibe — native Codex sessions (⌘⇧V)"
+          }
+        >
+          <button
+            onClick={() => setUiMode(m)}
+            className={cn(
+              "focus-ring rounded border px-2.5 py-1 capitalize transition-colors",
+              uiMode === m
+                ? "border-input bg-card text-foreground"
+                : "border-transparent text-faint hover:text-muted-foreground",
+            )}
+          >
+            {m}
+          </button>
+        </Tip>
+      ))}
+    </div>
   );
 }
 

@@ -2,6 +2,10 @@
 @import "@fontsource-variable/inter";
 @import "@fontsource-variable/jetbrains-mono";
 @import "@xterm/xterm/css/xterm.css";
+/* Vibe-Mode diff rendering — structure + a bundled hljs token theme, scoped to
+   the lib's own `.diff-tailwindcss-wrapper`. Its block colours are re-themed to
+   the SwarmZ tokens further down (see "Vibe diff view"). */
+@import "@git-diff-view/react/styles/diff-view-pure.css";
 
 /* ----------------------------------------------------------------------------
    SwarmZ design system — dark only.
@@ -52,6 +56,12 @@
      (limit meters); --ring stays for focus/selection. See DESIGN.md. */
   --attn: #f0a13a;
 
+  /* Diff add/remove — semantic diff colours, distinct from --success/
+     --destructive (those are process status; these are code deltas). Dark-tuned
+     so the +/- washes sit quietly on the --card surface. See DESIGN.md. */
+  --diff-add: #3fb950;
+  --diff-del: #f85149;
+
   --chart-1: #8ab4f8;
   --chart-2: #5b8def;
   --chart-3: #4477d4;
@@ -86,6 +96,8 @@
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-attn: var(--attn);
+  --color-diff-add: var(--diff-add);
+  --color-diff-del: var(--diff-del);
 
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);
@@ -217,6 +229,12 @@ body {
   );
   animation: activity-sweep 2.6s ease-in-out infinite;
 }
+/* same sweep, pinned to the TOP edge — used on the Vibe rail cards, whose
+   header sits at the top (the pane variant sweeps under a bottom border) */
+.activity-line-top {
+  top: 0;
+  bottom: auto;
+}
 @keyframes activity-sweep {
   from {
     transform: translateX(-100%);
@@ -308,6 +326,43 @@ body {
 }
 .animate-slide-in-right {
   animation: slide-in-right 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ----------------------------------------------------------------------------
+   Vibe diff view — re-theme @git-diff-view's block colours to the SwarmZ
+   tokens (the lib ships structure + a GitHub-ish hljs syntax theme; we keep the
+   syntax token colours, but recolour the +/- washes, borders and line-number
+   gutters to our palette so a diff card reads as part of the app, not GitHub).
+   Everything is scoped to the lib's own wrapper — no global bleed.
+---------------------------------------------------------------------------- */
+.diff-tailwindcss-wrapper[data-theme="dark"] .diff-style-root {
+  --diff-border--: var(--border);
+  --diff-plain-content--: transparent;
+  --diff-expand-content--: var(--card);
+  --diff-plain-lineNumber--: transparent;
+  --diff-expand-lineNumber--: var(--card);
+  --diff-plain-lineNumber-color--: var(--faint);
+  --diff-expand-lineNumber-color--: var(--faint);
+  --diff-empty-content--: color-mix(in srgb, var(--background) 60%, transparent);
+  --diff-add-content--: color-mix(in srgb, var(--diff-add) 12%, transparent);
+  --diff-add-content-highlight--: color-mix(in srgb, var(--diff-add) 26%, transparent);
+  --diff-add-lineNumber--: color-mix(in srgb, var(--diff-add) 18%, transparent);
+  --diff-del-content--: color-mix(in srgb, var(--diff-del) 12%, transparent);
+  --diff-del-content-highlight--: color-mix(in srgb, var(--diff-del) 26%, transparent);
+  --diff-del-lineNumber--: color-mix(in srgb, var(--diff-del) 18%, transparent);
+  --diff-hunk-content--: color-mix(in srgb, var(--ring) 8%, transparent);
+  --diff-hunk-lineNumber--: color-mix(in srgb, var(--ring) 12%, transparent);
+  --diff-hunk-content-color--: var(--faint);
+  --diff-hunk-lineNumber-hover--: var(--ring);
+}
+/* the lib's default body colour is white; our surface wants the muted token */
+.diff-tailwindcss-wrapper[data-theme="dark"] .diff-style-root {
+  color: var(--muted-foreground);
+}
+/* the diff table is mono + compact to match the rest of the transcript */
+.vibe-diff .diff-tailwindcss-wrapper {
+  font-family: var(--font-mono);
+  background: transparent;
 }
 
 /* Motion doctrine (DESIGN.md): events flash once, states are static. Users

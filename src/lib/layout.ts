@@ -290,3 +290,92 @@ export function setSplitSizes(
   }
   return recurse(root);
 }
+
+// ---- Balanced layout builders (orchestrator create_panes) --------------------
+//
+// Pure tree constructors used ONLY by the orchestrator's create_panes executor
+// to lay out a freshly-created batch of panes with EQUAL sizes (fixing the
+// "each new pane smaller than the last" split cascade). Hand-split/drag paths
+// (splitPane/movePane/setSplitSizes) are untouched.
+
+/** How a batch of new panes is arranged among themselves. */
+export type Arrangement = "auto" | "rows" | "columns" | "grid";
+
+/** Equal flex weights for `n` children (computeLayout divides by the sum). */
+function equalSizes(n: number): number[] {
+  return Array.from({ length: n }, () => 100 / n);
+}
+
+/** A split of the children, or the single child unwrapped. */
+function splitOf(direction: "row" | "column", children: LayoutNode[]): LayoutNode {
+  if (children.length === 1) return children[0];
+  return {
+    type: "split",
+    id: nanoid(8),
+    direction,
+    sizes: equalSizes(children.length),
+    children,
+  };
+}
+
+/**
+ * Pick a concrete arrangement for `count` panes given the container aspect
+ * (w/h): a few panes tile along the long axis, more panes go to a grid.
+ */
+export function autoArrangement(
+  count: number,
+  aspect: number,
+): "rows" | "columns" | "grid" {
+  if (count <= 1) return "columns";
+  if (count <= 3) return aspect >= 1 ? "columns" : "rows";
+  return "grid";
+}
+
+/**
+ * Build a balanced layout subtree for a set of agents with EQUAL sizes.
+ * `columns` = side by side (row split), `rows` = stacked (column split),
+ * `grid` = rows of columns (ceil(√n) per row). Returns null for an empty set.
+ */
+export function buildArrangement(
+  agentIds: string[],
+  arrangement: Arrangement,
+  aspect: number,
+): LayoutNode | null {
+  const ids = agentIds.filter((id) => !!id);
+  if (ids.length === 0) return null;
+  if (ids.length === 1) return newPane(ids[0]);
+  const mode =
+    arrangement === "auto" ? autoArrangement(ids.length, aspect) : arrangement;
+  const leaves = ids.map(newPane);
+  if (mode === "columns") return splitOf("row", leaves);
+  if (mode === "rows") return splitOf("column", leaves);
+  // grid: rows (stacked) of columns (side by side)
+  const cols = Math.ceil(Math.sqrt(ids.length));
+  const rows: LayoutNode[] = [];
+  for (let i = 0; i < leaves.length; i += cols) {
+    rows.push(splitOf("row", leaves.slice(i, i + cols)));
+  }
+  return splitOf("column", rows);
+}
+
+/**
+ * Graft a freshly-built block `added` beside an untouched `existing` layout,
+ * proportioned by pane count so panes stay ~equal across the boundary. Wide
+ * containers dock the block to the right (row), tall ones below (column).
+ */
+export function combineLayouts(
+  existing: LayoutNode,
+  added: LayoutNode,
+  aspect: number,
+): LayoutNode {
+  const ec = collectPanes(existing).length || 1;
+  const ac = collectPanes(added).length || 1;
+  const direction = aspect >= 1 ? "row" : "column";
+  return {
+    type: "split",
+    id: nanoid(8),
+    direction,
+    sizes: [ec, ac],
+    children: [existing, added],
+  };
+}

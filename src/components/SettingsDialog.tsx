@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
   Bot,
+  ChevronDown,
   ExternalLink,
   Folder,
   FolderCog,
@@ -43,6 +44,7 @@ import {
 } from "@/store";
 import { useUpdates } from "@/lib/updates";
 import { IS_TAURI, openUrl, pickDirectory } from "@/lib/transport";
+import { prettyModel } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
 
 // native-only direct invoke (like lib/openrouter.ts) — validates the binary
@@ -57,6 +59,18 @@ import {
   setOpenrouterKey,
 } from "@/lib/openrouter";
 import { DEFAULT_ORCHESTRATOR_MODEL } from "@/lib/orchestrator/openrouter-loop";
+import { recentCodexModels } from "@/lib/orchestrator/models";
+import { ModelEffortPicker } from "./orchestrator/ModelEffortPicker";
+import {
+  DEFAULT_PERSONA,
+  effectivePersona,
+  PERSONA_PRESETS,
+  type PersonaPreset,
+} from "@/lib/orchestrator/persona";
+import { readMemory, removeMemory } from "@/lib/orchestrator/memory";
+import type { OrchestratorMemoryEntry } from "@/lib/orchestrator/types";
+import type { OrchestratorPersona } from "@/types";
+import { appDataDir, join } from "@tauri-apps/api/path";
 import { listMicrophones } from "@/lib/dictation";
 import {
   LOCAL_STT_DOWNLOAD_MB,
@@ -1338,6 +1352,49 @@ function LocalModelRow() {
  * the key itself is managed once, in the Voice section (`onShowVoice`
  * jumps there), so there is exactly one key field app-wide.
  */
+/**
+ * Codex-provider defaults NEW orchestrator chats are stamped with (a per-chat
+ * override the model picker can still change per chat). Same model source as
+ * the picker — recently-used ids on this machine + free text. Empty = the
+ * user's plain codex config.
+ */
+function CodexDefaultsRows() {
+  const settings = useSwarm((s) => s.settings);
+  const updateSettings = useSwarm((s) => s.updateSettings);
+  const model = settings.orchestratorCodexModel;
+  const effort = settings.orchestratorCodexEffort;
+  return (
+    <Row
+      label="Default model & effort"
+      help="Model and reasoning effort new codex chats start on — the same picker (Available · Recent · Custom) each chat's header uses. Every chat can still change it per turn. Default = your plain codex config."
+    >
+      <ModelEffortPicker
+        model={model}
+        effort={effort}
+        models={recentCodexModels()}
+        footer="Default for new chats."
+        onApply={(next) =>
+          updateSettings({
+            orchestratorCodexModel: next.model || undefined,
+            orchestratorCodexEffort: next.effort || undefined,
+          })
+        }
+      >
+        <button
+          title="Default model & reasoning effort for new codex chats"
+          className="focus-ring flex items-center gap-1 rounded-full border border-border bg-secondary px-2.5 py-1 font-mono text-[11px] text-muted-foreground transition-colors hover:border-ring/50 hover:text-foreground"
+        >
+          <span className="max-w-40 truncate">
+            {model ? prettyModel(model) : "Default"}
+          </span>
+          {effort && <span className="text-faint">· {effort}</span>}
+          <ChevronDown size={11} className="text-faint" />
+        </button>
+      </ModelEffortPicker>
+    </Row>
+  );
+}
+
 function OrchestratorSection({ onShowVoice }: { onShowVoice: () => void }) {
   const settings = useSwarm((s) => s.settings);
   const updateSettings = useSwarm((s) => s.updateSettings);
@@ -1460,6 +1517,8 @@ function OrchestratorSection({ onShowVoice }: { onShowVoice: () => void }) {
         </StackedRow>
       )}
 
+      {provider === "codex" && <CodexDefaultsRows />}
+
       <Row
         label="OpenRouter API key"
         help={
@@ -1575,7 +1634,236 @@ function OrchestratorSection({ onShowVoice }: { onShowVoice: () => void }) {
           </div>
         </div>
       </StackedRow>
+
+      <PersonaControls />
+      <MemoryControls />
     </>
+  );
+}
+
+/**
+ * Persona editor: a preset picker (Maestro / Hive / Orchestrator) plus the
+ * editable voice fields. Persona is voice/self-image only — it never reaches
+ * the orchestrator's tools or safety rules (those are hard-wired in Rust).
+ * Editing writes the full persona object; unset = the Maestro seed.
+ */
+function PersonaControls() {
+  const stored = useSwarm((s) => s.settings.orchestratorPersona);
+  const updateSettings = useSwarm((s) => s.updateSettings);
+  const persona = effectivePersona(stored);
+
+  const patch = (p: Partial<OrchestratorPersona>) =>
+    updateSettings({ orchestratorPersona: { ...persona, ...p } });
+
+  const applyPreset = (preset: PersonaPreset) =>
+    updateSettings({
+      orchestratorPersona: {
+        name: preset.name,
+        role: preset.role,
+        tone: preset.tone,
+        principles: [...preset.principles],
+        emoji: preset.emoji,
+      },
+    });
+
+  const activePresetId = PERSONA_PRESETS.find(
+    (p) =>
+      p.name === persona.name &&
+      p.role === persona.role &&
+      p.tone === persona.tone &&
+      p.principles.join("\n") === persona.principles.join("\n"),
+  )?.id;
+
+  return (
+    <StackedRow
+      label="Persona"
+      help="Who the orchestrator is — its name, self-image, voice and principles. This shapes tone only; its tools, safety rules and delivery contract are fixed and can't be overridden here."
+    >
+      <div className="flex flex-col gap-3">
+        <div className="grid grid-cols-3 gap-1.5">
+          {PERSONA_PRESETS.map((preset) => (
+            <button
+              key={preset.id}
+              onClick={() => applyPreset(preset)}
+              className={cn(
+                "focus-ring flex flex-col gap-0.5 rounded-lg border px-2.5 py-2 text-left",
+                activePresetId === preset.id
+                  ? "border-ring/60 ring-1 ring-ring/30"
+                  : "border-border hover:border-input",
+              )}
+            >
+              <span className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+                <span>{preset.emoji}</span>
+                {preset.name}
+              </span>
+              <span className="text-[10px] leading-snug text-faint">
+                {preset.blurb}
+              </span>
+            </button>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Input
+            value={persona.emoji ?? ""}
+            onChange={(e) => patch({ emoji: e.target.value.slice(0, 4) })}
+            className="w-14 text-center text-sm"
+            placeholder="🎼"
+            aria-label="Persona emoji"
+          />
+          <Input
+            value={persona.name}
+            onChange={(e) => patch({ name: e.target.value })}
+            className="flex-1 text-xs"
+            placeholder="Name"
+            aria-label="Persona name"
+          />
+        </div>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-[11px] font-medium text-muted-foreground">
+            Self-image
+          </span>
+          <Input
+            value={persona.role}
+            onChange={(e) => patch({ role: e.target.value })}
+            className="text-xs"
+            placeholder="the fleet's conductor — you keep the tempo, the agents play"
+          />
+        </label>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-[11px] font-medium text-muted-foreground">
+            Voice
+          </span>
+          <Input
+            value={persona.tone}
+            onChange={(e) => patch({ tone: e.target.value })}
+            className="text-xs"
+            placeholder="Calm, precise, leading."
+          />
+        </label>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-[11px] font-medium text-muted-foreground">
+            Principles (one per line)
+          </span>
+          <Textarea
+            value={persona.principles.join("\n")}
+            onChange={(e) =>
+              patch({
+                principles: e.target.value
+                  .split("\n")
+                  .map((l) => l.trim())
+                  .filter(Boolean),
+              })
+            }
+            rows={3}
+            className="resize-none text-xs"
+            placeholder={"Clarity over chatter.\nYou delegate, you don't do the work yourself."}
+          />
+        </label>
+
+        {stored !== undefined && (
+          <div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                updateSettings({ orchestratorPersona: undefined })
+              }
+            >
+              <RotateCcw size={12} /> Reset to {DEFAULT_PERSONA.name}
+            </Button>
+          </div>
+        )}
+      </div>
+    </StackedRow>
+  );
+}
+
+/**
+ * Curated-memory management: shows the stored facts with a count against the
+ * cap and per-line delete. New entries are only ever added by the orchestrator
+ * via its `remember` tool (transparent chip in the chat) — the file itself is
+ * editable directly at the shown path.
+ */
+function MemoryControls() {
+  const [entries, setEntries] = useState<OrchestratorMemoryEntry[] | null>(null);
+  const [path, setPath] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!IS_TAURI) return;
+    readMemory().then(setEntries, () => setEntries([]));
+    void appDataDir()
+      .then((dir) => join(dir, "orchestrator-memory.md"))
+      .then(setPath, () => {});
+  }, []);
+
+  const del = (index: number) => {
+    void removeMemory(index).then(setEntries, () => {});
+  };
+
+  const count = entries?.length ?? 0;
+
+  return (
+    <StackedRow
+      label="Memory"
+      help={
+        <>
+          Durable facts the orchestrator chose to remember (preferences,
+          corrections, recurring workflows) — injected into every new session.
+          The orchestrator writes these itself via its <code>remember</code>{" "}
+          tool; here you can review and prune them.
+          {path && (
+            <>
+              {" "}
+              File: <span className="font-mono text-[10px]">{path}</span>
+            </>
+          )}
+        </>
+      }
+    >
+      <div className="flex flex-col gap-1.5">
+        <div className="flex items-center justify-between">
+          <span className="font-mono text-[10px] text-faint">
+            {count}/20 entries
+          </span>
+        </div>
+        {entries === null ? (
+          <p className="px-1 text-[11px] text-faint">Loading…</p>
+        ) : entries.length === 0 ? (
+          <p className="px-1 text-[11px] text-faint">
+            No memories yet — the orchestrator adds them as you work.
+          </p>
+        ) : (
+          entries.map((entry, i) => (
+            <div
+              key={`${i}-${entry.text}`}
+              className="flex items-start gap-2 rounded-md border border-border bg-secondary/40 px-2 py-1.5"
+            >
+              {entry.date && (
+                <span className="shrink-0 font-mono text-[10px] text-faint tabular-nums">
+                  {entry.date}
+                </span>
+              )}
+              <span className="min-w-0 flex-1 text-[11px] leading-snug text-foreground">
+                {entry.text}
+              </span>
+              <Button
+                size="xs"
+                variant="ghost"
+                title="Forget this entry"
+                className="hover:text-destructive"
+                onClick={() => del(i)}
+              >
+                <Trash2 size={11} />
+              </Button>
+            </div>
+          ))
+        )}
+      </div>
+    </StackedRow>
   );
 }
 

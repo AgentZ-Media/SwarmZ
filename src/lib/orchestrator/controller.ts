@@ -24,6 +24,8 @@
 //     STORE chat id, so the backend↔chat map self-links those chats.
 
 import { useSwarm } from "@/store";
+import { useVibe } from "@/lib/vibe/session-store";
+import { hasPendingApproval } from "@/lib/vibe/ui";
 import type {
   ClaudeActivity,
   OrchestratorPaneRef,
@@ -76,6 +78,8 @@ interface PendingTool {
   messageId: string;
   /** pane order snapshot around a create_panes call, for the ref diff */
   orderBefore: string[] | null;
+  /** native-session order snapshot around a create_panes call (native:true) */
+  sessionOrderBefore: string[] | null;
 }
 
 /** Per-chat streaming state (keyed by STORE chat id). */
@@ -161,13 +165,23 @@ function finalizeStream(chatId: string, st: StreamState, finalText?: string) {
   st.buffer = "";
 }
 
-/** Live panes whose id appears in the text (args summaries are one line). */
+/**
+ * Live panes AND native sessions whose id appears in the text (args summaries
+ * are one line). Session ids and pane ids share one flat namespace of jump
+ * chips — the chip resolves the id to a pane (focusAgent) or session
+ * (focusSession) at click time (see PaneChip in the chat view).
+ */
 function paneRefsFromText(text: string): OrchestratorPaneRef[] {
   if (!text) return [];
   const s = useSwarm.getState();
   const refs: OrchestratorPaneRef[] = [];
   for (const id of s.order) {
     if (text.includes(id)) refs.push({ id, name: s.agents[id]?.name ?? id });
+  }
+  const v = useVibe.getState();
+  for (const id of v.order) {
+    if (text.includes(id))
+      refs.push({ id, name: v.sessions[id]?.session.name ?? id });
   }
   return refs;
 }
@@ -222,6 +236,8 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
         messageId,
         orderBefore:
           tool === "create_panes" ? [...useSwarm.getState().order] : null,
+        sessionOrderBefore:
+          tool === "create_panes" ? [...useVibe.getState().order] : null,
       });
       break;
     }
@@ -231,13 +247,24 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
       if (idx < 0) break;
       const [pending] = st.pendingTools.splice(idx, 1);
       const patch: OrchestratorMessagePatch = { ok: data.ok !== false };
-      if (pending.orderBefore) {
-        // panes born while create_panes ran become jump chips
-        const before = new Set(pending.orderBefore);
+      if (pending.orderBefore || pending.sessionOrderBefore) {
+        // panes AND native sessions born while create_panes ran become jump
+        // chips (the tool result never reaches the frontend, so diff the order)
         const s = useSwarm.getState();
-        const created = s.order
-          .filter((id) => !before.has(id))
-          .map((id) => ({ id, name: s.agents[id]?.name ?? id }));
+        const created: OrchestratorPaneRef[] = [];
+        if (pending.orderBefore) {
+          const before = new Set(pending.orderBefore);
+          for (const id of s.order)
+            if (!before.has(id))
+              created.push({ id, name: s.agents[id]?.name ?? id });
+        }
+        if (pending.sessionOrderBefore) {
+          const before = new Set(pending.sessionOrderBefore);
+          const v = useVibe.getState();
+          for (const id of v.order)
+            if (!before.has(id))
+              created.push({ id, name: v.sessions[id]?.session.name ?? id });
+        }
         if (created.length) {
           const message = useOrchestrator
             .getState()
@@ -266,6 +293,18 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
       store.appendMessage(chatId, {
         role: "warning",
         text: `Turn failed: ${error}`,
+      });
+      break;
+    }
+    case "token_usage": {
+      // in-memory context accounting for the chat's context gauge (Block 2)
+      store.setChatTokenUsage(chatId, {
+        total: (data.total as Record<string, number>) ?? null,
+        last: (data.last as Record<string, number>) ?? null,
+        modelContextWindow:
+          typeof data.modelContextWindow === "number"
+            ? data.modelContextWindow
+            : null,
       });
       break;
     }
@@ -368,6 +407,65 @@ export function startOrchestratorActivityWatcher(): () => void {
   };
 }
 
+// ---- native-session pings (Phase 5) ----
+//
+// The session analogue of the pane activity watcher: a touched native session
+// finishing its turn (busy → idle) or raising a pending approval pings its
+// owning chat(s) through the SAME onPaneFinished machinery (session ids are
+// just ids in touchedPanes). Flap + settle guards are shared.
+
+/** last observed busy flag per session id */
+const prevSessBusy = new Map<string, boolean>();
+/** last observed pending-approval flag per session id */
+const prevSessPending = new Map<string, boolean>();
+let vibePingsStarted = false;
+
+/**
+ * Watch native sessions' busy/approval transitions OUTSIDE React (the vibe
+ * store is a plain zustand store, like the main one). Started once from
+ * App.tsx next to startOrchestratorActivityWatcher; returns a stop function.
+ * Only sessions some chat touched (prompt_pane / create_panes native) ping.
+ */
+export function startVibeSessionActivityWatcher(): () => void {
+  if (vibePingsStarted) return () => {};
+  vibePingsStarted = true;
+  const seed = useVibe.getState();
+  prevSessBusy.clear();
+  prevSessPending.clear();
+  for (const [id, entry] of Object.entries(seed.sessions)) {
+    prevSessBusy.set(id, !!seed.busy[id]);
+    prevSessPending.set(id, hasPendingApproval(entry));
+  }
+  const unsub = useVibe.subscribe((state) => {
+    for (const id of state.order) {
+      const entry = state.sessions[id];
+      if (!entry) continue;
+      const busy = !!state.busy[id];
+      const pending = hasPendingApproval(entry);
+      const pBusy = prevSessBusy.get(id);
+      const pPending = prevSessPending.get(id);
+      prevSessBusy.set(id, busy);
+      prevSessPending.set(id, pending);
+      const name = entry.session.name;
+      // a new pending approval waits on the human ("waiting" variant)
+      if (pPending === false && pending) onPaneFinished(id, name, "waiting");
+      // turn genuinely finished (busy → idle, nothing waiting)
+      else if (pBusy === true && !busy && !pending)
+        onPaneFinished(id, name, "idle");
+    }
+    for (const id of prevSessBusy.keys())
+      if (!state.sessions[id]) {
+        prevSessBusy.delete(id);
+        prevSessPending.delete(id);
+        lastPingAt.delete(id);
+      }
+  });
+  return () => {
+    vibePingsStarted = false;
+    unsub();
+  };
+}
+
 function hhmm(at: number): string {
   const d = new Date(at);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
@@ -396,16 +494,26 @@ function statusUpdateBlock(pings: OrchestratorPingRecord[]): string {
  * instead of the raw store action.
  */
 export function createChat(): string {
-  const { orchestratorProvider, orchestratorModel } =
-    useSwarm.getState().settings;
+  const {
+    orchestratorProvider,
+    orchestratorModel,
+    orchestratorCodexModel,
+    orchestratorCodexEffort,
+  } = useSwarm.getState().settings;
   const provider = orchestratorProvider ?? "codex";
+  if (provider === "openrouter") {
+    return useOrchestrator
+      .getState()
+      .newChat(provider, orchestratorModel?.trim() || DEFAULT_ORCHESTRATOR_MODEL);
+  }
+  // codex chats get the Settings defaults (a per-chat override the picker can
+  // change later); empty defaults = no stamp = the user's plain codex config
   return useOrchestrator
     .getState()
     .newChat(
       provider,
-      provider === "openrouter"
-        ? orchestratorModel?.trim() || DEFAULT_ORCHESTRATOR_MODEL
-        : undefined,
+      orchestratorCodexModel?.trim() || undefined,
+      orchestratorCodexEffort?.trim() || undefined,
     );
 }
 
@@ -496,7 +604,8 @@ export async function sendMessage(chatId: string, text: string): Promise<void> {
       });
     } else {
       const backendId = await ensureBackendChat(chatId);
-      await chatSend(backendId, wireText);
+      // per-chat model/effort ride along as a turn/start override
+      await chatSend(backendId, wireText, chat.model, chat.effort);
     }
   } catch (err) {
     // a turn_failed event already surfaced its own warning; everything else

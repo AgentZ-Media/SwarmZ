@@ -18,9 +18,11 @@ import type {
   OrchestratorWireMessage,
   OrchestratorWireToolCall,
   PersistedOrchestratorChats,
+  VibeTokenUsage,
 } from "@/types";
 // type-only: no runtime cycle (chat.ts imports the main store)
 import type { OrchestratorChatStatus } from "./chat";
+import { collapseEmptyChats, isReusableEmptyChat } from "./chat-reuse";
 
 /** Per-chat message cap — oldest messages drop first (display + persistence). */
 export const MAX_CHAT_MESSAGES = 200;
@@ -120,6 +122,9 @@ export interface OrchestratorState {
   panelWidth: number;
   /** chats with a turn in flight — set by the controller (in-memory) */
   busy: Record<string, boolean>;
+  /** latest per-chat token accounting (in-memory, never persisted) — codex
+   * chats get it from the `token_usage` chat event (thread/tokenUsage/updated) */
+  tokenUsage: Record<string, VibeTokenUsage>;
   /** codex app-server availability, checked on first panel open (in-memory) */
   status: OrchestratorChatStatus | null;
 
@@ -133,7 +138,11 @@ export interface OrchestratorState {
    * history yet, so it must follow the current setting). Callers go through
    * controller.ts `createChat()`, which reads the settings.
    */
-  newChat: (provider?: "codex" | "openrouter", model?: string) => string;
+  newChat: (
+    provider?: "codex" | "openrouter",
+    model?: string,
+    effort?: string,
+  ) => string;
   /**
    * Remove a chat from SwarmZ. The codex thread rollout stays on disk —
    * deliberate; it just never gets resumed again.
@@ -141,6 +150,17 @@ export interface OrchestratorState {
   deleteChat: (id: string) => void;
   setActiveChat: (id: string) => void;
   setStatus: (status: OrchestratorChatStatus | null) => void;
+  /**
+   * Override this chat's model / reasoning effort (persisted). A codex chat
+   * carries them into its next turn/start; an OpenRouter chat only uses
+   * `model` (effort is ignored there). `undefined` clears back to the default.
+   */
+  setChatModelEffort: (
+    chatId: string,
+    patch: { model?: string; effort?: string },
+  ) => void;
+  /** in-memory: store the latest token accounting for a chat (not persisted) */
+  setChatTokenUsage: (chatId: string, usage: VibeTokenUsage) => void;
 
   // controller internals
   setBusy: (chatId: string, busy: boolean) => void;
@@ -179,6 +199,7 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
   panelOpen: false,
   panelWidth: PANEL_DEFAULT_WIDTH,
   busy: {},
+  tokenUsage: {},
   status: null,
 
   setPanelOpen: (open) => {
@@ -194,21 +215,25 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
     schedulePersist();
   },
 
-  newChat: (provider = "codex", model) => {
+  newChat: (provider = "codex", model, effort) => {
     const s = get();
-    // don't stack empties — the + button reuses an untouched chat. An empty
-    // chat has no history, so re-stamping provider/model to the CURRENT
-    // setting is safe (and what the user expects after switching it).
-    const empty = s.chats.find((c) => c.messages.length === 0);
+    // don't stack empties — the + button reuses an untouched chat. "Untouched"
+    // means no user/assistant turn (system pings + warnings don't count, or a
+    // restart would stack a new chat behind that noise). A reusable-empty chat
+    // has no backend thread yet, so re-stamping provider/model/effort to the
+    // CURRENT setting is safe (and what the user expects after switching it).
+    const empty = s.chats.find((c) => isReusableEmptyChat(c));
     if (empty) {
       const stamp =
-        (empty.provider ?? "codex") !== provider || empty.model !== model;
+        (empty.provider ?? "codex") !== provider ||
+        empty.model !== model ||
+        empty.effort !== effort;
       if (s.activeChatId !== empty.id || stamp) {
         set({
           activeChatId: empty.id,
           chats: stamp
             ? s.chats.map((c) =>
-                c.id === empty.id ? { ...c, provider, model } : c,
+                c.id === empty.id ? { ...c, provider, model, effort } : c,
               )
             : s.chats,
         });
@@ -221,6 +246,7 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
       provider,
       threadId: null,
       ...(model !== undefined ? { model } : {}),
+      ...(effort !== undefined ? { effort } : {}),
       title: DEFAULT_CHAT_TITLE,
       createdAt: Date.now(),
       messages: [],
@@ -240,9 +266,11 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
     if (idx < 0) return;
     const chats = s.chats.filter((c) => c.id !== id);
     const { [id]: _gone, ...busy } = s.busy;
+    const { [id]: _u, ...tokenUsage } = s.tokenUsage;
     set({
       chats,
       busy,
+      tokenUsage,
       activeChatId:
         s.activeChatId === id
           ? (chats[Math.min(idx, chats.length - 1)]?.id ?? null)
@@ -259,6 +287,27 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
   },
 
   setStatus: (status) => set({ status }),
+
+  setChatModelEffort: (chatId, patch) => {
+    const s = get();
+    const chat = s.chats.find((c) => c.id === chatId);
+    if (!chat) return;
+    const model = "model" in patch ? patch.model : chat.model;
+    const effort = "effort" in patch ? patch.effort : chat.effort;
+    if (chat.model === model && chat.effort === effort) return;
+    set({
+      chats: s.chats.map((c) =>
+        c.id === chatId ? { ...c, model, effort } : c,
+      ),
+    });
+    schedulePersist();
+  },
+
+  setChatTokenUsage: (chatId, usage) => {
+    const s = get();
+    if (!s.chats.some((c) => c.id === chatId)) return;
+    set({ tokenUsage: { ...s.tokenUsage, [chatId]: usage } });
+  },
 
   setBusy: (chatId, busy) => {
     const s = get();
@@ -570,6 +619,9 @@ export async function hydrateOrchestratorChats(): Promise<void> {
         ...(typeof raw.model === "string" && raw.model
           ? { model: raw.model }
           : {}),
+        ...(typeof raw.effort === "string" && raw.effort
+          ? { effort: raw.effort }
+          : {}),
         ...(wire.length ? { wire } : {}),
         title:
           typeof raw.title === "string" && raw.title.trim()
@@ -592,20 +644,27 @@ export async function hydrateOrchestratorChats(): Promise<void> {
         ...chats.filter((c) => !state.chats.some((x) => x.id === c.id)),
       ].slice(0, MAX_CHATS)
     : chats.slice(0, MAX_CHATS);
+  const mergedActive =
+    state.activeChatId ??
+    (typeof data.activeId === "string" &&
+    merged.some((c) => c.id === data.activeId)
+      ? data.activeId
+      : (merged[0]?.id ?? null));
+  // fold multiple reusable-empty chats (the reload race + old-bug pollution)
+  // into one before it hits the store — "at most one empty chat" invariant
+  const collapsed = collapseEmptyChats(merged, mergedActive);
   useOrchestrator.setState({
-    chats: merged,
-    activeChatId:
-      state.activeChatId ??
-      (typeof data.activeId === "string" &&
-      merged.some((c) => c.id === data.activeId)
-        ? data.activeId
-        : (merged[0]?.id ?? null)),
+    chats: collapsed.chats,
+    activeChatId: collapsed.activeId,
     panelOpen:
       typeof data.panelOpen === "boolean" ? data.panelOpen : state.panelOpen,
     panelWidth: clampWidth(
       typeof data.panelWidth === "number" ? data.panelWidth : state.panelWidth,
     ),
   });
+  // persist the cleaned list so the on-disk pollution heals immediately (not
+  // only after the next interaction)
+  if (collapsed.chats.length !== merged.length) schedulePersist();
   // Fresh start per launch: yesterday's chat context must not silently absorb
   // today's first order — activate a new chat (createChat reuses a leftover
   // empty one, so restarts never stack empties; old chats stay in the

@@ -58,6 +58,10 @@ import {
   hydrateOrchestratorChats,
 } from "@/lib/orchestrator/chat-store";
 import {
+  flushVibePersist,
+  hydrateVibeSessions,
+} from "@/lib/vibe/session-store";
+import {
   collectPanes,
   findPaneByAgent,
   movePane as movePaneInLayout,
@@ -285,6 +289,8 @@ export async function flushAllPersists(): Promise<void> {
       ),
       // the orchestrator chat sidebar keeps its own debounced slice
       flushOrchestratorPersist(),
+      // the vibe-mode sessions keep their own debounced slice
+      flushVibePersist(),
     ]);
   } catch {
     /* never block quitting on a failed write */
@@ -544,6 +550,13 @@ export interface SwarmState {
     targetPaneId: string,
     zone: DropZone,
   ) => void;
+  /** Replace a workspace's tiling tree wholesale (orchestrator create_panes
+   * balancing) — agents keep their PTYs; only pane node placement changes. */
+  setWorkspaceLayout: (
+    workspaceId: string,
+    layout: LayoutNode | null,
+    activeAgentId?: string,
+  ) => void;
 
   // profiles
   saveProfile: (p: Omit<Profile, "id"> & { id?: string }) => void;
@@ -562,6 +575,8 @@ export interface SwarmState {
   deleteWorkspacePreset: (id: string) => void;
 
   // ui
+  /** switch the app-wide view (grid tiling wall ↔ vibe sessions); persisted via settings */
+  setUiMode: (mode: "grid" | "vibe") => void;
   setDashboardOpen: (open: boolean) => void;
   setNewAgentOpen: (open: boolean) => void;
   setFileDrag: (drag: { targetId: string | null } | null) => void;
@@ -1014,6 +1029,12 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     try {
       // orchestrator chat sidebar — hydrates its own store (chat-store.ts)
       await hydrateOrchestratorChats();
+    } catch {
+      /* ignore */
+    }
+    try {
+      // vibe-mode native codex sessions — hydrates its own store
+      await hydrateVibeSessions();
     } catch {
       /* ignore */
     }
@@ -2000,6 +2021,24 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     schedulePersistGrid();
   },
 
+  setWorkspaceLayout: (workspaceId, layout, activeAgentId) => {
+    const state = get();
+    if (!state.workspaces[workspaceId]) return;
+    const panes = collectPanes(layout);
+    let activePaneId = state.activePaneIds[workspaceId] ?? null;
+    const wanted = activeAgentId
+      ? panes.find((p) => p.agentId === activeAgentId)
+      : null;
+    if (wanted) activePaneId = wanted.id;
+    else if (!panes.find((p) => p.id === activePaneId))
+      activePaneId = panes[0]?.id ?? null;
+    set({
+      layouts: { ...state.layouts, [workspaceId]: layout },
+      activePaneIds: { ...state.activePaneIds, [workspaceId]: activePaneId },
+    });
+    schedulePersistGrid();
+  },
+
   splitActive: (direction) => {
     const state = get();
     const activeId = state.activeAgentId();
@@ -2187,6 +2226,12 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     void saveWorkspacePresets(workspacePresets);
   },
 
+  // uiMode lives in settings (persisted + hydrated with every other app
+  // preference) — the switch is a thin wrapper over updateSettings
+  setUiMode: (mode) => {
+    if ((get().settings.uiMode ?? "grid") === mode) return;
+    get().updateSettings({ uiMode: mode });
+  },
   setDashboardOpen: (open) => set({ dashboardOpen: open }),
   setNewAgentOpen: (open) =>
     set(open ? { newAgentOpen: true, newAgentPrefill: null } : { newAgentOpen: false }),

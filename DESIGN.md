@@ -64,6 +64,7 @@ produces correctly themed components without edits (`components.json` is configu
 | `--attn` | Amber. "Where I'm needed" — waiting/attention only, never decorative |
 | `--muted-foreground` / `--faint` | Secondary / tertiary text |
 | `--success` / `--warning` / `--destructive` | Status only (`--success` also = the ephemeral "finished" moment) |
+| `--diff-add` / `--diff-del` | Diff green/red — **code deltas** (Vibe diff cards, +N/−M counters). Distinct from `--success`/`--destructive` (process status); dark-tuned, washed via `color-mix` for the +/- line backgrounds |
 | `--chart-1..5` | Data viz — a blue ramp, bright = most capable model |
 
 Use them via Tailwind utility classes (`bg-card`, `text-muted-foreground`,
@@ -164,3 +165,55 @@ conflict with the surface ladder, and keep motion to the existing keyframes
   because the user works with it open. Its conventions: panel surface stays on
   `--background` with `--secondary` user bubbles, tool/data lines are compact
   mono chips in `--muted-foreground`/`--faint`, and `--warning` only on failures.
+- **Vibe Mode** (⌘⇧V) is a whole second *view*, not a grid-mode sidebar: the
+  title-bar segmented switch swaps the grid for a rail + focus stage (the Deck
+  stays). Its surfaces follow the ladder — `--card` rail cards and item cards on
+  the `--background` view, borders separating them, `--secondary` user bubbles.
+  Assistant messages reuse the orchestrator's markdown convention: a *finished*
+  message renders as the shared `OrchestratorMarkdown` subset (bold/italic,
+  inline + fenced code, lists, links); a *streaming* one stays plaintext with
+  the caret. Code is mono; fenced blocks sit on `--card` with `overflow-x`.
+  It obeys the signal triad exactly: a session card couples color + shape + word
+  (`▸ working` muted + the busy hairline / `⚑ needs you` amber / `✓ finished ·
+  Xm` ephemeral green / `· idle` neutral), the active card wears the blue ring,
+  and the context gauge uses `--warning` (never amber) only at genuine pressure
+  (≥90%). The rail's busy hairline reuses the pane sweep pinned to the top edge
+  (`.activity-line.activity-line-top`) — still the only looping state animation.
+  **Diff cards** (`@git-diff-view`, re-themed to `--diff-add`/`--diff-del` + the
+  app tokens, scoped to the lib's `.diff-tailwindcss-wrapper`) collapse large
+  sets by default and highlight lazily off-thread; every +N/−M counter uses the
+  diff tokens. A pending approval **takes over the composer** (amber panel,
+  ⏎ = Allow / ⎋ = Decline via a local handler — no new global shortcut) rather
+  than living only as a feed card; a pending approval in another session shows a
+  thin amber cross-session banner atop the stage.
+- **Chat is human-readable, not a dev log** (both the orchestrator chat and the
+  Vibe feed, `components/orchestrator/ChatView.tsx` + `ItemFeed.tsx`). Three
+  conventions:
+  - **Reading width.** The message column is capped (`CHAT_MAX_W ≈ 46rem`) and
+    centered, with the composer flush beneath it. Body text is ~13.5px Inter
+    with generous leading and paragraph rhythm; tool/meta lines stay small mono
+    and **recede** (`text-faint`) — they never compete with the prose.
+  - **One quiet line for everything non-prose.** Tool steps, status pings and
+    warnings all render through a single `QuietLine` shape (status glyph + human
+    text + optional tooltip + trailing chips) so the feed reads as one calm,
+    homogeneous stream — never a dev log. The status glyph obeys the triad:
+    `✓ --success` (done / a pane finished), `⚠ --warning` (a failed step or
+    warning), `⚑ --attn` (a pane waiting for input), a neutral `·`/`…` while
+    running or for an unclassifiable line. **Human verbs only** — never raw tool
+    names; those live in the tooltip. A **lone** tool step renders as one quiet
+    line (no disclosure); **consecutive** tool calls still fold into a
+    collapsible block ("Working · N steps") that expands to the per-step list,
+    with pane/session **jump chips first-class** (a union row even while
+    collapsed) and failed steps visible collapsed. The rule is
+    forward-proof: an unknown tool degrades to "Used a tool", an unknown ping to
+    the neutral marker — no raw name or iconless line ever surfaces.
+  - **Path pills.** Absolute and `~/…` paths in assistant prose render as a
+    compact pill — filename prominent, directory dimmed + middle-elided, full
+    path in the tooltip (not a link). Detection runs on text nodes **after**
+    markdown parsing, never inside code spans or fenced blocks.
+- **Model / effort are visible and changeable everywhere.** Every chat/session
+  surface shows its model · effort · context; the model/effort is a **clickable
+  chip** opening the shared `ModelEffortPicker` (session header, Conductor/panel
+  header). The picker states "applies from the next turn" — the change is a
+  per-turn override, never a silent restart. Rail cards show the same meta
+  read-only.

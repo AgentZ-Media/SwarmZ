@@ -1,6 +1,7 @@
 import { Loader2, Terminal } from "lucide-react";
 import { useSwarm } from "@/store";
 import { agentIsBusy, resolveQuitConfirm } from "@/lib/quit";
+import { useVibe } from "@/lib/vibe/session-store";
 import { Button } from "./ui/button";
 import {
   Dialog,
@@ -19,15 +20,18 @@ export function QuitConfirmDialog() {
   const quitConfirm = useSwarm((s) => s.quitConfirm);
   const agents = useSwarm((s) => s.agents);
   const floats = useSwarm((s) => s.floatingTerminals);
+  const vibeSessions = useVibe((s) => s.sessions);
 
-  // blocker ids are agent panes or floating terminals (floats block when a
-  // process still runs in them — they are never restored)
+  // blocker ids are agent panes, floating terminals (floats block when a
+  // process still runs in them — never restored) or busy Vibe sessions
   const listed = (quitConfirm ?? [])
     .map((id) => {
       const a = agents[id];
       if (a) return { id, name: a.name, cwd: a.cwd, busy: agentIsBusy(a) };
       const f = floats[id];
       if (f) return { id, name: f.name, cwd: f.cwd, busy: true };
+      const v = vibeSessions[id]?.session;
+      if (v) return { id, name: v.name, cwd: v.projectDir, busy: true };
       return null;
     })
     .filter((e): e is NonNullable<typeof e> => !!e);

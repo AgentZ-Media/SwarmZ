@@ -18,6 +18,7 @@ import type {
   GitInfo,
   PersistedGrid,
   PersistedOrchestratorChats,
+  PersistedVibeSessions,
   PersistedWorkspaces,
   Profile,
   QuickNotesData,
@@ -153,6 +154,18 @@ export const tauriBackend: Backend = {
   },
   saveOrchestratorChats: async (data) => {
     await store.set("orchestratorChats", data);
+    await store.save();
+  },
+
+  loadVibeSessions: async () => {
+    try {
+      return (await store.get<PersistedVibeSessions>("vibeSessions")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveVibeSessions: async (data) => {
+    await store.set("vibeSessions", data);
     await store.save();
   },
 

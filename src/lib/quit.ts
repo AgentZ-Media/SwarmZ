@@ -2,6 +2,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { IS_TAURI, ptyHasChildren } from "./transport";
 import { flushAllPersists, useSwarm } from "@/store";
+import { vibeBusyIds } from "./vibe/controller";
 import type { Agent } from "@/types";
 
 /** Claude is actively working in this pane right now (OSC 9;4 busy). */
@@ -55,7 +56,12 @@ async function floatBlockerIds(): Promise<string[]> {
 let confirmed = false;
 
 async function closeOrConfirm(win: { close: () => Promise<void> }) {
-  const blockers = [...quitBlockerIds(), ...(await floatBlockerIds())];
+  const blockers = [
+    ...quitBlockerIds(),
+    ...(await floatBlockerIds()),
+    // a Vibe session with a turn in flight loses the run just like a busy pane
+    ...vibeBusyIds(),
+  ];
   if (blockers.length > 0 && !confirmed) {
     useSwarm.getState().setQuitConfirm(blockers);
     return;

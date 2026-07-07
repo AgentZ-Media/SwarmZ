@@ -5,10 +5,47 @@
 // still-streaming message simply render literally until the closing half
 // arrives; the next batched store write re-parses the whole text.
 
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 import { openUrl } from "@/lib/transport";
+import { pathPillLabel, splitLineSuffix, splitTextWithPaths } from "@/lib/paths";
 
-const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g;
+// Inline tokens: code, bold, italic, http(s) links (group 4), and markdown
+// links whose href is a filesystem path (group 5, e.g. `[foo.ts](/a/foo.ts:9)`)
+// — the latter render as a non-clickable path pill, not a link.
+const INLINE =
+  /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))|(\[[^\]\n]+\]\(~?\/[^)\s]+\))/g;
+
+/**
+ * A filesystem path rendered as a compact pill: ONLY the filename (plus an
+ * optional `:line`), with the full path in the tooltip. Not a link — just a
+ * legibility affordance. Used on prose text nodes and on markdown links whose
+ * href is a path; code spans and fenced blocks are never touched.
+ */
+function PathPill({ path }: { path: string }) {
+  const { base, line } = pathPillLabel(path);
+  return (
+    <span
+      title={path}
+      className="mx-0.5 inline-flex max-w-full items-center rounded border border-border/70 bg-secondary/50 px-1 py-px align-middle font-mono text-[11px] leading-tight select-text"
+    >
+      <span className="truncate text-foreground">{base}</span>
+      {line && <span className="shrink-0 text-faint">:{line}</span>}
+    </span>
+  );
+}
+
+/** Split a prose run into text + path-pill nodes (paths.ts detection). */
+function renderTextWithPaths(text: string, keyPrefix: string): ReactNode[] {
+  const segs = splitTextWithPaths(text);
+  if (segs.length <= 1 && !segs.some((s) => s.path)) return text ? [text] : [];
+  return segs.map((s, i) =>
+    s.path ? (
+      <PathPill key={`${keyPrefix}-p${i}`} path={s.text} />
+    ) : (
+      <Fragment key={`${keyPrefix}-t${i}`}>{s.text}</Fragment>
+    ),
+  );
+}
 
 function renderInline(text: string, keyPrefix: string): ReactNode[] {
   const out: ReactNode[] = [];
@@ -16,14 +53,15 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
   let i = 0;
   for (const m of text.matchAll(INLINE)) {
     const idx = m.index ?? 0;
-    if (idx > last) out.push(text.slice(last, idx));
+    if (idx > last)
+      out.push(...renderTextWithPaths(text.slice(last, idx), `${keyPrefix}-${i}a`));
     const token = m[0];
     const key = `${keyPrefix}-${i++}`;
     if (m[1]) {
       out.push(
         <code
           key={key}
-          className="rounded border border-border bg-secondary px-1 py-px font-mono text-[11px]"
+          className="rounded-md border border-border bg-secondary px-1.5 py-px font-mono text-[12px]"
         >
           {token.slice(1, -1)}
         </code>,
@@ -38,7 +76,7 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
       out.push(
         <em key={key}>{renderInline(token.slice(1, -1), key)}</em>,
       );
-    } else {
+    } else if (m[4]) {
       const label = token.slice(1, token.indexOf("]("));
       const url = token.slice(token.indexOf("](") + 2, -1);
       out.push(
@@ -52,10 +90,21 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
           {label}
         </button>,
       );
+    } else {
+      // m[5]: markdown link with a filesystem-path href — a path pill, never a
+      // link. Line number comes from the href suffix, else from the link text
+      // (e.g. `[foo.ts:12](/a/foo.ts)`); the tooltip shows the full path.
+      const label = token.slice(1, token.indexOf("]("));
+      const href = token.slice(token.indexOf("](") + 2, -1);
+      const { line: hrefLine } = splitLineSuffix(href);
+      const line = hrefLine ?? splitLineSuffix(label).line;
+      const path = hrefLine || !line ? href : `${href}:${line}`;
+      out.push(<PathPill key={key} path={path} />);
     }
     last = idx + token.length;
   }
-  if (last < text.length) out.push(text.slice(last));
+  if (last < text.length)
+    out.push(...renderTextWithPaths(text.slice(last), `${keyPrefix}-end`));
   return out;
 }
 
@@ -124,14 +173,14 @@ function parseBlocks(text: string): Block[] {
 export function OrchestratorMarkdown({ text }: { text: string }) {
   const blocks = parseBlocks(text);
   return (
-    <div className="space-y-1.5">
+    <div className="space-y-2.5">
       {blocks.map((b, i) => {
         switch (b.kind) {
           case "h":
             return (
               <div
                 key={i}
-                className={`font-semibold tracking-tight ${b.level <= 2 ? "text-[13px]" : "text-xs"}`}
+                className={`pt-1 font-semibold tracking-tight ${b.level <= 2 ? "text-[15px]" : "text-[13.5px]"}`}
               >
                 {renderInline(b.text, `h${i}`)}
               </div>
@@ -140,7 +189,7 @@ export function OrchestratorMarkdown({ text }: { text: string }) {
             return (
               <pre
                 key={i}
-                className="overflow-x-auto rounded-md border border-border bg-card p-2 font-mono text-[11px] leading-relaxed"
+                className="overflow-x-auto rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[12px] leading-relaxed"
               >
                 {b.text}
               </pre>
@@ -151,10 +200,10 @@ export function OrchestratorMarkdown({ text }: { text: string }) {
             return (
               <Tag
                 key={i}
-                className={`space-y-0.5 pl-4 ${b.kind === "ul" ? "list-disc" : "list-decimal"}`}
+                className={`space-y-1 pl-5 ${b.kind === "ul" ? "list-disc" : "list-decimal"}`}
               >
                 {b.items.map((item, j) => (
-                  <li key={j} className="break-words">
+                  <li key={j} className="break-words pl-0.5">
                     {renderInline(item, `${i}-${j}`)}
                   </li>
                 ))}

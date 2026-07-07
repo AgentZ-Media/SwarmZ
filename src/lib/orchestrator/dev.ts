@@ -22,6 +22,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useSwarm } from "@/store";
 import { fleetSnapshot, fleetSummaryLine } from "./snapshot";
+import { fleetSessions } from "./executors";
 import { discoverProjects, projectDocs, readTranscript } from "./native";
 import {
   chatInterrupt,
@@ -69,7 +70,8 @@ if (import.meta.env.DEV) {
 
   window.__orch = {
     snapshot: () => fleetSnapshot(useSwarm.getState()),
-    summary: () => fleetSummaryLine(useSwarm.getState()),
+    // session-aware, like the fleet-summary Rust prepends to every turn
+    summary: () => fleetSummaryLine(useSwarm.getState(), fleetSessions()),
     readTranscript,
     projectDocs,
     discoverProjects,

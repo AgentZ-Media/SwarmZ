@@ -1,10 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { History } from "lucide-react";
-import { useShallow } from "zustand/react/shallow";
 import { useSwarm } from "@/store";
 import { useLimits } from "@/lib/limits";
 import { useFleetEvents, type FleetEvent } from "@/lib/events";
-import { triageEntries, type TriageEntry } from "@/lib/triage";
+import { triageEntries } from "@/lib/triage";
+import { useVibe } from "@/lib/vibe/session-store";
+import { vibeTriageEntries } from "@/lib/vibe/triage";
+import { focusSession } from "@/lib/vibe/controller";
+import { useVibeUi } from "@/lib/vibe/ui-store";
 import { useOrchestrator } from "@/lib/orchestrator/chat-store";
 import { focusTerm } from "@/lib/term-host";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
@@ -31,10 +34,12 @@ export function Deck() {
   );
 }
 
-/** Jump to a pane like the palette does (workspace switch + terminal focus). */
+/** Jump to a pane like the palette does (workspace switch + terminal focus).
+ * Also leaves Vibe Mode — the pane lives in the grid. */
 function jumpToPane(id: string) {
   const s = useSwarm.getState();
   if (!s.agents[id]) return;
+  s.setUiMode("grid");
   s.setFleetOpen(false);
   s.focusAgent(id);
   focusTerm(id);
@@ -54,16 +59,63 @@ function formatAge(ms: number): string {
 
 // ---- 1. Triage queue ----
 
-/** Every needs-you pane app-wide, oldest waiting first (unknown ages last).
- * Ordering lives in lib/triage.ts — shared with the fleet overview's
- * needs-you-first initial selection and Tab cycle. */
-function useTriageEntries(): TriageEntry[] {
-  return useSwarm(useShallow((s) => triageEntries(s)));
+/** One row in the merged needs-you queue — a grid pane or a Vibe session. */
+interface TriageRow {
+  id: string;
+  name: string;
+  /** workspace name (pane) or project folder (vibe) — the faint sub-label */
+  place: string;
+  since: number | null;
+  jump: () => void;
+}
+
+/** A stable primitive signature of a needs-you list — a store selector must
+ * NOT return a fresh array of fresh objects (it never stabilizes across
+ * getSnapshot calls → infinite loop). Selecting this string is stable. */
+function triageSig(rows: { id: string; since: number | null }[]): string {
+  return rows.map((r) => `${r.id}:${r.since ?? ""}`).join("|");
+}
+
+/**
+ * Every needs-you thing app-wide, oldest waiting first: grid panes (lib/triage)
+ * merged with Vibe sessions holding a pending approval (lib/vibe/triage).
+ * A pane row jumps into the grid; a session row jumps into Vibe Mode. The
+ * rows (fresh objects + jump closures) are rebuilt in useMemo, gated on the
+ * two primitive signatures so the store subscriptions stay stable.
+ */
+function useTriageRows(): TriageRow[] {
+  const paneSig = useSwarm((s) => triageSig(triageEntries(s)));
+  const vibeSig = useVibe((s) => triageSig(vibeTriageEntries(s)));
+  const workspaces = useSwarm((s) => s.workspaces);
+  return useMemo(() => {
+    const rows: TriageRow[] = [
+      ...triageEntries(useSwarm.getState()).map((e) => ({
+        id: e.id,
+        name: e.name,
+        place: workspaces[e.workspaceId]?.name ?? "",
+        since: e.since,
+        jump: () => jumpToPane(e.id),
+      })),
+      ...vibeTriageEntries(useVibe.getState()).map((e) => ({
+        id: `vibe:${e.id}`,
+        name: e.name,
+        place: e.project,
+        since: e.since,
+        jump: () => focusSession(e.id),
+      })),
+    ];
+    rows.sort(
+      (a, b) =>
+        (a.since ?? Number.MAX_SAFE_INTEGER) -
+        (b.since ?? Number.MAX_SAFE_INTEGER),
+    );
+    return rows;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paneSig, vibeSig, workspaces]);
 }
 
 function TriageChip() {
-  const entries = useTriageEntries();
-  const workspaces = useSwarm((s) => s.workspaces);
+  const entries = useTriageRows();
   const [open, setOpen] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
 
@@ -126,7 +178,7 @@ function TriageChip() {
               data-triage-row
               onClick={() => {
                 setOpen(false);
-                jumpToPane(entry.id);
+                entry.jump();
               }}
               className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent focus-visible:bg-accent focus-visible:outline-none"
             >
@@ -137,7 +189,7 @@ function TriageChip() {
                 {entry.name}
               </span>
               <span className="max-w-24 shrink-0 truncate font-mono text-[10px] text-faint">
-                {workspaces[entry.workspaceId]?.name ?? ""}
+                {entry.place}
               </span>
               <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
                 {entry.since ? formatAge(Date.now() - entry.since) : "—"}
@@ -173,6 +225,18 @@ const EVENT_STYLE: Record<
 };
 
 function eventLabel(e: FleetEvent): string {
+  if (e.source === "vibe") {
+    switch (e.kind) {
+      case "finished":
+        return `${e.paneName} finished`;
+      case "waiting":
+        return `${e.paneName} needs approval`;
+      case "exited":
+        return `${e.paneName} turn failed`;
+      default:
+        return e.paneName;
+    }
+  }
   switch (e.kind) {
     case "finished":
       return `${e.paneName} finished`;
@@ -188,13 +252,16 @@ function eventLabel(e: FleetEvent): string {
 }
 
 function EventChip({ event }: { event: FleetEvent }) {
-  const live = useSwarm((s) => !!s.agents[event.paneId]);
+  const vibe = event.source === "vibe";
+  const paneLive = useSwarm((s) => !!s.agents[event.paneId]);
+  const vibeLive = useVibe((s) => !!s.sessions[event.paneId]);
+  const live = vibe ? vibeLive : paneLive;
   const style = EVENT_STYLE[event.kind];
   return (
     <button
-      onClick={() => jumpToPane(event.paneId)}
+      onClick={() => (vibe ? focusSession(event.paneId) : jumpToPane(event.paneId))}
       disabled={!live}
-      title={live ? "Jump to pane" : "Pane closed"}
+      title={live ? (vibe ? "Open session" : "Jump to pane") : "Closed"}
       className={cn(
         "focus-ring flex min-w-0 shrink items-center gap-1 rounded px-1 py-0.5",
         live ? "hover:bg-accent" : "cursor-default",
@@ -396,8 +463,10 @@ function Meters() {
 
 /**
  * `orch` + dot: `--attn` when a chat has undelivered pings (a chat needs
- * attention), `--ring` while a turn runs, faint otherwise. Click toggles the
- * orchestrator panel (⌘⇧O).
+ * attention), `--ring` while a turn runs, faint otherwise. Click opens the
+ * orchestrator surface of the current mode: the sidebar in grid mode, the
+ * Conductor stage in Vibe Mode (same routing as ⌘⇧O — the sidebar would
+ * duplicate the stage).
  */
 function OrchestratorDot() {
   const running = useOrchestrator((s) =>
@@ -408,6 +477,13 @@ function OrchestratorDot() {
   );
   const panelOpen = useOrchestrator((s) => s.panelOpen);
   const togglePanel = useOrchestrator((s) => s.togglePanel);
+  const uiMode = useSwarm((s) => s.settings.uiMode ?? "grid");
+  const stageMode = useVibeUi((s) => s.stageMode);
+  const isVibe = uiMode === "vibe";
+  const open = isVibe
+    ? () => useVibeUi.getState().setStageMode("conductor")
+    : togglePanel;
+  const active = isVibe ? stageMode === "conductor" : panelOpen;
 
   const color = needsAttention
     ? "var(--attn)"
@@ -423,10 +499,10 @@ function OrchestratorDot() {
   return (
     <Tip label={`${label} (⌘⇧O)`}>
       <button
-        onClick={togglePanel}
+        onClick={open}
         className={cn(
           "flex h-5 shrink-0 items-center gap-1.5 rounded-md px-1.5 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
-          panelOpen ? "text-foreground" : "text-faint",
+          active ? "text-foreground" : "text-faint",
         )}
       >
         <span

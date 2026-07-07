@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { TitleBar } from "./components/TitleBar";
 import { WorkspaceLayer } from "./components/WorkspaceLayer";
+import { VibeLayer } from "./components/vibe/VibeLayer";
 import { FloatingTerminals } from "./components/FloatingTerminals";
 import { Deck } from "./components/Deck";
 import { CloseAgentDialog } from "./components/CloseAgentDialog";
@@ -21,13 +22,17 @@ import { OrchestratorPanel } from "./components/OrchestratorPanel";
 import { UsageDashboard } from "./components/UsageDashboard";
 import { useSwarm } from "./store";
 import { useOrchestrator } from "./lib/orchestrator/chat-store";
+import { useVibeUi } from "./lib/vibe/ui-store";
 import { useUpdates } from "./lib/updates";
 import { useLimits } from "./lib/limits";
 import { startGitPolling } from "./lib/git";
 import { startQuitGuard } from "./lib/quit";
 import { startFileDropListener } from "./lib/dnd";
 import { startOrchestratorBus } from "./lib/orchestrator/bus";
-import { startOrchestratorActivityWatcher } from "./lib/orchestrator/controller";
+import {
+  startOrchestratorActivityWatcher,
+  startVibeSessionActivityWatcher,
+} from "./lib/orchestrator/controller";
 import { fetchKeyStatus } from "./lib/openrouter";
 import { fetchLocalSttStatus } from "./lib/local-stt";
 import {
@@ -38,7 +43,7 @@ import {
   startDictation,
   stopDictation,
 } from "./lib/dictation";
-import { encodeProjectDir } from "./lib/utils";
+import { cn, encodeProjectDir } from "./lib/utils";
 import {
   ensureNotifyPermission,
   fetchUsageForSession,
@@ -50,6 +55,8 @@ import {
 // dev-only orchestrator smoke-test hook (`window.__orch`) — the DEV guard
 // makes production builds drop the import entirely
 if (import.meta.env.DEV) void import("./lib/orchestrator/dev");
+// dev-only Vibe-Mode smoke-test hook (`window.__vibe`) — same DEV guard
+if (import.meta.env.DEV) void import("./lib/vibe/dev");
 
 export default function App() {
   const hydrate = useSwarm((s) => s.hydrate);
@@ -59,6 +66,7 @@ export default function App() {
   const requestRemoveAgent = useSwarm((s) => s.requestRemoveAgent);
   const createFloatingTerminal = useSwarm((s) => s.createFloatingTerminal);
   const adjustFontSize = useSwarm((s) => s.adjustFontSize);
+  const uiMode = useSwarm((s) => s.settings.uiMode ?? "grid");
 
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -83,6 +91,8 @@ export default function App() {
     // orchestrator status pings: busy → idle/waiting transitions of panes an
     // orchestrator chat prompted become system pings in that chat (Phase 5)
     const stopOrchestratorPings = startOrchestratorActivityWatcher();
+    // same, for native Vibe sessions the orchestrator prompted (Phase 5)
+    const stopVibePings = startVibeSessionActivityWatcher();
     // dictation UI is hidden until a working OpenRouter key is found
     // (or, with the local engine, the local speech model is installed)
     void fetchKeyStatus()
@@ -99,6 +109,7 @@ export default function App() {
       stopFileDrop();
       stopOrchestratorBus();
       stopOrchestratorPings();
+      stopVibePings();
     };
   }, [hydrate]);
 
@@ -304,11 +315,23 @@ export default function App() {
         e.preventDefault();
         s.setFleetOpen(!s.fleetOpen);
       } else if (k === "o" && e.shiftKey) {
-        // ⌘⇧O — orchestrator chat sidebar. NOT a dialog: it stays open
-        // during work and global shortcuts keep firing while it's up. (No
-        // plain ⌘O exists today; keep this branch before one if it ever does.)
+        // ⌘⇧O — the orchestrator surface. In grid mode that is the chat
+        // sidebar (NOT a dialog: it stays open during work and global
+        // shortcuts keep firing while it's up). In Vibe Mode the Conductor
+        // stage IS the orchestrator surface — the sidebar would duplicate
+        // it, so the shortcut focuses the Conductor instead. (No plain ⌘O
+        // exists today; keep this branch before one if it ever does.)
         e.preventDefault();
-        useOrchestrator.getState().togglePanel();
+        if ((s.settings.uiMode ?? "grid") === "vibe") {
+          useVibeUi.getState().setStageMode("conductor");
+        } else {
+          useOrchestrator.getState().togglePanel();
+        }
+      } else if (k === "v" && e.shiftKey) {
+        // ⌘⇧V — toggle the app-wide view (grid tiling wall ↔ vibe sessions).
+        // Before plain-⌘ branches: nothing claims plain ⌘V (paste is native).
+        e.preventDefault();
+        s.setUiMode((s.settings.uiMode ?? "grid") === "vibe" ? "grid" : "vibe");
       } else if (k === "a" && e.shiftKey) {
         // jump to the next agent waiting for input, across all workspaces
         e.preventDefault();
@@ -419,16 +442,39 @@ export default function App() {
                 overlay and floating terminals keep covering exactly the grid
                 (never the Deck or the orchestrator panel) */}
             <div className="relative min-h-0 min-w-0 flex-1">
-              {/* all workspace grids stay mounted in here — see WorkspaceLayer */}
-              <WorkspaceLayer />
-              {/* floating terminals live above the grids — and survive them (detached) */}
+              {/* Both views stay mounted always; the inactive one is only
+                  hidden (visibility) — grids keep their PTYs, the vibe feed
+                  keeps its scroll. Same lossless pattern as WorkspaceLayer's
+                  per-workspace grids. */}
+              <div
+                className={cn(
+                  "absolute inset-0",
+                  uiMode === "vibe" && "invisible pointer-events-none",
+                )}
+              >
+                {/* all workspace grids stay mounted in here — see WorkspaceLayer */}
+                <WorkspaceLayer />
+              </div>
+              <div
+                className={cn(
+                  "absolute inset-0",
+                  uiMode !== "vibe" && "invisible pointer-events-none",
+                )}
+              >
+                <VibeLayer />
+              </div>
+              {/* floating terminals live above both views — and survive them (detached) */}
               <FloatingTerminals />
             </div>
             {/* the Deck: triage queue, event ticker, meters, orch status */}
             <Deck />
           </div>
           {/* orchestrator chat sidebar (⌘⇧O) — resizes the grid, not an overlay */}
-          <OrchestratorPanel />
+          {/* grid-only: in Vibe Mode the Conductor stage is the orchestrator
+              surface — mounting the sidebar too would show the same chat
+              twice. Unmounting is safe (the chat lives in its own store);
+              panelOpen persists and the panel reappears back in grid mode. */}
+          {uiMode !== "vibe" && <OrchestratorPanel />}
         </main>
       </div>
 

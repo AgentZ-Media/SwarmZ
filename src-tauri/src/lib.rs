@@ -1,3 +1,4 @@
+mod codex;
 mod codex_usage;
 mod git;
 mod limits;
@@ -366,13 +367,85 @@ async fn discover_projects(
 /// The tool catalog + the orchestrator system instructions, both single-
 /// source in Rust. Phase 3 hands the tools to Codex `dynamicTools` (and the
 /// instructions as `developerInstructions`); the Phase-6 OpenRouter loop
-/// fetches BOTH through this command for its wire messages.
+/// fetches BOTH through this command for its wire messages. `persona` is the
+/// current Settings persona (None = the Maestro seed); memory is read fresh
+/// so both provider paths compile the SAME instructions from one source.
 #[tauri::command]
-fn orchestrator_tools() -> serde_json::Value {
+async fn orchestrator_tools(
+    app: AppHandle,
+    persona: Option<orchestrator::PersonaSpec>,
+) -> serde_json::Value {
+    let persona = persona.unwrap_or_default();
+    let memory = orchestrator_memory_block(&app).await;
     serde_json::json!({
-        "instructions": orchestrator::ORCHESTRATOR_INSTRUCTIONS,
+        "instructions": orchestrator::build_instructions(&persona, &memory),
         "tools": orchestrator::tool_definitions(),
     })
+}
+
+/// The app data dir (holds `swarmz.json` and `orchestrator-memory.md`).
+fn orchestrator_data_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path().app_data_dir().map_err(|e| e.to_string())
+}
+
+/// Render the curated memory as prompt-ready list lines (empty on failure).
+async fn orchestrator_memory_block(app: &AppHandle) -> String {
+    let Ok(dir) = orchestrator_data_dir(app) else {
+        return String::new();
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let entries = orchestrator::memory_read(&dir);
+        entries
+            .iter()
+            .map(|e| {
+                if e.date.is_empty() {
+                    format!("- {}", e.text)
+                } else {
+                    format!("- {} {}", e.date, e.text)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Read the curated orchestrator memory (Settings UI).
+#[tauri::command]
+async fn orchestrator_memory_read(
+    app: AppHandle,
+) -> Result<Vec<orchestrator::MemoryEntry>, String> {
+    let dir = orchestrator_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || orchestrator::memory_read(&dir))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Append one fact to the curated memory (the `remember` tool executor). The
+/// caps are enforced here; the result reports any FIFO drop.
+#[tauri::command]
+async fn orchestrator_memory_append(
+    app: AppHandle,
+    text: String,
+) -> Result<orchestrator::AppendResult, String> {
+    let dir = orchestrator_data_dir(&app)?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    tauri::async_runtime::spawn_blocking(move || orchestrator::memory_append(&dir, &text, &today))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Remove one memory entry by index (Settings UI). Returns the remaining list.
+#[tauri::command]
+async fn orchestrator_memory_remove(
+    app: AppHandle,
+    index: usize,
+) -> Result<Vec<orchestrator::MemoryEntry>, String> {
+    let dir = orchestrator_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || orchestrator::memory_remove(&dir, index))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Run one tool through the roundtrip bus (Rust → webview executor → Rust).
@@ -408,8 +481,9 @@ fn orchestrator_tool_response(id: String, ok: bool, payload: serde_json::Value) 
 async fn orchestrator_chat_start(
     app: AppHandle,
     codex_path: Option<String>,
+    persona: Option<orchestrator::PersonaSpec>,
 ) -> Result<serde_json::Value, String> {
-    orchestrator::chat_start(&app, codex_path).await
+    orchestrator::chat_start(&app, codex_path, persona).await
 }
 
 /// Send one user message; resolves with the final assistant text when the
@@ -419,8 +493,10 @@ async fn orchestrator_chat_send(
     app: AppHandle,
     chat_id: String,
     text: String,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    orchestrator::chat_send(&app, &chat_id, &text).await
+    orchestrator::chat_send(&app, &chat_id, &text, model, effort).await
 }
 
 /// Interrupt the chat's running turn (turn/interrupt).
@@ -434,8 +510,9 @@ async fn orchestrator_chat_interrupt(chat_id: String) -> Result<(), String> {
 async fn orchestrator_chat_resume(
     app: AppHandle,
     thread_id: String,
+    persona: Option<orchestrator::PersonaSpec>,
 ) -> Result<serde_json::Value, String> {
-    orchestrator::chat_resume(&app, &thread_id).await
+    orchestrator::chat_resume(&app, &thread_id, persona).await
 }
 
 /// Liveness + codex version + account summary. Never errors — spawn
@@ -446,6 +523,13 @@ async fn orchestrator_chat_status(
     codex_path: Option<String>,
 ) -> serde_json::Value {
     orchestrator::chat_status(&app, codex_path).await
+}
+
+/// The model ids the installed codex offers (`model/list`, hidden entries
+/// dropped, server order = default first) — the pickers' "Available" section.
+#[tauri::command]
+async fn codex_list_models(app: AppHandle) -> Result<Vec<String>, String> {
+    orchestrator::list_models(&app).await
 }
 
 // ---- Orchestrator brain, provider B (Phase 6) — see orchestrator/openrouter.rs ----
@@ -472,6 +556,106 @@ async fn openrouter_chat_completion(
 #[tauri::command]
 fn openrouter_chat_cancel(chat_id: String) {
     orchestrator::openrouter_cancel(&chat_id);
+}
+
+// ---- Vibe-Mode native Codex sessions (Phase 2) — see codex/sessions.rs ----
+//
+// All async: they await JSON-RPC roundtrips against a PRIVATE `codex
+// app-server` child per session (strategy b — crash isolation). Progress
+// streams as `vibe://session-event` `{session_id, kind, data}`. `session_id`
+// is assigned by the frontend (it keys the store's VibeSession); `codex_path`
+// is the Settings codex-binary override, passed on the start/resume calls.
+
+/// Start a fresh Vibe session (dedicated process + thread/start). `access`
+/// ∈ workspace | full maps to the sandbox/approval policy. Returns `{thread_id}`.
+#[tauri::command]
+async fn vibe_session_start(
+    app: AppHandle,
+    session_id: String,
+    cwd: String,
+    model: Option<String>,
+    effort: Option<String>,
+    access: String,
+    codex_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    codex::sessions::session_start(&app, &session_id, cwd, model, effort, &access, codex_path).await
+}
+
+/// Reopen a persisted session across an app restart (thread/resume, with a
+/// fresh-start fallback when the rollout is gone). Returns `{thread_id, resumed}`.
+#[tauri::command]
+async fn vibe_session_resume(
+    app: AppHandle,
+    session_id: String,
+    thread_id: String,
+    cwd: String,
+    model: Option<String>,
+    effort: Option<String>,
+    access: String,
+    codex_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    codex::sessions::session_resume(
+        &app,
+        &session_id,
+        &thread_id,
+        cwd,
+        model,
+        effort,
+        &access,
+        codex_path,
+    )
+    .await
+}
+
+/// Send one user message — non-blocking; returns `{turn_id}` after the
+/// turn/start ack. The transcript + completion arrive as events.
+#[tauri::command]
+async fn vibe_session_send(
+    app: AppHandle,
+    session_id: String,
+    text: String,
+) -> Result<serde_json::Value, String> {
+    codex::sessions::session_send(&app, &session_id, &text).await
+}
+
+/// Interrupt the session's running turn (turn/interrupt).
+#[tauri::command]
+async fn vibe_session_interrupt(session_id: String) -> Result<(), String> {
+    codex::sessions::session_interrupt(&session_id).await
+}
+
+/// Answer a pending approval — `decision` ∈ accept | acceptForSession |
+/// decline | cancel.
+#[tauri::command]
+async fn vibe_session_respond_approval(
+    session_id: String,
+    approval_id: String,
+    decision: String,
+) -> Result<(), String> {
+    codex::sessions::session_respond_approval(&session_id, &approval_id, &decision).await
+}
+
+/// Change the session's access mode (takes effect on the next turn).
+#[tauri::command]
+async fn vibe_session_set_access(session_id: String, access: String) -> Result<(), String> {
+    codex::sessions::session_set_access(&session_id, &access).await
+}
+
+/// Change the session's model / reasoning effort (takes effect on the next
+/// turn). Empty/null clears back to the user's codex default.
+#[tauri::command]
+async fn vibe_session_set_model_effort(
+    session_id: String,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<(), String> {
+    codex::sessions::session_set_model_effort(&session_id, model, effort).await
+}
+
+/// Close a session: interrupt, cancel pending approvals, drop the process.
+#[tauri::command]
+async fn vibe_session_close(session_id: String) -> Result<(), String> {
+    codex::sessions::session_close(&session_id).await
 }
 
 fn start_usage_watcher(app: AppHandle) {
@@ -594,13 +778,25 @@ pub fn run() {
             orchestrator_tools,
             orchestrator_run_tool,
             orchestrator_tool_response,
+            orchestrator_memory_read,
+            orchestrator_memory_append,
+            orchestrator_memory_remove,
             orchestrator_chat_start,
             orchestrator_chat_send,
             orchestrator_chat_interrupt,
             orchestrator_chat_resume,
             orchestrator_chat_status,
+            codex_list_models,
             openrouter_chat_completion,
             openrouter_chat_cancel,
+            vibe_session_start,
+            vibe_session_resume,
+            vibe_session_send,
+            vibe_session_interrupt,
+            vibe_session_respond_approval,
+            vibe_session_set_access,
+            vibe_session_set_model_effort,
+            vibe_session_close,
             openrouter_key_status,
             openrouter_set_key,
             openrouter_clear_key,

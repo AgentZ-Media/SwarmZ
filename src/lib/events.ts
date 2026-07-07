@@ -25,6 +25,12 @@ export interface FleetEvent {
   /** pane name captured at event time (the pane may be gone later) */
   paneName: string;
   workspaceId: string;
+  /**
+   * Where the event comes from: a grid pane (default) or a Vibe session. The
+   * Deck ticker jumps into Vibe Mode + activates the session for "vibe"
+   * events instead of focusing a terminal; liveness checks the vibe store.
+   */
+  source?: "pane" | "vibe";
 }
 
 /** Feed cap — oldest events fall off first. */

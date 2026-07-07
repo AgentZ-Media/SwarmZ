@@ -276,7 +276,11 @@ export function TilingGrid({ workspaceId }: { workspaceId: string }) {
   }
 
   return (
-    <div ref={containerRef} className="relative h-full w-full">
+    <div
+      ref={containerRef}
+      data-ws-grid={workspaceId}
+      className="relative h-full w-full"
+    >
       {(focusedAgentId || closingFocusId) && (
         <div
           className={cn(

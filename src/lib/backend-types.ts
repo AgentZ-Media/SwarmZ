@@ -7,6 +7,7 @@ import type {
   GitInfo,
   PersistedGrid,
   PersistedOrchestratorChats,
+  PersistedVibeSessions,
   PersistedWorkspaces,
   Profile,
   QuickNotesData,
@@ -100,6 +101,10 @@ export interface Backend {
   /** Orchestrator chat sidebar — chats + active id + panel open/width. */
   loadOrchestratorChats(): Promise<PersistedOrchestratorChats | null>;
   saveOrchestratorChats(data: PersistedOrchestratorChats): Promise<void>;
+
+  /** Vibe-Mode native Codex sessions — session meta + normalized transcript. */
+  loadVibeSessions(): Promise<PersistedVibeSessions | null>;
+  saveVibeSessions(data: PersistedVibeSessions): Promise<void>;
 
   loadUsageHistory(): Promise<UsageHistoryEntry[] | null>;
   saveUsageHistory(entries: UsageHistoryEntry[]): Promise<void>;

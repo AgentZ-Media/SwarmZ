@@ -4,6 +4,7 @@ import * as DialogPrimitive from "@radix-ui/react-dialog";
 import {
   BarChart3,
   Bell,
+  Bot,
   LayoutGrid,
   LayoutTemplate,
   Plus,
@@ -11,9 +12,11 @@ import {
   Search,
   Settings,
   SlidersHorizontal,
+  Sparkles,
   SquarePlus,
 } from "lucide-react";
 import { presetKey, useSwarm } from "@/store";
+import { useVibeUi } from "@/lib/vibe/ui-store";
 import { focusTerm } from "@/lib/term-host";
 import { extractInputLabels } from "@/lib/command-vars";
 import { insertCommandText } from "@/lib/insert-command";
@@ -98,6 +101,7 @@ export function CommandPalette({
   }).length;
 
   const activeHasGrid = useSwarm((s) => !!s.layouts[s.activeWorkspaceId]);
+  const uiMode = useSwarm((s) => s.settings.uiMode ?? "grid");
 
   return (
     <DialogPrimitive.Root open={open} onOpenChange={setOpen}>
@@ -223,6 +227,50 @@ export function CommandPalette({
                   <LayoutGrid size={13} className="shrink-0 text-faint" />
                   Fleet overview
                   <Shortcut>⌘E</Shortcut>
+                </PaletteItem>
+                <PaletteItem
+                  value={
+                    uiMode === "vibe"
+                      ? "switch to grid mode view terminals"
+                      : "switch to vibe mode view sessions conductor"
+                  }
+                  onSelect={() =>
+                    run(() =>
+                      useSwarm.getState().setUiMode(uiMode === "vibe" ? "grid" : "vibe"),
+                    )
+                  }
+                >
+                  {uiMode === "vibe" ? (
+                    <LayoutGrid size={13} className="shrink-0 text-faint" />
+                  ) : (
+                    <Sparkles size={13} className="shrink-0 text-faint" />
+                  )}
+                  {uiMode === "vibe" ? "Switch to Grid mode" : "Switch to Vibe mode"}
+                  <Shortcut>⌘⇧V</Shortcut>
+                </PaletteItem>
+                <PaletteItem
+                  value="focus conductor orchestrator vibe chat"
+                  onSelect={() =>
+                    run(() => {
+                      useSwarm.getState().setUiMode("vibe");
+                      useVibeUi.getState().setStageMode("conductor");
+                    })
+                  }
+                >
+                  <Bot size={13} className="shrink-0 text-faint" />
+                  Focus Conductor
+                </PaletteItem>
+                <PaletteItem
+                  value="new codex session native vibe agent"
+                  onSelect={() =>
+                    run(() => {
+                      useSwarm.getState().setUiMode("vibe");
+                      useVibeUi.getState().setNewSessionOpen(true);
+                    })
+                  }
+                >
+                  <Plus size={13} className="shrink-0 text-faint" />
+                  New Codex session
                 </PaletteItem>
                 <PaletteItem
                   value="next pane cycle focus"

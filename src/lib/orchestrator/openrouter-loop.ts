@@ -26,8 +26,9 @@ import type {
   OrchestratorWireToolCall,
 } from "@/types";
 import { useOrchestrator } from "./chat-store";
-import { executors, type ToolExecutor } from "./executors";
+import { executors, fleetSessions, type ToolExecutor } from "./executors";
 import { fleetSummaryLine } from "./snapshot";
+import { currentPersonaWire } from "./persona";
 import type { OrchestratorChatEventKind } from "./chat";
 import type { OrchestratorToolsResponse } from "./types";
 
@@ -48,11 +49,16 @@ interface AssembledAssistant {
   finish_reason: string | null;
 }
 
-// instructions + registry are static per app run — fetch once, share
-let catalogPromise: Promise<OrchestratorToolsResponse> | null = null;
+// The tool schemas are static, but `instructions` now depends on the live
+// persona + curated memory (Rust compiles both fresh), so fetch per turn —
+// one cheap local invoke — instead of caching app-wide. Persona is read live
+// from settings; memory is read from disk by Rust (frozen for the turn).
 function fetchToolCatalog(): Promise<OrchestratorToolsResponse> {
-  catalogPromise ??= invoke<OrchestratorToolsResponse>("orchestrator_tools");
-  return catalogPromise;
+  return invoke<OrchestratorToolsResponse>("orchestrator_tools", {
+    persona: currentPersonaWire(
+      useSwarm.getState().settings.orchestratorPersona,
+    ),
+  });
 }
 
 /** Per-chat abort flags for the running turn (in-memory). */
@@ -177,7 +183,7 @@ export async function runOpenRouterTurn(
     }));
     // fresh each turn — mirrors the fleet line Rust chat_send prepends for
     // codex; the persisted wire history deliberately excludes it
-    const system = `${instructions}\n\n[fleet status: ${fleetSummaryLine(useSwarm.getState())}]`;
+    const system = `${instructions}\n\n[fleet status: ${fleetSummaryLine(useSwarm.getState(), fleetSessions())}]`;
     appendWire(chatId, [{ role: "user", content: wireText }]);
 
     for (let i = 0; ; i++) {

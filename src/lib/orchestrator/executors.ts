@@ -16,9 +16,37 @@ import { insertCommandText } from "@/lib/insert-command";
 import { pushFleetEvent } from "@/lib/events";
 import { addWorktree, generateBranchName } from "@/lib/worktree";
 import { runtimeFromStartup } from "@/lib/utils";
+import { useVibe, type VibeSessionEntry } from "@/lib/vibe/session-store";
+import {
+  sendMessage as vibeSendMessage,
+  startSession as startVibeSession,
+} from "@/lib/vibe/controller";
+import { renderSessionTranscript } from "@/lib/vibe/transcript";
+import {
+  buildArrangement,
+  collectPanes,
+  combineLayouts,
+  findPaneByAgent,
+  removePaneByAgent,
+  splitPane,
+  type Arrangement,
+} from "@/lib/layout";
 import { useOrchestrator } from "./chat-store";
-import { fleetSnapshot, fleetSummaryLine } from "./snapshot";
+import {
+  crowdingNote,
+  fleetSnapshot,
+  fleetSummaryLine,
+  sessionSnapshot,
+  type LayoutDims,
+} from "./snapshot";
+import {
+  MIN_PANE,
+  planPlacement,
+  type PlanSpec,
+  type WsMeta,
+} from "./placement";
 import { discoverProjects, projectDocs, readTranscript } from "./native";
+import { appendMemory } from "./memory";
 import type {
   CreatePaneResult,
   CreatePaneSpec,
@@ -87,6 +115,27 @@ function reviewModeActive(): boolean {
 }
 
 /**
+ * The session variant of the write choke point (Phase 5): the same
+ * double-prompt guard, but a busy session is always REFUSED (a native session
+ * runs one turn at a time — the backend rejects a second turn — so there is no
+ * "queue into the input" like a terminal pane). Review mode does not apply:
+ * a session turn is a single atomic submit, not a paste the user can inspect.
+ */
+function assertSessionPromptAllowed(sessionId: string, name: string): void {
+  const last = lastPromptDelivery.get(sessionId);
+  if (last !== undefined && Date.now() - last < DOUBLE_PROMPT_WINDOW_MS) {
+    throw new Error(
+      `session "${name}" (${sessionId}) already received an orchestrator prompt ${Date.now() - last} ms ago — this looks like a duplicate call; wait a moment and re-send only if it was intentional`,
+    );
+  }
+  if (useVibe.getState().busy[sessionId]) {
+    throw new Error(
+      `session "${name}" (${sessionId}) is busy — wait for it to finish, then prompt it (or tell the user it is still working)`,
+    );
+  }
+}
+
+/**
  * Record a delivered prompt: feeds the double-prompt guard, and — when the
  * call carries a chat context — the chat's touchedPanes (the Phase-5
  * activity watcher only pings panes recorded here). Every delivery also
@@ -122,6 +171,79 @@ function requireAgent(paneId: unknown): Agent {
     .join(", ");
   throw new Error(
     `unknown pane_id ${JSON.stringify(String(paneId))} — valid pane ids: ${valid || "(no panes open)"}`,
+  );
+}
+
+/** Ordered native Vibe session entries (newest first, matching the rail). */
+function orderedSessions(): VibeSessionEntry[] {
+  const v = useVibe.getState();
+  return v.order
+    .map((id) => v.sessions[id])
+    .filter((e): e is VibeSessionEntry => !!e);
+}
+
+/** The native-session snapshot section shared by fleet_snapshot + the summary. */
+export function fleetSessions() {
+  const v = useVibe.getState();
+  return sessionSnapshot({ sessions: orderedSessions(), busy: v.busy });
+}
+
+/**
+ * Real DOM measurement of one workspace's grid container. All grids stay
+ * mounted (inactive ones are `visibility:hidden`), and `clientWidth/Height`
+ * are LAYOUT boxes — unaffected by the fleet view's CSS scale transform — so
+ * this reports the true size a workspace renders at. Null for empty
+ * workspaces (no grid container) or a zero-size box.
+ */
+function gridDims(wsId: string): LayoutDims | null {
+  if (typeof document === "undefined") return null;
+  const el = document.querySelector(
+    `[data-ws-grid="${wsId}"]`,
+  ) as HTMLElement | null;
+  if (!el) return null;
+  const w = el.clientWidth;
+  const h = el.clientHeight;
+  return w > 0 && h > 0 ? { w, h } : null;
+}
+
+/** Measure every workspace's grid container (workspaceId → dims | null). */
+function gatherGridDims(order: string[]): Record<string, LayoutDims | null> {
+  const out: Record<string, LayoutDims | null> = {};
+  for (const id of order) out[id] = gridDims(id);
+  return out;
+}
+
+/**
+ * A prompt/read target is either an agent pane or a native Vibe session — the
+ * write/read tools accept either id (panes checked first, then sessions).
+ */
+type Target =
+  | { kind: "pane"; agent: Agent }
+  | { kind: "session"; entry: VibeSessionEntry };
+
+function resolveTarget(paneId: unknown): Target | null {
+  if (typeof paneId !== "string") return null;
+  const agent = useSwarm.getState().agents[paneId];
+  if (agent) return { kind: "pane", agent };
+  const entry = useVibe.getState().sessions[paneId];
+  if (entry) return { kind: "session", entry };
+  return null;
+}
+
+/** Resolve a pane_id to a pane or a session, or fail listing all valid ids. */
+function requireTarget(paneId: unknown): Target {
+  const target = resolveTarget(paneId);
+  if (target) return target;
+  const s = useSwarm.getState();
+  const panes = s.order
+    .map((id) => (s.agents[id] ? `${id} ("${s.agents[id].name}")` : null))
+    .filter(Boolean);
+  const sessions = orderedSessions().map(
+    (e) => `${e.session.id} ("${e.session.name}", native session)`,
+  );
+  const valid = [...panes, ...sessions].join(", ");
+  throw new Error(
+    `unknown pane_id ${JSON.stringify(String(paneId))} — valid ids: ${valid || "(no panes or sessions open)"}`,
   );
 }
 
@@ -178,10 +300,52 @@ async function deliverStartupPrompt(
   };
 }
 
+interface PendingPrompt {
+  id: string;
+  text: string;
+  /** native session prompt (vibe turn) vs. terminal-pane startup prompt */
+  native: boolean;
+}
+
+/**
+ * Create one native Vibe session (create_panes native:true). Worktree /
+ * runtime / profile do not apply (V1) — cwd, model, reasoning→effort, name and
+ * prompt do. Access defaults to workspace-write for orchestrator-created
+ * sessions (the human still decides approvals).
+ */
+async function createOneNativeSession(
+  spec: CreatePaneSpec,
+): Promise<{ result: CreatePaneResult; prompt?: PendingPrompt }> {
+  const cwd = typeof spec.cwd === "string" ? spec.cwd.trim() : "";
+  if (!cwd) throw new Error("cwd is required and must be a non-empty path");
+  const model = typeof spec.model === "string" ? spec.model.trim() : "";
+  if (model && !/^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(model))
+    throw new Error(`invalid model "${model}" — letters, digits and . _ : / - only`);
+  const effort = typeof spec.reasoning === "string" ? spec.reasoning : undefined;
+  if (effort && !["minimal", "low", "medium", "high", "xhigh"].includes(effort))
+    throw new Error(`invalid reasoning "${effort}"`);
+  const id = await startVibeSession({
+    name: typeof spec.name === "string" && spec.name.trim() ? spec.name.trim() : "Session",
+    projectDir: cwd,
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+    access: "workspace",
+  });
+  const name = useVibe.getState().sessions[id]?.session.name ?? spec.name ?? null;
+  return {
+    result: { id, name, cwd, native: true },
+    prompt:
+      typeof spec.prompt === "string" && spec.prompt.trim()
+        ? { id, text: spec.prompt, native: true }
+        : undefined,
+  };
+}
+
 async function createOnePane(
   spec: CreatePaneSpec,
   gitBin: string | undefined,
-): Promise<{ result: CreatePaneResult; prompt?: { id: string; text: string } }> {
+): Promise<{ result: CreatePaneResult; prompt?: PendingPrompt }> {
+  if (spec.native) return createOneNativeSession(spec);
   const cwd = typeof spec.cwd === "string" ? spec.cwd.trim() : "";
   if (!cwd) throw new Error("cwd is required and must be a non-empty path");
   const state = useSwarm.getState();
@@ -273,9 +437,57 @@ async function createOnePane(
     },
     prompt:
       typeof spec.prompt === "string" && spec.prompt.trim()
-        ? { id, text: spec.prompt }
+        ? { id, text: spec.prompt, native: false }
         : undefined,
   };
+}
+
+/** Grouping key for placement: the pane's project (cwd folder basename). */
+function projectBasename(cwd: unknown): string | null {
+  if (typeof cwd !== "string" || !cwd.trim()) return null;
+  const parts = cwd.trim().replace(/\/+$/, "").split("/");
+  return parts[parts.length - 1] || null;
+}
+
+/** Container aspect ratio (w/h), with a sensible fallback when unmeasured. */
+function aspectOf(dims: LayoutDims | null): number {
+  return dims && dims.h > 0 ? dims.w / dims.h : 1.6;
+}
+
+/** Honest, human-readable account of where the batch's panes landed. */
+function buildPlacementSummary(results: CreatePaneResult[]): string {
+  const byWs = new Map<string, { name: string; count: number }>();
+  let created = 0;
+  let failed = 0;
+  let native = 0;
+  for (const r of results) {
+    if (r.error) {
+      failed++;
+      continue;
+    }
+    if (r.native) {
+      native++;
+      continue;
+    }
+    if (r.id) {
+      created++;
+      const key = r.workspace_id ?? "?";
+      const e = byWs.get(key) ?? { name: r.workspace_name ?? "workspace", count: 0 };
+      e.count++;
+      byWs.set(key, e);
+    }
+  }
+  const segs = [...byWs.values()].map((e) => `${e.count} in «${e.name}»`);
+  let summary =
+    created > 0
+      ? `created ${created} pane${created === 1 ? "" : "s"}: ${segs.join("; ")}`
+      : "created 0 panes";
+  if (byWs.size > 1)
+    summary += " — overflowed into a new workspace to keep panes readable";
+  if (native)
+    summary += `; ${native} native session${native === 1 ? "" : "s"}`;
+  if (failed) summary += `; ${failed} failed`;
+  return summary;
 }
 
 export const executors: Record<OrchestratorToolName, ToolExecutor> = {
@@ -283,11 +495,42 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
 
   fleet_snapshot: async () => {
     const s = useSwarm.getState();
-    return { summary: fleetSummaryLine(s), workspaces: fleetSnapshot(s) };
+    const sessions = fleetSessions();
+    const dims = gatherGridDims(s.workspaceOrder);
+    const workspaces = fleetSnapshot(s, dims);
+    const crowd = crowdingNote(workspaces);
+    const base = fleetSummaryLine(s, sessions);
+    return {
+      summary: crowd ? `${base} · ${crowd}` : base,
+      ui_mode: s.settings.uiMode ?? "grid",
+      workspaces,
+      sessions,
+    };
   },
 
   read_transcript: async (args) => {
-    const agent = requireAgent(args.pane_id);
+    const target = requireTarget(args.pane_id);
+    // native session: render its structured items compactly (pure fn)
+    if (target.kind === "session") {
+      const entry = target.entry;
+      const items = entry.order
+        .map((id) => entry.items[id])
+        .filter((i): i is NonNullable<typeof i> => !!i);
+      const tail =
+        typeof args.tail_messages === "number" ? args.tail_messages : undefined;
+      return {
+        session: {
+          id: entry.session.id,
+          name: entry.session.name,
+          cwd: entry.session.projectDir,
+          model: entry.session.model ?? null,
+          access: entry.session.access,
+        },
+        native: true,
+        transcript: renderSessionTranscript(items, { tail }),
+      };
+    }
+    const agent = target.agent;
     const runtime = agent.runtime ?? "claude";
     if (runtime === "shell")
       throw new Error("no transcript: shell pane (plain terminal, no agent session)");
@@ -320,13 +563,21 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
       throw new Error('exactly one of "pane_id" or "path" is required');
     let root: string;
     if (hasPane) {
-      const agent = requireAgent(args.pane_id);
-      const paneRoot = agent.worktree?.root ?? agent.cwd;
-      if (!paneRoot)
+      // resolve panes first, then native Vibe sessions (their projectDir) —
+      // same id semantics as prompt_pane / read_transcript
+      const target = requireTarget(args.pane_id);
+      const targetRoot =
+        target.kind === "pane"
+          ? target.agent.worktree?.root ?? target.agent.cwd
+          : target.entry.session.projectDir;
+      if (!targetRoot) {
+        const label =
+          target.kind === "pane" ? `pane "${target.agent.name}"` : `session "${target.entry.session.name}"`;
         throw new Error(
-          `pane "${agent.name}" has no working directory (home) — pass "path" instead`,
+          `${label} has no working directory (home) — pass "path" instead`,
         );
-      root = paneRoot;
+      }
+      root = targetRoot;
     } else {
       root = (args.path as string).trim();
     }
@@ -441,13 +692,31 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
   // ---- write tools ----
 
   prompt_pane: async (args, ctx) => {
-    const agent = requireAgent(args.pane_id);
+    const target = requireTarget(args.pane_id);
+    const text = String(args.text ?? "");
+    if (!text) throw new Error("text must not be empty");
+
+    // native Vibe session: submit one turn (busy sessions REFUSE — unlike
+    // panes, which queue — because the backend rejects a second turn too)
+    if (target.kind === "session") {
+      const entry = target.entry;
+      const id = entry.session.id;
+      const name = entry.session.name;
+      assertSessionPromptAllowed(id, name);
+      await vibeSendMessage(id, text);
+      notePromptDelivered(id, name, ctx);
+      return {
+        delivered: true,
+        session: { id, name },
+        submitted: true,
+      };
+    }
+
+    const agent = target.agent;
     if (agent.status === "exited")
       throw new Error(
         `pane "${agent.name}" (${agent.id}) has exited — cannot deliver text`,
       );
-    const text = String(args.text ?? "");
-    if (!text) throw new Error("text must not be empty");
     assertPromptAllowed(agent);
     // review mode (orchestratorAutoSubmit off) overrides the model's submit
     const reviewMode = reviewModeActive();
@@ -472,61 +741,222 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
   },
 
   create_panes: async (args, ctx) => {
-    const s0 = useSwarm.getState();
-    const wsId =
-      typeof args.workspace_id === "string" && args.workspace_id
-        ? args.workspace_id
-        : s0.activeWorkspaceId;
-    if (!s0.workspaces[wsId]) {
-      const valid = s0.workspaceOrder
-        .map((id) => `${id} ("${s0.workspaces[id]?.name}")`)
-        .join(", ");
-      throw new Error(`unknown workspace_id "${wsId}" — valid workspaces: ${valid}`);
-    }
     const specs = args.panes as CreatePaneSpec[];
     if (!Array.isArray(specs) || specs.length < 1 || specs.length > 8)
       throw new Error("panes must contain 1–8 entries");
-    // createAgent inserts into the ACTIVE workspace — activate the target
-    // first (a visible side effect, and the pane becomes visible immediately,
-    // consistent with every other create path)
-    if (wsId !== s0.activeWorkspaceId) s0.setActiveWorkspace(wsId);
-    const gitBin = s0.settings.gitPath?.trim() || undefined;
+    const arrangement =
+      typeof args.arrangement === "string" ? args.arrangement : "auto";
+    if (!["auto", "rows", "columns", "grid"].includes(arrangement))
+      throw new Error(
+        `invalid arrangement "${arrangement}" — one of auto, rows, columns, grid`,
+      );
+    const gitBin =
+      useSwarm.getState().settings.gitPath?.trim() || undefined;
 
-    // sequential on purpose: parallel `git worktree add` against the same
-    // repo can race on git's lock files
-    const results: CreatePaneResult[] = [];
-    const prompts: { index: number; id: string; text: string }[] = [];
-    for (const spec of specs) {
+    const results: (CreatePaneResult | undefined)[] = new Array(specs.length);
+    const prompts: (PendingPrompt & { index: number })[] = [];
+    const errResult = (i: number, e: unknown): CreatePaneResult => ({
+      error: e instanceof Error ? e.message : String(e),
+      cwd: typeof specs[i]?.cwd === "string" ? specs[i].cwd : null,
+      name: typeof specs[i]?.name === "string" ? specs[i].name : null,
+    });
+
+    // Native sessions (native:true) are layout-agnostic — created up front,
+    // ignoring workspace/arrangement/beside (documented in the schema).
+    const nativeIdx: number[] = [];
+    const termIdx: number[] = [];
+    specs.forEach((sp, i) => (sp.native ? nativeIdx : termIdx).push(i));
+    for (const i of nativeIdx) {
       try {
-        const { result, prompt } = await createOnePane(spec, gitBin);
-        results.push(result);
-        if (prompt) prompts.push({ index: results.length - 1, ...prompt });
+        const { result, prompt } = await createOneNativeSession(specs[i]);
+        results[i] = result;
+        if (prompt) prompts.push({ index: i, ...prompt });
       } catch (e) {
-        results.push({
-          error: e instanceof Error ? e.message : String(e),
-          cwd: typeof spec?.cwd === "string" ? spec.cwd : null,
-          name: typeof spec?.name === "string" ? spec.name : null,
-        });
+        results[i] = errResult(i, e);
       }
     }
-    // startup prompts in parallel once all panes exist (each waits for its
-    // own CLI — see deliverStartupPrompt for the readiness heuristic)
+
+    // ---- terminal panes: plan placement (capacity, overflow, grouping, beside)
+    const s = useSwarm.getState();
+    const dims = gatherGridDims(s.workspaceOrder);
+    const activeDims =
+      dims[s.activeWorkspaceId] ??
+      s.workspaceOrder.map((id) => dims[id]).find((d): d is LayoutDims => !!d) ??
+      null;
+
+    // beside targets validated up front — an unknown target fails only its pane
+    const planEntries: { origIndex: number; spec: PlanSpec }[] = [];
+    for (const i of termIdx) {
+      const b = specs[i].beside;
+      const project = projectBasename(specs[i].cwd);
+      if (b && typeof b.pane_id === "string") {
+        if (!s.agents[b.pane_id]) {
+          results[i] = errResult(
+            i,
+            new Error(`beside: unknown pane_id ${JSON.stringify(b.pane_id)}`),
+          );
+          continue;
+        }
+        planEntries.push({
+          origIndex: i,
+          spec: {
+            project,
+            beside: {
+              paneId: b.pane_id,
+              direction: b.direction === "below" ? "below" : "right",
+            },
+          },
+        });
+      } else {
+        planEntries.push({ origIndex: i, spec: { project } });
+      }
+    }
+
+    let primaryWsId: string | null = null;
+    if (planEntries.length) {
+      const workspaces: WsMeta[] = s.workspaceOrder.map((id) => ({
+        id,
+        name: s.workspaces[id]?.name ?? "",
+        panes: collectPanes(s.layouts[id] ?? null).length,
+        dims: dims[id] ?? null,
+      }));
+      const plan = planPlacement({
+        workspace: typeof args.workspace === "string" ? args.workspace : undefined,
+        workspaceId:
+          typeof args.workspace_id === "string" ? args.workspace_id : undefined,
+        arrangement: arrangement as Arrangement,
+        activeWorkspaceId: s.activeWorkspaceId,
+        workspaces,
+        newWorkspaceDims: activeDims,
+        specs: planEntries.map((e) => e.spec),
+        min: MIN_PANE,
+      });
+      if (plan.error) throw new Error(plan.error);
+
+      // A. auto buckets — create the panes, then apply a BALANCED equal-size
+      // layout (fixes the "each new pane smaller than the last" cascade).
+      // Sequential on purpose: parallel `git worktree add` races on git locks.
+      for (let bi = 0; bi < plan.buckets.length; bi++) {
+        const bucket = plan.buckets[bi];
+        const wsId =
+          bucket.ref.kind === "existing"
+            ? bucket.ref.id
+            : useSwarm.getState().createWorkspace({ name: bucket.ref.name });
+        if (bi === 0) primaryWsId = wsId;
+        if (useSwarm.getState().activeWorkspaceId !== wsId)
+          useSwarm.getState().setActiveWorkspace(wsId);
+        const wsName = useSwarm.getState().workspaces[wsId]?.name ?? "";
+        const originalLayout = useSwarm.getState().layouts[wsId] ?? null;
+        const createdIds: string[] = [];
+        for (const planIdx of bucket.indices) {
+          const i = planEntries[planIdx].origIndex;
+          try {
+            const { result, prompt } = await createOnePane(specs[i], gitBin);
+            result.workspace_id = wsId;
+            result.workspace_name = wsName;
+            results[i] = result;
+            if (result.id) createdIds.push(result.id);
+            if (prompt) prompts.push({ index: i, ...prompt });
+          } catch (e) {
+            results[i] = errResult(i, e);
+          }
+        }
+        const aspect = aspectOf(dims[wsId] ?? activeDims);
+        const added = buildArrangement(createdIds, bucket.arrangement, aspect);
+        if (added && createdIds.length) {
+          const finalLayout = originalLayout
+            ? combineLayouts(originalLayout, added, aspect)
+            : added;
+          useSwarm.getState().setWorkspaceLayout(wsId, finalLayout, createdIds[0]);
+        }
+      }
+
+      // B. beside panes — create, then graft next to the target pane.
+      for (const bp of plan.beside) {
+        const i = planEntries[bp.index].origIndex;
+        const targetAgent = useSwarm.getState().agents[bp.targetPaneId];
+        if (!targetAgent) {
+          results[i] = errResult(
+            i,
+            new Error(`beside: target pane ${bp.targetPaneId} is gone`),
+          );
+          continue;
+        }
+        const wsId = targetAgent.workspaceId;
+        primaryWsId ??= wsId;
+        if (useSwarm.getState().activeWorkspaceId !== wsId)
+          useSwarm.getState().setActiveWorkspace(wsId);
+        try {
+          const { result, prompt } = await createOnePane(specs[i], gitBin);
+          result.workspace_id = wsId;
+          result.workspace_name =
+            useSwarm.getState().workspaces[wsId]?.name ?? "";
+          results[i] = result;
+          if (result.id) {
+            const cur = useSwarm.getState().layouts[wsId] ?? null;
+            const base = removePaneByAgent(cur, result.id);
+            const targetPane = base ? findPaneByAgent(base, bp.targetPaneId) : null;
+            if (base && targetPane) {
+              const grafted = splitPane(
+                base,
+                targetPane.id,
+                result.id,
+                bp.direction === "below" ? "column" : "row",
+              );
+              useSwarm.getState().setWorkspaceLayout(wsId, grafted, result.id);
+            }
+          }
+          if (prompt) prompts.push({ index: i, ...prompt });
+        } catch (e) {
+          results[i] = errResult(i, e);
+        }
+      }
+    }
+
+    // land the user back on the primary target
+    primaryWsId ??= useSwarm.getState().activeWorkspaceId;
+    if (useSwarm.getState().activeWorkspaceId !== primaryWsId)
+      useSwarm.getState().setActiveWorkspace(primaryWsId);
+
+    // startup prompts in parallel once all panes/sessions exist. Native
+    // sessions submit a turn straight away (the thread is live once started);
+    // terminal panes wait for their CLI to boot (deliverStartupPrompt).
     await Promise.all(
-      prompts.map(async ({ index, id, text }) => {
+      prompts.map(async ({ index, id, text, native }) => {
+        if (native) {
+          await vibeSendMessage(id, text);
+          notePromptDelivered(
+            id,
+            useVibe.getState().sessions[id]?.session.name ??
+              results[index]?.name ??
+              id,
+            ctx,
+          );
+          return;
+        }
         const { delivered, note } = await deliverStartupPrompt(id, text);
-        if (note) results[index].warning = note;
+        const r = results[index];
+        if (note && r) r.warning = note;
         // delivered startup prompts count as orchestrator prompts too
         // (submitted or not): guard window + touched-pane tracking for the
         // activity pings
         if (delivered)
           notePromptDelivered(
             id,
-            useSwarm.getState().agents[id]?.name ?? results[index].name ?? id,
+            useSwarm.getState().agents[id]?.name ?? results[index]?.name ?? id,
             ctx,
           );
       }),
     );
-    const out: CreatePanesResult = { workspace_id: wsId, panes: results };
+
+    const finalResults: CreatePaneResult[] = results.map(
+      (r) => r ?? { error: "not created" },
+    );
+    const out: CreatePanesResult = {
+      workspace_id: primaryWsId,
+      panes: finalResults,
+      summary: buildPlacementSummary(finalResults),
+    };
     return out;
   },
 
@@ -541,5 +971,16 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     });
     const ws = useSwarm.getState().workspaces[id];
     return { id, name: ws?.name ?? "" };
+  },
+
+  // ---- memory tool ----
+
+  remember: async (args) => {
+    const text = typeof args.text === "string" ? args.text.trim() : "";
+    if (!text) throw new Error("nothing to remember: text must not be empty");
+    // Rust enforces the caps + FIFO and returns an honest note (e.g. dropped
+    // the oldest entry). The remember chip shows in the chat via tool_call/done.
+    const res = await appendMemory(text);
+    return { remembered: text, ...res };
   },
 };
