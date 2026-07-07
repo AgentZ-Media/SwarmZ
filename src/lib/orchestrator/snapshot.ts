@@ -114,15 +114,32 @@ export function fleetSnapshot(state: SwarmState): FleetWorkspace[] {
     });
 }
 
-/** e.g. "8 panes · 3 busy · 1 waiting · 2 workspaces" */
-export function fleetSummaryLine(state: SwarmState): string {
+/** Shared fleet counting rules — single source for the orchestrator's
+ * summary line AND the fleet overview's header (WorkspaceLayer.tsx). */
+export interface FleetCounts {
+  panes: number;
+  busy: number;
+  /** needs-you: waiting activity or bell attention */
+  waiting: number;
+  workspaces: number;
+}
+
+export function fleetCounts(state: SwarmState): FleetCounts {
   const workspaces = fleetSnapshot(state);
   const panes = workspaces.flatMap((w) => w.panes);
-  const busy = panes.filter((p) => p.activity === "busy").length;
-  const waiting = panes.filter(
-    (p) => p.activity === "waiting" || p.attention,
-  ).length;
+  return {
+    panes: panes.length,
+    busy: panes.filter((p) => p.activity === "busy").length,
+    waiting: panes.filter((p) => p.activity === "waiting" || p.attention)
+      .length,
+    workspaces: workspaces.length,
+  };
+}
+
+/** e.g. "8 panes · 3 busy · 1 waiting · 2 workspaces" */
+export function fleetSummaryLine(state: SwarmState): string {
+  const c = fleetCounts(state);
   const n = (count: number, word: string) =>
     `${count} ${word}${count === 1 ? "" : "s"}`;
-  return `${n(panes.length, "pane")} · ${busy} busy · ${waiting} waiting · ${n(workspaces.length, "workspace")}`;
+  return `${n(c.panes, "pane")} · ${c.busy} busy · ${c.waiting} waiting · ${n(c.workspaces, "workspace")}`;
 }

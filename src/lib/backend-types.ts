@@ -1,5 +1,6 @@
 import type {
   AppSettings,
+  CodexAccountLimits,
   CustomCommandsData,
   DetectedCommand,
   FolderCommands,
@@ -123,4 +124,10 @@ export interface Backend {
    * fetch errors reject so callers can keep showing the last known values.
    */
   fetchSubscriptionLimits(): Promise<SubscriptionLimits | null>;
+
+  /**
+   * Account-level Codex rate limits from the newest `rate_limits` session
+   * event on disk. `limits: null` = no data ever (the Deck shows `CX —`).
+   */
+  fetchCodexAccountLimits(): Promise<CodexAccountLimits>;
 }

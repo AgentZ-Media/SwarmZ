@@ -11,6 +11,7 @@ import {
 import { LazyStore } from "@tauri-apps/plugin-store";
 import type {
   AppSettings,
+  CodexAccountLimits,
   CustomCommandsData,
   DetectedCommand,
   FolderCommands,
@@ -217,4 +218,7 @@ export const tauriBackend: Backend = {
 
   fetchSubscriptionLimits: () =>
     invoke<SubscriptionLimits | null>("subscription_limits"),
+
+  fetchCodexAccountLimits: () =>
+    invoke<CodexAccountLimits>("codex_account_limits"),
 };

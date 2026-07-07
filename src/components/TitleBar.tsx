@@ -3,7 +3,6 @@ import {
   BarChart3,
   Bot,
   Download,
-  Gauge,
   LayoutGrid,
   Plus,
   Settings,
@@ -15,13 +14,11 @@ import { useShallow } from "zustand/react/shallow";
 import { useSwarm } from "@/store";
 import { useOrchestrator } from "@/lib/orchestrator/chat-store";
 import { useUpdates } from "@/lib/updates";
-import { useLimits } from "@/lib/limits";
 import { WorktreesButton } from "./WorktreePanel";
 import { Button } from "./ui/button";
 import { Tip } from "./ui/tooltip";
 import { cn } from "@/lib/utils";
 import { IS_TAURI } from "@/lib/transport";
-import type { CodexRateLimits, RateLimitWindow } from "@/types";
 
 export function TitleBar({
   onManageProfiles,
@@ -63,7 +60,7 @@ export function TitleBar({
       <div className="ml-auto flex shrink-0 items-center gap-2">
         {IS_TAURI && <UpdatePill />}
 
-        <LimitsPill />
+        {/* subscription meters live in the Deck now (components/Deck.tsx) */}
 
         <Tip label="Fleet overview — every workspace live (⌘E)">
           <Button
@@ -172,7 +169,7 @@ function WorkspaceTabs() {
       ))}
       <Tip label="New workspace (⌘⇧N)">
         <button
-          className="no-drag flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
+          className="no-drag focus-ring flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
           onClick={() => createWorkspace()}
         >
           <Plus size={14} />
@@ -188,15 +185,15 @@ function useWorkspaceStats(id: string) {
     useShallow((s) => {
       let total = 0;
       let busy = 0;
-      let attention = false;
+      let attn = 0;
       for (const aid of s.order) {
         const a = s.agents[aid];
         if (!a || a.workspaceId !== id) continue;
         total++;
         if (a.activity === "busy") busy++;
-        if (a.attention || a.activity === "waiting") attention = true;
+        if (a.attention || a.activity === "waiting") attn++;
       }
-      return { total, busy, attention };
+      return { total, busy, attn };
     }),
   );
 }
@@ -223,7 +220,7 @@ function WorkspaceTab({
   const draggedRef = useRef(false);
 
   // keep the active tab in view when switching via keyboard
-  const tabRef = useRef<HTMLButtonElement>(null);
+  const tabRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (active)
       tabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -231,8 +228,9 @@ function WorkspaceTab({
 
   const startReorder = (e: React.MouseEvent) => {
     if (e.button !== 0 || editing) return;
-    if ((e.target as HTMLElement).closest("button:not([data-ws-tab]), input"))
-      return;
+    // dragging starts from the tab body; the close button and the rename
+    // input opt out (the main tab button deliberately does NOT)
+    if ((e.target as HTMLElement).closest("[data-tab-close], input")) return;
     const strip = stripRef.current;
     if (!strip) return;
     const startX = e.clientX;
@@ -269,212 +267,107 @@ function WorkspaceTab({
     window.addEventListener("mouseup", onUp);
   };
 
+  // busy is quiet — a static muted dot; needs-you is the ⚑n badge. Alive but
+  // idle is deliberately NEUTRAL (faint), not green: green is reserved for
+  // "just finished" / success states (DESIGN.md), and a permanent green tab
+  // dot next to a green "✓ finished" word read as the same signal.
+  const dotColor =
+    stats.busy > 0
+      ? "var(--muted-foreground)"
+      : stats.total > 0
+        ? "var(--faint)"
+        : "color-mix(in srgb, var(--faint) 40%, transparent)";
+
+  // The tab is a DIV with two real button siblings (activate + close) — a
+  // close X nested inside the tab <button> was unreachable by keyboard and
+  // invalid ARIA. `data-tauri-drag-region="false"` keeps the plain div from
+  // becoming a window-drag surface under the header's "deep" region.
   return (
-    <button
+    <div
       ref={tabRef}
       data-ws-tab={id}
+      data-tauri-drag-region="false"
       onMouseDown={startReorder}
-      onClick={() => {
-        if (!draggedRef.current) setActiveWorkspace(id);
-      }}
-      onDoubleClick={(e) => {
-        if ((e.target as HTMLElement).closest("input")) return;
-        setEditing(true);
-      }}
       onAuxClick={(e) => {
         // middle-click closes, like browser tabs
         if (e.button === 1) requestCloseWorkspace(id);
       }}
-      title={index <= 8 ? `${name} — ⌘${index + 1}` : name}
       className={cn(
-        "no-drag group/tab flex h-7 max-w-44 shrink-0 items-center gap-1.5 rounded-md border px-2 transition-colors",
+        "no-drag group/tab flex h-7 max-w-44 shrink-0 items-center rounded-md border pr-1 transition-colors",
         active
           ? "border-border bg-card text-foreground"
           : "border-transparent text-muted-foreground hover:bg-accent hover:text-foreground",
         isDropTarget && "border-ring bg-ring/10 text-foreground",
-        stats.attention && !active && "attn-pulse",
       )}
     >
-      <span className="relative flex h-1.5 w-1.5 shrink-0">
-        {stats.busy > 0 && (
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60" />
-        )}
-        <span
-          className="relative inline-flex h-1.5 w-1.5 rounded-full"
-          style={{
-            backgroundColor: stats.attention
-              ? "var(--ring)"
-              : stats.busy > 0
-                ? "var(--warning)"
-                : stats.total > 0
-                  ? "var(--success)"
-                  : "var(--faint)",
-          }}
-        />
-      </span>
-
       {editing ? (
-        <input
-          autoFocus
-          defaultValue={name}
-          onFocus={(e) => e.target.select()}
-          onBlur={(e) => {
-            renameWorkspace(id, e.target.value);
-            setEditing(false);
-          }}
-          onKeyDown={(e) => {
-            e.stopPropagation();
-            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-            if (e.key === "Escape") setEditing(false);
-          }}
-          onMouseDown={(e) => e.stopPropagation()}
-          className="h-5 w-24 rounded bg-secondary px-1 text-xs text-foreground outline-none select-text"
-        />
-      ) : (
-        <span className="min-w-0 truncate text-xs font-medium">{name}</span>
-      )}
-
-      {stats.total > 0 && (
-        <span className="font-mono text-[10px] tabular-nums text-faint">
-          {stats.busy > 0 ? `${stats.busy}/${stats.total}` : stats.total}
+        <span className="flex h-full items-center gap-1.5 pl-2">
+          <span
+            className="h-1.5 w-1.5 shrink-0 rounded-full"
+            style={{ backgroundColor: dotColor }}
+          />
+          <input
+            autoFocus
+            defaultValue={name}
+            onFocus={(e) => e.target.select()}
+            onBlur={(e) => {
+              renameWorkspace(id, e.target.value);
+              setEditing(false);
+            }}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+              if (e.key === "Escape") setEditing(false);
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+            className="h-5 w-24 rounded bg-secondary px-1 text-xs text-foreground outline-none select-text"
+          />
         </span>
+      ) : (
+        <button
+          onClick={() => {
+            if (!draggedRef.current) setActiveWorkspace(id);
+          }}
+          onDoubleClick={() => setEditing(true)}
+          title={index <= 8 ? `${name} — ⌘${index + 1}` : name}
+          className="focus-ring flex h-full min-w-0 items-center gap-1.5 rounded-md pl-2 pr-0.5"
+        >
+          <span
+            className="h-1.5 w-1.5 shrink-0 rounded-full"
+            style={{ backgroundColor: dotColor }}
+          />
+          <span className="min-w-0 truncate text-xs font-medium">{name}</span>
+          {stats.total > 0 && (
+            <span className="font-mono text-[10px] tabular-nums text-faint">
+              {stats.busy > 0 ? `${stats.busy}/${stats.total}` : stats.total}
+            </span>
+          )}
+          {stats.attn > 0 && (
+            <span
+              className="font-mono text-[10px] font-semibold tabular-nums text-attn"
+              title={`${stats.attn} agent${stats.attn > 1 ? "s" : ""} need${stats.attn > 1 ? "" : "s"} your input`}
+            >
+              ⚑{stats.attn}
+            </span>
+          )}
+        </button>
       )}
 
-      <span
-        role="button"
-        tabIndex={-1}
+      <button
+        data-tab-close
+        tabIndex={active ? 0 : -1}
         onClick={(e) => {
           e.stopPropagation();
           requestCloseWorkspace(id);
         }}
         onMouseDown={(e) => e.stopPropagation()}
-        className="-mr-0.5 hidden h-4 w-4 shrink-0 items-center justify-center rounded text-faint hover:bg-destructive/15 hover:text-destructive group-hover/tab:flex"
+        title="Close workspace"
+        className="focus-ring pointer-events-none flex h-4 w-4 shrink-0 items-center justify-center rounded text-faint opacity-0 hover:bg-destructive/15 hover:text-destructive focus-visible:opacity-100 group-hover/tab:pointer-events-auto group-hover/tab:opacity-100"
       >
         <X size={10} />
-      </span>
-    </button>
-  );
-}
-
-function limitColor(pct: number) {
-  return pct >= 85
-    ? "var(--destructive)"
-    : pct >= 65
-      ? "var(--warning)"
-      : "var(--success)";
-}
-
-function formatReset(iso: string | null) {
-  if (!iso) return null;
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return null;
-  const time = d.toLocaleTimeString(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-  const withinDay = d.getTime() - Date.now() < 24 * 60 * 60 * 1000;
-  if (withinDay) return time;
-  const day = d.toLocaleDateString(undefined, { weekday: "short" });
-  return `${day} ${time}`;
-}
-
-function LimitMeter({
-  label,
-  tip,
-  win,
-}: {
-  label: string;
-  tip: string;
-  win: RateLimitWindow;
-}) {
-  const pct = Math.min(Math.max(win.utilization ?? 0, 0), 100);
-  const reset = formatReset(win.resets_at);
-  return (
-    <Tip
-      label={
-        <span className="font-mono text-[11px]">
-          {tip}: {Math.round(pct)}% used
-          {reset ? ` · resets ${reset}` : ""}
-        </span>
-      }
-    >
-      <span className="flex items-center gap-1.5">
-        <span className="text-[10px] font-medium uppercase tracking-wider text-faint">
-          {label}
-        </span>
-        <span className="h-1 w-10 overflow-hidden rounded-full bg-secondary">
-          <span
-            className="block h-full rounded-full"
-            style={{ width: `${pct}%`, backgroundColor: limitColor(pct) }}
-          />
-        </span>
-        <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
-          {Math.round(pct)}%
-        </span>
-      </span>
-    </Tip>
-  );
-}
-
-/** Usage limits from Claude credentials plus active Codex session events. */
-function LimitsPill() {
-  const limits = useLimits((s) => s.limits);
-  const codexLimits = useSwarm((s) => latestCodexLimits(s.order, s.agents));
-  if (!limits && !codexLimits) return null;
-
-  const meters: { label: string; tip: string; win: RateLimitWindow }[] = [];
-  if (limits?.five_hour)
-    meters.push({ label: "cl 5h", tip: "Claude 5-hour session limit", win: limits.five_hour });
-  if (limits?.seven_day)
-    meters.push({ label: "cl wk", tip: "Claude weekly limit", win: limits.seven_day });
-  if (limits?.seven_day_sonnet?.utilization)
-    meters.push({
-      label: "son",
-      tip: "Claude weekly Sonnet limit",
-      win: limits.seven_day_sonnet,
-    });
-  if (limits?.seven_day_opus?.utilization)
-    meters.push({
-      label: "opus",
-      tip: "Claude weekly Opus limit",
-      win: limits.seven_day_opus,
-    });
-  if (codexLimits?.primary)
-    meters.push({
-      label: "cx 5h",
-      tip: `Codex ${codexLimits.plan_type ?? "plan"} primary limit`,
-      win: codexLimits.primary,
-    });
-  if (codexLimits?.secondary)
-    meters.push({
-      label: "cx wk",
-      tip: `Codex ${codexLimits.plan_type ?? "plan"} weekly limit`,
-      win: codexLimits.secondary,
-    });
-  if (meters.length === 0) return null;
-
-  return (
-    <div className="flex h-7 items-center gap-3 rounded-md border border-border bg-card px-3">
-      <Gauge size={12} className="shrink-0 text-faint" />
-      {meters.map((m, i) => (
-        <span key={m.label} className="flex items-center gap-3">
-          {i > 0 && <span className="h-3.5 w-px bg-border" />}
-          <LimitMeter label={m.label} tip={m.tip} win={m.win} />
-        </span>
-      ))}
+      </button>
     </div>
   );
-}
-
-function latestCodexLimits(
-  order: string[],
-  agents: ReturnType<typeof useSwarm.getState>["agents"],
-): CodexRateLimits | null {
-  for (const id of [...order].reverse()) {
-    const limits = agents[id]?.usage?.codex_limits;
-    if (limits?.primary || limits?.secondary) return limits;
-  }
-  return null;
 }
 
 /** Shows only when an update is live: available → downloading → ready. */
@@ -500,7 +393,7 @@ function UpdatePill() {
 
   return (
     <button
-      className="no-drag flex h-7 items-center gap-1.5 rounded-md border border-ring/50 bg-ring/10 px-2.5 text-[11px] font-medium text-foreground hover:bg-ring/20 disabled:opacity-70"
+      className="no-drag focus-ring flex h-7 items-center gap-1.5 rounded-md border border-ring/50 bg-ring/10 px-2.5 text-[11px] font-medium text-foreground hover:bg-ring/20 disabled:opacity-70"
       disabled={stage === "downloading"}
       onClick={() => (stage === "ready" ? restart() : downloadAndInstall())}
       title={

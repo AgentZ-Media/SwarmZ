@@ -420,7 +420,7 @@ function sanitizeMessage(raw: unknown): OrchestratorChatMessage | null {
     case "warning":
       return { id, at, role: m.role, text };
     case "system": {
-      // status pings carry the pinged pane (jump chip + "Auswerten")
+      // status pings carry the pinged pane (jump chip + "Review")
       const paneRefs = sanitizePaneRefs(m.paneRefs);
       return {
         id,
@@ -606,4 +606,17 @@ export async function hydrateOrchestratorChats(): Promise<void> {
       typeof data.panelWidth === "number" ? data.panelWidth : state.panelWidth,
     ),
   });
+  // Fresh start per launch: yesterday's chat context must not silently absorb
+  // today's first order — activate a new chat (createChat reuses a leftover
+  // empty one, so restarts never stack empties; old chats stay in the
+  // switcher). Skipped when a chat was already opened before hydrate resolved.
+  // Deferred import: controller statically imports this module.
+  if (!state.chats.length) {
+    try {
+      const { createChat } = await import("./controller");
+      createChat();
+    } catch {
+      /* non-fatal — the restored active chat stays selected */
+    }
+  }
 }

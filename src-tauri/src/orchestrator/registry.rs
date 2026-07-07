@@ -99,7 +99,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "list_blueprints",
-            description: "Reusable launch blueprints: agent profiles (id, name, runtime, startup command, default folder) and workspace presets (id, name, pane templates). Use profile ids / preset shapes when creating panes.",
+            description: "Reusable launch blueprints: agent profiles (id, name, runtime, startup command, default folder), workspace presets (id, name, pane templates), plus per-runtime info: the default startup command and recently used model ids (from real usage on this machine — directly usable as create_panes model). Use profile ids / preset shapes / model ids when creating panes.",
             parameters: empty_params(),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
@@ -119,7 +119,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "create_panes",
-            description: "Create 1–8 new agent panes in a workspace. Each pane gets a working directory, optionally a runtime or profile, a name, an initial prompt (delivered once the agent CLI is ready), and optionally a fresh git worktree (own branch + folder under <repo>/.worktrees/). A worktree request on a non-repo folder FAILS for that pane — it is never silently downgraded to a plain pane. Per-pane errors do not abort the batch.",
+            description: "Create 1–8 new agent panes in a workspace. Each pane gets a working directory, optionally a runtime or profile, a model override (omit = the user's default configuration), a name, an initial prompt (delivered once the agent CLI is ready), and optionally a fresh git worktree (own branch + folder under <repo>/.worktrees/). A worktree request on a non-repo folder FAILS for that pane — it is never silently downgraded to a plain pane. Per-pane errors do not abort the batch.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -134,6 +134,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                                 "cwd": { "type": "string", "description": "absolute working directory for the pane" },
                                 "runtime": { "type": "string", "enum": ["claude", "codex", "shell"], "description": "agent CLI to launch (default: the app's default runtime)" },
                                 "profile_id": { "type": "string", "description": "launch profile id (from list_blueprints) — sets runtime + startup command" },
+                                "model": { "type": "string", "description": "model id for the agent CLI (claude: --model, codex: -m). Use ids from list_blueprints runtimes.*.recently_used_models when the user names a model; OMIT for the user's default configuration" },
+                                "reasoning": { "type": "string", "enum": ["minimal", "low", "medium", "high", "xhigh"], "description": "codex only: model_reasoning_effort — omit unless the user asks for it" },
                                 "name": { "type": "string", "description": "pane name (default: auto)" },
                                 "prompt": { "type": "string", "description": "initial prompt, submitted once the agent is ready" },
                                 "worktree": { "type": "boolean", "description": "create a fresh git worktree off the repo at cwd and run the pane inside it" },

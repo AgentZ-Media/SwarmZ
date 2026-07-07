@@ -151,7 +151,9 @@ export function SettingsDialog({
             {section === "presets" && <PresetsSection />}
             {section === "commands" && <CommandsSection />}
             {section === "voice" && <VoiceSection />}
-            {section === "orchestrator" && <OrchestratorSection />}
+            {section === "orchestrator" && (
+              <OrchestratorSection onShowVoice={() => setSection("voice")} />
+            )}
             {section === "updates" && <UpdatesSection />}
             {section === "paths" && <PathsSection />}
             {section === "about" && <AboutSection />}
@@ -1332,9 +1334,11 @@ function LocalModelRow() {
  * Phase-6 orchestrator knobs. The provider/model choice applies to NEW
  * chats only (a chat keeps its brain for life); auto-submit, busy policy
  * and scan roots take effect immediately — they are read live by the tool
- * executors.
+ * executors. The OpenRouter key row only SURFACES the shared key status —
+ * the key itself is managed once, in the Voice section (`onShowVoice`
+ * jumps there), so there is exactly one key field app-wide.
  */
-function OrchestratorSection() {
+function OrchestratorSection({ onShowVoice }: { onShowVoice: () => void }) {
   const settings = useSwarm((s) => s.settings);
   const updateSettings = useSwarm((s) => s.updateSettings);
   const keyStatus = useSwarm((s) => s.openrouterStatus);
@@ -1383,8 +1387,8 @@ function OrchestratorSection() {
               <>
                 {" "}
                 <span className="text-warning">
-                  No OpenRouter API key stored yet — add one in the Voice
-                  section, orchestrator chats can't start without it.
+                  No OpenRouter API key stored yet — see the key row below,
+                  orchestrator chats can't start without it.
                 </span>
               </>
             )}
@@ -1455,6 +1459,31 @@ function OrchestratorSection() {
           </>
         </StackedRow>
       )}
+
+      <Row
+        label="OpenRouter API key"
+        help={
+          <>
+            {!keyStatus?.present ? (
+              "No key stored."
+            ) : keyStatus.valid === true ? (
+              <span className="text-success">Key valid.</span>
+            ) : keyStatus.valid === false ? (
+              <span className="text-destructive">
+                Key stored, but OpenRouter rejected it.
+              </span>
+            ) : (
+              "Key stored — couldn't verify it right now."
+            )}{" "}
+            One key is shared app-wide (voice dictation + orchestrator) and
+            managed in the Voice section.
+          </>
+        }
+      >
+        <Button size="sm" variant="outline" onClick={onShowVoice}>
+          Manage in Voice
+        </Button>
+      </Row>
 
       <Row
         label="Auto-submit prompts"

@@ -160,6 +160,17 @@ async fn subscription_limits() -> Result<Option<limits::SubscriptionLimits>, Str
     limits::fetch_limits().await
 }
 
+/// Account-level Codex rate limits: the newest `rate_limits` event across all
+/// of `~/.codex/sessions` (bounded tail reads, newest file first — see
+/// `codex_usage::account_limits`). `limits: null` = no data ever seen.
+#[tauri::command]
+async fn codex_account_limits() -> codex_usage::CodexAccountLimits {
+    // file walk + tail reads — keep them off the async runtime's core threads
+    tauri::async_runtime::spawn_blocking(codex_usage::account_limits)
+        .await
+        .unwrap_or_default()
+}
+
 #[tauri::command]
 async fn openrouter_key_status() -> openrouter::KeyStatus {
     openrouter::key_status().await
@@ -570,6 +581,7 @@ pub fn run() {
             usage_for_session,
             usage_totals,
             subscription_limits,
+            codex_account_limits,
             path_is_file,
             git_info,
             worktree_add,

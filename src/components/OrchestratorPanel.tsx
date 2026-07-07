@@ -36,12 +36,7 @@ import { focusTerm } from "@/lib/term-host";
 import { Button } from "./ui/button";
 import { Tip } from "./ui/tooltip";
 import { OrchestratorMarkdown } from "./OrchestratorMarkdown";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "./ui/dropdown-menu";
+import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { cn } from "@/lib/utils";
 import type {
   OpenrouterKeyStatus,
@@ -150,13 +145,21 @@ function ResizeHandle() {
   );
 }
 
-/** Title + chat switcher (dropdown — chips don't fit 30 chats at 300 px). */
+/**
+ * Title + chat switcher (a popover list — chips don't fit 30 chats at
+ * 300 px). Deliberately a Popover of sibling BUTTONS rather than a Radix
+ * menu: each row pairs "switch to chat" with a delete action, and a nested
+ * role="button" inside a menuitem is unreachable by keyboard — as real
+ * siblings both are plain tab stops (delete reveals on row hover AND on
+ * keyboard focus).
+ */
 function PanelHeader() {
   const chats = useOrchestrator((s) => s.chats);
   const activeChatId = useOrchestrator((s) => s.activeChatId);
   const busy = useOrchestrator((s) => s.busy);
   const setActiveChat = useOrchestrator((s) => s.setActiveChat);
   const setPanelOpen = useOrchestrator((s) => s.setPanelOpen);
+  const [switcherOpen, setSwitcherOpen] = useState(false);
   const active = chats.find((c) => c.id === activeChatId);
 
   return (
@@ -165,9 +168,9 @@ function PanelHeader() {
         Orchestrator
       </h2>
       {chats.length > 0 && (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button className="flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
+        <Popover open={switcherOpen} onOpenChange={setSwitcherOpen}>
+          <PopoverTrigger asChild>
+            <button className="focus-ring flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
               <span className="min-w-0 truncate">
                 {active?.title ?? DEFAULT_CHAT_TITLE}
               </span>
@@ -178,43 +181,43 @@ function PanelHeader() {
               )}
               <ChevronDown size={11} className="shrink-0 text-faint" />
             </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="max-h-72 w-64 overflow-y-auto">
+          </PopoverTrigger>
+          <PopoverContent align="start" className="max-h-72 w-64 overflow-y-auto">
             {chats.map((c) => (
-              <DropdownMenuItem
+              <div
                 key={c.id}
-                onSelect={() => setActiveChat(c.id)}
-                className="group/chat text-xs"
+                className="group/chat flex items-center gap-1 rounded-md pr-1 hover:bg-accent"
               >
-                <span
-                  className={cn(
-                    "h-1.5 w-1.5 shrink-0 rounded-full",
-                    busy[c.id]
-                      ? "bg-warning"
-                      : c.id === activeChatId
-                        ? "bg-ring"
-                        : "bg-faint/50",
-                  )}
-                />
-                <span className="min-w-0 flex-1 truncate">{c.title}</span>
-                <span
-                  role="button"
-                  tabIndex={-1}
-                  onPointerDown={(e) => e.stopPropagation()}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    e.preventDefault();
-                    removeChat(c.id);
+                <button
+                  onClick={() => {
+                    setActiveChat(c.id);
+                    setSwitcherOpen(false);
                   }}
+                  className="focus-ring flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-xs text-foreground"
+                >
+                  <span
+                    className={cn(
+                      "h-1.5 w-1.5 shrink-0 rounded-full",
+                      busy[c.id]
+                        ? "bg-warning"
+                        : c.id === activeChatId
+                          ? "bg-ring"
+                          : "bg-faint/50",
+                    )}
+                  />
+                  <span className="min-w-0 flex-1 truncate">{c.title}</span>
+                </button>
+                <button
+                  onClick={() => removeChat(c.id)}
                   title="Delete chat"
-                  className="hidden h-4 w-4 shrink-0 items-center justify-center rounded text-faint hover:bg-destructive/15 hover:text-destructive group-hover/chat:flex"
+                  className="focus-ring flex h-4 w-4 shrink-0 items-center justify-center rounded text-faint opacity-0 hover:bg-destructive/15 hover:text-destructive focus-visible:opacity-100 group-hover/chat:opacity-100"
                 >
                   <X size={11} />
-                </span>
-              </DropdownMenuItem>
+                </button>
+              </div>
             ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
+          </PopoverContent>
+        </Popover>
       )}
       <div className="ml-auto flex shrink-0 items-center gap-0.5">
         <Tip label="New chat">
@@ -373,8 +376,8 @@ const MessageRow = memo(function MessageRow({
 });
 
 /**
- * Phase-5 status ping ("«api» ist fertig"): quiet system line + the pane's
- * jump chip + an "Auswerten" button that sends a normal (visible) user turn
+ * Phase-5 status ping ("«api» finished"): quiet system line + the pane's
+ * jump chip + a "Review" button that sends a normal (visible) user turn
  * asking for a transcript summary. Disabled while the chat is busy.
  */
 function SystemRow({
@@ -404,13 +407,13 @@ function SystemRow({
           onClick={() =>
             void sendMessage(
               chatId,
-              `Lies das Transkript-Ende von Pane «${pane.name}» (${pane.id}) und fasse kurz zusammen: Was wurde erledigt, gab es Probleme, was schlägst du als nächsten Schritt vor?`,
+              `Read the transcript tail of pane «${pane.name}» (${pane.id}) and summarize briefly: what got done, were there problems, and what do you suggest as the next step?`,
             )
           }
-          title={`Ergebnis von "${pane.name}" zusammenfassen lassen`}
-          className="flex shrink-0 items-center rounded border border-border bg-secondary/50 px-1.5 py-px font-mono text-[10px] text-muted-foreground transition-colors hover:border-ring/60 hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+          title={`Summarize what "${pane.name}" produced`}
+          className="focus-ring flex shrink-0 items-center rounded border border-border bg-secondary/50 px-1.5 py-px font-mono text-[10px] text-muted-foreground transition-colors hover:border-ring/60 hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
         >
-          Auswerten
+          Review
         </button>
       )}
     </div>
@@ -451,7 +454,7 @@ function PaneChip({ pane }: { pane: OrchestratorPaneRef }) {
         focusTerm(pane.id);
       }}
       title={`Jump to pane "${name}"`}
-      className="flex shrink-0 items-center rounded border border-border bg-secondary/50 px-1.5 py-px font-mono text-[10px] text-muted-foreground transition-colors hover:border-ring/60 hover:text-foreground"
+      className="focus-ring flex shrink-0 items-center rounded border border-border bg-secondary/50 px-1.5 py-px font-mono text-[10px] text-muted-foreground transition-colors hover:border-ring/60 hover:text-foreground"
     >
       → {name}
     </button>
@@ -497,9 +500,9 @@ function availabilityProblem(status: OrchestratorChatStatus | null): string | nu
 function openrouterProblem(status: OpenrouterKeyStatus | null): string | null {
   if (!status) return null;
   if (!status.present)
-    return "No OpenRouter API key stored — add one in Settings → Voice, then check again.";
+    return "No OpenRouter API key stored — see Settings → Orchestrator, then check again.";
   if (status.valid === false)
-    return "OpenRouter rejected the stored API key — replace it in Settings → Voice.";
+    return "OpenRouter rejected the stored API key — see Settings → Orchestrator.";
   return null;
 }
 
@@ -558,7 +561,7 @@ function InputArea({ chatId }: { chatId: string }) {
           <Tip label="Check again">
             <button
               onClick={recheck}
-              className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-faint hover:bg-accent hover:text-foreground"
+              className="focus-ring flex h-5 w-5 shrink-0 items-center justify-center rounded text-faint hover:bg-accent hover:text-foreground"
             >
               <RotateCw size={11} />
             </button>

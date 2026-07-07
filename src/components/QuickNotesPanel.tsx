@@ -143,7 +143,7 @@ export function QuickNotesPanel() {
             {doneCount > 0 && (
               <button
                 onClick={() => clearDoneNotes(scope)}
-                className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-faint transition-colors hover:bg-accent hover:text-foreground"
+                className="focus-ring flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-faint transition-colors hover:bg-accent hover:text-foreground"
                 title={`Remove ${doneCount} completed item${doneCount === 1 ? "" : "s"}`}
               >
                 <Trash2 size={11} /> Clear done
@@ -151,7 +151,7 @@ export function QuickNotesPanel() {
             )}
             <button
               onClick={() => setOpen(false)}
-              className="flex h-7 w-7 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
+              className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
             >
               <X size={16} />
             </button>
@@ -243,7 +243,7 @@ function ScopeChip({
       onClick={onClick}
       title={title}
       className={cn(
-        "flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+        "focus-ring flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
         active ? "bg-accent text-foreground" : "text-faint hover:text-foreground",
       )}
     >
@@ -296,7 +296,7 @@ function NoteRow({
         <button
           onClick={() => updateNote(scope, note.id, { done: !note.done })}
           className={cn(
-            "mt-px flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors",
+            "focus-ring mt-px flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors",
             note.done
               ? "border-transparent bg-success/80 text-background"
               : "border-border bg-secondary hover:border-ring/60",
@@ -334,19 +334,21 @@ function NoteRow({
         </span>
       )}
 
-      <span className="hidden shrink-0 items-center gap-0.5 group-hover/note:flex">
+      {/* opacity (not display:none) so the actions stay real tab stops —
+          they reveal on row hover AND on keyboard focus */}
+      <span className="flex shrink-0 items-center gap-0.5 opacity-0 focus-within:opacity-100 group-hover/note:opacity-100">
         <button
           onClick={() =>
             updateNote(scope, note.id, { plain: !note.plain, done: false })
           }
-          className="flex h-4 w-4 items-center justify-center rounded text-faint hover:bg-accent hover:text-foreground"
+          className="focus-ring flex h-4 w-4 items-center justify-center rounded text-faint hover:bg-accent hover:text-foreground"
           title={note.plain ? "Turn into checkbox item" : "Turn into plain text"}
         >
           {note.plain ? <Square size={10} /> : <Type size={10} />}
         </button>
         <button
           onClick={() => deleteNote(scope, note.id)}
-          className="flex h-4 w-4 items-center justify-center rounded text-faint hover:bg-destructive/15 hover:text-destructive"
+          className="focus-ring flex h-4 w-4 items-center justify-center rounded text-faint hover:bg-destructive/15 hover:text-destructive"
           title="Delete note"
         >
           <X size={11} />

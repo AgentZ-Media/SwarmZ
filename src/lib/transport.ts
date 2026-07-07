@@ -49,5 +49,6 @@ export const saveGrid = backend.saveGrid;
 export const loadWorkspacePresets = backend.loadWorkspacePresets;
 export const saveWorkspacePresets = backend.saveWorkspacePresets;
 export const fetchSubscriptionLimits = backend.fetchSubscriptionLimits;
+export const fetchCodexAccountLimits = backend.fetchCodexAccountLimits;
 
 export type { PtyDataEvent, PtyExitEvent } from "./backend-types";

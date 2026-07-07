@@ -133,6 +133,18 @@ export interface SubscriptionLimits {
 }
 
 /**
+ * Account-level Codex rate limits: the newest `rate_limits` event found
+ * across ALL of `~/.codex/sessions` (`codex_account_limits` in Rust) —
+ * account-scoped like the Claude subscription limits, independent of any
+ * open pane. `limits: null` = no data ever seen (Codex never ran / logged
+ * out); `as_of_ms` dates the source event so stale data can be annotated.
+ */
+export interface CodexAccountLimits {
+  limits: CodexRateLimits | null;
+  as_of_ms: number | null;
+}
+
+/**
  * Read-only git snapshot of an agent's working directory, polled every few
  * seconds. Produced by `git_info` (Rust), which shells out to the git binary.
  */
@@ -476,6 +488,20 @@ export interface Agent {
    * resume) a sibling session from the same folder.
    */
   firstBusyAt?: number;
+  /**
+   * epoch ms of the last busy → idle/waiting transition — drives the
+   * ephemeral "✓ finished" moment in the pane header (fades after ~5 min).
+   * In-memory only, never persisted.
+   */
+  lastBusyEndAt?: number;
+  /**
+   * epoch ms the pane entered needs-you via BELL attention while its
+   * activity wasn't "waiting" (OSC waiting stamps `lastBusyEndAt` instead) —
+   * gives the triage ordering (Deck queue, fleet Tab cycle) a waiting-since
+   * for bell-only panes. Stamped in `setAttention(true)`, cleared when the
+   * attention clears. In-memory only, never persisted.
+   */
+  waitingSince?: number;
   /** per-pane terminal font size override (⌘+/⌘− zoom); unset = default */
   fontSize?: number;
   /** live git snapshot of the cwd; null = checked and not inside a repo */
@@ -517,8 +543,8 @@ export interface OrchestratorPaneRef {
 
 /**
  * One message in an orchestrator chat. `system` carries the Phase-5 status
- * pings ("«api» ist fertig") — its `paneRefs` render the jump chip and the
- * "Auswerten" button. Assistant messages carry a transient `streaming` flag
+ * pings ("«api» finished") — its `paneRefs` render the jump chip and the
+ * "Review" button. Assistant messages carry a transient `streaming` flag
  * while deltas arrive — cleared on finalize and on hydrate.
  */
 export type OrchestratorChatMessage =
@@ -542,7 +568,7 @@ export type OrchestratorChatMessage =
       at: number;
       role: "system";
       text: string;
-      /** the pinged pane — jump chip + "Auswerten" target (Phase 5) */
+      /** the pinged pane — jump chip + "Review" target (Phase 5) */
       paneRefs?: OrchestratorPaneRef[];
     };
 

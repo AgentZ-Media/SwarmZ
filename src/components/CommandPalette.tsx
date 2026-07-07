@@ -225,6 +225,26 @@ export function CommandPalette({
                   <Shortcut>⌘E</Shortcut>
                 </PaletteItem>
                 <PaletteItem
+                  value="next pane cycle focus"
+                  onSelect={() =>
+                    run(() => useSwarm.getState().cycleActivePane(1))
+                  }
+                >
+                  <LayoutGrid size={13} className="shrink-0 text-faint" />
+                  Next pane
+                  <Shortcut>⌘]</Shortcut>
+                </PaletteItem>
+                <PaletteItem
+                  value="previous pane cycle focus"
+                  onSelect={() =>
+                    run(() => useSwarm.getState().cycleActivePane(-1))
+                  }
+                >
+                  <LayoutGrid size={13} className="shrink-0 text-faint" />
+                  Previous pane
+                  <Shortcut>⌘[</Shortcut>
+                </PaletteItem>
+                <PaletteItem
                   value="next attention waiting agent jump"
                   onSelect={() => run(() => useSwarm.getState().attentionJump())}
                 >
@@ -342,26 +362,34 @@ export function Shortcut({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** Status dot matching the pane header's logic, condensed. */
+/** Status dot matching the pane header's signal triad, condensed: amber
+ * dot + ⚑ for needs-you, quiet muted dot for busy, green for idle/alive. */
 function AgentDot({ agent }: { agent: Agent }) {
   const state =
     agent.status === "running" && agent.activity
-      ? agent.activity === "waiting"
-        ? "attention"
-        : agent.activity
+      ? agent.activity
       : agent.status;
-  const color =
-    agent.attention || state === "attention"
-      ? "var(--ring)"
-      : state === "busy" || state === "starting"
-        ? "var(--warning)"
-        : state === "exited"
-          ? "var(--faint)"
-          : "var(--success)";
+  const needsYou =
+    agent.status !== "exited" &&
+    (agent.attention || agent.activity === "waiting");
+  const color = needsYou
+    ? "var(--attn)"
+    : state === "busy" || state === "starting"
+      ? "var(--muted-foreground)"
+      : state === "exited"
+        ? "var(--faint)"
+        : "var(--success)";
   return (
-    <span
-      className="h-1.5 w-1.5 shrink-0 rounded-full"
-      style={{ backgroundColor: color }}
-    />
+    <>
+      <span
+        className="h-1.5 w-1.5 shrink-0 rounded-full"
+        style={{ backgroundColor: color }}
+      />
+      {needsYou && (
+        <span className="shrink-0 font-mono text-[10px] font-semibold leading-none text-attn">
+          ⚑
+        </span>
+      )}
+    </>
   );
 }

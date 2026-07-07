@@ -52,6 +52,7 @@ import type {
   WorktreeStatus,
 } from "@/types";
 import { listWorktrees, removeWorktree, worktreeStatus } from "@/lib/worktree";
+import { pushFleetEvent } from "@/lib/events";
 import {
   flushOrchestratorPersist,
   hydrateOrchestratorChats,
@@ -426,6 +427,8 @@ export interface SwarmState {
   moveAgentToWorkspace: (agentId: string, workspaceId: string) => void;
   /** jump to the next agent that needs attention, across all workspaces (⌘⇧A) */
   attentionJump: () => void;
+  /** cycle panes in the active workspace, layout order + wrap (⌘] / ⌘[) */
+  cycleActivePane: (delta: 1 | -1) => void;
   setFleetOpen: (open: boolean) => void;
   setPaletteOpen: (open: boolean) => void;
   setCommandPickerOpen: (open: boolean) => void;
@@ -781,6 +784,21 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     set({ fleetOpen: false });
     get().focusAgent(next);
     focusTerm(next);
+  },
+
+  cycleActivePane: (delta) => {
+    const s = get();
+    const panes = collectPanes(s.layouts[s.activeWorkspaceId] ?? null);
+    if (panes.length === 0) return;
+    const activePane = s.activePaneIds[s.activeWorkspaceId] ?? null;
+    const idx = panes.findIndex((p) => p.id === activePane);
+    // stale/missing active pane starts the cycle from the first pane
+    const next = panes[(Math.max(idx, 0) + delta + panes.length) % panes.length];
+    if (!next) return;
+    // in focus mode the shortcut moves the zoomed pane along
+    if (s.focusedAgentId) get().setFocusedAgent(next.agentId);
+    else get().focusAgent(next.agentId);
+    focusTerm(next.agentId);
   },
 
   setFleetOpen: (open) =>
@@ -1144,6 +1162,12 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     schedulePersistGrid();
     if (projectCwd) get().updateSettings({ lastCwd: projectCwd });
     if (agent.worktree) get().registerWorktreeRepo(agent.worktree.root);
+    pushFleetEvent({
+      kind: "created",
+      paneId: id,
+      paneName: agent.name,
+      workspaceId: wsId,
+    });
     return id;
   },
 
@@ -1151,6 +1175,16 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const state = get();
     const agent = state.agents[agentId];
     if (!agent) return;
+    // Deck ticker: closing a still-live pane ends it; already-exited panes
+    // logged their event in setStatus
+    if (agent.status !== "exited") {
+      pushFleetEvent({
+        kind: "exited",
+        paneId: agentId,
+        paneName: agent.name,
+        workspaceId: agent.workspaceId,
+      });
+    }
     // a worktree marked for cleanup dies with its pane (folder + branch)
     const cleanup = pendingWorktreeCleanup.get(agentId);
     pendingWorktreeCleanup.delete(agentId);
@@ -1682,6 +1716,16 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const agent = state.agents[agentId];
     if (!agent) return;
     set({ agents: { ...state.agents, [agentId]: { ...agent, status } } });
+    // Deck ticker: the pane's process ended (closing the pane later is
+    // silent then — removeAgent only emits for still-running panes)
+    if (status === "exited" && agent.status !== "exited") {
+      pushFleetEvent({
+        kind: "exited",
+        paneId: agentId,
+        paneName: agent.name,
+        workspaceId: agent.workspaceId,
+      });
+    }
   },
 
   setAttention: (agentId, on) => {
@@ -1695,9 +1739,25 @@ export const useSwarm = create<SwarmState>((set, get) => ({
           ...agent,
           attention: on,
           status: on ? "attention" : agent.status === "attention" ? "running" : agent.status,
+          // bell-only needs-you gets a waiting-since for the triage ordering
+          // (OSC "waiting" panes are timestamped by lastBusyEndAt instead)
+          waitingSince: on
+            ? (agent.waitingSince ??
+              (agent.activity !== "waiting" ? Date.now() : undefined))
+            : undefined,
         },
       },
     });
+    // Deck ticker: bell attention is the other needs-you entry (a pane
+    // already "waiting" is deduped by the feed's 3s waiting guard)
+    if (on && agent.status !== "exited") {
+      pushFleetEvent({
+        kind: "waiting",
+        paneId: agentId,
+        paneName: agent.name,
+        workspaceId: agent.workspaceId,
+      });
+    }
   },
 
   setActivity: (agentId, activity) => {
@@ -1706,7 +1766,34 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     if (!agent || agent.activity === activity) return;
     const firstBusyAt =
       agent.firstBusyAt ?? (activity === "busy" ? Date.now() : undefined);
-    set({ agents: { ...state.agents, [agentId]: { ...agent, activity, firstBusyAt } } });
+    // leaving busy stamps the "just finished" moment (ephemeral green signal)
+    const lastBusyEndAt =
+      agent.activity === "busy" && activity !== "busy"
+        ? Date.now()
+        : agent.lastBusyEndAt;
+    set({
+      agents: {
+        ...state.agents,
+        [agentId]: { ...agent, activity, firstBusyAt, lastBusyEndAt },
+      },
+    });
+    // Deck ticker: entering needs-you beats a plain finish (busy → waiting
+    // emits "waiting", not both); busy → idle is the quiet green "finished"
+    if (activity === "waiting") {
+      pushFleetEvent({
+        kind: "waiting",
+        paneId: agentId,
+        paneName: agent.name,
+        workspaceId: agent.workspaceId,
+      });
+    } else if (agent.activity === "busy" && activity === "idle") {
+      pushFleetEvent({
+        kind: "finished",
+        paneId: agentId,
+        paneName: agent.name,
+        workspaceId: agent.workspaceId,
+      });
+    }
   },
 
   setUsage: (agentId, usage) => {
@@ -1761,7 +1848,34 @@ export const useSwarm = create<SwarmState>((set, get) => ({
 
     const titlePatch =
       usage.title && !agent.renamed ? { name: usage.title, title: usage.title } : {};
-    const activityPatch = usage.activity ? { activity: usage.activity } : {};
+    // Codex reports activity through usage events — stamp the busy→idle
+    // transition here too (Claude's path is setActivity via OSC 9;4)
+    const activityPatch = usage.activity
+      ? {
+          activity: usage.activity,
+          ...(agent.activity === "busy" && usage.activity !== "busy"
+            ? { lastBusyEndAt: Date.now() }
+            : {}),
+        }
+      : {};
+    // Deck ticker — mirror the setActivity transitions for the Codex path
+    if (usage.activity && usage.activity !== agent.activity) {
+      if (usage.activity === "waiting") {
+        pushFleetEvent({
+          kind: "waiting",
+          paneId: agentId,
+          paneName: agent.name,
+          workspaceId: agent.workspaceId,
+        });
+      } else if (agent.activity === "busy" && usage.activity === "idle") {
+        pushFleetEvent({
+          kind: "finished",
+          paneId: agentId,
+          paneName: agent.name,
+          workspaceId: agent.workspaceId,
+        });
+      }
+    }
     set({
       agents: {
         ...state.agents,
@@ -2026,6 +2140,19 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     schedulePersistWorkspaces();
     schedulePersistGrid();
     if (folder) get().updateSettings({ lastCwd: folder });
+    // Deck ticker: preset-built panes are creations too (this path bypasses
+    // createAgent, which emits for every other create)
+    for (const id of order) {
+      const a = agents[id];
+      if (a && a.workspaceId === wsId && !state.agents[id]) {
+        pushFleetEvent({
+          kind: "created",
+          paneId: id,
+          paneName: a.name,
+          workspaceId: wsId,
+        });
+      }
+    }
   },
 
   setLoadPresetRequest: (presetId) => set({ loadPresetRequest: presetId }),

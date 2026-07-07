@@ -1,7 +1,6 @@
-import { memo, useState, type ReactNode } from "react";
+import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   BarChart3,
-  Bell,
   Bot,
   CheckCircle2,
   Columns2,
@@ -21,6 +20,7 @@ import { TerminalView } from "./Terminal";
 import { DictationButton, DictationOverlay } from "./Dictation";
 import { FileDropOverlay } from "./FileDropOverlay";
 import { Tip } from "./ui/tooltip";
+import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { Badge } from "./ui/misc";
 import {
   DropdownMenu,
@@ -54,7 +54,11 @@ function GitChip({ git }: { git: GitInfo }) {
         </span>
       }
     >
-      <span className="flex shrink-0 items-center gap-1 font-mono text-[10px] tabular-nums @max-md:hidden">
+      {/* tabIndex: the tooltip's data needs a keyboard path too */}
+      <span
+        tabIndex={0}
+        className="focus-ring flex shrink-0 items-center gap-1 rounded font-mono text-[10px] tabular-nums @max-md:hidden"
+      >
         <span className="flex items-center gap-1 text-faint">
           <GitBranch size={10} className="shrink-0" />
           <span className="max-w-28 truncate">{git.branch}</span>
@@ -105,7 +109,7 @@ function ContextGauge({ usage }: { usage: SessionUsage }) {
         </span>
       }
     >
-      <span className="flex shrink-0 items-center gap-1.5">
+      <span tabIndex={0} className="focus-ring flex shrink-0 items-center gap-1.5 rounded">
         <svg width={14} height={14} viewBox="0 0 14 14" className="shrink-0 -rotate-90">
           <circle
             cx={7}
@@ -172,11 +176,15 @@ function SubagentChip({ sub }: { sub: SubagentUsage }) {
         </span>
       }
     >
-      <span className="flex shrink-0 items-center gap-1.5 rounded bg-secondary/60 px-1.5 py-0.5 font-mono text-[10px] tabular-nums">
+      <span
+        tabIndex={0}
+        className="focus-ring flex shrink-0 items-center gap-1.5 rounded bg-secondary/60 px-1.5 py-0.5 font-mono text-[10px] tabular-nums"
+      >
+        {/* states are static (DESIGN.md motion doctrine) — green dot = running */}
         <span
           className={cn(
             "h-1.5 w-1.5 shrink-0 rounded-full",
-            sub.running ? "animate-pulse bg-success" : "bg-faint/60",
+            sub.running ? "bg-success" : "bg-faint/60",
           )}
         />
         <span className="max-w-24 truncate text-muted-foreground">{label}</span>
@@ -224,21 +232,25 @@ function StatRow({ k, v }: { k: string; v: ReactNode }) {
   );
 }
 
-/** Per-pane stats: everything tracked for this agent, on demand. */
+/** Per-pane stats: everything tracked for this agent, on demand. A Popover,
+ * not a DropdownMenu — it shows a data sheet, not menu items (and the old
+ * Tip-wrapping-DropdownMenuTrigger double-asChild conflicted in Radix; the
+ * plain `title` attr replaces the tooltip). */
 function AgentStatsButton({ agent }: { agent: Agent }) {
   return (
-    <DropdownMenu>
-      <Tip label="Agent stats">
-        <DropdownMenuTrigger asChild>
-          <button className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-md:hidden">
-            <BarChart3 size={13} />
-          </button>
-        </DropdownMenuTrigger>
-      </Tip>
-      <DropdownMenuContent align="end" className="w-72">
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          title="Agent stats"
+          className="no-drag focus-ring flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-md:hidden"
+        >
+          <BarChart3 size={13} />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-72">
         <AgentStatsBody agent={agent} />
-      </DropdownMenuContent>
-    </DropdownMenu>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -366,39 +378,136 @@ function AgentStatsBody({ agent }: { agent: Agent }) {
   );
 }
 
-function StatusDot({ agent }: { agent: Agent }) {
-  // Agent-reported activity refines the coarse PTY status while running.
-  const state =
-    agent.status === "running" && agent.activity
-      ? agent.activity === "waiting"
-        ? "attention"
-        : agent.activity
-      : agent.status;
-  const map: Record<string, { color: string; label: string }> = {
-    starting: { color: "var(--warning)", label: "Starting" },
-    running: { color: "var(--success)", label: "Running" },
-    busy: { color: "var(--warning)", label: "Working…" },
-    idle: { color: "var(--success)", label: "Idle" },
-    attention: { color: "var(--ring)", label: "Waiting for input" },
-    exited: { color: "var(--faint)", label: "Exited" },
-  };
-  const { color, label } = map[state] ?? { color: "var(--faint)", label: state };
+// ---- Signal triad (see DESIGN.md): every state couples color + shape + word.
+
+/** How long a busy→idle transition shows as "✓ finished" before decaying. */
+const FINISHED_MS = 5 * 60_000;
+
+export type PaneSignal =
+  | "starting"
+  | "working"
+  | "needsYou"
+  | "finished"
+  | "idle"
+  | "running"
+  | "exited";
+
+/** Derive the pane's display signal from PTY status + reported activity.
+ * Exported for the fleet overview's card chrome — one signal rule app-wide. */
+export function paneSignal(agent: Agent, now: number): PaneSignal {
+  if (agent.status === "exited") return "exited";
+  if (agent.status === "starting") return "starting";
+  if (agent.attention || agent.activity === "waiting") return "needsYou";
+  if (agent.activity === "busy") return "working";
+  if (agent.activity === "idle") {
+    if (agent.lastBusyEndAt && now - agent.lastBusyEndAt < FINISHED_MS)
+      return "finished";
+    return "idle";
+  }
+  return "running"; // plain shells etc. — no activity reports
+}
+
+/** Whether the pane needs the human — drives the --attn tint/outline/flash. */
+function needsHuman(agent: Agent): boolean {
   return (
-    <Tip label={label}>
-      <span className="relative flex h-1.5 w-1.5">
-        {(state === "running" || state === "busy") && (
-          <span
-            className="absolute inline-flex h-full w-full rounded-full opacity-60"
-            style={{ backgroundColor: color }}
-          />
-        )}
-        <span
-          className="relative inline-flex h-1.5 w-1.5 rounded-full"
-          style={{ backgroundColor: color }}
-        />
-      </span>
-    </Tip>
+    agent.status !== "exited" &&
+    (agent.attention || agent.activity === "waiting")
   );
+}
+
+function formatAgo(ms: number): string {
+  const mins = Math.floor(ms / 60_000);
+  return mins <= 0 ? "just now" : `${mins}m ago`;
+}
+
+/**
+ * The pane's primary status element: glyph + word in 10px mono. The word
+ * collapses below @md (the glyph/dot stays — a status is visible at every
+ * container tier); the full label always lives in the tooltip. The "finished"
+ * age re-renders on a 30s ticker scoped to THIS component only, and only
+ * while the finished window is live.
+ */
+function PaneStatus({ agent }: { agent: Agent }) {
+  const signal = paneSignal(agent, Date.now());
+  // cheap decay driver: ticks every 30s only while "finished" shows, and the
+  // re-render is confined to this small component
+  const [, setTick] = useState(0);
+  const ticking = signal === "finished";
+  useEffect(() => {
+    if (!ticking) return;
+    const t = setInterval(() => setTick((n) => n + 1), 30_000);
+    return () => clearInterval(t);
+  }, [ticking]);
+
+  const word = "font-mono text-[10px] leading-none";
+  switch (signal) {
+    case "working":
+      return (
+        <Tip label="Working…">
+          <span className={cn(word, "flex shrink-0 items-center gap-1 text-muted-foreground")}>
+            <span aria-hidden>▸</span>
+            <span className="@max-md:hidden">working</span>
+          </span>
+        </Tip>
+      );
+    case "needsYou":
+      return (
+        <Tip label="Needs your input">
+          <span className={cn(word, "flex shrink-0 items-center gap-1 font-semibold text-attn")}>
+            <span aria-hidden>⚑</span>
+            <span className="@max-md:hidden">needs you</span>
+          </span>
+        </Tip>
+      );
+    case "finished": {
+      const ago = formatAgo(Date.now() - (agent.lastBusyEndAt ?? 0));
+      return (
+        <Tip label={`Finished ${ago}`}>
+          <span className={cn(word, "flex shrink-0 items-center gap-1 text-success")}>
+            <span aria-hidden>✓</span>
+            <span className="@max-md:hidden">
+              finished <span className="text-success/60">· {ago}</span>
+            </span>
+          </span>
+        </Tip>
+      );
+    }
+    case "starting":
+      // quiet muted, like the fleet chrome's "· starting" — a spawning pane
+      // is normal, not a warning
+      return (
+        <Tip label="Starting">
+          <span className={cn(word, "flex shrink-0 items-center gap-1 text-muted-foreground")}>
+            <span aria-hidden>·</span>
+            <span className="@max-md:hidden">starting</span>
+          </span>
+        </Tip>
+      );
+    case "idle":
+      return (
+        <Tip label="Idle">
+          <span className={cn(word, "flex shrink-0 items-center gap-1 text-faint")}>
+            <span className="h-1.5 w-1.5 rounded-full bg-faint/70" />
+            <span className="@max-md:hidden">idle</span>
+          </span>
+        </Tip>
+      );
+    case "exited":
+      return (
+        <Tip label="Exited">
+          <span className={cn(word, "flex shrink-0 items-center gap-1 text-faint")}>
+            <span className="h-1.5 w-1.5 rounded-full bg-faint" />
+            <span className="@max-md:hidden">exited</span>
+          </span>
+        </Tip>
+      );
+    case "running":
+      return (
+        <Tip label="Running">
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-success" />
+        </Tip>
+      );
+  }
 }
 
 export const AgentPane = memo(function AgentPane({
@@ -421,6 +530,19 @@ export const AgentPane = memo(function AgentPane({
   const setFocusedAgent = useSwarm((s) => s.setFocusedAgent);
   const [editing, setEditing] = useState(false);
 
+  const needsYou = !!agent && needsHuman(agent);
+  const working = !!agent && agent.status !== "exited" && agent.activity === "busy";
+
+  // One-shot arrive-flash on ENTERING "needs you": a transition counter keys
+  // the overlay, so the 300ms animation replays exactly once per entry (a
+  // render-phase self-setState, same pattern as WorkspaceLayer's fleetClosing).
+  const [flashKey, setFlashKey] = useState(0);
+  const prevNeedsYouRef = useRef(needsYou);
+  if (prevNeedsYouRef.current !== needsYou) {
+    prevNeedsYouRef.current = needsYou;
+    if (needsYou) setFlashKey((k) => k + 1);
+  }
+
   if (!agent) return null;
 
   const usage = agent.usage;
@@ -429,23 +551,36 @@ export const AgentPane = memo(function AgentPane({
   return (
     <div
       className={cn(
-        "flex h-full w-full flex-col overflow-hidden rounded-lg border bg-card transition-colors",
-        active ? "border-ring ring-1 ring-ring/40" : "border-border",
-        agent.attention && !active && "attn-pulse border-ring/50",
+        "relative flex h-full w-full flex-col overflow-hidden rounded-lg border bg-card transition-colors",
+        // blue = where I am (exclusive); amber = where I'm needed
+        active
+          ? "border-ring ring-1 ring-ring/40"
+          : needsYou
+            ? "border-attn/60"
+            : "border-border",
       )}
       onMouseDown={() => focusAgent(agentId)}
     >
+      {needsYou && flashKey > 0 && (
+        <div
+          key={flashKey}
+          className="arrive-flash pointer-events-none absolute inset-0 z-20 rounded-lg"
+        />
+      )}
       {/* header — a container query root: as the pane narrows, secondary
           info collapses away (@max-xl: path/readout/split buttons, @max-lg:
-          model badge, @max-md: git chip/stats/mic/focus) until only status
-          dot, truncated title, context donut, ⋯ menu and close remain
-          (everything stays reachable via tooltips and the ⋯ menu) */}
+          model badge, @max-md: git chip/stats/mic/focus + the status WORD —
+          its glyph/dot stays) until only status glyph, truncated title,
+          context donut, ⋯ menu and close remain (everything stays reachable
+          via tooltips and the ⋯ menu) */}
       <div
         className={cn(
-          "@container flex h-9 shrink-0 cursor-grab items-center gap-2 border-b px-2.5",
-          active
-            ? "border-ring/30 bg-ring/10"
-            : "border-border bg-transparent",
+          "@container relative flex h-9 shrink-0 cursor-grab items-center gap-2 border-b px-2.5",
+          needsYou
+            ? "border-attn/30 bg-attn/10"
+            : active
+              ? "border-ring/30 bg-ring/10"
+              : "border-border bg-transparent",
         )}
         onMouseDown={(e) => {
           if (editing) return;
@@ -458,7 +593,8 @@ export const AgentPane = memo(function AgentPane({
           setFocusedAgent(focused ? null : agentId);
         }}
       >
-        <StatusDot agent={agent} />
+        <PaneStatus agent={agent} />
+        {working && <span className="activity-line" aria-hidden />}
 
         {editing ? (
           <input
@@ -516,8 +652,6 @@ export const AgentPane = memo(function AgentPane({
           </div>
         )}
 
-        {agent.attention && <Bell size={12} className="shrink-0 text-ring" />}
-
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
           {model && (
             <Badge className="font-mono @max-lg:hidden">
@@ -532,7 +666,7 @@ export const AgentPane = memo(function AgentPane({
 
           <Tip label="Floating terminal">
             <button
-              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-xl:hidden"
+              className="no-drag focus-ring flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-xl:hidden"
               onClick={(e) => {
                 e.stopPropagation();
                 createFloatingTerminal(agentId);
@@ -544,7 +678,7 @@ export const AgentPane = memo(function AgentPane({
 
           <Tip label="Split right">
             <button
-              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-xl:hidden"
+              className="no-drag focus-ring flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-xl:hidden"
               onClick={(e) => {
                 e.stopPropagation();
                 focusAgent(agentId);
@@ -556,7 +690,7 @@ export const AgentPane = memo(function AgentPane({
           </Tip>
           <Tip label="Split down">
             <button
-              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-xl:hidden"
+              className="no-drag focus-ring flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-xl:hidden"
               onClick={(e) => {
                 e.stopPropagation();
                 focusAgent(agentId);
@@ -569,7 +703,7 @@ export const AgentPane = memo(function AgentPane({
 
           <Tip label={focused ? "Exit focus" : "Focus"}>
             <button
-              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-md:hidden"
+              className="no-drag focus-ring flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground @max-md:hidden"
               onClick={(e) => {
                 e.stopPropagation();
                 setFocusedAgent(focused ? null : agentId);
@@ -581,7 +715,7 @@ export const AgentPane = memo(function AgentPane({
 
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <button className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground">
+              <button className="no-drag focus-ring flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground">
                 <MoreVertical size={13} />
               </button>
             </DropdownMenuTrigger>
@@ -655,7 +789,7 @@ export const AgentPane = memo(function AgentPane({
 
           <Tip label="Close">
             <button
-              className="no-drag flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-destructive/15 hover:text-destructive"
+              className="no-drag focus-ring flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-destructive/15 hover:text-destructive"
               onClick={(e) => {
                 e.stopPropagation();
                 requestRemoveAgent(agentId);

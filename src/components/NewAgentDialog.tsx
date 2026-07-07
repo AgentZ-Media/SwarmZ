@@ -30,6 +30,24 @@ import {
 import { runtimeFromStartup, shortPath } from "@/lib/utils";
 import type { AgentRuntime } from "@/types";
 
+/**
+ * Map the common worktree-creation failures (raw git stderr) to a human
+ * sentence that says what to DO; unknown errors fall back to a generic lead.
+ * The raw text always stays visible as a smaller secondary line.
+ */
+function humanizeWorktreeError(raw: string): string {
+  const s = raw.toLowerCase();
+  if (s.includes("not a git repository") || s.includes("not a regular git repository"))
+    return "This folder isn't inside a git repository — pick a repo folder or turn the worktree option off.";
+  if (s.includes("already exists"))
+    return "A branch or worktree with this name already exists — pick a different branch name (or reroll one).";
+  if (s.includes("is not a valid branch name") || s.includes("branch name is empty"))
+    return "That branch name isn't valid — letters, digits, dashes and slashes work best.";
+  if (s.includes("failed to run git") || s.includes("no such file"))
+    return "Couldn't run git — check the git binary path in Settings → Paths.";
+  return "Creating the worktree failed.";
+}
+
 export function NewAgentDialog() {
   const open_ = useSwarm((s) => s.newAgentOpen);
   const setOpen = useSwarm((s) => s.setNewAgentOpen);
@@ -226,7 +244,9 @@ export function NewAgentDialog() {
         );
       } catch (e) {
         if (sameSession()) {
-          setError(String(e));
+          // our commands reject with plain strings; a real Error would
+          // stringify as "Error: …" — strip the prefix either way
+          setError(String(e).replace(/^Error:\s*/, ""));
           setCreating(false);
         }
       }
@@ -424,9 +444,14 @@ export function NewAgentDialog() {
           </div>
 
           {error && (
-            <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-[11px] text-destructive">
-              {error}
-            </p>
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2">
+              <p className="text-[11px] leading-relaxed text-destructive">
+                {humanizeWorktreeError(error)}
+              </p>
+              <p className="mt-1 break-words font-mono text-[10px] leading-relaxed text-destructive/70">
+                {error}
+              </p>
+            </div>
           )}
         </div>
 

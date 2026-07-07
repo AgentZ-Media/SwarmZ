@@ -66,6 +66,7 @@ pub const ORCHESTRATOR_INSTRUCTIONS: &str = r#"You are the SwarmZ Orchestrator �
 - codex panes expect direct, fully specified, self-contained orders: name the files, the constraints and the definition of done — leave no room for interpretation.
 - claude panes get the goal, the relevant context and the constraints; Claude can be trusted to think along and fill gaps sensibly.
 - shell panes only ever receive shell commands, never prose.
+- Model choice: create_panes accepts an optional model (and, codex-only, reasoning). Set it ONLY when the user names a model or capability tier ("take Opus for the docs", "the fast one") — resolve casual names against list_blueprints runtimes.*.recently_used_models (real usage on this machine) and prefer an exact id from there; pass a literal id if the user gives one. When the user says nothing about models, omit model/reasoning entirely — the pane then uses the user's default configuration.
 
 ## Worktrees
 Request worktree:true in create_panes only when multiple agents will WRITE in the same repository concurrently. Reviews and read-only tasks run as plain panes in the repo itself. An explicit user wish always overrides this rule.

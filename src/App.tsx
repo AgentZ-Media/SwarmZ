@@ -3,6 +3,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { TitleBar } from "./components/TitleBar";
 import { WorkspaceLayer } from "./components/WorkspaceLayer";
 import { FloatingTerminals } from "./components/FloatingTerminals";
+import { Deck } from "./components/Deck";
 import { CloseAgentDialog } from "./components/CloseAgentDialog";
 import { CloseBusyDialog } from "./components/CloseBusyDialog";
 import { CloseWorkspaceDialog } from "./components/CloseWorkspaceDialog";
@@ -368,6 +369,12 @@ export default function App() {
             (idx + delta + s.workspaceOrder.length) % s.workspaceOrder.length
           ];
         if (next) s.setActiveWorkspace(next);
+      } else if (k === "[" || k === "]") {
+        // ⌘[ / ⌘] cycle panes within the active workspace — layout order,
+        // wrapping; updates the active pane and puts the cursor in its
+        // terminal. (macOS text editors use ⌘] for indent; terminals don't.)
+        e.preventDefault();
+        s.cycleActivePane(k === "[" ? -1 : 1);
       } else if (k === "+" || k === "=" || k === "-" || k === "0") {
         // per-pane zoom — "=" covers ⌘+ on layouts where + needs shift (US)
         const id = s.activeAgentId();
@@ -405,14 +412,20 @@ export default function App() {
           onOpenSettings={() => setSettingsOpen(true)}
         />
         <main className="flex min-h-0 min-w-0 flex-1">
-          {/* the workspace area is its own positioning context so the fleet
-              overlay and floating terminals keep covering exactly the grid —
-              the orchestrator panel is a flex sibling that squeezes it */}
-          <div className="relative min-h-0 min-w-0 flex-1">
-            {/* all workspace grids stay mounted in here — see WorkspaceLayer */}
-            <WorkspaceLayer />
-            {/* floating terminals live above the grids — and survive them (detached) */}
-            <FloatingTerminals />
+          {/* workspace column: grid area on top, the Deck below it — the
+              orchestrator panel stays a full-height flex sibling */}
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+            {/* the grid area is its own positioning context so the fleet
+                overlay and floating terminals keep covering exactly the grid
+                (never the Deck or the orchestrator panel) */}
+            <div className="relative min-h-0 min-w-0 flex-1">
+              {/* all workspace grids stay mounted in here — see WorkspaceLayer */}
+              <WorkspaceLayer />
+              {/* floating terminals live above the grids — and survive them (detached) */}
+              <FloatingTerminals />
+            </div>
+            {/* the Deck: triage queue, event ticker, meters, orch status */}
+            <Deck />
           </div>
           {/* orchestrator chat sidebar (⌘⇧O) — resizes the grid, not an overlay */}
           <OrchestratorPanel />

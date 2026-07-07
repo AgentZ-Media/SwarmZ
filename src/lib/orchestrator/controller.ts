@@ -294,7 +294,7 @@ let pingsStarted = false;
 
 /**
  * A touched pane finished (busy → idle/waiting): ping every chat that
- * prompted it — persisted system message (jump chip + "Auswerten" via
+ * prompted it — persisted system message (jump chip + "Review" via
  * paneRefs) plus an undelivered ping record for the next send's context
  * injection. Runs regardless of the chat's turn state; a running turn just
  * means the ping rides along with the NEXT send (never auto-starts a turn).
@@ -320,8 +320,8 @@ function onPaneFinished(
       role: "system",
       text:
         activity === "waiting"
-          ? `«${name}» wartet auf Eingabe`
-          : `«${name}» ist fertig`,
+          ? `«${name}» waiting for input`
+          : `«${name}» finished`,
       paneRefs: [{ id: paneId, name }],
     });
     orch.addPendingPing(chat.id, { paneId, paneName: name, activity, at: now });
@@ -374,17 +374,17 @@ function hhmm(at: number): string {
 }
 
 /**
- * The `[Status-Update]` block injected before the user's wire text — one
- * German sentence per ping, absolute HH:MM times. The stored user message
+ * The `[Status update]` block injected before the user's wire text — one
+ * English sentence per ping, absolute HH:MM times. The stored user message
  * stays the raw text; the pings are already visible as system messages.
  */
 function statusUpdateBlock(pings: OrchestratorPingRecord[]): string {
   const lines = pings.map((p) =>
     p.activity === "waiting"
-      ? `«${p.paneName}» wartet seit ${hhmm(p.at)} auf Eingabe.`
-      : `«${p.paneName}» ist um ${hhmm(p.at)} fertig geworden.`,
+      ? `«${p.paneName}» waiting for input since ${hhmm(p.at)}.`
+      : `«${p.paneName}» finished at ${hhmm(p.at)}.`,
   );
-  return `[Status-Update] ${lines.join("\n")}`;
+  return `[Status update] ${lines.join("\n")}`;
 }
 
 // ---- public surface (used by OrchestratorPanel) ----
@@ -448,7 +448,7 @@ function errorText(err: unknown): string {
  * is ignored (the UI shows a stop button instead).
  *
  * Phase 5: undelivered status pings are marked delivered and prepended as a
- * `[Status-Update]` block to the WIRE text only — the stored user bubble
+ * `[Status update]` block to the WIRE text only — the stored user bubble
  * stays the raw text (the pings are already visible as system messages).
  * Rust's chat_send additionally prepends its `[fleet status: …]` line; both
  * stay — the fleet line is the current snapshot, the status block is what

@@ -13,6 +13,7 @@ import { defaultStartupForRuntime, useSwarm } from "@/store";
 import type { Agent, NoteItem, PresetLayoutNode } from "@/types";
 import { fetchGitInfo, getHome } from "@/lib/transport";
 import { insertCommandText } from "@/lib/insert-command";
+import { pushFleetEvent } from "@/lib/events";
 import { addWorktree, generateBranchName } from "@/lib/worktree";
 import { runtimeFromStartup } from "@/lib/utils";
 import { useOrchestrator } from "./chat-store";
@@ -88,7 +89,8 @@ function reviewModeActive(): boolean {
 /**
  * Record a delivered prompt: feeds the double-prompt guard, and — when the
  * call carries a chat context — the chat's touchedPanes (the Phase-5
- * activity watcher only pings panes recorded here).
+ * activity watcher only pings panes recorded here). Every delivery also
+ * lands in the Deck's fleet event feed (`▸ orch → pane`).
  */
 function notePromptDelivered(
   paneId: string,
@@ -98,6 +100,12 @@ function notePromptDelivered(
   lastPromptDelivery.set(paneId, Date.now());
   if (ctx.chatId)
     useOrchestrator.getState().recordTouchedPane(ctx.chatId, paneId, paneName);
+  pushFleetEvent({
+    kind: "orch_prompt",
+    paneId,
+    paneName,
+    workspaceId: useSwarm.getState().agents[paneId]?.workspaceId ?? "",
+  });
 }
 
 /** Resolve a pane_id to its agent, or fail listing every valid pane id. */
@@ -190,8 +198,42 @@ async function createOnePane(
   // an explicit runtime without a profile pins the matching startup command —
   // otherwise createAgent would fall back to the settings default, which may
   // belong to a different runtime
-  const startup =
+  let startup =
     !profile && spec.runtime ? defaultStartupForRuntime(spec.runtime) : undefined;
+
+  // Optional model override ("open an Opus pane"): appended as a CLI flag to
+  // the pane's effective startup. Strictly validated — the startup line runs
+  // in a shell, so the model id must never carry shell metacharacters.
+  const model = typeof spec.model === "string" ? spec.model.trim() : "";
+  const reasoning = typeof spec.reasoning === "string" ? spec.reasoning : "";
+  if (model || reasoning) {
+    if (model && !/^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(model))
+      throw new Error(
+        `invalid model "${model}" — letters, digits and . _ : / - only`,
+      );
+    if (reasoning && !["minimal", "low", "medium", "high", "xhigh"].includes(reasoning))
+      throw new Error(`invalid reasoning "${reasoning}"`);
+    const base =
+      profile?.startup ??
+      startup ??
+      state.settings.defaultStartup?.trim() ??
+      defaultStartupForRuntime(state.settings.defaultRuntime ?? "codex");
+    const effRuntime =
+      spec.runtime ?? profile?.runtime ?? runtimeFromStartup(base);
+    if (effRuntime === "shell")
+      throw new Error(
+        "model/reasoning need an agent runtime (claude or codex) — this pane would be a plain shell",
+      );
+    if (effRuntime === "claude" && reasoning)
+      throw new Error('reasoning is codex-only — omit it for claude panes');
+    // note: appended to the END of the startup line — fine for the simple
+    // single-command startups profiles/defaults use; compound custom commands
+    // would need smarter splicing (not a supported orchestrator path today)
+    startup =
+      base +
+      (model ? (effRuntime === "claude" ? ` --model ${model}` : ` -m ${model}`) : "") +
+      (reasoning ? ` -c model_reasoning_effort="${reasoning}"` : "");
+  }
 
   let worktree: { root: string; branch: string } | undefined;
   let paneCwd = cwd;
@@ -338,7 +380,39 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
 
   list_blueprints: async () => {
     const s = useSwarm.getState();
+    // "which models exist here" — honestly derived from real usage (open
+    // panes + persisted usage history) instead of a hardcoded list that
+    // would go stale. These ids are directly usable as create_panes.model.
+    const recentModels: Record<"claude" | "codex", Set<string>> = {
+      claude: new Set(),
+      codex: new Set(),
+    };
+    const note = (runtime: string | undefined, model: string | undefined) => {
+      if (!model) return;
+      if (runtime === "codex") recentModels.codex.add(model);
+      else if (runtime === "claude" || runtime === undefined)
+        recentModels.claude.add(model);
+    };
+    for (const a of Object.values(s.agents)) {
+      note(a.runtime, a.usage?.primary_model ?? undefined);
+      for (const m of a.usage?.by_model ?? []) note(a.runtime, m.model);
+    }
+    const history = Object.values(s.usageHistory)
+      .sort((a, b) => b.last_updated - a.last_updated)
+      .slice(0, 120);
+    for (const e of history) for (const m of e.by_model) note(e.runtime, m.model);
     return {
+      default_runtime: s.settings.defaultRuntime ?? "codex",
+      runtimes: {
+        claude: {
+          default_startup: defaultStartupForRuntime("claude"),
+          recently_used_models: [...recentModels.claude].slice(0, 12),
+        },
+        codex: {
+          default_startup: defaultStartupForRuntime("codex"),
+          recently_used_models: [...recentModels.codex].slice(0, 12),
+        },
+      },
       profiles: s.profiles.map((p) => ({
         id: p.id,
         name: p.name,

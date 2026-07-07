@@ -204,7 +204,7 @@ export function UsageDashboard() {
           </div>
           <button
             onClick={() => setOpen(false)}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
+            className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
           >
             <X size={16} />
           </button>
@@ -221,11 +221,12 @@ export function UsageDashboard() {
             <button
               key={key}
               onClick={() => setScope(key)}
-              className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+              className={cn(
+                "focus-ring rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
                 scope === key
                   ? "bg-accent text-foreground"
-                  : "text-faint hover:text-foreground"
-              }`}
+                  : "text-faint hover:text-foreground",
+              )}
             >
               {label}
             </button>
@@ -428,7 +429,7 @@ function HistoryList({
             }}
             onPointerLeave={disarm}
             className={cn(
-              "flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] transition-colors",
+              "focus-ring flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] transition-colors",
               armed
                 ? "bg-destructive/15 text-destructive"
                 : "text-faint hover:bg-accent hover:text-foreground",

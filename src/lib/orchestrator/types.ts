@@ -139,6 +139,10 @@ export interface CreatePaneSpec {
   cwd: string;
   runtime?: "claude" | "codex" | "shell";
   profile_id?: string;
+  /** model id appended to the startup (claude: --model, codex: -m); omit = default config */
+  model?: string;
+  /** codex-only: model_reasoning_effort */
+  reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
   name?: string;
   /** initial prompt, submitted once the agent CLI is ready */
   prompt?: string;
