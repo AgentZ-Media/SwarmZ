@@ -152,7 +152,15 @@ impl Client {
         program: &str,
         events: mpsc::UnboundedSender<ServerEvent>,
     ) -> Result<Self, String> {
-        let mut child = Command::new(program)
+        // enrich the child's PATH with the binary's own dir — the built app's
+        // minimal GUI PATH otherwise breaks anything codex spawns by name
+        // (user-configured MCP servers etc.)
+        let mut cmd = Command::new(program);
+        if let Some(dir) = std::path::Path::new(program).parent().filter(|d| !d.as_os_str().is_empty()) {
+            let base = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{}", dir.display(), base));
+        }
+        let mut child = cmd
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -340,10 +348,63 @@ static SHARED: Lazy<Mutex<Shared>> = Lazy::new(Mutex::default);
 struct Manager {
     client: Option<Arc<Client>>,
     codex_path: Option<String>,
+    /// absolute codex binary resolved for the CURRENT codex_path — cleared
+    /// whenever codex_path changes or a spawn with it fails (see
+    /// resolve_codex_program: the built app's minimal GUI PATH problem)
+    resolved_program: Option<String>,
     version: Option<String>,
     /// bumped per successful spawn+handshake — see ChatState.generation
     generation: u64,
     chat_counter: u64,
+}
+
+/// First `codex` binary found in `dirs` (pure — unit-tested).
+fn find_codex_in(dirs: impl Iterator<Item = std::path::PathBuf>) -> Option<String> {
+    dirs.map(|d| d.join("codex"))
+        .find(|c| c.is_file())
+        .map(|c| c.to_string_lossy().into_owned())
+}
+
+/// Resolve the codex binary to an ABSOLUTE path. macOS gives GUI apps a
+/// minimal PATH (/usr/bin:/bin:…), so the bare `codex` that works in dev
+/// (inherited shell PATH) fails in the built app with "No such file or
+/// directory". Order: settings override → current $PATH → well-known install
+/// dirs → login-shell probe (loads nvm/asdf/mise profiles). Blocking work —
+/// callers wrap in spawn_blocking.
+fn resolve_codex_program(override_path: Option<&str>) -> Result<String, String> {
+    if let Some(p) = override_path.map(str::trim).filter(|p| !p.is_empty()) {
+        return Ok(p.to_string());
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        if let Some(found) = find_codex_in(std::env::split_paths(&path)) {
+            return Ok(found);
+        }
+    }
+    let mut known: Vec<std::path::PathBuf> =
+        vec!["/opt/homebrew/bin".into(), "/usr/local/bin".into()];
+    if let Some(h) = dirs::home_dir() {
+        for rel in [".local/bin", ".bun/bin", ".volta/bin", ".cargo/bin", ".npm-global/bin"] {
+            known.push(h.join(rel));
+        }
+    }
+    if let Some(found) = find_codex_in(known.into_iter()) {
+        return Ok(found);
+    }
+    if let Ok(out) = std::process::Command::new("/bin/zsh")
+        .args(["-lc", "command -v codex"])
+        .output()
+    {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() {
+                return Ok(p);
+            }
+        }
+    }
+    Err(
+        "codex CLI not found on this system — install it or set the Codex binary path in Settings"
+            .to_string(),
+    )
 }
 
 /// Process manager — tokio mutex because ensure_client awaits while holding
@@ -369,12 +430,29 @@ async fn ensure_client(app: &AppHandle, mgr: &mut Manager) -> Result<Arc<Client>
             return Ok(c.clone());
         }
     }
-    let program = mgr
-        .codex_path
-        .clone()
-        .unwrap_or_else(|| "codex".to_string());
+    let program = match mgr.resolved_program.clone() {
+        Some(p) => p,
+        None => {
+            let override_path = mgr.codex_path.clone();
+            let resolved = tauri::async_runtime::spawn_blocking(move || {
+                resolve_codex_program(override_path.as_deref())
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            mgr.resolved_program = Some(resolved.clone());
+            resolved
+        }
+    };
     let (events_tx, events_rx) = mpsc::unbounded_channel();
-    let client = Arc::new(Client::spawn(&program, events_tx).await?);
+    let client = match Client::spawn(&program, events_tx).await {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            // a cached path may have gone stale (codex moved/uninstalled) —
+            // drop the cache so the next attempt re-resolves from scratch
+            mgr.resolved_program = None;
+            return Err(e);
+        }
+    };
     spawn_dispatcher(app.clone(), client.clone(), events_rx);
     let version = handshake(&client)
         .await
@@ -709,6 +787,7 @@ pub async fn chat_start(app: &AppHandle, codex_path: Option<String>) -> Result<V
         // the frontend passes the current settings value on every call —
         // an empty string clears the override back to plain `codex`
         mgr.codex_path = normalize_path(codex_path);
+        mgr.resolved_program = None; // path changed — re-resolve on next spawn
     }
     let client = ensure_client(app, &mut mgr).await?;
     let version = mgr.version.clone();
@@ -891,6 +970,7 @@ pub async fn chat_status(app: &AppHandle, codex_path: Option<String>) -> Value {
     let mut mgr = MANAGER.lock().await;
     if codex_path.is_some() {
         mgr.codex_path = normalize_path(codex_path);
+        mgr.resolved_program = None; // path changed — re-resolve on next spawn
     }
     let client = match ensure_client(app, &mut mgr).await {
         Ok(c) => c,
@@ -957,6 +1037,34 @@ mod tests {
     }
 
     #[test]
+    fn codex_resolution_prefers_override_and_scans_dirs() {
+        // explicit override wins untouched (even if it doesn't exist)
+        assert_eq!(
+            resolve_codex_program(Some("  /custom/codex  ")).unwrap(),
+            "/custom/codex"
+        );
+        // pure dir scan: only the dir that actually holds a codex file hits
+        let dir = std::env::temp_dir().join(format!(
+            "swarmz-codex-resolve-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            find_codex_in([dir.join("missing"), dir.clone()].into_iter()),
+            None
+        );
+        std::fs::write(dir.join("codex"), "").unwrap();
+        assert_eq!(
+            find_codex_in([dir.join("missing"), dir.clone()].into_iter()),
+            Some(dir.join("codex").to_string_lossy().into_owned())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn version_guard_wraps_dynamic_tool_failures_only() {
         let wrapped = guard_dynamic_tools_error(
             "unknown field `dynamicTools` (code -32602)".into(),
@@ -995,8 +1103,12 @@ mod tests {
     #[ignore]
     async fn appserver_spike() {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        // resolve exactly like production — doubles as a regression test for
+        // the built app's minimal GUI PATH (run with PATH=/usr/bin:/bin …)
+        let program = resolve_codex_program(None).expect("resolve codex binary");
+        println!("resolved codex: {program}");
         let client = Arc::new(
-            Client::spawn("codex", events_tx)
+            Client::spawn(&program, events_tx)
                 .await
                 .expect("spawn codex app-server"),
         );
