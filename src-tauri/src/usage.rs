@@ -306,7 +306,7 @@ pub fn claude_projects_dir() -> Option<PathBuf> {
 
 /// Claude encodes a project's cwd as the directory name by replacing every
 /// `/` and `.` with `-`. e.g. `/Users/x/Desktop/.claude` -> `-Users-x-Desktop--claude`.
-fn encode_project_dir(cwd: &str) -> String {
+pub(crate) fn encode_project_dir(cwd: &str) -> String {
     cwd.chars()
         .map(|c| if c == '/' || c == '.' { '-' } else { c })
         .collect()

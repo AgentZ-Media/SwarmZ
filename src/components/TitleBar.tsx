@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   BarChart3,
+  Bot,
   Download,
   Gauge,
   LayoutGrid,
@@ -12,6 +13,7 @@ import {
 } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
 import { useSwarm } from "@/store";
+import { useOrchestrator } from "@/lib/orchestrator/chat-store";
 import { useUpdates } from "@/lib/updates";
 import { useLimits } from "@/lib/limits";
 import { WorktreesButton } from "./WorktreePanel";
@@ -35,6 +37,8 @@ export function TitleBar({
   const setFleetOpen = useSwarm((s) => s.setFleetOpen);
   const notesOpen = useSwarm((s) => s.notesOpen);
   const setNotesOpen = useSwarm((s) => s.setNotesOpen);
+  const orchestratorOpen = useOrchestrator((s) => s.panelOpen);
+  const toggleOrchestrator = useOrchestrator((s) => s.togglePanel);
 
   return (
     <header
@@ -91,6 +95,17 @@ export function TitleBar({
             onClick={() => setNotesOpen(!notesOpen)}
           >
             <StickyNote size={15} />
+          </Button>
+        </Tip>
+
+        <Tip label="Orchestrator (⌘⇧O)">
+          <Button
+            size="icon"
+            variant={orchestratorOpen ? "secondary" : "ghost"}
+            className="no-drag"
+            onClick={toggleOrchestrator}
+          >
+            <Bot size={15} />
           </Button>
         </Tip>
 

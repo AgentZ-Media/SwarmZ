@@ -75,4 +75,8 @@ conflict with the surface ladder, and keep motion to the existing keyframes
 - No sidebar by design — the tiling grid owns the viewport. Top-level navigation
   is the workspace tab strip inside the title bar; new global features go into
   the title bar, a drawer (like UsageDashboard), the command palette (⌘K) or
-  the fleet overview (⌘E).
+  the fleet overview (⌘E). The **one deliberate exception** is the orchestrator
+  chat panel (⌘⇧O): a resizable right-hand flex sibling that squeezes the grid,
+  because the user works with it open. Its conventions: panel surface stays on
+  `--background` with `--secondary` user bubbles, tool/data lines are compact
+  mono chips in `--muted-foreground`/`--faint`, and `--warning` only on failures.

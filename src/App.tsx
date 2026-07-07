@@ -16,13 +16,17 @@ import { SavePresetDialog } from "./components/SavePresetDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { QuickNotesPanel } from "./components/QuickNotesPanel";
+import { OrchestratorPanel } from "./components/OrchestratorPanel";
 import { UsageDashboard } from "./components/UsageDashboard";
 import { useSwarm } from "./store";
+import { useOrchestrator } from "./lib/orchestrator/chat-store";
 import { useUpdates } from "./lib/updates";
 import { useLimits } from "./lib/limits";
 import { startGitPolling } from "./lib/git";
 import { startQuitGuard } from "./lib/quit";
 import { startFileDropListener } from "./lib/dnd";
+import { startOrchestratorBus } from "./lib/orchestrator/bus";
+import { startOrchestratorActivityWatcher } from "./lib/orchestrator/controller";
 import { fetchKeyStatus } from "./lib/openrouter";
 import { fetchLocalSttStatus } from "./lib/local-stt";
 import {
@@ -41,6 +45,10 @@ import {
   notify,
   onUsageChanged,
 } from "./lib/transport";
+
+// dev-only orchestrator smoke-test hook (`window.__orch`) — the DEV guard
+// makes production builds drop the import entirely
+if (import.meta.env.DEV) void import("./lib/orchestrator/dev");
 
 export default function App() {
   const hydrate = useSwarm((s) => s.hydrate);
@@ -68,6 +76,12 @@ export default function App() {
     const stopGit = startGitPolling();
     const stopQuitGuard = startQuitGuard();
     const stopFileDrop = startFileDropListener();
+    // orchestrator tool bus: executes Rust-dispatched tool requests against
+    // the store (Phase 2) — registered once, guarded against double starts
+    const stopOrchestratorBus = startOrchestratorBus();
+    // orchestrator status pings: busy → idle/waiting transitions of panes an
+    // orchestrator chat prompted become system pings in that chat (Phase 5)
+    const stopOrchestratorPings = startOrchestratorActivityWatcher();
     // dictation UI is hidden until a working OpenRouter key is found
     // (or, with the local engine, the local speech model is installed)
     void fetchKeyStatus()
@@ -82,6 +96,8 @@ export default function App() {
       stopGit();
       stopQuitGuard();
       stopFileDrop();
+      stopOrchestratorBus();
+      stopOrchestratorPings();
     };
   }, [hydrate]);
 
@@ -286,6 +302,12 @@ export default function App() {
       } else if (k === "e") {
         e.preventDefault();
         s.setFleetOpen(!s.fleetOpen);
+      } else if (k === "o" && e.shiftKey) {
+        // ⌘⇧O — orchestrator chat sidebar. NOT a dialog: it stays open
+        // during work and global shortcuts keep firing while it's up. (No
+        // plain ⌘O exists today; keep this branch before one if it ever does.)
+        e.preventDefault();
+        useOrchestrator.getState().togglePanel();
       } else if (k === "a" && e.shiftKey) {
         // jump to the next agent waiting for input, across all workspaces
         e.preventDefault();
@@ -382,11 +404,18 @@ export default function App() {
           onManageProfiles={() => setProfilesOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
         />
-        <main className="relative min-h-0 min-w-0 flex-1">
-          {/* all workspace grids stay mounted in here — see WorkspaceLayer */}
-          <WorkspaceLayer />
-          {/* floating terminals live above the grids — and survive them (detached) */}
-          <FloatingTerminals />
+        <main className="flex min-h-0 min-w-0 flex-1">
+          {/* the workspace area is its own positioning context so the fleet
+              overlay and floating terminals keep covering exactly the grid —
+              the orchestrator panel is a flex sibling that squeezes it */}
+          <div className="relative min-h-0 min-w-0 flex-1">
+            {/* all workspace grids stay mounted in here — see WorkspaceLayer */}
+            <WorkspaceLayer />
+            {/* floating terminals live above the grids — and survive them (detached) */}
+            <FloatingTerminals />
+          </div>
+          {/* orchestrator chat sidebar (⌘⇧O) — resizes the grid, not an overlay */}
+          <OrchestratorPanel />
         </main>
       </div>
 

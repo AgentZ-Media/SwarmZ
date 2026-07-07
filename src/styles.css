@@ -233,6 +233,25 @@ body {
   animation: dialog-in 0.16s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+/* orchestrator chat: pulsing caret/ellipsis while a response streams */
+@keyframes caret-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.15;
+  }
+}
+.streaming-caret {
+  animation: caret-pulse 1s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .streaming-caret {
+    animation: none;
+  }
+}
+
 @keyframes slide-in-right {
   from {
     opacity: 0;

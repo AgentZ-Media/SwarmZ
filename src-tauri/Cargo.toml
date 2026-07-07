@@ -39,7 +39,10 @@ walkdir = "2"
 base64 = "0.22"
 # both already in the tree via tauri / tauri-plugin-updater
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }
-tokio = { version = "1", features = ["time"] }
+# "sync" for the orchestrator bus's oneshot pending map (orchestrator/bus.rs);
+# "process"/"io-util"/"rt" for the long-lived `codex app-server` child and its
+# stdio pump tasks (orchestrator/appserver.rs)
+tokio = { version = "1", features = ["time", "sync", "process", "io-util", "rt"] }
 futures-util = "0.3"
 # local speech-to-text (Parakeet via ONNX Runtime) — "onnx" only, so no
 # whisper.cpp/cmake; ort pulls prebuilt onnxruntime binaries at build time
@@ -49,6 +52,10 @@ sha2 = "0.10"
 # macOS Keychain for the OpenRouter key — the Security framework (unlike the
 # `security` CLI) keeps the key out of argv and ACLs the item to this binary
 security-framework = "3"
+
+[dev-dependencies]
+# async unit tests for the orchestrator bus (#[tokio::test])
+tokio = { version = "1", features = ["time", "sync", "rt", "macros"] }
 
 [profile.release]
 codegen-units = 1

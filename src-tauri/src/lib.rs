@@ -3,9 +3,12 @@ mod git;
 mod limits;
 mod localstt;
 mod openrouter;
+mod orchestrator;
 mod project;
+mod projects;
 mod pty;
 mod storefile;
+mod transcript;
 mod usage;
 mod worktree;
 
@@ -303,6 +306,163 @@ async fn worktree_list(
         .map_err(|e| e.to_string())
 }
 
+// ---- Orchestrator sensing (Phase 1) — read-only, see transcript.rs / projects.rs ----
+
+#[tauri::command]
+async fn transcript_read(
+    cwd: String,
+    session_id: String,
+    runtime: String,
+    tail_messages: Option<usize>,
+    max_bytes: Option<u64>,
+    include_first_user_message: Option<bool>,
+) -> Result<transcript::TranscriptView, String> {
+    // file reads (possibly a seek into a huge jsonl) — off the core threads
+    tauri::async_runtime::spawn_blocking(move || {
+        let defaults = transcript::TranscriptOpts::default();
+        let opts = transcript::TranscriptOpts {
+            tail_messages: tail_messages.unwrap_or(defaults.tail_messages),
+            max_bytes: max_bytes.unwrap_or(defaults.max_bytes),
+            include_first_user_message: include_first_user_message
+                .unwrap_or(defaults.include_first_user_message),
+        };
+        transcript::read(&cwd, &session_id, &runtime, &opts)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn project_docs(root: String) -> Result<transcript::ProjectDocs, String> {
+    tauri::async_runtime::spawn_blocking(move || transcript::project_docs(&root))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn discover_projects(
+    scan_roots: Vec<String>,
+    known: Vec<projects::KnownFolder>,
+) -> Result<Vec<projects::ProjectEntry>, String> {
+    // directory walks + jsonl head reads — off the core threads
+    tauri::async_runtime::spawn_blocking(move || projects::discover_default(&scan_roots, &known))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ---- Orchestrator tool bus (Phase 2) — see orchestrator/ ----
+
+/// The tool catalog + the orchestrator system instructions, both single-
+/// source in Rust. Phase 3 hands the tools to Codex `dynamicTools` (and the
+/// instructions as `developerInstructions`); the Phase-6 OpenRouter loop
+/// fetches BOTH through this command for its wire messages.
+#[tauri::command]
+fn orchestrator_tools() -> serde_json::Value {
+    serde_json::json!({
+        "instructions": orchestrator::ORCHESTRATOR_INSTRUCTIONS,
+        "tools": orchestrator::tool_definitions(),
+    })
+}
+
+/// Run one tool through the roundtrip bus (Rust → webview executor → Rust).
+/// Async: it awaits the webview's response (or the tool's timeout) — no
+/// blocking work happens on this side.
+#[tauri::command]
+async fn orchestrator_run_tool(
+    app: AppHandle,
+    tool: String,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    // dev-hook surface — no chat context (executors skip touched-pane tracking)
+    orchestrator::run_tool(&app, &tool, args, None).await
+}
+
+/// Webview → Rust leg of the roundtrip. Sync on purpose: it only resolves a
+/// oneshot in the pending map (fast, non-blocking). Unknown/expired ids are
+/// a logged no-op — a late response after a timeout is normal, not an error.
+#[tauri::command]
+fn orchestrator_tool_response(id: String, ok: bool, payload: serde_json::Value) {
+    orchestrator::resolve_tool_response(&id, ok, payload);
+}
+
+// ---- Orchestrator brain (Phase 3) — see orchestrator/appserver.rs ----
+//
+// All async: they await JSON-RPC roundtrips against the long-lived
+// `codex app-server` child (spawned lazily; tokio::process — no blocking
+// work on the main thread). Progress streams as `orchestrator://chat-event`.
+
+/// Start a fresh orchestrator chat (app-server thread with dynamic tools).
+/// `codex_path` is the Settings codex-binary override, passed on every call.
+#[tauri::command]
+async fn orchestrator_chat_start(
+    app: AppHandle,
+    codex_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    orchestrator::chat_start(&app, codex_path).await
+}
+
+/// Send one user message; resolves with the final assistant text when the
+/// turn completes (deltas/tool calls stream as events meanwhile).
+#[tauri::command]
+async fn orchestrator_chat_send(
+    app: AppHandle,
+    chat_id: String,
+    text: String,
+) -> Result<serde_json::Value, String> {
+    orchestrator::chat_send(&app, &chat_id, &text).await
+}
+
+/// Interrupt the chat's running turn (turn/interrupt).
+#[tauri::command]
+async fn orchestrator_chat_interrupt(chat_id: String) -> Result<(), String> {
+    orchestrator::chat_interrupt(&chat_id).await
+}
+
+/// Reopen a persisted app-server thread as a chat (thread/resume).
+#[tauri::command]
+async fn orchestrator_chat_resume(
+    app: AppHandle,
+    thread_id: String,
+) -> Result<serde_json::Value, String> {
+    orchestrator::chat_resume(&app, &thread_id).await
+}
+
+/// Liveness + codex version + account summary. Never errors — spawn
+/// failures come back as `{ running: false, error }`.
+#[tauri::command]
+async fn orchestrator_chat_status(
+    app: AppHandle,
+    codex_path: Option<String>,
+) -> serde_json::Value {
+    orchestrator::chat_status(&app, codex_path).await
+}
+
+// ---- Orchestrator brain, provider B (Phase 6) — see orchestrator/openrouter.rs ----
+
+/// One streamed OpenRouter chat-completion call for the webview tool loop.
+/// Content tokens emit as `orchestrator://chat-event` deltas under `chat_id`
+/// (the STORE chat id); resolves with the assembled assistant message
+/// `{ content, tool_calls, finish_reason }`. The key stays in the keychain —
+/// it never reaches JS.
+#[tauri::command]
+async fn openrouter_chat_completion(
+    app: AppHandle,
+    chat_id: String,
+    model: String,
+    messages: serde_json::Value,
+    tools: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    orchestrator::openrouter_chat_completion(&app, chat_id, model, messages, tools).await
+}
+
+/// Cancel the chat's in-flight OpenRouter stream (the completion resolves
+/// with `finish_reason: "cancelled"`, keeping the partial content). Sync on
+/// purpose: it only flips an atomic flag.
+#[tauri::command]
+fn openrouter_chat_cancel(chat_id: String) {
+    orchestrator::openrouter_cancel(&chat_id);
+}
+
 fn start_usage_watcher(app: AppHandle) {
     let claude_dir = usage::claude_projects_dir().filter(|d| d.exists());
     let codex_dir = dirs::home_dir()
@@ -416,6 +576,19 @@ pub fn run() {
             worktree_status,
             worktree_remove,
             worktree_list,
+            transcript_read,
+            project_docs,
+            discover_projects,
+            orchestrator_tools,
+            orchestrator_run_tool,
+            orchestrator_tool_response,
+            orchestrator_chat_start,
+            orchestrator_chat_send,
+            orchestrator_chat_interrupt,
+            orchestrator_chat_resume,
+            orchestrator_chat_status,
+            openrouter_chat_completion,
+            openrouter_chat_cancel,
             openrouter_key_status,
             openrouter_set_key,
             openrouter_clear_key,

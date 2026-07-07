@@ -5,6 +5,7 @@ import type {
   FolderCommands,
   GitInfo,
   PersistedGrid,
+  PersistedOrchestratorChats,
   PersistedWorkspaces,
   Profile,
   QuickNotesData,
@@ -94,6 +95,10 @@ export interface Backend {
   /** Quick notes (checklists) — global + per project folder (repo root). */
   loadQuickNotes(): Promise<QuickNotesData | null>;
   saveQuickNotes(data: QuickNotesData): Promise<void>;
+
+  /** Orchestrator chat sidebar — chats + active id + panel open/width. */
+  loadOrchestratorChats(): Promise<PersistedOrchestratorChats | null>;
+  saveOrchestratorChats(data: PersistedOrchestratorChats): Promise<void>;
 
   loadUsageHistory(): Promise<UsageHistoryEntry[] | null>;
   saveUsageHistory(entries: UsageHistoryEntry[]): Promise<void>;

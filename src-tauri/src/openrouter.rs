@@ -57,7 +57,9 @@ pub struct KeyStatus {
 
 /// `read_key` for async contexts — the keychain call can block on the
 /// one-time macOS consent prompt, so it must not pin a runtime core thread.
-async fn read_key_blocking() -> Option<String> {
+/// Crate-visible: the orchestrator's OpenRouter loop (orchestrator/
+/// openrouter.rs) shares the same keychain item.
+pub(crate) async fn read_key_blocking() -> Option<String> {
     tauri::async_runtime::spawn_blocking(read_key)
         .await
         .ok()
@@ -89,7 +91,7 @@ pub async fn key_status() -> KeyStatus {
 }
 
 /// Pull a useful error message out of an OpenRouter error body.
-fn api_error(status: reqwest::StatusCode, body: &str) -> String {
+pub(crate) fn api_error(status: reqwest::StatusCode, body: &str) -> String {
     let msg = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| {

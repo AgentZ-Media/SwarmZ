@@ -262,6 +262,29 @@ export interface AppSettings {
    * left are pruned again on refresh
    */
   worktreeRepos?: string[];
+  /**
+   * orchestrator brain for NEW chats: "codex" = the codex app-server
+   * (ChatGPT login), "openrouter" = a tool loop over the OpenRouter API
+   * (key from the Voice section). A chat keeps the provider it was created
+   * with; switching this only affects new chats. Unset = codex.
+   */
+  orchestratorProvider?: "codex" | "openrouter";
+  /** OpenRouter model id for orchestrator chats; unset = DEFAULT_ORCHESTRATOR_MODEL */
+  orchestratorModel?: string;
+  /**
+   * let the orchestrator press Enter on prompts it types into panes
+   * (default on). Off = review mode: prompt_pane and create_panes startup
+   * prompts paste but never submit — the user submits manually.
+   */
+  orchestratorAutoSubmit?: boolean;
+  /**
+   * what prompt_pane does on a busy pane: "deliver" queues the text in the
+   * CLI's input with a warning to the model (default), "refuse" errors so
+   * the model waits instead
+   */
+  orchestratorBusyPolicy?: "deliver" | "refuse";
+  /** default scan roots for the orchestrator's list_projects when the model passes none */
+  orchestratorScanRoots?: string[];
 }
 
 // ---- OpenRouter voice dictation ----
@@ -480,6 +503,130 @@ export interface NoteItem {
 export interface QuickNotesData {
   global: NoteItem[];
   folders: Record<string, NoteItem[]>;
+}
+
+// ---- Orchestrator chat sidebar ----
+
+/** A pane referenced by an orchestrator tool call — rendered as a jump chip. */
+export interface OrchestratorPaneRef {
+  /** agent id (chips hide themselves once the pane is gone) */
+  id: string;
+  /** pane name captured at reference time (fallback when the agent closed) */
+  name: string;
+}
+
+/**
+ * One message in an orchestrator chat. `system` carries the Phase-5 status
+ * pings ("«api» ist fertig") — its `paneRefs` render the jump chip and the
+ * "Auswerten" button. Assistant messages carry a transient `streaming` flag
+ * while deltas arrive — cleared on finalize and on hydrate.
+ */
+export type OrchestratorChatMessage =
+  | { id: string; at: number; role: "user"; text: string }
+  | { id: string; at: number; role: "assistant"; text: string; streaming?: boolean }
+  | {
+      id: string;
+      at: number;
+      role: "tool";
+      tool: string;
+      /** one-line args summary from the chat event stream */
+      argsSummary: string;
+      /** undefined while the call runs; patched from tool_done */
+      ok?: boolean;
+      /** panes this call touched/created — the UI's "→ pane" jump chips */
+      paneRefs?: OrchestratorPaneRef[];
+    }
+  | { id: string; at: number; role: "warning"; text: string }
+  | {
+      id: string;
+      at: number;
+      role: "system";
+      text: string;
+      /** the pinged pane — jump chip + "Auswerten" target (Phase 5) */
+      paneRefs?: OrchestratorPaneRef[];
+    };
+
+/** A pane this chat prompted (prompt_pane / create_panes startup prompt). */
+export interface OrchestratorTouchedPane {
+  /** pane name at prompt time (fallback once the pane is gone) */
+  name: string;
+  /** last orchestrator prompt delivery into this pane, epoch ms */
+  lastPromptAt: number;
+}
+
+/**
+ * One "pane finished" status ping (Phase 5). Recorded per chat when a
+ * touched pane transitions busy → idle/waiting; `delivered` flips once the
+ * ping was injected into the wire text of an outgoing turn.
+ */
+export interface OrchestratorPingRecord {
+  paneId: string;
+  paneName: string;
+  /** the activity the pane landed on */
+  activity: "idle" | "waiting";
+  at: number;
+  delivered: boolean;
+}
+
+/** One streamed tool call of the OpenRouter loop (OpenAI wire format). */
+export interface OrchestratorWireToolCall {
+  id: string;
+  name: string;
+  /** raw JSON string of the arguments, exactly as streamed */
+  arguments_json: string;
+}
+
+/**
+ * One OpenAI-format wire message of an OpenRouter chat's model context
+ * (Phase 6). Persisted per chat, capped — a capped history simply loses old
+ * context like any long chat. The system message is NOT persisted; it is
+ * rebuilt fresh each turn (instructions + current fleet-status line).
+ */
+export type OrchestratorWireMessage =
+  | { role: "user"; content: string }
+  | {
+      role: "assistant";
+      content: string | null;
+      tool_calls?: OrchestratorWireToolCall[];
+    }
+  | { role: "tool"; tool_call_id: string; content: string };
+
+/**
+ * One orchestrator chat (right sidebar, ⌘⇧O). `provider` is stamped at
+ * creation from the settings and never changes (missing = codex, for chats
+ * from pre-Phase-6 builds). Codex chats: `threadId` is the app-server thread
+ * behind it — persisted so the chat reconnects across app restarts
+ * (chatResume); null until the first message was sent. OpenRouter chats:
+ * `model` + `wire` (the OpenAI-format model context) take that role.
+ * `touchedPanes`/`pendingPings` are the Phase-5 status-ping state — persisted
+ * so pings survive restarts.
+ */
+export interface OrchestratorChat {
+  id: string;
+  /** the brain behind this chat — fixed for the chat's lifetime */
+  provider?: "codex" | "openrouter";
+  threadId: string | null;
+  /** OpenRouter model id, captured at creation (openrouter chats only) */
+  model?: string;
+  /** OpenRouter wire history, capped (openrouter chats only) */
+  wire?: OrchestratorWireMessage[];
+  title: string;
+  createdAt: number;
+  messages: OrchestratorChatMessage[];
+  /** panes this chat prompted, keyed by pane id */
+  touchedPanes: Record<string, OrchestratorTouchedPane>;
+  /** ping history, oldest first, capped (delivered + undelivered) */
+  pendingPings: OrchestratorPingRecord[];
+}
+
+/** Persisted shape of the orchestrator sidebar (store key `orchestratorChats`). */
+export interface PersistedOrchestratorChats {
+  /** shape version — bump when the persisted shape changes (missing = 1) */
+  version?: number;
+  chats: OrchestratorChat[];
+  activeId: string | null;
+  panelOpen?: boolean;
+  panelWidth?: number;
 }
 
 // ---- Floating terminals & quick commands ----

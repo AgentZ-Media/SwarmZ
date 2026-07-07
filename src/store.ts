@@ -53,6 +53,10 @@ import type {
 } from "@/types";
 import { listWorktrees, removeWorktree, worktreeStatus } from "@/lib/worktree";
 import {
+  flushOrchestratorPersist,
+  hydrateOrchestratorChats,
+} from "@/lib/orchestrator/chat-store";
+import {
   collectPanes,
   findPaneByAgent,
   movePane as movePaneInLayout,
@@ -278,6 +282,8 @@ export async function flushAllPersists(): Promise<void> {
           .sort((a, b) => b.last_updated - a.last_updated)
           .slice(0, MAX_HISTORY_ENTRIES),
       ),
+      // the orchestrator chat sidebar keeps its own debounced slice
+      flushOrchestratorPersist(),
     ]);
   } catch {
     /* never block quitting on a failed write */
@@ -324,7 +330,7 @@ const pendingWorktreeCleanup = new Map<
   }
 >();
 
-interface SwarmState {
+export interface SwarmState {
   agents: Record<string, Agent>;
   order: string[];
   /** workspace tabs — name/order/defaultCwd persist */
@@ -984,6 +990,12 @@ export const useSwarm = create<SwarmState>((set, get) => ({
           quickNotes: { global: notes.global ?? [], folders: notes.folders ?? {} },
         });
       }
+    } catch {
+      /* ignore */
+    }
+    try {
+      // orchestrator chat sidebar — hydrates its own store (chat-store.ts)
+      await hydrateOrchestratorChats();
     } catch {
       /* ignore */
     }

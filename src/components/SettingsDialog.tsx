@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
+  Bot,
   ExternalLink,
   Folder,
   FolderCog,
@@ -55,6 +56,7 @@ import {
   fetchOpenrouterModels,
   setOpenrouterKey,
 } from "@/lib/openrouter";
+import { DEFAULT_ORCHESTRATOR_MODEL } from "@/lib/orchestrator/openrouter-loop";
 import { listMicrophones } from "@/lib/dictation";
 import {
   LOCAL_STT_DOWNLOAD_MB,
@@ -91,6 +93,7 @@ type SectionId =
   | "presets"
   | "commands"
   | "voice"
+  | "orchestrator"
   | "updates"
   | "paths"
   | "about";
@@ -100,6 +103,7 @@ const SECTIONS: { id: SectionId; label: string; icon: LucideIcon }[] = [
   { id: "presets", label: "Presets", icon: LayoutTemplate },
   { id: "commands", label: "Commands", icon: ScrollText },
   { id: "voice", label: "Voice", icon: Mic },
+  { id: "orchestrator", label: "Orchestrator", icon: Bot },
   { id: "updates", label: "Updates", icon: RefreshCw },
   { id: "paths", label: "Paths", icon: FolderCog },
   { id: "about", label: "About", icon: Info },
@@ -147,6 +151,7 @@ export function SettingsDialog({
             {section === "presets" && <PresetsSection />}
             {section === "commands" && <CommandsSection />}
             {section === "voice" && <VoiceSection />}
+            {section === "orchestrator" && <OrchestratorSection />}
             {section === "updates" && <UpdatesSection />}
             {section === "paths" && <PathsSection />}
             {section === "about" && <AboutSection />}
@@ -1318,6 +1323,230 @@ function LocalModelRow() {
         </Button>
       )}
     </StackedRow>
+  );
+}
+
+// ---- Orchestrator ----
+
+/**
+ * Phase-6 orchestrator knobs. The provider/model choice applies to NEW
+ * chats only (a chat keeps its brain for life); auto-submit, busy policy
+ * and scan roots take effect immediately — they are read live by the tool
+ * executors.
+ */
+function OrchestratorSection() {
+  const settings = useSwarm((s) => s.settings);
+  const updateSettings = useSwarm((s) => s.updateSettings);
+  const keyStatus = useSwarm((s) => s.openrouterStatus);
+  const [models, setModels] = useState<OpenrouterModel[] | null>(null);
+
+  const provider = settings.orchestratorProvider ?? "codex";
+  const model = settings.orchestratorModel ?? DEFAULT_ORCHESTRATOR_MODEL;
+  const scanRoots = settings.orchestratorScanRoots ?? [];
+
+  // same public catalog as the dictation cleanup picker (cached in Rust)
+  useEffect(() => {
+    if (!IS_TAURI || provider !== "openrouter") return;
+    fetchOpenrouterModels().then(setModels, () => setModels(null));
+  }, [provider]);
+
+  if (!IS_TAURI) {
+    return (
+      <>
+        <SectionHeader
+          title="Orchestrator"
+          sub="The AI team lead behind the chat sidebar (⌘⇧O)."
+        />
+        <p className="border-t border-border py-3 text-xs leading-relaxed text-muted-foreground">
+          The orchestrator ships with the native macOS app.
+        </p>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <SectionHeader
+        title="Orchestrator"
+        sub="The AI team lead behind the chat sidebar (⌘⇧O) — which brain drives it and how it may touch your panes."
+      />
+
+      <Row
+        label="Brain"
+        help={
+          <>
+            Codex runs on your ChatGPT subscription via the codex CLI;
+            OpenRouter uses your own API key (from the Voice section) with any
+            model you pick. Applies to <em>new</em> chats — existing chats keep
+            the brain they were started with.
+            {provider === "openrouter" && !keyStatus?.present && (
+              <>
+                {" "}
+                <span className="text-warning">
+                  No OpenRouter API key stored yet — add one in the Voice
+                  section, orchestrator chats can't start without it.
+                </span>
+              </>
+            )}
+          </>
+        }
+      >
+        <Segmented
+          value={provider}
+          options={[
+            { value: "codex", label: "Codex" },
+            { value: "openrouter", label: "OpenRouter" },
+          ]}
+          onChange={(v) =>
+            updateSettings({
+              orchestratorProvider: v === "codex" ? undefined : v,
+            })
+          }
+        />
+      </Row>
+
+      {provider === "openrouter" && (
+        <StackedRow
+          label="Model"
+          help={
+            <>
+              Any tool-calling model on OpenRouter — suggestions come from the
+              live catalog{models ? ` (${models.length} models)` : ""}. New
+              chats capture the model at creation.
+              {settings.orchestratorModel !== undefined && (
+                <>
+                  {" "}
+                  <button
+                    className="text-ring hover:underline"
+                    onClick={() =>
+                      updateSettings({ orchestratorModel: undefined })
+                    }
+                  >
+                    Reset to default
+                  </button>
+                </>
+              )}
+            </>
+          }
+        >
+          <>
+            <Input
+              value={model}
+              onChange={(e) =>
+                updateSettings({
+                  orchestratorModel:
+                    e.target.value === DEFAULT_ORCHESTRATOR_MODEL
+                      ? undefined
+                      : e.target.value,
+                })
+              }
+              list="orchestrator-openrouter-models"
+              className="font-mono text-xs"
+              placeholder={DEFAULT_ORCHESTRATOR_MODEL}
+              spellCheck={false}
+            />
+            <datalist id="orchestrator-openrouter-models">
+              {models?.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name}
+                </option>
+              ))}
+            </datalist>
+          </>
+        </StackedRow>
+      )}
+
+      <Row
+        label="Auto-submit prompts"
+        help="Let the orchestrator press Enter on prompts it types into panes. Off = review mode: text is pasted into the pane but never submitted — you review and press Enter yourself."
+      >
+        <Switch
+          checked={settings.orchestratorAutoSubmit !== false}
+          onCheckedChange={(v) =>
+            updateSettings({ orchestratorAutoSubmit: v ? undefined : false })
+          }
+          label="Auto-submit prompts"
+        />
+      </Row>
+
+      <Row
+        label="Busy panes"
+        help="What happens when the orchestrator prompts a pane that is still working: Deliver queues the text in the pane's input (the model gets a warning), Refuse rejects the prompt so the model waits instead."
+      >
+        <Segmented
+          value={settings.orchestratorBusyPolicy ?? "deliver"}
+          options={[
+            { value: "deliver", label: "Deliver" },
+            { value: "refuse", label: "Refuse" },
+          ]}
+          onChange={(v) =>
+            updateSettings({
+              orchestratorBusyPolicy: v === "deliver" ? undefined : v,
+            })
+          }
+        />
+      </Row>
+
+      <StackedRow
+        label="Project scan folders"
+        help="Extra folders (e.g. ~/Code) the orchestrator's project discovery shallow-scans for git repos when the model doesn't name its own — on top of your Claude/Codex session history and folders the app already knows."
+      >
+        <div className="flex flex-col gap-1.5">
+          {scanRoots.map((root) => (
+            <div
+              key={root}
+              className="flex items-center gap-2 rounded-md border border-border bg-secondary/40 px-2 py-1"
+            >
+              <FolderOpen
+                size={12}
+                className="shrink-0 text-muted-foreground"
+              />
+              <span
+                className="min-w-0 flex-1 truncate font-mono text-[10px] text-foreground"
+                title={root}
+              >
+                {shortPath(root)}
+              </span>
+              <Button
+                size="xs"
+                variant="ghost"
+                title="Remove folder"
+                className="hover:text-destructive"
+                onClick={() =>
+                  updateSettings({
+                    orchestratorScanRoots: scanRoots.filter((r) => r !== root),
+                  })
+                }
+              >
+                <Trash2 size={11} />
+              </Button>
+            </div>
+          ))}
+          {scanRoots.length === 0 && (
+            <p className="px-1 text-[11px] text-faint">
+              No folders yet — discovery then relies on session history and
+              known folders alone.
+            </p>
+          )}
+          <div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                void pickDirectory().then((dir) => {
+                  if (dir && !scanRoots.includes(dir))
+                    updateSettings({
+                      orchestratorScanRoots: [...scanRoots, dir],
+                    });
+                });
+              }}
+            >
+              <Plus size={13} /> Add folder…
+            </Button>
+          </div>
+        </div>
+      </StackedRow>
+    </>
   );
 }
 

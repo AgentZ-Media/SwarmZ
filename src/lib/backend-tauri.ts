@@ -16,6 +16,7 @@ import type {
   FolderCommands,
   GitInfo,
   PersistedGrid,
+  PersistedOrchestratorChats,
   PersistedWorkspaces,
   Profile,
   QuickNotesData,
@@ -136,6 +137,21 @@ export const tauriBackend: Backend = {
   },
   saveQuickNotes: async (data) => {
     await store.set("quickNotes", data);
+    await store.save();
+  },
+
+  loadOrchestratorChats: async () => {
+    try {
+      return (
+        (await store.get<PersistedOrchestratorChats>("orchestratorChats")) ??
+        null
+      );
+    } catch {
+      return null;
+    }
+  },
+  saveOrchestratorChats: async (data) => {
+    await store.set("orchestratorChats", data);
     await store.save();
   },
 
