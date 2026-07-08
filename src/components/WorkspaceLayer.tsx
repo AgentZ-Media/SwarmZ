@@ -12,6 +12,7 @@ import { blurActiveTerm, focusTerm } from "@/lib/term-host";
 import { lastEventForPane, useFleetEvents, type FleetEvent } from "@/lib/events";
 import { triageEntries } from "@/lib/triage";
 import { fleetCounts } from "@/lib/orchestrator/snapshot";
+import { AgentIdentityMark, useAgentSummary } from "./agents/AgentIdentity";
 import type { Agent } from "@/types";
 
 /**
@@ -576,6 +577,7 @@ function FleetPaneChrome({
   now: number;
 }) {
   const agent = useSwarm((s) => s.agents[agentId]);
+  const agentSummary = useAgentSummary(agent?.agentSlug);
   const lastEvent = useFleetEvents((s) => lastEventForPane(s.events, agentId));
   if (!agent) return null;
 
@@ -615,6 +617,7 @@ function FleetPaneChrome({
       <div className="absolute bottom-1.5 left-1.5 flex min-w-0 max-w-[calc(100%-0.75rem)] flex-col gap-1 rounded-md border border-border bg-popover/95 px-2 py-1.5 shadow-sm">
         <div className="flex min-w-0 items-center gap-1.5">
           <FleetSignalChip agent={agent} now={now} />
+          <AgentIdentityMark summary={agentSummary} size={11} />
           <span className="min-w-0 truncate text-[10px] font-medium leading-none text-foreground">
             {agent.name}
           </span>

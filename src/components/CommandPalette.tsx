@@ -5,6 +5,7 @@ import {
   BarChart3,
   Bell,
   Bot,
+  Boxes,
   LayoutGrid,
   LayoutTemplate,
   Plus,
@@ -14,8 +15,10 @@ import {
   SlidersHorizontal,
   Sparkles,
   SquarePlus,
+  Wand2,
 } from "lucide-react";
 import { presetKey, useSwarm } from "@/store";
+import { useAgents } from "@/lib/agents/store";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { focusTerm } from "@/lib/term-host";
 import { extractInputLabels } from "@/lib/command-vars";
@@ -334,6 +337,24 @@ export function CommandPalette({
                 >
                   <BarChart3 size={13} className="shrink-0 text-faint" />
                   Usage dashboard
+                </PaletteItem>
+                <PaletteItem
+                  value="agents library custom personas specialists"
+                  onSelect={() =>
+                    run(() => useAgents.getState().setLibraryOpen(true))
+                  }
+                >
+                  <Boxes size={13} className="shrink-0 text-faint" />
+                  Agents
+                </PaletteItem>
+                <PaletteItem
+                  value="new agent build custom specialist persona builder"
+                  onSelect={() =>
+                    run(() => useAgents.getState().setNewBuilderOpen(true))
+                  }
+                >
+                  <Wand2 size={13} className="shrink-0 text-faint" />
+                  New agent
                 </PaletteItem>
                 <PaletteItem
                   value="profiles manage"

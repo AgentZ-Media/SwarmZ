@@ -41,6 +41,10 @@ import {
   shortPath,
 } from "@/lib/utils";
 import { openUrl } from "@/lib/transport";
+import {
+  AgentIdentityMark,
+  useAgentSummary,
+} from "./agents/AgentIdentity";
 import type { Agent, GitInfo, SessionUsage, SubagentUsage } from "@/types";
 
 /** Branch + dirty counters (±lines, untracked) for the pane header. */
@@ -521,6 +525,7 @@ export const AgentPane = memo(function AgentPane({
   onHeaderDragStart?: (agentId: string, e: React.MouseEvent) => void;
 }) {
   const agent = useSwarm((s) => s.agents[agentId]);
+  const agentSummary = useAgentSummary(agent?.agentSlug);
   const requestRemoveAgent = useSwarm((s) => s.requestRemoveAgent);
   const createFloatingTerminal = useSwarm((s) => s.createFloatingTerminal);
   const splitActive = useSwarm((s) => s.splitActive);
@@ -612,6 +617,7 @@ export const AgentPane = memo(function AgentPane({
           />
         ) : (
           <div className="flex min-w-0 items-center gap-2">
+            <AgentIdentityMark summary={agentSummary} size={13} />
             <span
               className={cn(
                 "min-w-0 truncate text-xs font-medium",

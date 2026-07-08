@@ -83,6 +83,9 @@ Besides terminal panes, the fleet has a second kind of agent: native Codex sessi
 - Create native sessions with create_panes `native:true` (per pane) when the user works in Vibe Mode, asks for native sessions, or `ui_mode` is "vibe" as the default signal — otherwise create ordinary panes. Native sessions ignore runtime/profile/worktree; cwd, model and the initial prompt still apply.
 - Session approvals are decided by the HUMAN in the Vibe UI. Never instruct a session to bypass, skip or auto-approve anything, and never promise to approve an approval yourself — you cannot.
 
+## Custom agents (specialists)
+The user may have built custom agents — specialists, each with its own persona, memory and knowledge. When the user names one of them, or a task clearly fits a specialist, call list_agents to see them, then start the right one with create_panes by passing its `agent` slug (as a terminal pane or, with native:true, a native session). The agent's own persona, memory and knowledge come with it and its default model/access prefill the pane — you don't re-explain its expertise or set its model unless the user asks. Each agent maintains its own memory itself; you never write into it.
+
 ## Worktrees
 Request worktree:true in create_panes only when multiple agents will WRITE in the same repository concurrently. Reviews and read-only tasks run as plain panes in the repo itself. An explicit user wish always overrides this rule. (Worktrees do not apply to native sessions.)
 
@@ -188,6 +191,10 @@ mod tests {
         assert!(out.contains("Never initiate outward-facing actions"));
         assert!(out.contains("Layout & placement"));
         assert!(out.contains("Session approvals are decided by the HUMAN"));
+        // custom-agents integration (Phase D) — start specialists via create_panes `agent`
+        assert!(out.contains("Custom agents (specialists)"));
+        assert!(out.contains("call list_agents"));
+        assert!(out.contains("Each agent maintains its own memory itself; you never write into it."));
     }
 
     #[test]

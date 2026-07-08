@@ -22,6 +22,8 @@ export function vibeTriageEntries(s: VibeState): VibeTriageEntry[] {
   for (const id of s.order) {
     const entry = s.sessions[id];
     if (!entry) continue;
+    // Builder sessions live only in their modal — never in the Deck queue.
+    if (entry.session.builderForSlug) continue;
     const since = oldestPendingApprovalAt(entry);
     if (since === null) continue;
     entries.push({

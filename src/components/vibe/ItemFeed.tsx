@@ -131,7 +131,7 @@ function RenderItem({
 function UserRow({ text }: { text: string }) {
   return (
     <div className="flex justify-end">
-      <div className="max-w-[80%] whitespace-pre-wrap rounded-2xl border border-border bg-secondary px-3.5 py-2 text-[13.5px] leading-relaxed text-foreground select-text">
+      <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl border border-border bg-secondary px-3.5 py-2 text-[13.5px] leading-relaxed text-foreground select-text">
         {text}
       </div>
     </div>
@@ -153,14 +153,14 @@ const AssistantRow = memo(function AssistantRow({
 }) {
   if (streaming) {
     return (
-      <div className="w-full whitespace-pre-wrap text-[13.5px] leading-relaxed text-foreground/90 select-text">
+      <div className="w-full whitespace-pre-wrap break-words text-[13.5px] leading-relaxed text-foreground/90 select-text">
         {text}
         <span className="streaming-caret ml-0.5 inline-block h-[14px] w-[6px] translate-y-[2px] bg-foreground/70 align-baseline" />
       </div>
     );
   }
   return (
-    <div className="w-full text-[13.5px] leading-relaxed text-foreground/90 select-text">
+    <div className="w-full break-words text-[13.5px] leading-relaxed text-foreground/90 select-text">
       <OrchestratorMarkdown text={text} />
     </div>
   );

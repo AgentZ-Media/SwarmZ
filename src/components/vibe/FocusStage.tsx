@@ -28,7 +28,16 @@ import { ConductorStage } from "./ConductorStage";
 export function FocusStage() {
   const conductor = useVibeUi((s) => s.stageMode === "conductor");
   const activeId = useVibe((s) => s.activeId);
-  const hasActive = useVibe((s) => !!(s.activeId && s.sessions[s.activeId]));
+  // a Builder session lives only in its modal — it must never take the stage,
+  // even if it briefly became the active session on creation
+  const hasActive = useVibe(
+    (s) =>
+      !!(
+        s.activeId &&
+        s.sessions[s.activeId] &&
+        !s.sessions[s.activeId]?.session.builderForSlug
+      ),
+  );
 
   if (conductor || !activeId || !hasActive) return <ConductorStage />;
   // key on the id so per-session composer/feed state resets cleanly on switch
@@ -66,7 +75,7 @@ function CrossSessionBanner({ sessionId }: { sessionId: string }) {
     for (const id of s.order) {
       if (id === sessionId) continue;
       const e = s.sessions[id];
-      if (e && hasPendingApproval(e)) n++;
+      if (e && !e.session.builderForSlug && hasPendingApproval(e)) n++;
     }
     return n;
   });
@@ -74,7 +83,7 @@ function CrossSessionBanner({ sessionId }: { sessionId: string }) {
     for (const id of s.order) {
       if (id === sessionId) continue;
       const e = s.sessions[id];
-      if (e && hasPendingApproval(e)) return id;
+      if (e && !e.session.builderForSlug && hasPendingApproval(e)) return id;
     }
     return "";
   });

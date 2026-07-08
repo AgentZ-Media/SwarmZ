@@ -17,6 +17,8 @@ import { LoadPresetDialog } from "./components/LoadPresetDialog";
 import { SavePresetDialog } from "./components/SavePresetDialog";
 import { ProfilesDialog } from "./components/ProfilesDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { AgentLibrary } from "./components/agents/AgentLibrary";
+import { BuilderModal } from "./components/agents/BuilderModal";
 import { QuickNotesPanel } from "./components/QuickNotesPanel";
 import { OrchestratorPanel } from "./components/OrchestratorPanel";
 import { UsageDashboard } from "./components/UsageDashboard";
@@ -493,6 +495,8 @@ export default function App() {
       <InsertCommandPalette />
       <ProfilesDialog open={profilesOpen} onOpenChange={setProfilesOpen} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      <AgentLibrary onOpenSettings={() => setSettingsOpen(true)} />
+      <BuilderModal />
       <UsageDashboard />
       <QuickNotesPanel />
     </TooltipProvider>

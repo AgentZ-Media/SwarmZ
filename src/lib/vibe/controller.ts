@@ -30,6 +30,9 @@ import type {
 } from "@/types";
 import { useVibe, type NewVibeSession } from "./session-store";
 import { useVibeUi } from "./ui-store";
+import { agentBuilderInstructions, compileAgentContext } from "@/lib/agents/api";
+import { useAgents } from "@/lib/agents/store";
+import { builderSessionName } from "@/lib/agents/builder";
 
 /** Trailing-edge delta flush — word-level deltas never write per event. */
 const DELTA_FLUSH_MS = 80;
@@ -82,6 +85,10 @@ function invokeStart(
     model: opts.model ?? null,
     effort: opts.effort ?? null,
     access: opts.access,
+    developerInstructions: opts.developerInstructions ?? null,
+    // a custom-agent session hands its slug so Rust adds the agent's own folder
+    // to the sandbox's writable roots (memory self-maintenance, workspace access)
+    agentSlug: opts.agentSlug ?? null,
     codexPath: codexPath(),
   });
 }
@@ -98,6 +105,8 @@ function invokeResume(
     model: opts.model ?? null,
     effort: opts.effort ?? null,
     access: opts.access,
+    developerInstructions: opts.developerInstructions ?? null,
+    agentSlug: opts.agentSlug ?? null,
     codexPath: codexPath(),
   });
 }
@@ -183,12 +192,24 @@ function scheduleFlush(sessionId: string, st: StreamState) {
   }, DELTA_FLUSH_MS);
 }
 
-/** Close out the streaming assistant item: `finalText` replaces the delta
- * accumulation; either way the caret stops pulsing. */
+/**
+ * Close out the streaming assistant item: `finalText` replaces the delta
+ * accumulation; either way the caret stops pulsing.
+ *
+ * `completedId` is the item id carried by the codex `item/completed` (the
+ * `message` event). Keying the finalize on it — not just the transient stream
+ * pointer — is what keeps the bubble NORMALIZED BY ID (AGENTS.md): the streamed
+ * item was created under this same id, so we patch it in place; and if no delta
+ * ever arrived (or codex repeats a completion), we upsert under that SAME id,
+ * so a duplicate completion REPLACES the bubble instead of appending a second
+ * one. This closes the double-text path (a `message` used to append a fresh
+ * `msg-…` item whenever the stream pointer had been cleared).
+ */
 function finalizeStream(
   sessionId: string,
   finalText?: string,
   phase?: string | null,
+  completedId?: string,
 ) {
   const st = streamOf(sessionId);
   if (st.flushTimer) {
@@ -196,12 +217,27 @@ function finalizeStream(
     st.flushTimer = null;
   }
   const store = useVibe.getState();
-  if (st.itemId) {
-    store.patchItem(sessionId, st.itemId, {
-      text: finalText ?? st.buffer,
-      streaming: false,
-      ...(phase !== undefined ? { phase } : {}),
-    });
+  // prefer the completed item's own id; fall back to the active stream pointer
+  const targetId = completedId || st.itemId;
+  const text = finalText ?? st.buffer;
+  if (targetId) {
+    const exists = !!store.sessions[sessionId]?.items[targetId];
+    if (exists) {
+      store.patchItem(sessionId, targetId, {
+        text,
+        streaming: false,
+        ...(phase !== undefined ? { phase } : {}),
+      });
+    } else if (text) {
+      // idempotent by id: a repeat completion for the same id replaces, not appends
+      store.upsertItem(sessionId, {
+        id: targetId,
+        at: Date.now(),
+        kind: "assistant",
+        text,
+        ...(phase !== undefined ? { phase } : {}),
+      });
+    }
   } else if (finalText) {
     store.upsertItem(sessionId, {
       id: `msg-${nanoid(8)}`,
@@ -300,10 +336,11 @@ function warn(sessionId: string, text: string) {
 }
 
 /** Mirror a session lifecycle moment into the shared Deck ticker (source=vibe;
- * the ticker jumps into Vibe Mode for these). */
+ * the ticker jumps into Vibe Mode for these). Builder sessions are invisible to
+ * the Vibe world (they live only in their modal), so they never ticker. */
 function pushSessionEvent(sessionId: string, kind: FleetEventKind) {
   const entry = useVibe.getState().sessions[sessionId];
-  if (!entry) return;
+  if (!entry || entry.session.builderForSlug) return;
   pushFleetEvent({
     kind,
     paneId: sessionId,
@@ -354,7 +391,12 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
         typeof data.phase === "string" || data.phase === null
           ? (data.phase as string | null)
           : undefined;
-      finalizeStream(sessionId, str(data.text) || undefined, phase);
+      finalizeStream(
+        sessionId,
+        str(data.text) || undefined,
+        phase,
+        str(data.item_id) || undefined,
+      );
       break;
     }
     case "item_started":
@@ -412,6 +454,13 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
       store.setBusy(sessionId, false);
       store.setTurnId(sessionId, null);
       pushSessionEvent(sessionId, "finished");
+      // Builder live-refresh: a Builder turn may have written/changed the
+      // agent's files — re-scan the Library so the fresh agent (name, blurb,
+      // memory/knowledge counts) shows up without a manual reload. Cheap
+      // (a single folder scan) and only fires for Builder sessions.
+      if (store.sessions[sessionId]?.session.builderForSlug) {
+        void useAgents.getState().refreshAgents();
+      }
       break;
     }
     case "turn_failed": {
@@ -447,6 +496,10 @@ interface StartOpts {
   model?: string;
   effort?: string;
   access: VibeAccess;
+  /** custom-agent persona → thread developerInstructions (additive) */
+  developerInstructions?: string;
+  /** custom-agent slug → its folder becomes a writable sandbox root (memory) */
+  agentSlug?: string;
 }
 
 function errorText(err: unknown): string {
@@ -461,6 +514,96 @@ export interface StartSessionOpts {
   model?: string;
   effort?: string;
   access?: VibeAccess;
+  /** run this session as a custom agent (its persona is compiled at start) */
+  agentSlug?: string;
+  /**
+   * Explicit thread developerInstructions. When set, these are used verbatim
+   * and the `agentSlug` persona compile is SKIPPED — the Builder uses this to
+   * inject its own guide (not a persona). A plain/agent session leaves it off.
+   */
+  developerInstructions?: string;
+  /** mark this session as the Agent Builder for `<slug>` (Phase C) */
+  builderForSlug?: string;
+}
+
+/**
+ * Compile a custom agent's persona for the thread's developerInstructions, or
+ * `undefined` for a plain session. Never throws — a compile failure just means
+ * the session starts without a persona (logged, not fatal).
+ */
+async function personaFor(agentSlug?: string): Promise<string | undefined> {
+  if (!agentSlug) return undefined;
+  try {
+    const compiled = await compileAgentContext(agentSlug);
+    return compiled.text || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Fetch the Agent-Builder guide for `slug` (the thread developerInstructions
+ * of a Builder session). Throws — a Builder MUST have its guide. */
+async function builderGuide(slug: string, refine: boolean): Promise<string> {
+  return agentBuilderInstructions(slug, refine);
+}
+
+/** Options for the Agent Builder entry (new-agent flow + refine-existing). */
+export interface StartBuilderOpts {
+  /** the agent's slug (its folder is the session cwd) */
+  slug: string;
+  /** the agent's folder — the session cwd (workspace-write home) */
+  agentDir: string;
+  /** the agent's display name (for the session title) */
+  name: string;
+  /** optional codex model for the build (a capable one lifts quality) */
+  model?: string;
+  /** refine an existing agent instead of building a new one */
+  refine?: boolean;
+}
+
+/**
+ * Start an Agent Builder session (Phase C). This is a normal Vibe session with
+ * three peculiarities: cwd = the agent's own folder, `workspace` access (it can
+ * write there approval-free and nowhere else), and the Builder guide as its
+ * developerInstructions.
+ *
+ * Presentation-wise the Builder does NOT live on the Vibe stage anymore: it
+ * opens a dedicated focused MODAL (BuilderModal) that stays up until the agent
+ * is finished. The session is deliberately kept OUT of the Vibe world — it is
+ * filtered from the rail, the Deck triage and the ticker (`builderForSlug`), so
+ * the active-session pick is restored after the (createSession-forced) switch.
+ * Finally it kicks off its own opening turn so the Builder greets first.
+ */
+export async function startBuilderSession(
+  opts: StartBuilderOpts,
+): Promise<string> {
+  const refine = !!opts.refine;
+  const guide = await builderGuide(opts.slug, refine);
+  const prevActive = useVibe.getState().activeId;
+  const id = await startSession({
+    name: builderSessionName(opts.name, refine),
+    projectDir: opts.agentDir,
+    access: "workspace",
+    developerInstructions: guide,
+    builderForSlug: opts.slug,
+    ...(opts.model ? { model: opts.model } : {}),
+  });
+  // createSession made the builder the active session — restore the previous
+  // pick so the (hidden) builder never shows up as the selected Vibe session.
+  if (prevActive !== id) useVibe.getState().setActive(prevActive);
+  useAgents.getState().openBuilderModal(id);
+  // The Builder opens the conversation itself: a hidden kickoff turn (never a
+  // visible user bubble) so the first thing the user sees is the Builder's
+  // greeting + first question, not an empty transcript waiting on them.
+  void sendMessage(id, builderKickoff(refine), { hidden: true });
+  return id;
+}
+
+/** The invisible opening instruction that makes the Builder speak first. */
+function builderKickoff(refine: boolean): string {
+  return refine
+    ? "Begin now: greet me in one short line, tell me in one line what this agent currently is, then ask what I'd like to change. Reply in my language."
+    : "Begin now: greet me in one short line, then ask your first question. One question, not the whole round. Reply in my language.";
 }
 
 /**
@@ -472,6 +615,10 @@ export async function startSession(opts: StartSessionOpts): Promise<string> {
   ensureEvents();
   const id = nanoid(10);
   const access = opts.access ?? "full";
+  // an explicit developerInstructions override (the Builder) wins over the
+  // agent-persona compile — they are mutually exclusive by construction.
+  const developerInstructions =
+    opts.developerInstructions ?? (await personaFor(opts.agentSlug));
   const newSession: NewVibeSession = {
     id,
     name: opts.name,
@@ -480,10 +627,12 @@ export async function startSession(opts: StartSessionOpts): Promise<string> {
     ...(opts.effort ? { effort: opts.effort } : {}),
     access,
     threadId: null,
+    ...(opts.agentSlug ? { agentSlug: opts.agentSlug } : {}),
+    ...(opts.builderForSlug ? { builderForSlug: opts.builderForSlug } : {}),
   };
   useVibe.getState().createSession(newSession);
   try {
-    const res = await invokeStart(id, { ...opts, access });
+    const res = await invokeStart(id, { ...opts, access, developerInstructions });
     liveBackends.add(id);
     useVibe.getState().setThreadId(id, res.thread_id);
     return id;
@@ -504,11 +653,22 @@ export async function resumeSession(sessionId: string): Promise<void> {
   const session = useVibe.getState().sessions[sessionId]?.session;
   if (!session) throw new Error(`unknown vibe session "${sessionId}"`);
   if (!session.threadId) throw new Error("this session has no thread to resume");
+  // recompute the thread instructions fresh: a Builder session re-derives its
+  // guide (in refine mode — the folder now has content); an agent session
+  // recompiles its persona (memory may have grown since the last start).
+  const developerInstructions = session.builderForSlug
+    ? await builderGuide(session.builderForSlug, true)
+    : await personaFor(session.agentSlug);
   const res = await invokeResume(sessionId, session.threadId, {
     projectDir: session.projectDir,
     model: session.model,
     effort: session.effort,
     access: session.access,
+    developerInstructions,
+    // agent sessions (not the Builder) re-add their folder as a writable root
+    ...(session.agentSlug && !session.builderForSlug
+      ? { agentSlug: session.agentSlug }
+      : {}),
   });
   liveBackends.add(sessionId);
   useVibe.getState().setThreadId(sessionId, res.thread_id);
@@ -524,22 +684,29 @@ export async function resumeSession(sessionId: string): Promise<void> {
  * Send one user message (non-blocking backend): append the user item, ensure
  * the backend session is live, fire the turn. Progress streams as events; busy
  * is cleared by the turn's completion event, not here. A busy session ignores.
+ *
+ * `hidden` sends the turn WITHOUT rendering a user bubble — used for the
+ * Builder's auto-kickoff, where the instruction is machinery, not a message the
+ * user typed. The model's reply still streams normally.
  */
 export async function sendMessage(
   sessionId: string,
   text: string,
+  opts?: { hidden?: boolean },
 ): Promise<void> {
   const trimmed = text.trim();
   if (!trimmed) return;
   const store = useVibe.getState();
   if (!store.sessions[sessionId] || store.busy[sessionId]) return;
   ensureEvents();
-  store.upsertItem(sessionId, {
-    id: `user-${nanoid(8)}`,
-    at: Date.now(),
-    kind: "user",
-    text: trimmed,
-  });
+  if (!opts?.hidden) {
+    store.upsertItem(sessionId, {
+      id: `user-${nanoid(8)}`,
+      at: Date.now(),
+      kind: "user",
+      text: trimmed,
+    });
+  }
   store.setBusy(sessionId, true);
   resetStream(sessionId);
   try {

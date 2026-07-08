@@ -428,6 +428,8 @@ export interface PersistedAgent {
   sessionId?: string;
   /** set when the pane lives in a SwarmZ-managed git worktree */
   worktree?: WorktreeMeta;
+  /** slug of the custom agent this pane runs as (persona survives restore) */
+  agentSlug?: string;
 }
 
 /**
@@ -548,6 +550,13 @@ export interface Agent {
   git?: GitInfo | null;
   /** set when the pane lives in a SwarmZ-managed git worktree (cwd = worktree path) */
   worktree?: WorktreeMeta;
+  /**
+   * slug of the custom agent this pane runs as, if any (persona injected at
+   * spawn via the startup command). The agent folder on disk is the source of
+   * truth — emoji/accent/name are looked up from the agent library by slug, so
+   * the pane persists only the slug. Unset = a plain pane (no persona).
+   */
+  agentSlug?: string;
 }
 
 // ---- Quick notes ----
@@ -726,6 +735,22 @@ export interface VibeSession {
   /** app-server thread id — survives restarts; null until the first turn */
   threadId: string | null;
   createdAt: number;
+  /**
+   * slug of the custom agent this session runs as, if any. Its compiled
+   * persona is (re)compiled at start/resume and sent as the thread's
+   * developerInstructions; emoji/accent/name are looked up by slug from the
+   * agent library. Unset = a plain Vibe session.
+   */
+  agentSlug?: string;
+  /**
+   * Set when this session is an Agent BUILDER (Phase C): its cwd is the target
+   * agent's own folder (`~/.swarmz/agents/<slug>/`), it runs workspace-write,
+   * and its developerInstructions are the Builder guide (not a persona). The
+   * value is the slug of the agent being built/refined. The stage shows a
+   * "🛠 Building <name>" hint and turn-completion triggers a Library refresh.
+   * Unset = a normal session.
+   */
+  builderForSlug?: string;
 }
 
 /** Status of an approval item over its lifetime. */

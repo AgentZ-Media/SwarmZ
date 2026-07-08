@@ -17,6 +17,11 @@ interface VibeUiState {
   /** the New-Session dialog is open */
   newSessionOpen: boolean;
   setNewSessionOpen: (open: boolean) => void;
+  /** custom agent to preselect when the dialog opens (Library "Start"); null
+   * for a plain session. Cleared whenever the dialog closes. */
+  newSessionAgentSlug: string | null;
+  /** open the New-Session dialog preselecting a custom agent */
+  openNewSessionForAgent: (slug: string) => void;
   /** session id awaiting a busy-close confirmation (null = no dialog) */
   closeConfirmId: string | null;
   setCloseConfirmId: (id: string | null) => void;
@@ -27,7 +32,11 @@ interface VibeUiState {
 
 export const useVibeUi = create<VibeUiState>((set) => ({
   newSessionOpen: false,
-  setNewSessionOpen: (open) => set({ newSessionOpen: open }),
+  setNewSessionOpen: (open) =>
+    set(open ? { newSessionOpen: true } : { newSessionOpen: false, newSessionAgentSlug: null }),
+  newSessionAgentSlug: null,
+  openNewSessionForAgent: (slug) =>
+    set({ newSessionOpen: true, newSessionAgentSlug: slug }),
   closeConfirmId: null,
   setCloseConfirmId: (id) => set({ closeConfirmId: id }),
   stageMode: "conductor",

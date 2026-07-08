@@ -70,6 +70,10 @@ export interface NewVibeSession {
   effort?: string;
   access: VibeAccess;
   threadId?: string | null;
+  /** slug of the custom agent this session runs as, if any */
+  agentSlug?: string;
+  /** slug of the agent this session is a BUILDER for (Phase C), if any */
+  builderForSlug?: string;
 }
 
 // Sessions stream item patches during turns — batch disk writes ~800 ms.
@@ -217,6 +221,8 @@ export const useVibe = create<VibeState>((set, get) => ({
         access: s.access,
         threadId: s.threadId ?? null,
         createdAt: Date.now(),
+        ...(s.agentSlug ? { agentSlug: s.agentSlug } : {}),
+        ...(s.builderForSlug ? { builderForSlug: s.builderForSlug } : {}),
       },
       items: {},
       order: [],
@@ -430,6 +436,12 @@ function sanitizeSession(raw: unknown): VibeSession | null {
     access,
     threadId: typeof s.threadId === "string" ? s.threadId : null,
     createdAt: typeof s.createdAt === "number" ? s.createdAt : Date.now(),
+    ...(typeof s.agentSlug === "string" && s.agentSlug
+      ? { agentSlug: s.agentSlug }
+      : {}),
+    ...(typeof s.builderForSlug === "string" && s.builderForSlug
+      ? { builderForSlug: s.builderForSlug }
+      : {}),
   };
 }
 
