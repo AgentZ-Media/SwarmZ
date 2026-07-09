@@ -47,6 +47,10 @@ import {
 } from "./placement";
 import { discoverProjects, projectDocs, readTranscript } from "./native";
 import { appendMemory } from "./memory";
+import { agentListForModel } from "./agents";
+import { listAgents, writeAgentCompiled } from "@/lib/agents/api";
+import { injectAgentIntoStartup } from "@/lib/agents/startup";
+import type { AgentSummary } from "@/lib/agents/types";
 import type {
   CreatePaneResult,
   CreatePaneSpec,
@@ -308,6 +312,40 @@ interface PendingPrompt {
 }
 
 /**
+ * A slug→agent index for one create_panes batch. Built once (a single
+ * `agent_list`) when ANY pane names an `agent`, so an unknown slug can list the
+ * valid ones; `null` when no pane uses an agent (skip the lookup entirely).
+ */
+type AgentIndex = Map<string, AgentSummary> | null;
+
+async function buildAgentIndex(specs: CreatePaneSpec[]): Promise<AgentIndex> {
+  const uses = specs.some((s) => typeof s.agent === "string" && s.agent.trim());
+  if (!uses) return null;
+  const all = await listAgents();
+  return new Map(all.map((a) => [a.slug, a]));
+}
+
+/** Resolve a pane's `agent` slug to its card, or fail listing valid slugs. */
+function requireAgentBySlug(slug: string, index: AgentIndex): AgentSummary {
+  const found = index?.get(slug);
+  if (found) return found;
+  const valid = index ? [...index.keys()].join(", ") : "";
+  throw new Error(
+    `unknown agent ${JSON.stringify(slug)} — valid agent slugs: ${valid || "(no custom agents)"}`,
+  );
+}
+
+/** A custom agent's suggested runtime, mapped to a terminal runtime (vibe = codex). */
+function terminalRuntimeOf(runtime: string): "claude" | "codex" {
+  return runtime === "claude" ? "claude" : "codex";
+}
+
+/** A native session's access from the agent's default (workspace | full), else workspace. */
+function agentAccess(agent: AgentSummary | null): "workspace" | "full" {
+  return agent?.defaultAccess === "full" ? "full" : "workspace";
+}
+
+/**
  * Create one native Vibe session (create_panes native:true). Worktree /
  * runtime / profile do not apply (V1) — cwd, model, reasoning→effort, name and
  * prompt do. Access defaults to workspace-write for orchestrator-created
@@ -315,21 +353,37 @@ interface PendingPrompt {
  */
 async function createOneNativeSession(
   spec: CreatePaneSpec,
+  agentIndex: AgentIndex,
 ): Promise<{ result: CreatePaneResult; prompt?: PendingPrompt }> {
   const cwd = typeof spec.cwd === "string" ? spec.cwd.trim() : "";
   if (!cwd) throw new Error("cwd is required and must be a non-empty path");
-  const model = typeof spec.model === "string" ? spec.model.trim() : "";
+  const slug = typeof spec.agent === "string" ? spec.agent.trim() : "";
+  const agent = slug ? requireAgentBySlug(slug, agentIndex) : null;
+  // the call may override the agent's defaults; otherwise they prefill
+  const model = (
+    typeof spec.model === "string" && spec.model.trim()
+      ? spec.model.trim()
+      : (agent?.defaultModel?.trim() ?? "")
+  );
   if (model && !/^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(model))
     throw new Error(`invalid model "${model}" — letters, digits and . _ : / - only`);
-  const effort = typeof spec.reasoning === "string" ? spec.reasoning : undefined;
+  const effort =
+    typeof spec.reasoning === "string" ? spec.reasoning : agent?.defaultEffort;
   if (effort && !["minimal", "low", "medium", "high", "xhigh"].includes(effort))
     throw new Error(`invalid reasoning "${effort}"`);
   const id = await startVibeSession({
-    name: typeof spec.name === "string" && spec.name.trim() ? spec.name.trim() : "Session",
+    name: typeof spec.name === "string" && spec.name.trim()
+      ? spec.name.trim()
+      : (agent?.name ?? "Session"),
     projectDir: cwd,
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
-    access: "workspace",
+    // an agent session runs under the agent's default access (workspace | full)
+    // — its own folder is added to the sandbox's writable roots by the backend,
+    // so the specialist can maintain its memory.md approval-free (see
+    // codex/sessions.rs). Non-agent orchestrator sessions stay workspace.
+    access: agentAccess(agent),
+    ...(agent ? { agentSlug: agent.slug } : {}),
   });
   const name = useVibe.getState().sessions[id]?.session.name ?? spec.name ?? null;
   return {
@@ -344,16 +398,32 @@ async function createOneNativeSession(
 async function createOnePane(
   spec: CreatePaneSpec,
   gitBin: string | undefined,
+  agentIndex: AgentIndex,
 ): Promise<{ result: CreatePaneResult; prompt?: PendingPrompt }> {
-  if (spec.native) return createOneNativeSession(spec);
+  if (spec.native) return createOneNativeSession(spec, agentIndex);
   const cwd = typeof spec.cwd === "string" ? spec.cwd.trim() : "";
   if (!cwd) throw new Error("cwd is required and must be a non-empty path");
   const state = useSwarm.getState();
 
-  const profile = spec.profile_id
-    ? state.profiles.find((p) => p.id === spec.profile_id)
+  // resolve a custom agent and let its defaults prefill runtime/model/reasoning
+  // (an explicit call value always wins). "vibe" agents run as codex terminals.
+  const slug = typeof spec.agent === "string" ? spec.agent.trim() : "";
+  const agent = slug ? requireAgentBySlug(slug, agentIndex) : null;
+  const eff: CreatePaneSpec = agent
+    ? {
+        ...spec,
+        runtime: spec.runtime ?? terminalRuntimeOf(agent.defaultRuntime),
+        model: spec.model ?? agent.defaultModel,
+        reasoning:
+          spec.reasoning ??
+          (agent.defaultEffort as CreatePaneSpec["reasoning"] | undefined),
+      }
+    : spec;
+
+  const profile = eff.profile_id
+    ? state.profiles.find((p) => p.id === eff.profile_id)
     : undefined;
-  if (spec.profile_id && !profile) {
+  if (eff.profile_id && !profile) {
     const valid = state.profiles.map((p) => `${p.id} ("${p.name}")`).join(", ");
     throw new Error(
       `unknown profile_id "${spec.profile_id}" — valid profiles: ${valid || "(none)"}`,
@@ -363,13 +433,13 @@ async function createOnePane(
   // otherwise createAgent would fall back to the settings default, which may
   // belong to a different runtime
   let startup =
-    !profile && spec.runtime ? defaultStartupForRuntime(spec.runtime) : undefined;
+    !profile && eff.runtime ? defaultStartupForRuntime(eff.runtime) : undefined;
 
   // Optional model override ("open an Opus pane"): appended as a CLI flag to
   // the pane's effective startup. Strictly validated — the startup line runs
   // in a shell, so the model id must never carry shell metacharacters.
-  const model = typeof spec.model === "string" ? spec.model.trim() : "";
-  const reasoning = typeof spec.reasoning === "string" ? spec.reasoning : "";
+  const model = typeof eff.model === "string" ? eff.model.trim() : "";
+  const reasoning = typeof eff.reasoning === "string" ? eff.reasoning : "";
   if (model || reasoning) {
     if (model && !/^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(model))
       throw new Error(
@@ -383,7 +453,7 @@ async function createOnePane(
       state.settings.defaultStartup?.trim() ??
       defaultStartupForRuntime(state.settings.defaultRuntime ?? "codex");
     const effRuntime =
-      spec.runtime ?? profile?.runtime ?? runtimeFromStartup(base);
+      eff.runtime ?? profile?.runtime ?? runtimeFromStartup(base);
     if (effRuntime === "shell")
       throw new Error(
         "model/reasoning need an agent runtime (claude or codex) — this pane would be a plain shell",
@@ -399,9 +469,28 @@ async function createOnePane(
       (reasoning ? ` -c model_reasoning_effort="${reasoning}"` : "");
   }
 
+  // Custom agent: compile + write .compiled.md and inject the persona flag onto
+  // the pane's startup (the Phase-B mechanic, exactly like NewAgentDialog). A
+  // shell never carries a persona; an agent implies a coding runtime, so the
+  // effective runtime resolves to claude/codex here.
+  let agentSlug: string | undefined;
+  if (agent) {
+    const base =
+      startup ??
+      profile?.startup ??
+      state.settings.defaultStartup?.trim() ??
+      defaultStartupForRuntime(eff.runtime ?? "codex");
+    const effRuntime = eff.runtime ?? profile?.runtime ?? runtimeFromStartup(base);
+    if (effRuntime === "claude" || effRuntime === "codex") {
+      const compiledPath = await writeAgentCompiled(agent.slug);
+      startup = injectAgentIntoStartup(base, effRuntime, compiledPath);
+      agentSlug = agent.slug;
+    }
+  }
+
   let worktree: { root: string; branch: string } | undefined;
   let paneCwd = cwd;
-  if (spec.worktree) {
+  if (eff.worktree) {
     // worktree FIRST, exactly like NewAgentDialog: repo check, generated
     // branch, `.worktrees/<slug>` + env copy via the native flow. A non-repo
     // folder is an ERROR — never a silent downgrade to a plain pane.
@@ -410,7 +499,7 @@ async function createOnePane(
       throw new Error(
         `worktree requested but "${cwd}" is not inside a git repository`,
       );
-    const branch = spec.branch?.trim() || generateBranchName(info.repo);
+    const branch = eff.branch?.trim() || generateBranchName(info.repo);
     const wt = await addWorktree({ cwd, branch, copyEnv: true, gitBin });
     worktree = { root: wt.root, branch: wt.branch };
     paneCwd = wt.path;
@@ -418,26 +507,27 @@ async function createOnePane(
 
   const id = useSwarm.getState().createAgent(
     {
-      name: spec.name,
-      runtime: spec.runtime,
+      name: eff.name,
+      runtime: eff.runtime,
       cwd: paneCwd,
       startup,
       profileId: profile?.id,
       worktree,
+      agentSlug,
     },
     "row",
   );
-  const agent = useSwarm.getState().agents[id];
+  const created = useSwarm.getState().agents[id];
   return {
     result: {
       id,
-      name: agent?.name ?? spec.name ?? null,
+      name: created?.name ?? eff.name ?? null,
       cwd: paneCwd,
       worktree: worktree ?? null,
     },
     prompt:
-      typeof spec.prompt === "string" && spec.prompt.trim()
-        ? { id, text: spec.prompt, native: false }
+      typeof eff.prompt === "string" && eff.prompt.trim()
+        ? { id, text: eff.prompt, native: false }
         : undefined,
   };
 }
@@ -689,6 +779,12 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     };
   },
 
+  list_agents: async () => {
+    // the user's custom specialists — start one via create_panes `agent`
+    const agents = await listAgents();
+    return { agents: agentListForModel(agents) };
+  },
+
   // ---- write tools ----
 
   prompt_pane: async (args, ctx) => {
@@ -752,6 +848,8 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
       );
     const gitBin =
       useSwarm.getState().settings.gitPath?.trim() || undefined;
+    // one agent_list lookup for the whole batch (only when a pane names an agent)
+    const agentIndex = await buildAgentIndex(specs);
 
     const results: (CreatePaneResult | undefined)[] = new Array(specs.length);
     const prompts: (PendingPrompt & { index: number })[] = [];
@@ -768,7 +866,10 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     specs.forEach((sp, i) => (sp.native ? nativeIdx : termIdx).push(i));
     for (const i of nativeIdx) {
       try {
-        const { result, prompt } = await createOneNativeSession(specs[i]);
+        const { result, prompt } = await createOneNativeSession(
+          specs[i],
+          agentIndex,
+        );
         results[i] = result;
         if (prompt) prompts.push({ index: i, ...prompt });
       } catch (e) {
@@ -851,7 +952,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         for (const planIdx of bucket.indices) {
           const i = planEntries[planIdx].origIndex;
           try {
-            const { result, prompt } = await createOnePane(specs[i], gitBin);
+            const { result, prompt } = await createOnePane(specs[i], gitBin, agentIndex);
             result.workspace_id = wsId;
             result.workspace_name = wsName;
             results[i] = result;
@@ -887,7 +988,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         if (useSwarm.getState().activeWorkspaceId !== wsId)
           useSwarm.getState().setActiveWorkspace(wsId);
         try {
-          const { result, prompt } = await createOnePane(specs[i], gitBin);
+          const { result, prompt } = await createOnePane(specs[i], gitBin, agentIndex);
           result.workspace_id = wsId;
           result.workspace_name =
             useSwarm.getState().workspaces[wsId]?.name ?? "";

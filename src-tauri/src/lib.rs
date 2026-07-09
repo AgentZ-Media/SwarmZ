@@ -1,3 +1,4 @@
+mod agents;
 mod codex;
 mod codex_usage;
 mod git;
@@ -448,6 +449,129 @@ async fn orchestrator_memory_remove(
         .map_err(|e| e.to_string())?
 }
 
+// ---- Custom Agents (the Agent-Baukasten) ----
+//
+// Agents live in `~/.swarmz/agents/<slug>/` (home-relative, NOT the app data
+// dir — they are global + hand-editable). The folder is the source of truth;
+// the frontend store only caches. All IO is small + sync → spawn_blocking.
+
+/// The agents root: `~/.swarmz/agents`. Missing home dir → error.
+fn agents_root() -> Result<std::path::PathBuf, String> {
+    dirs::home_dir()
+        .map(|h| h.join(".swarmz").join("agents"))
+        .ok_or_else(|| "cannot resolve the home directory".to_string())
+}
+
+/// List every discoverable agent (library cards). Broken agents are skipped.
+#[tauri::command]
+async fn agent_list() -> Result<Vec<agents::AgentSummary>, String> {
+    let root = agents_root()?;
+    tauri::async_runtime::spawn_blocking(move || agents::list(&root))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Full detail for one agent (editor): def + soul + memory + knowledge files.
+#[tauri::command]
+async fn agent_read(slug: String) -> Result<agents::AgentDetail, String> {
+    let root = agents_root()?;
+    tauri::async_runtime::spawn_blocking(move || agents::read(&root, &slug))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Create a new agent folder (agent.json + soul.md). Errors if the slug exists.
+#[tauri::command]
+async fn agent_create(
+    def: agents::AgentDef,
+    soul: String,
+) -> Result<agents::AgentDetail, String> {
+    let root = agents_root()?;
+    tauri::async_runtime::spawn_blocking(move || agents::create(&root, &def, &soul))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Overwrite an existing agent's agent.json + soul.md (the editor's Save).
+#[tauri::command]
+async fn agent_write(
+    slug: String,
+    def: agents::AgentDef,
+    soul: String,
+) -> Result<agents::AgentDetail, String> {
+    let root = agents_root()?;
+    tauri::async_runtime::spawn_blocking(move || agents::write(&root, &slug, &def, &soul))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Delete an agent folder (idempotent, slug-guarded).
+#[tauri::command]
+async fn agent_delete(slug: String) -> Result<(), String> {
+    let root = agents_root()?;
+    tauri::async_runtime::spawn_blocking(move || agents::delete(&root, &slug))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Append one fact to an agent's own memory.md (caps enforced in Rust).
+#[tauri::command]
+async fn agent_memory_append(
+    slug: String,
+    text: String,
+) -> Result<agents::AppendResult, String> {
+    let root = agents_root()?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    tauri::async_runtime::spawn_blocking(move || agents::memory_append(&root, &slug, &text, &today))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Remove one memory entry by index; returns the remaining entries.
+#[tauri::command]
+async fn agent_memory_remove(
+    slug: String,
+    index: usize,
+) -> Result<Vec<agents::MemoryEntry>, String> {
+    let root = agents_root()?;
+    tauri::async_runtime::spawn_blocking(move || agents::memory_remove(&root, &slug, index))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Compile an agent's runtime context (Phase B start pipeline): soul → fixed
+/// operative block → memory snapshot → knowledge TOC, with the hard budget flag.
+#[tauri::command]
+async fn agent_compile_context(slug: String) -> Result<agents::CompiledContext, String> {
+    let root = agents_root()?;
+    tauri::async_runtime::spawn_blocking(move || agents::compile_context(&root, &slug))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Compile the agent's context and write it to `<dir>/.compiled.md`, returning
+/// the absolute path — the terminal start-ways (Claude
+/// `--append-system-prompt-file`, Codex `-c developer_instructions="$(cat …)"`)
+/// read the persona from this file at PTY spawn.
+#[tauri::command]
+async fn agent_write_compiled(slug: String) -> Result<String, String> {
+    let root = agents_root()?;
+    tauri::async_runtime::spawn_blocking(move || agents::write_compiled(&root, &slug))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Build the Agent-Builder developer-instructions for a new-agent (or refine)
+/// Vibe session whose cwd is the agent's own folder. Pure string assembly, but
+/// kept async + `spawn_blocking` for consistency with the other agent commands.
+#[tauri::command]
+async fn agent_builder_instructions(slug: String, refine: bool) -> Result<String, String> {
+    let root = agents_root()?;
+    tauri::async_runtime::spawn_blocking(move || agents::builder_instructions(&root, &slug, refine))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Run one tool through the roundtrip bus (Rust → webview executor → Rust).
 /// Async: it awaits the webview's response (or the tool's timeout) — no
 /// blocking work happens on this side.
@@ -566,6 +690,18 @@ fn openrouter_chat_cancel(chat_id: String) {
 // is assigned by the frontend (it keys the store's VibeSession); `codex_path`
 // is the Settings codex-binary override, passed on the start/resume calls.
 
+/// The extra writable sandbox roots for a Vibe session: a custom agent's own
+/// folder (`~/.swarmz/agents/<slug>`), so a specialist can maintain its own
+/// memory.md approval-free even when the session runs in a project elsewhere.
+/// Slug-validated (never a path escape); empty for plain sessions or a bad slug.
+fn agent_writable_roots(agent_slug: Option<String>) -> Vec<String> {
+    agent_slug
+        .filter(|s| agents::is_valid_slug(s))
+        .and_then(|slug| agents_root().ok().map(|root| root.join(slug)))
+        .map(|dir| vec![dir.to_string_lossy().into_owned()])
+        .unwrap_or_default()
+}
+
 /// Start a fresh Vibe session (dedicated process + thread/start). `access`
 /// ∈ workspace | full maps to the sandbox/approval policy. Returns `{thread_id}`.
 #[tauri::command]
@@ -576,9 +712,22 @@ async fn vibe_session_start(
     model: Option<String>,
     effort: Option<String>,
     access: String,
+    developer_instructions: Option<String>,
+    agent_slug: Option<String>,
     codex_path: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    codex::sessions::session_start(&app, &session_id, cwd, model, effort, &access, codex_path).await
+    codex::sessions::session_start(
+        &app,
+        &session_id,
+        cwd,
+        model,
+        effort,
+        &access,
+        developer_instructions,
+        agent_writable_roots(agent_slug),
+        codex_path,
+    )
+    .await
 }
 
 /// Reopen a persisted session across an app restart (thread/resume, with a
@@ -592,6 +741,8 @@ async fn vibe_session_resume(
     model: Option<String>,
     effort: Option<String>,
     access: String,
+    developer_instructions: Option<String>,
+    agent_slug: Option<String>,
     codex_path: Option<String>,
 ) -> Result<serde_json::Value, String> {
     codex::sessions::session_resume(
@@ -602,6 +753,8 @@ async fn vibe_session_resume(
         model,
         effort,
         &access,
+        developer_instructions,
+        agent_writable_roots(agent_slug),
         codex_path,
     )
     .await
@@ -781,6 +934,16 @@ pub fn run() {
             orchestrator_memory_read,
             orchestrator_memory_append,
             orchestrator_memory_remove,
+            agent_list,
+            agent_read,
+            agent_create,
+            agent_write,
+            agent_delete,
+            agent_memory_append,
+            agent_memory_remove,
+            agent_compile_context,
+            agent_write_compiled,
+            agent_builder_instructions,
             orchestrator_chat_start,
             orchestrator_chat_send,
             orchestrator_chat_interrupt,

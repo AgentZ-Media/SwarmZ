@@ -5,7 +5,10 @@
 // thread"). Unlike the orchestrator, a Vibe session keeps codex' STANDARD
 // harness intact — NO `dynamicTools`, NO `developerInstructions`; it is a
 // plain agentic Codex session (exec + apply_patch), just driven natively and
-// mirrored into the SwarmZ UI over `vibe://session-event`.
+// mirrored into the SwarmZ UI over `vibe://session-event`. A CUSTOM-AGENT
+// session is the one exception: it carries the agent's compiled persona as
+// `developerInstructions` (an additive developer message — still no
+// dynamicTools, the standard harness is untouched).
 //
 // Layers, bottom to top:
 //   - `codex::host` — process, framing, per-threadId event routing, the
@@ -86,11 +89,14 @@ impl Access {
 
     /// `SandboxPolicy` object (the tagged form turn/start overrides expect —
     /// NOT the `SandboxMode` string). Shapes match the 0.142.5 response form.
-    fn sandbox_policy(self) -> Value {
+    /// `writable_roots` are EXTRA folders made writable on top of the workspace
+    /// cwd (a custom agent's own folder, so it can maintain its memory.md even
+    /// when the session runs in a project elsewhere). Ignored for full access.
+    fn sandbox_policy(self, writable_roots: &[String]) -> Value {
         match self {
             Access::Workspace => json!({
                 "type": "workspaceWrite",
-                "writableRoots": [],
+                "writableRoots": writable_roots,
                 "networkAccess": false,
                 "excludeTmpdirEnvVar": false,
                 "excludeSlashTmp": false,
@@ -106,6 +112,16 @@ struct SessionProfile {
     model: Option<String>,
     effort: Option<String>,
     access: Access,
+    /// Custom-agent persona: the compiled agent context, passed as the
+    /// thread's `developerInstructions` (an ADDITIVE developer message — the
+    /// standard Codex harness stays intact). `None` for a plain Vibe session.
+    developer_instructions: Option<String>,
+    /// Extra writable roots for the workspace-write sandbox — a custom agent's
+    /// own folder, so it can append to its memory.md approval-free even when the
+    /// session's cwd is a project elsewhere. Empty for plain sessions and
+    /// ignored under full access (no sandbox). Applied via a per-turn
+    /// `sandboxPolicy` object override on every turn (workspace access only).
+    writable_roots: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -433,8 +449,13 @@ fn thread_start_params(profile: &SessionProfile) -> Value {
     if let Some(model) = &profile.model {
         p["model"] = json!(model);
     }
-    // NO dynamicTools, NO developerInstructions — Codex' standard harness must
-    // stay intact for a plain agentic session.
+    // NO dynamicTools — Codex' standard agentic harness stays intact. A custom
+    // agent's persona rides on `developerInstructions` (an ADDITIVE developer
+    // message, verified against the 0.142.5 protocol); a plain Vibe session
+    // leaves it off entirely.
+    if let Some(di) = &profile.developer_instructions {
+        p["developerInstructions"] = json!(di);
+    }
     p
 }
 
@@ -447,6 +468,9 @@ fn thread_resume_params(thread_id: &str, profile: &SessionProfile) -> Value {
     });
     if let Some(model) = &profile.model {
         p["model"] = json!(model);
+    }
+    if let Some(di) = &profile.developer_instructions {
+        p["developerInstructions"] = json!(di);
     }
     p
 }
@@ -474,8 +498,13 @@ fn turn_params(
     if let Some(effort) = &profile.effort {
         p["effort"] = json!(effort);
     }
-    if include_access_override {
-        p["sandboxPolicy"] = profile.access.sandbox_policy();
+    // Attach the object-form sandboxPolicy when access changed (the pending
+    // override) OR when a workspace-access session carries extra writable roots
+    // (a custom agent's folder) — the roots have to ride on EVERY turn, since
+    // thread/start only takes the string SandboxMode (no writableRoots there).
+    let extra_roots = profile.access == Access::Workspace && !profile.writable_roots.is_empty();
+    if include_access_override || extra_roots {
+        p["sandboxPolicy"] = profile.access.sandbox_policy(&profile.writable_roots);
         p["approvalPolicy"] = json!(profile.access.approval_policy());
     }
     p
@@ -526,6 +555,8 @@ pub async fn session_start(
     model: Option<String>,
     effort: Option<String>,
     access: &str,
+    developer_instructions: Option<String>,
+    writable_roots: Vec<String>,
     codex_path: Option<String>,
 ) -> Result<Value, String> {
     if codex_path.is_some() {
@@ -539,6 +570,8 @@ pub async fn session_start(
         model,
         effort,
         access: Access::parse(access)?,
+        developer_instructions: developer_instructions.filter(|s| !s.is_empty()),
+        writable_roots,
     };
     let host = Arc::new(ProcessHost::new());
     let (conn, generation) = host.ensure().await?;
@@ -567,6 +600,8 @@ pub async fn session_resume(
     model: Option<String>,
     effort: Option<String>,
     access: &str,
+    developer_instructions: Option<String>,
+    writable_roots: Vec<String>,
     codex_path: Option<String>,
 ) -> Result<Value, String> {
     if codex_path.is_some() {
@@ -580,6 +615,8 @@ pub async fn session_resume(
         model,
         effort,
         access: Access::parse(access)?,
+        developer_instructions: developer_instructions.filter(|s| !s.is_empty()),
+        writable_roots,
     };
     let host = Arc::new(ProcessHost::new());
     let (conn, generation) = host.ensure().await?;
@@ -890,8 +927,13 @@ mod tests {
         assert_eq!(Access::Workspace.approval_policy(), "on-request");
         assert_eq!(Access::Full.sandbox_mode(), "danger-full-access");
         assert_eq!(Access::Full.approval_policy(), "never");
-        assert_eq!(Access::Workspace.sandbox_policy()["type"], "workspaceWrite");
-        assert_eq!(Access::Full.sandbox_policy()["type"], "dangerFullAccess");
+        assert_eq!(Access::Workspace.sandbox_policy(&[])["type"], "workspaceWrite");
+        assert_eq!(Access::Full.sandbox_policy(&[])["type"], "dangerFullAccess");
+        // extra writable roots ride only under workspace access
+        let roots = vec!["/agents/youtube-coach".to_string()];
+        let wp = Access::Workspace.sandbox_policy(&roots);
+        assert_eq!(wp["writableRoots"][0], "/agents/youtube-coach");
+        assert_eq!(Access::Full.sandbox_policy(&roots), json!({ "type": "dangerFullAccess" }));
         assert!(Access::parse("workspace").is_ok());
         assert!(Access::parse("full").is_ok());
         assert!(Access::parse("nonsense").is_err());
@@ -904,6 +946,8 @@ mod tests {
             model: Some("gpt-5.5".into()),
             effort: Some("high".into()),
             access: Access::Workspace,
+            developer_instructions: None,
+            writable_roots: Vec::new(),
         };
         let start = thread_start_params(&profile);
         assert_eq!(start["cwd"], "/repo");
@@ -912,7 +956,29 @@ mod tests {
         assert_eq!(start["model"], "gpt-5.5");
         // the standard Codex harness stays intact
         assert!(start.get("dynamicTools").is_none());
+        // a plain session carries no persona
         assert!(start.get("developerInstructions").is_none());
+
+        // a custom-agent session carries its compiled persona as an additive
+        // developerInstructions on BOTH start and resume
+        let persona = SessionProfile {
+            cwd: "/repo".into(),
+            model: None,
+            effort: None,
+            access: Access::Full,
+            developer_instructions: Some("# You are Ferris".into()),
+            writable_roots: Vec::new(),
+        };
+        assert_eq!(
+            thread_start_params(&persona)["developerInstructions"],
+            "# You are Ferris"
+        );
+        assert_eq!(
+            thread_resume_params("tn", &persona)["developerInstructions"],
+            "# You are Ferris"
+        );
+        // still no dynamicTools — the standard harness is untouched
+        assert!(thread_start_params(&persona).get("dynamicTools").is_none());
         // effort is a per-turn override, not a thread/start field
         assert!(start.get("effort").is_none());
 
@@ -936,10 +1002,39 @@ mod tests {
             model: None,
             effort: None,
             access: Access::Workspace,
+            developer_instructions: None,
+            writable_roots: Vec::new(),
         };
         let bare_turn = turn_params("tn", "hi", &bare, false);
         assert!(bare_turn.get("model").is_none());
         assert!(bare_turn.get("effort").is_none());
+
+        // a custom-agent session under workspace access rides its folder as an
+        // extra writable root on EVERY turn (no explicit override needed), so it
+        // can maintain its own memory.md approval-free
+        let agent_sess = SessionProfile {
+            cwd: "/some/project".into(),
+            model: None,
+            effort: None,
+            access: Access::Workspace,
+            developer_instructions: Some("# You are Mara".into()),
+            writable_roots: vec!["/home/x/.swarmz/agents/podcast-editor".into()],
+        };
+        let agent_turn = turn_params("tn", "hi", &agent_sess, false);
+        assert_eq!(agent_turn["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(
+            agent_turn["sandboxPolicy"]["writableRoots"][0],
+            "/home/x/.swarmz/agents/podcast-editor"
+        );
+        assert_eq!(agent_turn["approvalPolicy"], "on-request");
+        // under FULL access the roots are irrelevant — no sandbox, no override
+        let agent_full = SessionProfile {
+            access: Access::Full,
+            ..agent_sess.clone()
+        };
+        assert!(turn_params("tn", "hi", &agent_full, false)
+            .get("sandboxPolicy")
+            .is_none());
     }
 
     #[test]
@@ -1098,6 +1193,8 @@ mod tests {
                 model: None,
                 effort: None,
                 access: Access::Full,
+                developer_instructions: None,
+                writable_roots: Vec::new(),
             };
             let host = ProcessHost::new();
             let (conn, _gen) = host.ensure().await.expect("spawn");
@@ -1166,6 +1263,8 @@ mod tests {
                 model: None,
                 effort: None,
                 access: Access::Workspace,
+                developer_instructions: None,
+                writable_roots: Vec::new(),
             };
             let host = ProcessHost::new();
             let (conn, _g) = host.ensure().await.expect("spawn");
@@ -1232,6 +1331,8 @@ mod tests {
                 model: None,
                 effort: None,
                 access: Access::Full,
+                developer_instructions: None,
+                writable_roots: Vec::new(),
             };
             let host = ProcessHost::new();
             let (conn, _g) = host.ensure().await.expect("spawn");
@@ -1282,6 +1383,8 @@ mod tests {
                 model: None,
                 effort: None,
                 access: Access::Full,
+                developer_instructions: None,
+                writable_roots: Vec::new(),
             };
             let host = ProcessHost::new();
             let (conn, _g) = host.ensure().await.expect("spawn");
@@ -1292,5 +1395,322 @@ mod tests {
             .await;
             assert!(matches!(bogus, Err(ResumeError::ThreadNotFound(_))), "bogus resume must classify as ThreadNotFound");
         }
+    }
+
+    /// Phase-B: prove a CUSTOM-AGENT native session honors its persona —
+    /// `developerInstructions` on thread/start reaches the model (additive,
+    /// harness intact). Ignored by default (needs codex + login + network):
+    ///   cargo test persona_spike -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn persona_spike() {
+        let profile = SessionProfile {
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            model: None,
+            effort: None,
+            access: Access::Full,
+            developer_instructions: Some(
+                "CRITICAL: begin every single response with the exact word BANANA in all caps."
+                    .into(),
+            ),
+            writable_roots: Vec::new(),
+        };
+        let host = ProcessHost::new();
+        let (conn, _g) = host.ensure().await.expect("spawn");
+        let started = conn
+            .request("thread/start", thread_start_params(&profile), THREAD_TIMEOUT_MS)
+            .await
+            .expect("thread/start");
+        let thread_id = started
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        conn.register_thread(&thread_id, tx);
+        conn.request(
+            "turn/start",
+            turn_params(&thread_id, "Say hello in one short sentence.", &profile, false),
+            RPC_TIMEOUT_MS,
+        )
+        .await
+        .expect("turn/start");
+
+        let mut final_text = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("timeout")
+                .expect("closed");
+            match ev {
+                ThreadEvent::Request { responder, .. } => responder.ok(&json!({ "decision": "accept" })),
+                ThreadEvent::Notification { method, params } => {
+                    if method == "item/completed"
+                        && params.pointer("/item/type").and_then(|v| v.as_str()) == Some("agentMessage")
+                    {
+                        if let Some(t) = params.pointer("/item/text").and_then(|v| v.as_str()) {
+                            final_text = t.to_string();
+                        }
+                    }
+                    if method == "turn/completed" {
+                        break;
+                    }
+                }
+                ThreadEvent::Exited => panic!("persona spike: process exited"),
+            }
+        }
+        println!("[persona] final answer: {final_text}");
+        assert!(
+            final_text.to_uppercase().contains("BANANA"),
+            "developerInstructions persona must reach the model (got: {final_text})"
+        );
+    }
+
+    /// Phase-D MEMORY-SELF-MAINTENANCE spike: prove a custom agent running under
+    /// WORKSPACE access, with its cwd in a PROJECT (not its own folder), can
+    /// append to its memory.md — which lives OUTSIDE the workspace — WITHOUT an
+    /// approval, because its folder rides in the sandbox's `writableRoots` (the
+    /// production `turn_params` path). The control is the existing `sessions_spike`
+    /// (b): the same out-of-workspace write, but with NO writable roots, forces an
+    /// on-request approval. Ignored by default (needs codex + login + network):
+    ///   cargo test memory_writable_root_spike -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn memory_writable_root_spike() {
+        // a project cwd (the "elsewhere" the session works in)…
+        let project = std::env::temp_dir().join("swarmz-mem-spike-project");
+        std::fs::create_dir_all(&project).ok();
+        // …and the agent's OWN folder, outside the workspace, with a memory.md
+        let agent_dir = std::env::temp_dir().join("swarmz-mem-spike-agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let memory_path = agent_dir.join("memory.md");
+        std::fs::write(&memory_path, "# Agent memory\n\n- 2026-07-08 existing fact\n").unwrap();
+
+        let developer = format!(
+            "You are a test agent. You maintain your own memory file at `{}`. When the user gives you a durable fact, append it there as one short dated line, then confirm.",
+            memory_path.display()
+        );
+        let profile = SessionProfile {
+            cwd: project.to_string_lossy().into_owned(),
+            model: None,
+            effort: None,
+            access: Access::Workspace,
+            developer_instructions: Some(developer),
+            // THE FIX under test: the agent's folder as an extra writable root
+            writable_roots: vec![agent_dir.to_string_lossy().into_owned()],
+        };
+        let host = ProcessHost::new();
+        let (conn, _g) = host.ensure().await.expect("spawn");
+        let started = conn
+            .request("thread/start", thread_start_params(&profile), THREAD_TIMEOUT_MS)
+            .await
+            .expect("thread/start");
+        let thread_id = started
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        conn.register_thread(&thread_id, tx);
+
+        let prompt =
+            "Remember this durable fact: the show is always called 'DevTalk' and airs on Tuesdays. Append it to your memory file now.";
+        // production path: extra_roots makes turn_params attach the writableRoots
+        conn.request(
+            "turn/start",
+            turn_params(&thread_id, prompt, &profile, false),
+            RPC_TIMEOUT_MS,
+        )
+        .await
+        .expect("turn/start");
+
+        let mut approvals = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("timeout")
+                .expect("closed");
+            match ev {
+                ThreadEvent::Request { method, params, responder } => {
+                    if approval_kind(&method).is_some() {
+                        approvals += 1;
+                        println!(
+                            "[mem] APPROVAL requested: {method} — reason={:?}",
+                            params.get("reason").and_then(|v| v.as_str())
+                        );
+                        // accept so we can still observe the write, but the count
+                        // is what the assertion cares about
+                        responder.ok(&json!({ "decision": "accept" }));
+                    } else {
+                        responder.error(-32601, "unsupported");
+                    }
+                }
+                ThreadEvent::Notification { method, .. } => {
+                    if method == "turn/completed" {
+                        break;
+                    }
+                }
+                ThreadEvent::Exited => panic!("[mem] process exited mid-spike"),
+            }
+        }
+
+        let after = std::fs::read_to_string(&memory_path).unwrap_or_default();
+        println!("[mem] approvals fired: {approvals}");
+        println!("[mem] memory.md after:\n{after}");
+        assert!(
+            after.contains("DevTalk"),
+            "the agent must have appended its new fact to memory.md (got: {after})"
+        );
+        assert_eq!(
+            approvals, 0,
+            "writing to the agent folder (a writable root) must NOT require an approval"
+        );
+    }
+
+    /// Phase-C QUALITY spike: drive the REAL Agent Builder end-to-end against
+    /// codex and dump the files it writes, so the Builder instructions can be
+    /// iterated against real output. Also observes whether webSearch fires under
+    /// workspace-write. Ignored by default (needs codex + login + network):
+    ///   cargo test builder_spike -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn builder_spike() {
+        use crate::agents::builder::build_builder_instructions;
+
+        let slug = "podcast-editor";
+        // a stable folder so the files can be inspected after the run
+        let dir = std::env::temp_dir().join("swarmz-builder-spike").join(slug);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_string_lossy().to_string();
+        println!("\n[builder] agent folder: {dir_str}");
+
+        let guide = build_builder_instructions(slug, &dir_str, false);
+        let profile = SessionProfile {
+            cwd: dir_str.clone(),
+            model: std::env::var("BUILDER_MODEL").ok(),
+            effort: None,
+            access: Access::Workspace,
+            developer_instructions: Some(guide),
+            writable_roots: Vec::new(),
+        };
+        let host = ProcessHost::new();
+        let (conn, _g) = host.ensure().await.expect("spawn");
+        let started = conn
+            .request("thread/start", thread_start_params(&profile), THREAD_TIMEOUT_MS)
+            .await
+            .expect("thread/start");
+        let thread_id = started
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        conn.register_thread(&thread_id, tx);
+
+        // scripted conversation — generic answers that cover the fields no matter
+        // exactly what the Builder asks, then a "write everything now" close.
+        let user_turns = [
+            "I want an agent that helps me edit and tighten podcast episodes — cutting filler, fixing pacing, and punching up weak intros. Keep your questions short.",
+            "Audience: solo and small-team indie podcasters, mostly interview shows. Voice: warm but blunt, like a seasoned audio editor who has heard every 'um' and isn't precious about anyone's darlings. No-gos: never fake laughter, never manipulative clickbait cold-opens, never pad runtime. Yes, please research current podcast cold-open and retention best practices if it helps. A typical job: I hand you a rambling four-minute intro and you tell me exactly where to cut and why.",
+            "That's enough — you have what you need. Please write ALL the agent files now (agent.json, soul.md, memory.md, and any knowledge files), then give me the summary.",
+        ];
+
+        let mut web_search_seen = false;
+        for (i, text) in user_turns.iter().enumerate() {
+            println!("\n[builder] === user turn {} ===\n{text}", i + 1);
+            conn.request(
+                "turn/start",
+                turn_params(&thread_id, text, &profile, i == 0),
+                RPC_TIMEOUT_MS,
+            )
+            .await
+            .expect("turn/start");
+
+            let mut final_text = String::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(360);
+            loop {
+                let ev = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("turn timed out")
+                    .expect("closed");
+                match ev {
+                    ThreadEvent::Request { method, params, responder } => {
+                        println!(
+                            "[builder] approval {method} — {:?}",
+                            params.get("reason").and_then(|v| v.as_str())
+                        );
+                        // accept everything so the build runs unattended
+                        responder.ok(&json!({ "decision": "accept" }));
+                    }
+                    ThreadEvent::Notification { method, params } => {
+                        if method == "item/started" || method == "item/completed" {
+                            let ty = params.pointer("/item/type").and_then(|v| v.as_str());
+                            if ty == Some("webSearch") {
+                                web_search_seen = true;
+                                println!(
+                                    "[builder] webSearch: {:?}",
+                                    params.pointer("/item/query").and_then(|v| v.as_str())
+                                );
+                            }
+                            if method == "item/completed" && ty == Some("fileChange") {
+                                if let Some(changes) = params.pointer("/item/changes").and_then(|v| v.as_array()) {
+                                    for c in changes {
+                                        println!(
+                                            "[builder] wrote {:?}",
+                                            c.get("path").and_then(|v| v.as_str())
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if method == "item/completed"
+                            && params.pointer("/item/type").and_then(|v| v.as_str()) == Some("agentMessage")
+                        {
+                            if let Some(t) = params.pointer("/item/text").and_then(|v| v.as_str()) {
+                                final_text = t.to_string();
+                            }
+                        }
+                        if method == "turn/completed" {
+                            let status = params
+                                .pointer("/turn/status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
+                            println!("[builder] turn {} done (status={status})", i + 1);
+                            break;
+                        }
+                    }
+                    ThreadEvent::Exited => panic!("[builder] process exited mid-build"),
+                }
+            }
+            if !final_text.is_empty() {
+                println!("[builder] assistant:\n{final_text}");
+            }
+        }
+
+        // dump every file the Builder wrote, so the instructions can be judged
+        println!("\n[builder] ===== GENERATED FILES =====");
+        fn dump(dir: &std::path::Path, root: &std::path::Path) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .map(|rd| rd.filter_map(Result::ok).map(|e| e.path()).collect())
+                .unwrap_or_default();
+            entries.sort();
+            for p in entries {
+                if p.is_dir() {
+                    dump(&p, root);
+                } else {
+                    let rel = p.strip_prefix(root).unwrap_or(&p);
+                    let body = std::fs::read_to_string(&p).unwrap_or_default();
+                    println!("\n----- {} -----\n{body}", rel.display());
+                }
+            }
+        }
+        dump(&dir, &dir);
+        println!("\n[builder] webSearch used under workspace-write: {web_search_seen}");
+
+        assert!(dir.join("agent.json").is_file(), "agent.json must be written");
+        assert!(dir.join("soul.md").is_file(), "soul.md must be written");
     }
 }

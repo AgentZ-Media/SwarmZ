@@ -21,6 +21,8 @@ import {
 import { Switch } from "./ui/switch";
 import { Tip } from "./ui/tooltip";
 import {
+  CODEX_READONLY_STARTUP,
+  CODEX_WORKSPACE_STARTUP,
   DEFAULT_CODEX_STARTUP,
   DEFAULT_RUNTIME,
   DEFAULT_STARTUP,
@@ -28,7 +30,35 @@ import {
   useSwarm,
 } from "@/store";
 import { runtimeFromStartup, shortPath } from "@/lib/utils";
+import { AgentPicker } from "./agents/AgentPicker";
+import { AgentIdentityMark } from "./agents/AgentIdentity";
+import { useAgents } from "@/lib/agents/store";
+import { writeAgentCompiled } from "@/lib/agents/api";
+import { injectAgentIntoStartup } from "@/lib/agents/startup";
+import type { AgentSummary } from "@/lib/agents/types";
 import type { AgentRuntime } from "@/types";
+
+/** A custom agent's terminal runtime — "vibe"-default agents fall back to
+ * codex here (the terminal has no native-session runtime). */
+function agentTerminalRuntime(defaultRuntime: string): AgentRuntime {
+  return defaultRuntime === "claude" ? "claude" : "codex";
+}
+
+/** Base startup command for a custom agent's runtime + access default (the
+ * user can still edit it). Only codex encodes access in its flags. */
+function baseStartupForAgent(
+  runtime: AgentRuntime,
+  access: string | undefined,
+): string {
+  if (runtime === "claude") return DEFAULT_STARTUP;
+  if (runtime === "codex") {
+    if (access === "workspace") return CODEX_WORKSPACE_STARTUP;
+    if (access === "read-only" || access === "readonly")
+      return CODEX_READONLY_STARTUP;
+    return DEFAULT_CODEX_STARTUP;
+  }
+  return "";
+}
 
 /**
  * Map the common worktree-creation failures (raw git stderr) to a human
@@ -61,6 +91,11 @@ export function NewAgentDialog() {
   const [runtime, setRuntime] = useState<AgentRuntime>("claude");
   const [startup, setStartup] = useState(DEFAULT_STARTUP);
   const [profileId, setProfileId] = useState<string | undefined>();
+  // custom-agent persona: unset = a plain pane (behaves exactly as before)
+  const [agentSlug, setAgentSlug] = useState<string | undefined>();
+  const agentSummary = useAgents((s) =>
+    agentSlug ? s.agents?.find((a) => a.slug === agentSlug) : undefined,
+  );
 
   // worktree toggle — only offered when the chosen folder is a git repo
   // (repoName: undefined = still checking, null = not a repo)
@@ -74,6 +109,25 @@ export function NewAgentDialog() {
   // bumped on every open — lets an in-flight worktree creation detect that
   // its dialog session ended (cancel, or cancel + reopen) and roll back
   const openGen = useRef(0);
+
+  /** Preselect an agent + its start defaults (runtime, startup, name). The
+   * user can still override every field afterwards. */
+  const applyAgentPrefill = (summary: AgentSummary) => {
+    const rt = agentTerminalRuntime(summary.defaultRuntime);
+    setAgentSlug(summary.slug);
+    setRuntime(rt);
+    setProfileId(undefined);
+    setStartup(baseStartupForAgent(rt, summary.defaultAccess));
+    setName(summary.name);
+  };
+
+  const onAgent = (summary: AgentSummary | null) => {
+    if (!summary) {
+      setAgentSlug(undefined);
+      return;
+    }
+    applyAgentPrefill(summary);
+  };
 
   // reset ONLY on the opening edge: inherit from the split-source pane if
   // present, otherwise fall back to the profile's default cwd or the last
@@ -113,6 +167,14 @@ export function NewAgentDialog() {
     // the configured default command beats the preselected profile's startup —
     // picking a profile by hand still overwrites the field (see onProfile)
     setStartup(nextStartup);
+    // opened via the Library "Start" action: preselect the agent + its defaults
+    // (the library is already loaded, so the summary is in the cache)
+    setAgentSlug(undefined);
+    if (pre?.agentSlug) {
+      const summary = useAgents.getState().agents?.find((a) => a.slug === pre.agentSlug);
+      if (summary) applyAgentPrefill(summary);
+      else setAgentSlug(pre.agentSlug);
+    }
     // workspace context wins over the generic profile/last-used fallbacks
     setCwd(
       pre?.cwd ?? ws?.defaultCwd ?? profile?.defaultCwd ?? s.settings.lastCwd,
@@ -198,8 +260,37 @@ export function NewAgentDialog() {
     // repo check still in flight: a submit now would silently downgrade the
     // requested worktree to a plain pane on the main checkout — wait
     if (worktree && repoName === undefined && cwd) return;
+    void doSubmit();
+  };
+
+  const doSubmit = async () => {
+    // a persona only rides on the coding-CLI runtimes; a shell stays a shell
+    const personaSlug =
+      agentSlug && (runtime === "claude" || runtime === "codex")
+        ? agentSlug
+        : undefined;
+    // compile + write the agent's .compiled.md and inject the runtime-specific
+    // flag onto the startup (a no-op without an agent — the plain path is
+    // byte-for-byte what it was before)
+    let startupToUse = startup;
+    if (personaSlug) {
+      setCreating(true);
+      setError(null);
+      try {
+        const path = await writeAgentCompiled(personaSlug);
+        startupToUse = injectAgentIntoStartup(startup, runtime, path);
+      } catch (e) {
+        setError(String(e).replace(/^Error:\s*/, ""));
+        setCreating(false);
+        return;
+      }
+    }
+
     if (!worktree || !repoName || !cwd) {
-      createAgent({ name, runtime, cwd, startup, profileId }, prefill?.direction ?? "row");
+      createAgent(
+        { name, runtime, cwd, startup: startupToUse, profileId, agentSlug: personaSlug },
+        prefill?.direction ?? "row",
+      );
       return;
     }
     // worktree flow: create it first, then spawn the agent inside it
@@ -207,7 +298,7 @@ export function NewAgentDialog() {
     setError(null);
     const gitBin = settings.gitPath?.trim() || undefined;
     const gen = openGen.current;
-    void (async () => {
+    await (async () => {
       // "still this dialog session": open, and not closed + reopened while
       // the worktree was being created (a fresh session must not receive a
       // stale agent with the old inputs)
@@ -235,9 +326,10 @@ export function NewAgentDialog() {
           {
             name,
             cwd: info.path,
-            startup,
+            startup: startupToUse,
             runtime,
             profileId,
+            agentSlug: personaSlug,
             worktree: { root: info.root, branch: info.branch },
           },
           prefill?.direction ?? "row",
@@ -279,6 +371,41 @@ export function NewAgentDialog() {
               onChange={(e) => setName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit()}
             />
+          </div>
+
+          <div>
+            <Label>Agent</Label>
+            <AgentPicker value={agentSlug ?? null} onChange={onAgent}>
+              <button
+                type="button"
+                className="flex h-9 w-full items-center gap-2 rounded-md border border-border bg-secondary/60 px-3 text-left text-sm transition-colors hover:border-input"
+              >
+                {agentSummary ? (
+                  <>
+                    <AgentIdentityMark summary={agentSummary} size={14} />
+                    <span className="min-w-0 truncate text-foreground">
+                      {agentSummary.name}
+                    </span>
+                    <span className="ml-auto shrink-0 font-mono text-[10px] text-faint">
+                      {agentSummary.role || "agent"}
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-faint">No agent (plain pane)</span>
+                )}
+              </button>
+            </AgentPicker>
+            {agentSummary && (
+              <p className="mt-1.5 text-[11px] text-faint">
+                Its persona is injected at launch via{" "}
+                <code className="font-mono text-muted-foreground">
+                  {runtime === "claude"
+                    ? "--append-system-prompt-file"
+                    : "developer_instructions"}
+                </code>
+                .
+              </p>
+            )}
           </div>
 
           <div>

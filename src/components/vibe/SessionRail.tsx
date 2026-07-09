@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { Plus, X } from "lucide-react";
 import { useVibe } from "@/lib/vibe/session-store";
 import { useVibeUi } from "@/lib/vibe/ui-store";
@@ -15,13 +15,23 @@ import {
   VIBE_FINISHED_WINDOW_MS,
 } from "@/lib/vibe/ui";
 import { cn, folderName, prettyModel } from "@/lib/utils";
+import { AgentIdentityMark, useAgentSummary } from "../agents/AgentIdentity";
 
 const RAIL_LABEL = "font-mono text-[9px] uppercase tracking-[0.12em] text-faint px-1 py-0.5";
 
 /** The left rail: the pinned orchestrator "Conductor", the session cards
  * (signal-triad status), and the New-Session button. */
 export function SessionRail() {
-  const order = useVibe((s) => s.order);
+  // Builder sessions are excluded — they run in their own modal, not the rail.
+  // Select a stable primitive signature (a joined id string) and rebuild the
+  // array in useMemo, never a fresh array in the selector (AGENTS.md).
+  const visibleSig = useVibe((s) =>
+    s.order.filter((id) => !s.sessions[id]?.session.builderForSlug).join(","),
+  );
+  const order = useMemo(
+    () => (visibleSig ? visibleSig.split(",") : []),
+    [visibleSig],
+  );
   const setNewSessionOpen = useVibeUi((s) => s.setNewSessionOpen);
 
   return (
@@ -165,6 +175,8 @@ const SessionCard = memo(function SessionCard({ id }: { id: string }) {
     return e ? hasPendingApproval(e) : false;
   });
   const lastBusyEndAt = useVibe((s) => s.sessions[id]?.lastBusyEndAt ?? null);
+  const agentSlug = useVibe((s) => s.sessions[id]?.session.agentSlug);
+  const agentSummary = useAgentSummary(agentSlug);
 
   const setActive = useVibe((s) => s.setActive);
   const setStageMode = useVibeUi((s) => s.setStageMode);
@@ -233,6 +245,7 @@ const SessionCard = memo(function SessionCard({ id }: { id: string }) {
                   : "var(--faint)",
           }}
         />
+        <AgentIdentityMark summary={agentSummary} size={12} />
         <span className="min-w-0 flex-1 truncate text-xs font-semibold text-foreground">
           {name}
         </span>

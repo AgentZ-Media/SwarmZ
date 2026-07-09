@@ -112,6 +112,14 @@ the lowest layer that still covers what it must:
   (Fable → chart-1 … Haiku → chart-4). Add new families there.
 - Agents are identified by **name + position + active border**, not color.
   Profiles keep a desaturated identity dot (`AGENT_COLORS`).
+- **Custom agents carry an `accent` (hex) — it is IDENTITY, never status.** It
+  tints the agent's avatar/identity mark (`components/agents/AgentIdentity.tsx`
+  `AgentIdentityMark`: the emoji, or a small accent dot when there's no emoji)
+  shown before the name in the pane header, fleet-ops card and Vibe rail. It
+  renders **alongside**, never in place of, the Signal-Triade status dot — the
+  triad (`--focus`/`--attn`/`--success`) still owns "busy / needs you /
+  finished". Never derive status from `accent`, and never let it stand in for a
+  triad signal.
 
 ## Adding new components
 

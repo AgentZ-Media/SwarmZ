@@ -104,6 +104,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
         ToolDefinition {
+            name: "list_agents",
+            description: "List the user's custom agents — specialists the user built, each with its own persona, memory and knowledge. Returns per agent: slug, name, role, a one-line description, defaultRuntime (\"vibe\" = a native session, else a terminal runtime) and its default model/access when set. Start one with create_panes by passing its `agent` slug (as a terminal pane or, with native:true, a Vibe session). Call this when the user names one of their agents or a task clearly fits a specialist.",
+            parameters: empty_params(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        ToolDefinition {
             name: "prompt_pane",
             description: "Send a prompt to an agent pane OR a native Vibe session (accepts either id — panes are checked first, then sessions). For a pane: bracketed-paste the text into its terminal and optionally submit with Enter (a busy pane still receives the text — it queues in the CLI's input — and the response carries a warning). For a native session: submit one turn to it; a busy session refuses (wait for it to finish).",
             parameters: json!({
@@ -119,7 +125,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "create_panes",
-            description: "Create 1–8 new agents in a workspace. Each entry gets a working directory, optionally a runtime or profile, a model override (omit = the user's default configuration), a name, an initial prompt (delivered once the agent is ready), and optionally a fresh git worktree (own branch + folder under <repo>/.worktrees/). New panes are laid out with EQUAL sizes (the system owns the geometry — no manual sizing) and the system OVERFLOWS into a fresh workspace automatically if the target can't hold them above a readable minimum (~380×240 px), so you never have to compute whether panes fit. Use `workspace` to target a workspace, `arrangement` to shape the new panes, and per-pane `beside` for contextual placement next to an existing pane; consult fleet_snapshot's layout section (grid size + effective pane px) first. Set native:true to create a native Vibe-Mode Codex session instead of a terminal pane (prefer this when the user works in Vibe Mode / ui_mode is \"vibe\"); native sessions ignore runtime/profile/worktree AND all layout params (workspace/arrangement/beside). A worktree request on a non-repo folder FAILS for that pane — it is never silently downgraded to a plain pane. Per-entry errors do not abort the batch.",
+            description: "Create 1–8 new agents in a workspace. Each entry gets a working directory, optionally a runtime or profile, a model override (omit = the user's default configuration), a name, an initial prompt (delivered once the agent is ready), and optionally a fresh git worktree (own branch + folder under <repo>/.worktrees/). New panes are laid out with EQUAL sizes (the system owns the geometry — no manual sizing) and the system OVERFLOWS into a fresh workspace automatically if the target can't hold them above a readable minimum (~380×240 px), so you never have to compute whether panes fit. Use `workspace` to target a workspace, `arrangement` to shape the new panes, and per-pane `beside` for contextual placement next to an existing pane; consult fleet_snapshot's layout section (grid size + effective pane px) first. Set native:true to create a native Vibe-Mode Codex session instead of a terminal pane (prefer this when the user works in Vibe Mode / ui_mode is \"vibe\"); native sessions ignore runtime/profile/worktree AND all layout params (workspace/arrangement/beside). Set `agent` to a custom-agent slug (from list_agents) to start that specialist — its persona, memory and knowledge are injected and its default model/access prefill the pane; works for terminal panes AND native sessions, and an unknown slug fails only that entry. A worktree request on a non-repo folder FAILS for that pane — it is never silently downgraded to a plain pane. Per-entry errors do not abort the batch.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -135,6 +141,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                             "properties": {
                                 "cwd": { "type": "string", "description": "absolute working directory for the pane / native session" },
                                 "native": { "type": "boolean", "description": "create a native Vibe-Mode Codex session instead of a terminal pane. Native sessions have structured transcripts and an exact status, and prompt_pane can prompt them directly by id. runtime/profile/worktree/branch and all layout params do NOT apply to native sessions (V1); cwd, model, reasoning, name and prompt do" },
+                                "agent": { "type": "string", "description": "custom-agent slug (from list_agents): starts this specialist with its persona/memory/knowledge injected. Its default model/access prefill the pane unless you override them here. Applies to terminal panes and native sessions; an unknown slug fails only this entry. Do not also pass runtime/profile — the agent decides them" },
                                 "runtime": { "type": "string", "enum": ["claude", "codex", "shell"], "description": "agent CLI to launch (default: the app's default runtime). Ignored when native:true (always codex)" },
                                 "profile_id": { "type": "string", "description": "launch profile id (from list_blueprints) — sets runtime + startup command. Ignored when native:true" },
                                 "model": { "type": "string", "description": "model id for the agent (claude: --model, codex: -m; native: the session model). Use ids from list_blueprints runtimes.*.recently_used_models when the user names a model; OMIT for the user's default configuration" },
@@ -281,7 +288,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_all_eleven_tools_and_serializes() {
+    fn catalog_has_all_twelve_tools_and_serializes() {
         let defs = tool_definitions();
         let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
         for expected in [
@@ -292,6 +299,7 @@ mod tests {
             "git_status",
             "list_projects",
             "list_blueprints",
+            "list_agents",
             "prompt_pane",
             "create_panes",
             "create_workspace",
@@ -299,7 +307,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
-        assert_eq!(defs.len(), 11);
+        assert_eq!(defs.len(), 12);
         // serializable — this exact shape is handed to Codex dynamicTools later
         let json = serde_json::to_value(&defs).expect("serialize");
         for def in json.as_array().unwrap() {
@@ -371,6 +379,23 @@ mod tests {
             &def.parameters["properties"]["panes"]["items"]["properties"];
         assert_eq!(item_props["native"]["type"], "boolean", "native flag missing");
         assert!(def.description.contains("native"), "description omits native sessions");
+    }
+
+    #[test]
+    fn create_panes_exposes_the_agent_slug_param() {
+        let def = find_tool("create_panes").unwrap();
+        let item_props = &def.parameters["properties"]["panes"]["items"]["properties"];
+        assert_eq!(item_props["agent"]["type"], "string", "agent slug param missing");
+        assert!(
+            def.description.contains("agent"),
+            "description omits custom agents"
+        );
+        // a per-pane agent slug validates
+        assert!(validate_args(
+            &def,
+            &json!({ "panes": [{ "cwd": "/tmp/x", "agent": "youtube-coach" }] })
+        )
+        .is_ok());
     }
 
     #[test]

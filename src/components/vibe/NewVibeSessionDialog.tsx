@@ -23,10 +23,19 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { folderName, shortPath } from "@/lib/utils";
+import { AgentPicker } from "@/components/agents/AgentPicker";
+import { AgentIdentityMark } from "@/components/agents/AgentIdentity";
+import { useAgents } from "@/lib/agents/store";
+import type { AgentSummary } from "@/lib/agents/types";
 import type { ProjectEntry } from "@/lib/orchestrator/types";
 import type { VibeAccess } from "@/types";
 
 const NO_EFFORT = "__default__";
+
+/** A custom agent's access default → the Vibe session's access mode. */
+function agentVibeAccess(access: string | undefined): VibeAccess {
+  return access === "workspace" ? "workspace" : "full";
+}
 
 export function NewVibeSessionDialog() {
   const open = useVibeUi((s) => s.newSessionOpen);
@@ -41,6 +50,27 @@ export function NewVibeSessionDialog() {
   const [recents, setRecents] = useState<ProjectEntry[]>([]);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [agentSlug, setAgentSlug] = useState<string | undefined>();
+  const agentSummary = useAgents((s) =>
+    agentSlug ? s.agents?.find((a) => a.slug === agentSlug) : undefined,
+  );
+
+  const applyAgentPrefill = (a: AgentSummary) => {
+    setAgentSlug(a.slug);
+    setAccess(agentVibeAccess(a.defaultAccess));
+    if (a.defaultModel) setModel(a.defaultModel);
+    if (a.defaultEffort) setEffort(a.defaultEffort);
+    setName(a.name);
+    setNameEdited(true);
+  };
+
+  const onAgent = (a: AgentSummary | null) => {
+    if (!a) {
+      setAgentSlug(undefined);
+      return;
+    }
+    applyAgentPrefill(a);
+  };
 
   // reset + load recents on the opening edge only
   useEffect(() => {
@@ -53,6 +83,13 @@ export function NewVibeSessionDialog() {
     setEffort(NO_EFFORT);
     setError(null);
     setCreating(false);
+    // opened via the Library "Start" action: preselect the agent + its defaults
+    const preSlug = useVibeUi.getState().newSessionAgentSlug;
+    setAgentSlug(preSlug ?? undefined);
+    if (preSlug) {
+      const summary = useAgents.getState().agents?.find((a) => a.slug === preSlug);
+      if (summary) applyAgentPrefill(summary);
+    }
     let stale = false;
     void discoverProjects()
       .then((ps) => {
@@ -85,6 +122,7 @@ export function NewVibeSessionDialog() {
         access,
         ...(model.trim() ? { model: model.trim() } : {}),
         ...(effort !== NO_EFFORT ? { effort } : {}),
+        ...(agentSlug ? { agentSlug } : {}),
       });
       // a freshly created session takes the stage (leave the Conductor)
       useVibeUi.getState().setStageMode("session");
@@ -145,6 +183,30 @@ export function NewVibeSessionDialog() {
                 ))}
               </div>
             )}
+          </div>
+
+          <div>
+            <Label>Agent</Label>
+            <AgentPicker value={agentSlug ?? null} onChange={onAgent}>
+              <button
+                type="button"
+                className="flex h-9 w-full items-center gap-2 rounded-md border border-border bg-secondary/60 px-3 text-left text-sm transition-colors hover:border-input"
+              >
+                {agentSummary ? (
+                  <>
+                    <AgentIdentityMark summary={agentSummary} size={14} />
+                    <span className="min-w-0 truncate text-foreground">
+                      {agentSummary.name}
+                    </span>
+                    <span className="ml-auto shrink-0 font-mono text-[10px] text-faint">
+                      {agentSummary.role || "agent"}
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-faint">No agent (plain session)</span>
+                )}
+              </button>
+            </AgentPicker>
           </div>
 
           <div>

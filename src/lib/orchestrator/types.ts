@@ -73,6 +73,7 @@ export const ORCHESTRATOR_TOOL_NAMES = [
   "git_status",
   "list_projects",
   "list_blueprints",
+  "list_agents",
   "prompt_pane",
   "create_panes",
   "create_workspace",
@@ -158,6 +159,9 @@ export interface CreatePaneSpec {
   cwd: string;
   /** create a native Vibe-Mode Codex session instead of a terminal pane */
   native?: boolean;
+  /** custom-agent slug (from list_agents): injects that specialist's persona /
+   * memory / knowledge and prefills its default model/access */
+  agent?: string;
   runtime?: "claude" | "codex" | "shell";
   profile_id?: string;
   /** model id appended to the startup (claude: --model, codex: -m); omit = default config */

@@ -8,11 +8,13 @@ import {
   Settings,
   SlidersHorizontal,
   StickyNote,
+  Wand2,
   X,
 } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
 import { useSwarm } from "@/store";
 import { useOrchestrator } from "@/lib/orchestrator/chat-store";
+import { useAgents } from "@/lib/agents/store";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { useUpdates } from "@/lib/updates";
 import { WorktreesButton } from "./WorktreePanel";
@@ -97,6 +99,17 @@ export function TitleBar({
             onClick={() => setNotesOpen(!notesOpen)}
           >
             <StickyNote size={15} />
+          </Button>
+        </Tip>
+
+        <Tip label="Build a new agent — design a specialist in chat">
+          <Button
+            size="icon"
+            variant="ghost"
+            className="no-drag"
+            onClick={() => useAgents.getState().setNewBuilderOpen(true)}
+          >
+            <Wand2 size={15} />
           </Button>
         </Tip>
 

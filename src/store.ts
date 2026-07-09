@@ -237,6 +237,7 @@ function snapshotGrid(): PersistedGrid {
         fontSize: a.fontSize,
         sessionId: a.sessionId,
         worktree: a.worktree,
+        agentSlug: a.agentSlug,
       })),
     layouts: s.layouts,
     activePaneIds: s.activePaneIds,
@@ -306,6 +307,10 @@ interface CreateAgentOpts {
   color?: string;
   /** the pane lives in this SwarmZ-managed worktree (cwd = worktree path) */
   worktree?: WorktreeMeta;
+  /** run this pane as a custom agent — its persona is already baked into
+   * `startup` (the caller wrote `.compiled.md` and injected the flag); this
+   * only records the identity for chrome + restore */
+  agentSlug?: string;
 }
 
 /** Values the New Agent dialog opens with (e.g. inherited from the pane being split). */
@@ -318,6 +323,8 @@ export interface NewAgentPrefill {
   direction?: "row" | "column";
   /** preselect the worktree toggle (split from a worktree pane) */
   worktree?: boolean;
+  /** preselect a custom agent (opened via the Library "Start" action) */
+  agentSlug?: string;
 }
 
 /**
@@ -579,6 +586,8 @@ export interface SwarmState {
   setUiMode: (mode: "grid" | "vibe") => void;
   setDashboardOpen: (open: boolean) => void;
   setNewAgentOpen: (open: boolean) => void;
+  /** open the New Agent dialog preselecting a custom agent (Library "Start") */
+  openNewAgentForAgent: (slug: string) => void;
   setFileDrag: (drag: { targetId: string | null } | null) => void;
   setDictation: (d: DictationState | null) => void;
   setOpenrouterStatus: (status: OpenrouterKeyStatus | null) => void;
@@ -949,6 +958,10 @@ export const useSwarm = create<SwarmState>((set, get) => ({
                 sessionId: p.sessionId,
                 resume: p.sessionId,
                 worktree: p.worktree,
+                // persona survives restore: the startup already carries the
+                // injection flag, `.compiled.md` is still on disk, and the slug
+                // restores the identity chrome
+                agentSlug: p.agentSlug,
               };
               order.push(p.id);
             }
@@ -1128,6 +1141,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       createdAt: Date.now(),
       profileId: opts.profileId,
       worktree: opts.worktree,
+      agentSlug: opts.agentSlug,
     };
     // for tab naming / default cwd / last-used folder, a worktree pane
     // counts as its main repo — never the .worktrees/<slug> path
@@ -2235,6 +2249,8 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   setDashboardOpen: (open) => set({ dashboardOpen: open }),
   setNewAgentOpen: (open) =>
     set(open ? { newAgentOpen: true, newAgentPrefill: null } : { newAgentOpen: false }),
+  openNewAgentForAgent: (slug) =>
+    set({ newAgentOpen: true, newAgentPrefill: { agentSlug: slug } }),
   setFileDrag: (drag) => {
     // drag-over fires at mouse-move rate — only re-render on actual changes
     const cur = get().fileDrag;
