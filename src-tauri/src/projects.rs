@@ -1,9 +1,10 @@
-//! Orchestrator sensing: project discovery. Merges every place a project
-//! folder can be known from — Codex rollout history (`~/.codex/sessions`
-//! session_meta), folders the frontend already knows (sessions, notes,
-//! worktree repos, last used folder) and an optional shallow filesystem scan
-//! for git repos — into one deduped, recency-sorted list. Read-only:
-//! stat/mtime plus head-reads of single jsonl files, never full parses.
+//! Project discovery (the "open project" recents + the orchestrator's
+//! list_projects). Merges every place a project folder can be known from —
+//! Codex rollout history (`~/.codex/sessions` session_meta), folders the
+//! frontend already knows (open projects, sessions, notes, worktree repos,
+//! last used folder) and an optional shallow filesystem scan for git repos —
+//! into one deduped, recency-sorted list. Read-only: stat/mtime plus
+//! head-reads of single jsonl files, never full parses. Codex-only.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,7 +19,7 @@ const HEAD_BYTES: u64 = 64 * 1024;
 const SCAN_SKIP: &[&str] = &["node_modules", "target", "dist", ".worktrees"];
 
 /// A folder the frontend already knows about, with where it came from
-/// (e.g. "workspace", "profile", "preset", "notes", "worktree-repo").
+/// (e.g. "project", "session", "notes", "worktree-repo", "last-used").
 #[derive(Deserialize, Clone, Debug)]
 pub struct KnownFolder {
     pub path: String,
@@ -46,8 +47,8 @@ fn file_modified_ms(path: &Path) -> Option<i64> {
         .map(|d| d.as_millis() as i64)
 }
 
-/// Head-read a jsonl and return the first `cwd` (Claude lines) or
-/// `session_meta.payload.cwd` (Codex rollouts) found.
+/// Head-read a Codex rollout jsonl and return the first
+/// `session_meta.payload.cwd` found.
 fn cwd_from_jsonl_head(path: &Path) -> Option<String> {
     let Ok(f) = fs::File::open(path) else {
         return None;
@@ -61,9 +62,6 @@ fn cwd_from_jsonl_head(path: &Path) -> Option<String> {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue; // possibly the cut-off last line of the window
         };
-        if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
-            return Some(c.to_string());
-        }
         if let Some(c) = v.pointer("/payload/cwd").and_then(|c| c.as_str()) {
             return Some(c.to_string());
         }

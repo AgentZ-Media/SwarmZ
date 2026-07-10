@@ -15,6 +15,8 @@
 
 import { create } from "zustand";
 import { loadVibeSessions, saveVibeSessions } from "@/lib/transport";
+import { useProjects } from "@/lib/projects/store";
+import type { MigratableSession } from "@/lib/projects/core";
 import type {
   PersistedVibeSession,
   PersistedVibeSessions,
@@ -24,13 +26,15 @@ import type {
   VibeItem,
   VibePlanStep,
   VibeSession,
+  VibeSessionWorktree,
+  VibeSpawnedBy,
   VibeTokenUsage,
 } from "@/types";
 
 /** Per-session item cap — oldest items drop first (display + persistence). */
 export const MAX_ITEMS = 500;
-/** Total session cap — oldest sessions are dropped first. */
-export const MAX_SESSIONS = 30;
+/** Session cap PER PROJECT — a project's oldest sessions are dropped first. */
+export const MAX_SESSIONS_PER_PROJECT = 30;
 /** Live command output cap held in memory (per command item). */
 export const OUTPUT_CAP = 64 * 1024;
 /** Command output cap written to disk (per item) — smaller than the live one. */
@@ -65,6 +69,12 @@ export interface VibeSessionEntry {
 export interface NewVibeSession {
   id: string;
   name: string;
+  /** owning project tab — resolved by the controller (never empty) */
+  projectId: string;
+  /** the generated agent identity (defaults to `name` when omitted) */
+  agentName?: string;
+  spawnedBy?: VibeSpawnedBy;
+  worktree?: VibeSessionWorktree | null;
   projectDir: string;
   model?: string;
   effort?: string;
@@ -96,7 +106,8 @@ export function buildVibePersistSnapshot(): PersistedVibeSessions {
 function snapshot(): PersistedVibeSessions {
   const s = useVibe.getState();
   return {
-    version: 1,
+    // v2 = sessions carry projectId/agentName/spawnedBy/worktree
+    version: 2,
     sessions: s.order
       .map((id) => s.sessions[id])
       .filter((e): e is VibeSessionEntry => !!e)
@@ -180,6 +191,27 @@ export interface VibeState {
   ) => void;
 }
 
+/**
+ * Enforce the per-project session cap on a newest-first id order: each
+ * project keeps its newest MAX_SESSIONS_PER_PROJECT sessions. Ids without a
+ * live entry drop out too.
+ */
+function capPerProject(
+  order: string[],
+  sessions: Record<string, VibeSessionEntry>,
+): string[] {
+  const counts = new Map<string, number>();
+  const kept: string[] = [];
+  for (const id of order) {
+    const e = sessions[id];
+    if (!e) continue;
+    const n = (counts.get(e.session.projectId) ?? 0) + 1;
+    counts.set(e.session.projectId, n);
+    if (n <= MAX_SESSIONS_PER_PROJECT) kept.push(id);
+  }
+  return kept;
+}
+
 /** Replace one session entry immutably, only touching that entry's reference. */
 function withEntry(
   state: VibeState,
@@ -211,6 +243,10 @@ export const useVibe = create<VibeState>((set, get) => ({
       session: {
         id: s.id,
         name: s.name,
+        projectId: s.projectId,
+        agentName: s.agentName ?? s.name,
+        spawnedBy: s.spawnedBy ?? "user",
+        worktree: s.worktree ?? null,
         projectDir: s.projectDir,
         ...(s.model !== undefined ? { model: s.model } : {}),
         ...(s.effort !== undefined ? { effort: s.effort } : {}),
@@ -226,11 +262,12 @@ export const useVibe = create<VibeState>((set, get) => ({
       tokenUsage: null,
       lastBusyEndAt: null,
     };
-    // newest first — the cap drops the oldest sessions from the end
-    const order = [s.id, ...state.order].slice(0, MAX_SESSIONS);
-    const dropped = state.order.filter((oid) => !order.includes(oid));
+    // newest first — the PER-PROJECT cap drops that project's oldest sessions
     const sessions = { ...state.sessions, [s.id]: entry };
-    for (const oid of dropped) delete sessions[oid];
+    const order = capPerProject([s.id, ...state.order], sessions);
+    for (const oid of state.order) {
+      if (!order.includes(oid)) delete sessions[oid];
+    }
     set({ sessions, order, activeId: s.id });
     schedulePersist();
   },
@@ -416,14 +453,37 @@ export const useVibe = create<VibeState>((set, get) => ({
 // Hydration — per-entry graceful degradation (a broken entry costs only itself)
 // ---------------------------------------------------------------------------
 
+/** Tolerant worktree hydration — Phase 4 fills the field, Phase 2 carries it. */
+function sanitizeWorktree(raw: unknown): VibeSessionWorktree | null {
+  if (!raw || typeof raw !== "object") return null;
+  const w = raw as Record<string, unknown>;
+  if (typeof w.root !== "string" || typeof w.branch !== "string") return null;
+  return { root: w.root, branch: w.branch, shared: w.shared === true };
+}
+
+/**
+ * One persisted session, hardened field by field. Pre-v2 sessions come out
+ * with `projectId: ""` — the hydrate migration assigns them to a project
+ * derived from their `projectDir` (see `useProjects.adoptSessions`).
+ */
 function sanitizeSession(raw: unknown): VibeSession | null {
   if (!raw || typeof raw !== "object") return null;
   const s = raw as Record<string, unknown>;
   if (typeof s.id !== "string" || typeof s.projectDir !== "string") return null;
   const access: VibeAccess = s.access === "full" ? "full" : "workspace";
+  const name =
+    typeof s.name === "string" && s.name.trim() ? s.name : "Vibe session";
   return {
     id: s.id,
-    name: typeof s.name === "string" && s.name.trim() ? s.name : "Vibe session",
+    name,
+    projectId: typeof s.projectId === "string" ? s.projectId : "",
+    // migrated (pre-v2) sessions carry their old display name as identity
+    agentName:
+      typeof s.agentName === "string" && s.agentName.trim()
+        ? s.agentName
+        : name,
+    spawnedBy: s.spawnedBy === "conductor" ? "conductor" : "user",
+    worktree: sanitizeWorktree(s.worktree),
     projectDir: s.projectDir,
     ...(typeof s.model === "string" && s.model ? { model: s.model } : {}),
     ...(typeof s.effort === "string" && s.effort ? { effort: s.effort } : {}),
@@ -548,10 +608,16 @@ function sanitizeItem(raw: unknown): VibeItem | null {
 }
 
 /**
- * Load persisted sessions — called from store.ts hydrate(). A session created
- * before hydrate resolved survives (merged after the persisted ones). Sessions
- * are NOT auto-reconnected here — the controller resumes a session's thread
- * lazily on the next send (Phase 3 wires the UI).
+ * Load persisted sessions — called from store.ts hydrate() AFTER the project
+ * store hydrated. A session created before hydrate resolved survives (merged
+ * after the persisted ones). Sessions are NOT auto-reconnected here — the
+ * controller resumes a session's thread lazily on the next send.
+ *
+ * Schema-v2 migration: every hydrated session is run through the project
+ * assignment (`useProjects.adoptSessions`) — a valid `projectId` passes
+ * through, pre-v2 sessions (and sessions whose project record was lost) get
+ * projects derived/created from their `projectDir`s (deduped). The stamped
+ * result is persisted right away so the migration runs once.
  */
 export async function hydrateVibeSessions(): Promise<void> {
   let data: PersistedVibeSessions | null = null;
@@ -593,18 +659,42 @@ export async function hydrateVibeSessions(): Promise<void> {
       /* skip this session only */
     }
   }
+
+  // ---- project assignment (v2 migration + self-heal) ----
+  let migrated = false;
+  try {
+    const migratable: MigratableSession[] = order.map((id) => ({
+      id,
+      projectDir: sessions[id].session.projectDir,
+      projectId: sessions[id].session.projectId || null,
+    }));
+    const assignments = useProjects.getState().adoptSessions(migratable);
+    for (const id of order) {
+      const assigned = assignments[id];
+      if (assigned && sessions[id].session.projectId !== assigned) {
+        sessions[id] = {
+          ...sessions[id],
+          session: { ...sessions[id].session, projectId: assigned },
+        };
+        migrated = true;
+      }
+    }
+  } catch {
+    /* keep sessions hydrated even if the assignment failed */
+  }
+
   const state = useVibe.getState();
   // a session created before hydrate resolved wins; append persisted after
-  const mergedOrder = state.order.length
-    ? [...state.order, ...order.filter((id) => !state.sessions[id])].slice(
-        0,
-        MAX_SESSIONS,
-      )
-    : order.slice(0, MAX_SESSIONS);
   const mergedSessions: Record<string, VibeSessionEntry> = { ...sessions };
   for (const id of Object.keys(state.sessions))
     mergedSessions[id] = state.sessions[id];
-  // drop anything beyond the cap
+  const mergedOrder = capPerProject(
+    state.order.length
+      ? [...state.order, ...order.filter((id) => !state.sessions[id])]
+      : order,
+    mergedSessions,
+  );
+  // drop anything beyond the per-project cap
   for (const id of Object.keys(mergedSessions))
     if (!mergedOrder.includes(id)) delete mergedSessions[id];
   useVibe.setState({
@@ -616,4 +706,6 @@ export async function hydrateVibeSessions(): Promise<void> {
         ? data.activeId
         : (mergedOrder[0] ?? null)),
   });
+  // the one-time migration result must survive a quit without further edits
+  if (migrated || (data.version ?? 1) < 2) schedulePersist();
 }

@@ -7,6 +7,7 @@
 import { create } from "zustand";
 import { nanoid } from "nanoid";
 import {
+  deleteStoreKeys,
   IS_TAURI,
   loadQuickNotes,
   loadSchemaVersion,
@@ -17,7 +18,7 @@ import {
   saveSettings,
   saveUsageHistory,
 } from "@/lib/transport";
-import { normalizeSchemaVersion } from "@/lib/schema-version";
+import { DEAD_STORE_KEYS, planSchemaMigration } from "@/lib/schema-version";
 import type {
   AppSettings,
   NoteItem,
@@ -37,6 +38,7 @@ import {
   hydrateVibeSessions,
   useVibe,
 } from "@/lib/vibe/session-store";
+import { flushProjectsPersist, hydrateProjects } from "@/lib/projects/store";
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
@@ -75,6 +77,8 @@ export async function flushAllPersists(): Promise<void> {
       flushOrchestratorPersist(),
       // the vibe sessions keep their own debounced slice
       flushVibePersist(),
+      // the project tabs keep their own debounced slice
+      flushProjectsPersist(),
     ]);
   } catch {
     /* never block quitting on a failed write */
@@ -189,13 +193,15 @@ export const useSwarm = create<SwarmState>((set, get) => ({
 
   hydrate: async () => {
     try {
-      // schemaVersion — the migration anchor (lib/schema-version.ts): a
-      // pre-versioning/invalid store is stamped with the current version;
-      // a valid (even newer) version is left untouched. No migrations yet.
-      const { version, stamp } = normalizeSchemaVersion(
-        await loadSchemaVersion(),
-      );
-      if (stamp) await saveSchemaVersion(version);
+      // schemaVersion — the migration anchor (lib/schema-version.ts).
+      // v2 (projects & swarm): stores below v2 (incl. pre-versioning ones)
+      // get the one-time cleanup of the dead pane-era keys, then the stamp;
+      // a valid current-or-newer version is left untouched. The storefile.rs
+      // rescue path stays version-agnostic. The per-slice VALUE migration
+      // (sessions → projects) runs tolerantly in the slice hydrators below.
+      const plan = planSchemaMigration(await loadSchemaVersion());
+      if (plan.cleanupDeadKeys) await deleteStoreKeys([...DEAD_STORE_KEYS]);
+      if (plan.stampVersion !== null) await saveSchemaVersion(plan.stampVersion);
     } catch {
       /* ignore */
     }
@@ -234,7 +240,15 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       /* ignore */
     }
     try {
-      // vibe native codex sessions — hydrates its own store
+      // project tabs — MUST hydrate before the vibe sessions: the session
+      // migration assigns projectIds into this store
+      await hydrateProjects();
+    } catch {
+      /* ignore */
+    }
+    try {
+      // vibe native codex sessions — hydrates its own store (and runs the
+      // schema-v2 project assignment against the hydrated project store)
       await hydrateVibeSessions();
     } catch {
       /* ignore */

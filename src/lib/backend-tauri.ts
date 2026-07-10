@@ -13,6 +13,7 @@ import type {
   CodexAccountLimits,
   GitInfo,
   PersistedOrchestratorChats,
+  PersistedProjects,
   PersistedVibeSessions,
   QuickNotesData,
   UsageHistoryEntry,
@@ -78,6 +79,27 @@ export const tauriBackend: Backend = {
   saveVibeSessions: async (data) => {
     await store.set("vibeSessions", data);
     await store.save();
+  },
+
+  loadProjects: async () => {
+    try {
+      return (await store.get<PersistedProjects>("projects")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveProjects: async (data) => {
+    await store.set("projects", data);
+    await store.save();
+  },
+
+  deleteStoreKeys: async (keys) => {
+    let changed = false;
+    for (const key of keys) {
+      // delete() resolves true only when the key existed
+      if (await store.delete(key)) changed = true;
+    }
+    if (changed) await store.save();
   },
 
   loadUsageHistory: async () => {

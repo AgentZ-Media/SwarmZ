@@ -5,6 +5,7 @@ import {
   BarChart3,
   Bell,
   Bot,
+  FolderOpen,
   Plus,
   Search,
   Settings,
@@ -12,10 +13,12 @@ import {
 } from "lucide-react";
 import { useSwarm } from "@/store";
 import { useVibe, type VibeSessionEntry } from "@/lib/vibe/session-store";
-import { focusSession } from "@/lib/vibe/controller";
+import { activateProject, focusSession } from "@/lib/vibe/controller";
+import { useProjects, openProjectIds } from "@/lib/projects/store";
 import { vibeTriageEntries } from "@/lib/vibe/triage";
 import { hasPendingApproval } from "@/lib/vibe/ui";
 import { useVibeUi } from "@/lib/vibe/ui-store";
+import { pickDirectory } from "@/lib/transport";
 import { cn, shortPath } from "@/lib/utils";
 
 /**
@@ -32,6 +35,11 @@ export function CommandPalette({
   const setOpen = useSwarm((s) => s.setPaletteOpen);
   const order = useVibe((s) => s.order);
   const sessions = useVibe((s) => s.sessions);
+  // primitive signature — never a fresh array from the selector
+  const projectIdsSig = useProjects((s) => openProjectIds(s).join("|"));
+  const projectIds = projectIdsSig ? projectIdsSig.split("|") : [];
+  const projects = useProjects((s) => s.projects);
+  const activeProjectId = useProjects((s) => s.activeProjectId);
 
   const [search, setSearch] = useState("");
 
@@ -75,6 +83,52 @@ export function CommandPalette({
               <Command.Empty className="px-3 py-6 text-center text-sm text-faint">
                 Nothing found.
               </Command.Empty>
+
+              <PaletteGroup heading="Projects">
+                {projectIds.map((id, i) => {
+                  const p = projects[id];
+                  if (!p) return null;
+                  return (
+                    <PaletteItem
+                      key={id}
+                      value={`project ${p.name} ${p.dir} ${id}`}
+                      onSelect={() => run(() => activateProject(id))}
+                    >
+                      <span
+                        className="h-1.5 w-1.5 shrink-0 rounded-full"
+                        style={{
+                          backgroundColor:
+                            activeProjectId === id
+                              ? "var(--ring)"
+                              : "var(--faint)",
+                        }}
+                      />
+                      <span className="truncate text-foreground">{p.name}</span>
+                      <span className="ml-auto min-w-0 truncate pl-3 font-mono text-[10px] text-faint">
+                        {shortPath(p.dir)}
+                      </span>
+                      {i <= 8 && <Shortcut>⌘{i + 1}</Shortcut>}
+                    </PaletteItem>
+                  );
+                })}
+                <PaletteItem
+                  value="open project folder tab"
+                  onSelect={() =>
+                    run(() => {
+                      void pickDirectory().then(async (dir) => {
+                        if (!dir) return;
+                        const id = await useProjects
+                          .getState()
+                          .openProject(dir);
+                        activateProject(id);
+                      });
+                    })
+                  }
+                >
+                  <FolderOpen size={13} className="shrink-0 text-faint" />
+                  Open project…
+                </PaletteItem>
+              </PaletteGroup>
 
               <PaletteGroup heading="Sessions">
                 {order.map((id) => {

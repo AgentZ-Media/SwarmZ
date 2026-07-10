@@ -1,11 +1,35 @@
 import { describe, expect, it } from "vitest";
+import type { VibeSession } from "@/types";
 import { fleetSummaryLine, sessionCounts, sessionSnapshot } from "./snapshot";
 import type { VibeSessionEntry } from "@/lib/vibe/session-store";
 
 // The pure snapshot helpers only touch a handful of fields; casts keep the
 // fixtures terse without reconstructing the full VibeSessionEntry shape.
-const entry = (e: Partial<VibeSessionEntry> & Pick<VibeSessionEntry, "session">) =>
-  ({ items: {}, order: [], turnId: null, diff: null, plan: null, tokenUsage: null, lastBusyEndAt: null, ...e }) as VibeSessionEntry;
+const entry = (
+  e: Omit<Partial<VibeSessionEntry>, "session"> & {
+    session: Partial<VibeSession> & Pick<VibeSession, "id" | "name" | "projectDir">;
+  },
+) =>
+  ({
+    items: {},
+    order: [],
+    turnId: null,
+    diff: null,
+    plan: null,
+    tokenUsage: null,
+    lastBusyEndAt: null,
+    ...e,
+    session: {
+      projectId: "p1",
+      agentName: e.session.name,
+      spawnedBy: "user",
+      worktree: null,
+      access: "workspace",
+      threadId: null,
+      createdAt: 0,
+      ...e.session,
+    },
+  }) as VibeSessionEntry;
 
 describe("sessionSnapshot / sessionCounts", () => {
   const entryA = entry({

@@ -3,6 +3,7 @@ import type {
   CodexAccountLimits,
   GitInfo,
   PersistedOrchestratorChats,
+  PersistedProjects,
   PersistedVibeSessions,
   QuickNotesData,
   UsageHistoryEntry,
@@ -36,6 +37,16 @@ export interface Backend {
   /** Native Codex sessions — session meta + normalized transcript. */
   loadVibeSessions(): Promise<PersistedVibeSessions | null>;
   saveVibeSessions(data: PersistedVibeSessions): Promise<void>;
+
+  /** Project tabs — projects (open + closed) and the active tab. */
+  loadProjects(): Promise<PersistedProjects | null>;
+  saveProjects(data: PersistedProjects): Promise<void>;
+
+  /**
+   * Delete top-level swarmz.json keys (missing keys are a no-op) — the
+   * one-time schema-v2 cleanup of the dead pane-era keys runs through this.
+   */
+  deleteStoreKeys(keys: string[]): Promise<void>;
 
   loadUsageHistory(): Promise<UsageHistoryEntry[] | null>;
   saveUsageHistory(entries: UsageHistoryEntry[]): Promise<void>;

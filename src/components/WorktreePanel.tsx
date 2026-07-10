@@ -3,6 +3,7 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { CheckCircle2, FolderGit2, FolderOpen, Plus, Trash2 } from "lucide-react";
 import { useSwarm } from "@/store";
 import { useVibe } from "@/lib/vibe/session-store";
+import { useProjects } from "@/lib/projects/store";
 import { focusSession, startSession } from "@/lib/vibe/controller";
 import { Button } from "./ui/button";
 import { Tip } from "./ui/tooltip";
@@ -140,11 +141,22 @@ function WorktreeRow({
       focusSession(openSessionId);
       return;
     }
-    void startSession({
-      name: folderName(entry.path),
-      projectDir: entry.path,
-      access: "workspace",
-    })
+    // the session runs IN the worktree but belongs to the main repo's
+    // project tab; the worktree meta is stamped so Phase 4's close/cleanup
+    // flows know what the session works in
+    void useProjects
+      .getState()
+      .openProject(entry.root, { activate: false })
+      .then((projectId) =>
+        startSession({
+          name: folderName(entry.path),
+          projectDir: entry.path,
+          projectId,
+          spawnedBy: "user",
+          worktree: { root: entry.root, branch: entry.branch, shared: false },
+          access: "workspace",
+        }),
+      )
       .then((id) => focusSession(id))
       .catch(() => {});
   };

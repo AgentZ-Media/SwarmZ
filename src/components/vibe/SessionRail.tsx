@@ -1,8 +1,9 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { Plus, X } from "lucide-react";
 import { useVibe } from "@/lib/vibe/session-store";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { closeSession } from "@/lib/vibe/controller";
+import { useProjects } from "@/lib/projects/store";
 import { useOrchestrator } from "@/lib/orchestrator/chat-store";
 import { useSwarm } from "@/store";
 import { effectivePersona } from "@/lib/orchestrator/persona";
@@ -18,10 +19,23 @@ import { cn, folderName, prettyModel } from "@/lib/utils";
 
 const RAIL_LABEL = "font-mono text-[9px] uppercase tracking-[0.12em] text-faint px-1 py-0.5";
 
-/** The left rail: the pinned orchestrator "Conductor", the session cards
- * (signal-triad status), and the New-Session button. */
+/** The left rail: the pinned orchestrator "Conductor", the ACTIVE PROJECT's
+ * session cards (signal-triad status — the Deck triage stays global), and
+ * the New-Session button. */
 export function SessionRail() {
-  const order = useVibe((s) => s.order);
+  const activeProjectId = useProjects((s) => s.activeProjectId);
+  // primitive signature (joined ids), rebuilt in useMemo — a selector must
+  // never return a fresh array (AGENTS.md invariant). No active project
+  // (degenerate pre-migration state) falls back to showing everything.
+  const idsSig = useVibe((s) =>
+    (activeProjectId
+      ? s.order.filter(
+          (id) => s.sessions[id]?.session.projectId === activeProjectId,
+        )
+      : s.order
+    ).join("|"),
+  );
+  const ids = useMemo(() => (idsSig ? idsSig.split("|") : []), [idsSig]);
   const setNewSessionOpen = useVibeUi((s) => s.setNewSessionOpen);
 
   return (
@@ -31,12 +45,14 @@ export function SessionRail() {
 
       <span className={cn(RAIL_LABEL, "mt-1")}>Sessions</span>
       <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
-        {order.map((id) => (
+        {ids.map((id) => (
           <SessionCard key={id} id={id} />
         ))}
-        {order.length === 0 && (
+        {ids.length === 0 && (
           <p className="px-1 text-[11px] leading-relaxed text-faint">
-            No sessions yet.
+            {activeProjectId
+              ? "No sessions in this project yet."
+              : "No sessions yet."}
           </p>
         )}
       </div>

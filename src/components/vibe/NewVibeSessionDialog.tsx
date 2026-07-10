@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
-import { Folder, FolderOpen } from "lucide-react";
+import { Dices, Folder, FolderOpen } from "lucide-react";
 import { pickDirectory } from "@/lib/transport";
 import { discoverProjects } from "@/lib/orchestrator/native";
 import { closeSession, startSession } from "@/lib/vibe/controller";
 import { useVibe } from "@/lib/vibe/session-store";
+import { pickAgentName } from "@/lib/vibe/names";
+import { useProjects } from "@/lib/projects/store";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import {
   Dialog,
@@ -22,11 +24,22 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { folderName, shortPath } from "@/lib/utils";
+import { shortPath } from "@/lib/utils";
 import type { ProjectEntry } from "@/lib/orchestrator/types";
 import type { VibeAccess } from "@/types";
 
 const NO_EFFORT = "__default__";
+
+/** All live session names — the generator's strict global collision set. */
+function takenSessionNames(): string[] {
+  const v = useVibe.getState();
+  const taken: string[] = [];
+  for (const id of v.order) {
+    const s = v.sessions[id]?.session;
+    if (s) taken.push(s.name, s.agentName);
+  }
+  return taken;
+}
 
 export function NewVibeSessionDialog() {
   const open = useVibeUi((s) => s.newSessionOpen);
@@ -42,11 +55,18 @@ export function NewVibeSessionDialog() {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // reset + load recents on the opening edge only
+  // reset + load recents on the opening edge only. The folder defaults to
+  // the ACTIVE project (⌘T = new session there); picking another folder
+  // opens/reuses that project's tab on create. The name comes prefilled
+  // from the agent-name pool (🎲 rerolls).
   useEffect(() => {
     if (!open) return;
-    setProjectDir(undefined);
-    setName("");
+    const projects = useProjects.getState();
+    const active = projects.activeProjectId
+      ? projects.projects[projects.activeProjectId]
+      : null;
+    setProjectDir(active?.dir);
+    setName(pickAgentName(takenSessionNames()));
     setNameEdited(false);
     setAccess("workspace");
     setModel("");
@@ -64,9 +84,11 @@ export function NewVibeSessionDialog() {
     };
   }, [open]);
 
-  const choose = (dir: string) => {
-    setProjectDir(dir);
-    if (!nameEdited) setName(folderName(dir));
+  const choose = (dir: string) => setProjectDir(dir);
+
+  const reroll = () => {
+    setName(pickAgentName([...takenSessionNames(), name]));
+    setNameEdited(false);
   };
 
   const pick = async () => {
@@ -80,8 +102,10 @@ export function NewVibeSessionDialog() {
     setError(null);
     try {
       await startSession({
-        name: name.trim() || folderName(projectDir),
+        // the generated (or user-typed) name doubles as the agent identity
+        name: name.trim() || undefined,
         projectDir,
+        spawnedBy: "user",
         access,
         ...(model.trim() ? { model: model.trim() } : {}),
         ...(effort !== NO_EFFORT ? { effort } : {}),
@@ -148,16 +172,33 @@ export function NewVibeSessionDialog() {
           </div>
 
           <div>
-            <Label>Session name</Label>
-            <Input
-              value={name}
-              onChange={(e) => {
-                setNameEdited(true);
-                setName(e.target.value);
-              }}
-              placeholder="Session name"
-              onKeyDown={(e) => e.key === "Enter" && void submit()}
-            />
+            <Label>Agent name</Label>
+            <div className="flex items-center gap-2">
+              <Input
+                value={name}
+                onChange={(e) => {
+                  setNameEdited(true);
+                  setName(e.target.value);
+                }}
+                placeholder="Agent name"
+                onKeyDown={(e) => e.key === "Enter" && void submit()}
+              />
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={reroll}
+                title="Roll a new name"
+                aria-label="Roll a new name"
+                className="shrink-0"
+              >
+                <Dices size={15} />
+              </Button>
+            </div>
+            {!nameEdited && (
+              <p className="mt-1 text-[10px] text-faint">
+                Auto-generated — edit or 🎲 reroll.
+              </p>
+            )}
           </div>
 
           <div className="flex items-center justify-between gap-2 rounded-md border border-border bg-secondary/40 px-3 py-2.5">

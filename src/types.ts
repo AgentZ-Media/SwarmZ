@@ -140,6 +140,41 @@ export interface WorktreeScan {
   scanned: string[];
 }
 
+// ---- Projects ----
+
+/**
+ * One project tab: a folder the swarm works in. Sessions belong to exactly
+ * one project (`VibeSession.projectId`); Phase 3 gives every project its own
+ * Conductor. Persisted under the store key `projects`.
+ */
+export interface Project {
+  id: string;
+  /** canonical absolute folder path (symlinks resolved) — the dedupe key */
+  dir: string;
+  /** display name — folder basename, deduped with a numeric suffix ("api 2") */
+  name: string;
+  /** tab position among the open projects, ascending */
+  order: number;
+  /** last time this project was the active tab, epoch ms */
+  lastActiveAt: number;
+  createdAt: number;
+  /**
+   * Epoch ms the tab was closed — null/absent = open (shown in the tab bar).
+   * Closing a project NEVER touches its sessions; the entity stays persisted
+   * so reopening the same folder brings them back under the same id.
+   */
+  closedAt?: number | null;
+}
+
+/** Persisted shape of the projects (store key `projects`). */
+export interface PersistedProjects {
+  /** shape version — bump when the persisted shape changes (missing = 1) */
+  version?: number;
+  projects: Project[];
+  /** the active project tab — persisted so a restart lands where you left */
+  activeId: string | null;
+}
+
 // ---- Settings ----
 
 /** Small app-wide preferences, persisted across restarts. Edited in the Settings dialog. */
@@ -315,17 +350,47 @@ export interface PersistedOrchestratorChats {
 /** How much a Vibe session's Codex agent may touch the machine. */
 export type VibeAccess = "workspace" | "full";
 
+/** Who created a session: the human (dialog/palette) or the Conductor. */
+export type VibeSpawnedBy = "user" | "conductor";
+
+/**
+ * The git worktree a session's agent works in. Phase 2 only carries the
+ * field (plus the WorktreePanel "open in session" flow, which knows all
+ * three values); Phase 4's worktree tools fill it for conductor-spawned
+ * agents. `shared` = other agents work in the same worktree.
+ */
+export interface VibeSessionWorktree {
+  /** main repo root the worktree belongs to */
+  root: string;
+  branch: string;
+  shared: boolean;
+}
+
 /**
  * One Vibe session (a native Codex agent driven over the app-server). `id` is
  * assigned frontend-side and keys the backend session too; `threadId` is the
  * codex thread behind it — persisted so the session reconnects across restarts
  * (vibe_session_resume), null until the first turn. `access` maps to the
- * sandbox/approval policy in Rust.
+ * sandbox/approval policy in Rust. Since schema v2 every session belongs to
+ * exactly one project (`projectId`); pre-v2 persists hydrate through the
+ * migration that derives/creates projects from their `projectDir`s.
  */
 export interface VibeSession {
   id: string;
+  /** display name — renamable; starts as the generated agent name */
   name: string;
-  /** the project directory the session runs in (thread cwd) */
+  /** owning project tab (`Project.id`) — the rail scopes on this */
+  projectId: string;
+  /**
+   * The generated agent identity (names.ts pool), collision-free per project
+   * and immutable — Phase 4 derives branch names from it (`swarm/maya-…`).
+   * Migrated sessions carry their old display name here.
+   */
+  agentName: string;
+  spawnedBy: VibeSpawnedBy;
+  /** the worktree the agent works in — null = directly in the project dir */
+  worktree: VibeSessionWorktree | null;
+  /** the directory the session runs in (thread cwd; a worktree path when `worktree` is set) */
   projectDir: string;
   /** codex model id (unset = the user's codex default) */
   model?: string;
@@ -430,7 +495,12 @@ export interface PersistedVibeSession {
   items: VibeItem[];
 }
 
-/** Persisted shape of the Vibe sessions (store key `vibeSessions`). */
+/**
+ * Persisted shape of the Vibe sessions (store key `vibeSessions`).
+ * Version 2 = sessions carry `projectId`/`agentName`/`spawnedBy`/`worktree`;
+ * version 1 / missing hydrates through the project migration (projects are
+ * derived from the sessions' `projectDir`s).
+ */
 export interface PersistedVibeSessions {
   /** shape version — bump when the persisted shape changes (missing = 1) */
   version?: number;

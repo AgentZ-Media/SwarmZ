@@ -19,15 +19,21 @@ import { listen } from "@tauri-apps/api/event";
 import { nanoid } from "nanoid";
 import { useSwarm } from "@/store";
 import { pushFleetEvent, type FleetEventKind } from "@/lib/events";
+import { useProjects, openProjectIds } from "@/lib/projects/store";
 import type {
+  ModelUsage,
+  UsageHistoryEntry,
   VibeAccess,
   VibeApprovalStatus,
   VibeFileChange,
   VibeItem,
   VibePlanStep,
+  VibeSessionWorktree,
+  VibeSpawnedBy,
   VibeTokenUsage,
 } from "@/types";
 import { useVibe, type NewVibeSession } from "./session-store";
+import { pickAgentName } from "./names";
 import { useVibeUi } from "./ui-store";
 
 /** Trailing-edge delta flush — word-level deltas never write per event. */
@@ -381,6 +387,9 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
     }
     case "token_usage": {
       store.setTokenUsage(sessionId, data as VibeTokenUsage);
+      // session accounting: mirror into the persistent all-time usage
+      // history (UsageDashboard) — debounced, never per delta tick
+      scheduleUsageMirror(sessionId);
       break;
     }
     case "approval_request": {
@@ -430,6 +439,94 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
   }
 }
 
+// ---- session accounting (usage-history mirror) ----
+
+/** Trailing-edge debounce for the usage mirror — never per delta tick. */
+const USAGE_MIRROR_MS = 2_000;
+const usageMirrorTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleUsageMirror(sessionId: string) {
+  if (usageMirrorTimers.has(sessionId)) return;
+  usageMirrorTimers.set(
+    sessionId,
+    setTimeout(() => {
+      usageMirrorTimers.delete(sessionId);
+      mirrorUsageHistory(sessionId);
+    }, USAGE_MIRROR_MS),
+  );
+}
+
+function cancelUsageMirror(sessionId: string) {
+  const t = usageMirrorTimers.get(sessionId);
+  if (t) {
+    clearTimeout(t);
+    usageMirrorTimers.delete(sessionId);
+  }
+}
+
+function bucketNum(
+  bucket: Record<string, number> | null | undefined,
+  key: string,
+): number {
+  const v = bucket?.[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+
+/**
+ * Mirror one session's latest cumulative token accounting into the
+ * persistent all-time history (store key `usageHistory`) so the
+ * UsageDashboard covers native sessions. Keyed `codex:<session id>`;
+ * `total` is the thread's cumulative accounting, so each write REPLACES the
+ * entry (recordUsageHistory dedupes unchanged snapshots). Codex ChatGPT-plan
+ * turns carry no reliable USD cost — cost stays 0. Cached input is reported
+ * as cache reads and subtracted from fresh input to avoid double counting.
+ */
+function mirrorUsageHistory(sessionId: string): void {
+  const entry = useVibe.getState().sessions[sessionId];
+  const usage = entry?.tokenUsage;
+  if (!entry || !usage) return;
+  const t = usage.total ?? usage.last;
+  if (!t) return;
+  const inputAll = bucketNum(t, "inputTokens");
+  const cached = Math.min(bucketNum(t, "cachedInputTokens"), inputAll);
+  const output = bucketNum(t, "outputTokens");
+  const reasoning = bucketNum(t, "reasoningOutputTokens");
+  if (inputAll + output === 0) return;
+  // turns the human/orchestrator sent into this session so far
+  let messages = 0;
+  for (const iid of entry.order) {
+    if (entry.items[iid]?.kind === "user") messages++;
+  }
+  const model = entry.session.model ?? "codex default";
+  const byModel: ModelUsage = {
+    model,
+    input_tokens: inputAll - cached,
+    output_tokens: output,
+    cache_creation_tokens: 0,
+    cache_read_tokens: cached,
+    reasoning_output_tokens: reasoning,
+    message_count: Math.max(messages, 1),
+    cost_usd: 0,
+  };
+  const record: UsageHistoryEntry = {
+    runtime: "codex",
+    session_id: entry.session.id,
+    agent_name: entry.session.name,
+    cwd: entry.session.projectDir,
+    started_at: entry.session.createdAt,
+    last_updated: Date.now(),
+    message_count: Math.max(messages, 1),
+    input_tokens: inputAll - cached,
+    output_tokens: output,
+    cache_creation_tokens: 0,
+    cache_read_tokens: cached,
+    reasoning_output_tokens: reasoning,
+    cost_usd: 0,
+    by_model: [byModel],
+  };
+  useSwarm.getState().recordUsageHistory(record);
+}
+
 // ---- backend liveness ----
 
 /** Sessions whose Rust-side registry entry is live this app run. After a
@@ -450,25 +547,66 @@ function errorText(err: unknown): string {
 // ---- public surface ----
 
 export interface StartSessionOpts {
-  name: string;
+  /** display name — omitted = the generated agent name */
+  name?: string;
   projectDir: string;
+  /**
+   * Owning project tab. Omitted = the project is resolved from `projectDir`
+   * (opened/reused via the canonical-path dedupe; conductor spawns never
+   * steal the active tab, user spawns activate it).
+   */
+  projectId?: string;
+  /** generated identity — omitted = `name`, or a fresh pool pick */
+  agentName?: string;
+  spawnedBy?: VibeSpawnedBy;
+  /** worktree the session works in (WorktreePanel flow; Phase 4 tools) */
+  worktree?: VibeSessionWorktree | null;
   model?: string;
   effort?: string;
   access?: VibeAccess;
 }
 
+/** Names already used by sessions of one project (collision set). */
+function takenAgentNames(projectId: string): string[] {
+  const v = useVibe.getState();
+  const taken: string[] = [];
+  for (const id of v.order) {
+    const s = v.sessions[id]?.session;
+    if (!s || s.projectId !== projectId) continue;
+    taken.push(s.agentName, s.name);
+  }
+  return taken;
+}
+
 /**
- * Start a fresh Vibe session: create the store entry, spawn its dedicated
- * app-server + thread. The session id is assigned here (keys both stores).
- * Rejects (and drops the store entry) if the process can't start.
+ * Start a fresh Vibe session: resolve its project, create the store entry,
+ * spawn its dedicated app-server + thread. The session id is assigned here
+ * (keys both stores). Rejects (and drops the store entry) if the process
+ * can't start.
  */
 export async function startSession(opts: StartSessionOpts): Promise<string> {
   ensureEvents();
+  const spawnedBy = opts.spawnedBy ?? "user";
+  // every session belongs to a project tab: reuse/open one for the dir when
+  // the caller didn't resolve it — conductor spawns don't steal the active tab
+  const projectId =
+    opts.projectId ??
+    (await useProjects
+      .getState()
+      .openProject(opts.projectDir, { activate: spawnedBy === "user" }));
+  const agentName =
+    opts.agentName?.trim() ||
+    opts.name?.trim() ||
+    pickAgentName(takenAgentNames(projectId));
   const id = nanoid(10);
   const access = opts.access ?? "full";
   const newSession: NewVibeSession = {
     id,
-    name: opts.name,
+    name: opts.name?.trim() || agentName,
+    projectId,
+    agentName,
+    spawnedBy,
+    worktree: opts.worktree ?? null,
     projectDir: opts.projectDir,
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.effort ? { effort: opts.effort } : {}),
@@ -649,20 +787,62 @@ export async function closeSession(sessionId: string): Promise<void> {
       /* best effort — the process dies with the app anyway */
     }
   }
+  // flush a pending accounting mirror before the entry disappears
+  cancelUsageMirror(sessionId);
+  mirrorUsageHistory(sessionId);
   resetStream(sessionId);
   streams.delete(sessionId);
   useVibe.getState().dropSession(sessionId);
 }
 
 /**
- * Bring a session into view: select it and leave the Conductor stage — the
- * Deck triage/ticker and cross-session jumps route through here.
+ * Bring a session into view: switch to its PROJECT tab first (reopening a
+ * closed one — the Deck triage/counters are global across projects), then
+ * select it and leave the Conductor stage. The triage queue, ticker chips,
+ * palette rows and cross-session jumps all route through here.
  */
 export function focusSession(sessionId: string): void {
-  if (!useVibe.getState().sessions[sessionId]) return;
+  const session = useVibe.getState().sessions[sessionId]?.session;
+  if (!session) return;
+  const projects = useProjects.getState();
+  if (session.projectId && projects.activeProjectId !== session.projectId) {
+    // setActiveProject reopens a closed tab; a session whose project record
+    // was lost entirely still focuses (the rail falls back to showing all)
+    if (projects.projects[session.projectId])
+      projects.setActiveProject(session.projectId);
+  }
   useVibe.getState().setActive(sessionId);
   // a jump targets a session — leave the Conductor stage
   useVibeUi.getState().setStageMode("session");
+}
+
+/**
+ * Switch the active project tab (TitleBar click, ⌘1–9, palette) and align
+ * the stage: the selection moves to the project's newest session when the
+ * current one belongs elsewhere; a session-less project lands on the
+ * Conductor stage.
+ */
+export function activateProject(projectId: string): void {
+  const projects = useProjects.getState();
+  if (!projects.projects[projectId]) return;
+  projects.setActiveProject(projectId);
+  const v = useVibe.getState();
+  const activeBelongs =
+    !!v.activeId && v.sessions[v.activeId]?.session.projectId === projectId;
+  if (activeBelongs) return;
+  const first = v.order.find(
+    (id) => v.sessions[id]?.session.projectId === projectId,
+  );
+  v.setActive(first ?? null);
+  if (!first && useVibeUi.getState().stageMode === "session")
+    useVibeUi.getState().setStageMode("conductor");
+}
+
+/** Activate the n-th open project tab (⌘1–⌘9). */
+export function activateProjectByIndex(index: number): void {
+  const ids = openProjectIds(useProjects.getState());
+  const id = ids[index];
+  if (id) activateProject(id);
 }
 
 /** Busy session ids — used by the quit guard (they count like busy panes). */

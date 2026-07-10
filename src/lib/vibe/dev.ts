@@ -28,6 +28,7 @@ import {
   type VibeApprovalDecision,
 } from "./controller";
 import { buildVibePersistSnapshot, useVibe } from "./session-store";
+import { useProjects } from "@/lib/projects/store";
 import type { VibeAccess, VibeFileChange } from "@/types";
 
 // ---- fake-diff generators (rendering-only) ----
@@ -123,10 +124,20 @@ function buildBigDiff(files: number, linesPerFile: number): {
 
 function seedSession(opts?: Partial<StartSessionOpts>): string {
   const id = nanoid(10);
+  const projectDir = opts?.projectDir ?? "/Users/you/Code/SwarmZ";
+  // backend-free project assignment: reuse/create the dir's project tab
+  // synchronously (no canonicalize roundtrip) — same dedupe as the migration
+  const projectId =
+    opts?.projectId ??
+    useProjects.getState().adoptSessions([{ id, projectDir, projectId: null }])[
+      id
+    ];
   useVibe.getState().createSession({
     id,
     name: opts?.name ?? "seeded session",
-    projectDir: opts?.projectDir ?? "/Users/you/Code/SwarmZ",
+    projectId,
+    spawnedBy: opts?.spawnedBy ?? "user",
+    projectDir,
     model: opts?.model ?? "gpt-5-codex",
     effort: opts?.effort ?? "medium",
     access: opts?.access ?? "workspace",

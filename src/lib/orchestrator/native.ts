@@ -4,6 +4,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useSwarm, type SwarmState } from "@/store";
 import { useVibe } from "@/lib/vibe/session-store";
+import { useProjects } from "@/lib/projects/store";
 import type {
   KnownFolder,
   ProjectDocs,
@@ -55,6 +56,9 @@ export function collectKnownFolders(state: SwarmState): KnownFolder[] {
     seen.add(p);
     known.push({ path: p, source });
   };
+  // project tabs (open AND closed — a closed tab is still a known folder)
+  const projects = useProjects.getState();
+  for (const id of projects.order) add(projects.projects[id]?.dir, "project");
   // live session project dirs
   const vibe = useVibe.getState();
   for (const id of vibe.order)

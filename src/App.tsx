@@ -19,7 +19,7 @@ import { startQuitGuard } from "./lib/quit";
 import { startOrchestratorBus } from "./lib/orchestrator/bus";
 import { startVibeSessionActivityWatcher } from "./lib/orchestrator/controller";
 import { vibeTriageEntries } from "./lib/vibe/triage";
-import { focusSession } from "./lib/vibe/controller";
+import { activateProjectByIndex, focusSession } from "./lib/vibe/controller";
 import { ensureNotifyPermission, notify } from "./lib/transport";
 
 // dev-only orchestrator smoke-test hook (`window.__orch`) — the DEV guard
@@ -125,6 +125,10 @@ export default function App() {
         // quick notes drawer (closing while open is handled in the dialog branch)
         e.preventDefault();
         s.setNotesOpen(true);
+      } else if (k >= "1" && k <= "9" && !e.shiftKey && !e.altKey) {
+        // ⌘1–⌘9 — switch to the n-th project tab
+        e.preventDefault();
+        activateProjectByIndex(Number(k) - 1);
       } else if (k === "w") {
         // always claim ⌘W: unhandled it falls through to the native menu's
         // Close Window item and closes the whole app

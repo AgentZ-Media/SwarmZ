@@ -132,21 +132,17 @@ function stripNotes(items: NoteItem[]): ToolNoteItem[] {
 }
 
 /**
- * Collision-free fallback name for unnamed sessions ("Session 1", "Session
- * 2", …, against the CURRENT session set — the batch creates sequentially,
- * so every prior session is already in the store). Interim until the
- * Phase-2 name generator lands.
- */
-function fallbackSessionName(): string {
-  const names = new Set(orderedSessions().map((e) => e.session.name));
-  let n = 1;
-  while (names.has(`Session ${n}`)) n++;
-  return `Session ${n}`;
-}
-
-/**
- * Create one native session. Access defaults to workspace-write for
- * orchestrator-created sessions (the human still decides approvals).
+ * Create one native session (marked conductor-spawned). Access defaults to
+ * workspace-write for orchestrator-created sessions (the human still
+ * decides approvals).
+ *
+ * Project assignment: the session's PROJECT is resolved from its `cwd`
+ * (startSession → `openProject`, deduped by canonical path) — NOT from the
+ * user's currently active tab. Rationale: the orchestrator may spawn into
+ * any folder, and a session must always live under the tab of the folder it
+ * actually works in; an unknown cwd opens its project tab WITHOUT stealing
+ * the user's active one (spawnedBy: "conductor" → activate: false).
+ * Unnamed sessions get a pool agent name, collision-free per project.
  */
 async function createOneSession(
   spec: CreatePaneSpec,
@@ -160,11 +156,11 @@ async function createOneSession(
   if (effort && !["minimal", "low", "medium", "high", "xhigh"].includes(effort))
     throw new Error(`invalid reasoning "${effort}"`);
   const id = await startVibeSession({
-    name:
-      typeof spec.name === "string" && spec.name.trim()
-        ? spec.name.trim()
-        : fallbackSessionName(),
+    ...(typeof spec.name === "string" && spec.name.trim()
+      ? { name: spec.name.trim() }
+      : {}),
     projectDir: cwd,
+    spawnedBy: "conductor",
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
     access: "workspace",

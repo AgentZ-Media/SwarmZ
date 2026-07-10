@@ -69,6 +69,22 @@ async fn path_is_file(path: String) -> bool {
         .unwrap_or(false)
 }
 
+/// Canonicalize a path (symlinks, `/var` → `/private/var` aliasing) — the
+/// strong half of the project-tab dedupe key (frontend `openProject`).
+/// Falls back to the input when resolution fails (folder gone), so opening
+/// a project never hard-fails on the resolver.
+#[tauri::command]
+async fn canonicalize_path(path: String) -> String {
+    let input = path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::canonicalize(&path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(path)
+    })
+    .await
+    .unwrap_or(input)
+}
+
 #[tauri::command]
 async fn git_info(cwd: String, bin: Option<String>) -> Option<git::GitInfo> {
     // subprocess work — keep it off the async runtime's core threads
@@ -460,6 +476,7 @@ pub fn run() {
             usage_totals,
             codex_account_limits,
             path_is_file,
+            canonicalize_path,
             git_info,
             worktree_add,
             worktree_status,

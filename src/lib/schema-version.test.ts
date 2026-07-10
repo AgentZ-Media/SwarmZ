@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CURRENT_SCHEMA_VERSION,
   normalizeSchemaVersion,
+  planSchemaMigration,
 } from "./schema-version";
 
 describe("normalizeSchemaVersion", () => {
@@ -36,5 +37,43 @@ describe("normalizeSchemaVersion", () => {
         stamp: true,
       });
     }
+  });
+});
+
+describe("planSchemaMigration", () => {
+  it("does nothing for a current or newer store", () => {
+    expect(planSchemaMigration(CURRENT_SCHEMA_VERSION)).toEqual({
+      cleanupDeadKeys: false,
+      stampVersion: null,
+    });
+    expect(planSchemaMigration(CURRENT_SCHEMA_VERSION + 3)).toEqual({
+      cleanupDeadKeys: false,
+      stampVersion: null,
+    });
+  });
+
+  it("cleans up + stamps a v1 store", () => {
+    expect(planSchemaMigration(1)).toEqual({
+      cleanupDeadKeys: true,
+      stampVersion: CURRENT_SCHEMA_VERSION,
+    });
+  });
+
+  it("cleans up + stamps a pre-versioning / invalid store (may still carry pane-era keys)", () => {
+    for (const raw of [undefined, null, "2", 0, -1, 1.5]) {
+      expect(planSchemaMigration(raw)).toEqual({
+        cleanupDeadKeys: true,
+        stampVersion: CURRENT_SCHEMA_VERSION,
+      });
+    }
+  });
+
+  it("is idempotent: after the stamp, a re-run plans nothing", () => {
+    const first = planSchemaMigration(1);
+    expect(first.stampVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(planSchemaMigration(first.stampVersion)).toEqual({
+      cleanupDeadKeys: false,
+      stampVersion: null,
+    });
   });
 });
