@@ -3,6 +3,7 @@ import type { Project } from "@/types";
 import {
   assignSessionsToProjects,
   dirBasename,
+  isDirWithin,
   normalizeDirKey,
   openProjectsSorted,
   reorderOpenProject,
@@ -30,6 +31,24 @@ describe("normalizeDirKey", () => {
   it("keeps the filesystem root and empties empty input", () => {
     expect(normalizeDirKey("/")).toBe("/");
     expect(normalizeDirKey("   ")).toBe("");
+  });
+});
+
+describe("isDirWithin", () => {
+  it("accepts the root itself and true subfolders", () => {
+    expect(isDirWithin("/a/b", "/a/b")).toBe(true);
+    expect(isDirWithin("/a/b", "/a/b/")).toBe(true);
+    expect(isDirWithin("/a/b", "/a/b/src/lib")).toBe(true);
+    expect(isDirWithin("/", "/anything")).toBe(true);
+  });
+
+  it("rejects siblings, parents and lookalike prefixes", () => {
+    expect(isDirWithin("/a/b", "/a/c")).toBe(false);
+    expect(isDirWithin("/a/b", "/a")).toBe(false);
+    // segment boundary: /a/bc is NOT within /a/b
+    expect(isDirWithin("/a/b", "/a/bc")).toBe(false);
+    expect(isDirWithin("/a/b", "")).toBe(false);
+    expect(isDirWithin("", "/a/b")).toBe(false);
   });
 });
 

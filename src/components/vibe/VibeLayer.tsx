@@ -1,6 +1,7 @@
 import { SessionRail } from "./SessionRail";
 import { FocusStage } from "./FocusStage";
 import {
+  CloseProjectConfirm,
   CloseSessionConfirm,
   NewVibeSessionDialog,
 } from "./NewVibeSessionDialog";
@@ -16,6 +17,7 @@ export function VibeLayer() {
       <FocusStage />
       <NewVibeSessionDialog />
       <CloseSessionConfirm />
+      <CloseProjectConfirm />
     </div>
   );
 }

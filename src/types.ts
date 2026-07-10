@@ -314,13 +314,18 @@ export interface OrchestratorPingRecord {
 }
 
 /**
- * One orchestrator chat. `threadId` is the app-server thread behind it —
+ * One Conductor chat. `threadId` is the app-server thread behind it —
  * persisted so the chat reconnects across app restarts (chatResume); null
  * until the first message was sent. `touchedPanes`/`pendingPings` are the
- * status-ping state — persisted so pings survive restarts.
+ * status-ping state — persisted so pings survive restarts. Since Phase 3
+ * every chat belongs to exactly one project (`projectId` — the Conductor
+ * instance it runs on); pre-Phase-3 chats hydrate through a migration that
+ * derives the project from the sessions the chat touched.
  */
 export interface OrchestratorChat {
   id: string;
+  /** owning project (`Project.id`) — the Conductor stage scopes on this */
+  projectId: string;
   threadId: string | null;
   /** codex model override (a per-turn override, editable mid-chat). Unset = the user's default. */
   model?: string;
@@ -336,13 +341,17 @@ export interface OrchestratorChat {
 }
 
 /** Persisted shape of the orchestrator chats (store key `orchestratorChats`).
- * Pre-rebuild persists may additionally carry `panelOpen`/`panelWidth` (the
- * removed ⌘⇧O side panel) — ignored tolerantly on hydrate. */
+ * Version 2 = chats carry `projectId` + the per-project active map. Pre-rebuild
+ * persists may additionally carry `panelOpen`/`panelWidth` (the removed ⌘⇧O
+ * side panel) — ignored tolerantly on hydrate. */
 export interface PersistedOrchestratorChats {
   /** shape version — bump when the persisted shape changes (missing = 1) */
   version?: number;
   chats: OrchestratorChat[];
-  activeId: string | null;
+  /** v1 leftover: the single global active chat (migrated into the map) */
+  activeId?: string | null;
+  /** active chat per project — the Conductor stage restores per-tab (v2) */
+  activeByProject?: Record<string, string>;
 }
 
 // ---- Vibe: native Codex sessions ----
@@ -506,4 +515,6 @@ export interface PersistedVibeSessions {
   version?: number;
   sessions: PersistedVibeSession[];
   activeId: string | null;
+  /** remembered session selection per project — restored on tab switch */
+  activeIdByProject?: Record<string, string>;
 }

@@ -20,6 +20,12 @@ interface VibeUiState {
   /** session id awaiting a busy-close confirmation (null = no dialog) */
   closeConfirmId: string | null;
   setCloseConfirmId: (id: string | null) => void;
+  /** project tab awaiting a close confirmation because sessions are still
+   * busy (closing never stops them — the dialog just says so) */
+  closeProjectConfirm: { projectId: string; busyCount: number } | null;
+  setCloseProjectConfirm: (
+    confirm: { projectId: string; busyCount: number } | null,
+  ) => void;
   /** conductor vs. session stage (Phase 5, Orchestrator-first) */
   stageMode: VibeStageMode;
   setStageMode: (mode: VibeStageMode) => void;
@@ -30,6 +36,8 @@ export const useVibeUi = create<VibeUiState>((set) => ({
   setNewSessionOpen: (open) => set({ newSessionOpen: open }),
   closeConfirmId: null,
   setCloseConfirmId: (id) => set({ closeConfirmId: id }),
+  closeProjectConfirm: null,
+  setCloseProjectConfirm: (confirm) => set({ closeProjectConfirm: confirm }),
   stageMode: "conductor",
   setStageMode: (mode) => set({ stageMode: mode }),
 }));

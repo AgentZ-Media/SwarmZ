@@ -82,6 +82,12 @@ export interface ProjectsState {
   /** stable id order (persistence order, not tab order — that's `order`) */
   order: string[];
   activeProjectId: string | null;
+  /** true once hydrate() SUCCEEDED (incl. a fresh install with no persisted
+   * data) — consumers that migrate against this store (the chat→project
+   * assignment) must not run while this is false: a transient load failure
+   * would otherwise read as "no projects exist" and strip every
+   * chat→project link. In-memory, never persisted. */
+  hydrated: boolean;
 
   /**
    * Open a project for a folder: dedupe by canonical path — an existing
@@ -135,6 +141,7 @@ export const useProjects = create<ProjectsState>((set, get) => ({
   projects: {},
   order: [],
   activeProjectId: null,
+  hydrated: false,
 
   openProject: async (dir, opts) => {
     const canon = await canonicalDir(dir);
@@ -273,9 +280,14 @@ export const useProjects = create<ProjectsState>((set, get) => ({
     try {
       data = await loadProjects();
     } catch {
+      // load failed — `hydrated` stays false, downstream migrations skip
       return;
     }
-    if (!data) return;
+    if (!data) {
+      // fresh install: nothing persisted IS a successful hydration
+      set({ hydrated: true });
+      return;
+    }
     const projects: Record<string, Project> = {};
     const order: string[] = [];
     for (const raw of Array.isArray(data.projects) ? data.projects : []) {
@@ -304,6 +316,7 @@ export const useProjects = create<ProjectsState>((set, get) => ({
         active && projects[active] && !projects[active].closedAt
           ? active
           : fallbackActive(projects),
+      hydrated: true,
     });
   },
 }));

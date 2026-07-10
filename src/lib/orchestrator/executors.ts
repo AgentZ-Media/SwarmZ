@@ -9,9 +9,12 @@
 // (unknown session ids, non-repo git requests, …). A thrown error becomes
 // the tool call's error message.
 
+import { invoke } from "@tauri-apps/api/core";
 import { useSwarm } from "@/store";
 import type { NoteItem } from "@/types";
 import { fetchGitInfo } from "@/lib/transport";
+import { useProjects } from "@/lib/projects/store";
+import { isDirWithin, normalizeDirKey } from "@/lib/projects/core";
 import { pushFleetEvent } from "@/lib/events";
 import { useVibe, type VibeSessionEntry } from "@/lib/vibe/session-store";
 import {
@@ -39,10 +42,13 @@ import type {
  * Per-call context the bus passes alongside the args. `chatId` is the STORE
  * chat id of the orchestrator chat whose turn triggered the call (the bus
  * resolves the backend id) — null for dev-hook calls (`__orch.tool`), which
- * therefore never track touched sessions.
+ * therefore never track touched sessions. `projectId` is the Conductor
+ * instance's project (Phase 3) — session resolution and fleet_snapshot are
+ * scoped on it; null = unscoped (dev-hook).
  */
 export interface ToolCallContext {
   chatId: string | null;
+  projectId: string | null;
 }
 
 export type ToolExecutor = (
@@ -100,30 +106,55 @@ function notePromptDelivered(
   pushFleetEvent({ kind: "orch_prompt", sessionId, sessionName });
 }
 
-/** Ordered session entries (rail order). */
-function orderedSessions(): VibeSessionEntry[] {
+/** Ordered session entries (rail order), optionally scoped to one project. */
+function orderedSessions(projectId: string | null): VibeSessionEntry[] {
   const v = useVibe.getState();
   return v.order
     .map((id) => v.sessions[id])
-    .filter((e): e is VibeSessionEntry => !!e);
+    .filter((e): e is VibeSessionEntry => !!e)
+    .filter((e) => projectId === null || e.session.projectId === projectId);
 }
 
-/** The session snapshot shared by fleet_snapshot + the summary. */
-export function fleetSessions() {
+/** The session snapshot shared by fleet_snapshot + the summary (scoped). */
+export function fleetSessions(projectId: string | null = null) {
   const v = useVibe.getState();
-  return sessionSnapshot({ sessions: orderedSessions(), busy: v.busy });
+  return sessionSnapshot({ sessions: orderedSessions(projectId), busy: v.busy });
 }
 
-/** Resolve a pane_id to its session entry, or fail listing every valid id. */
-function requireSession(paneId: unknown): VibeSessionEntry {
-  const entry =
-    typeof paneId === "string" ? useVibe.getState().sessions[paneId] : undefined;
-  if (entry) return entry;
-  const valid = orderedSessions()
+/**
+ * Resolve a pane_id to its session entry WITHIN the call's project scope, or
+ * fail listing every valid id. Accepts a raw session id, or a session name /
+ * agent name (optionally `@`-prefixed, case-insensitive) that is unique
+ * within the scope.
+ */
+function requireSession(paneId: unknown, ctx: ToolCallContext): VibeSessionEntry {
+  const scoped = orderedSessions(ctx.projectId);
+  if (typeof paneId === "string" && paneId.trim()) {
+    const byId = scoped.find((e) => e.session.id === paneId);
+    if (byId) return byId;
+    // name resolution: "@Maya" / "maya" — unique within the project scope
+    const needle = paneId.trim().replace(/^@/, "").toLowerCase();
+    const byName = scoped.filter(
+      (e) =>
+        e.session.name.toLowerCase() === needle ||
+        e.session.agentName.toLowerCase() === needle,
+    );
+    if (byName.length === 1) return byName[0];
+    if (byName.length > 1) {
+      throw new Error(
+        `ambiguous session name ${JSON.stringify(String(paneId))} — matches: ${byName
+          .map((e) => `${e.session.id} ("${e.session.name}")`)
+          .join(", ")}; use the id`,
+      );
+    }
+  }
+  const valid = scoped
     .map((e) => `${e.session.id} ("${e.session.name}")`)
     .join(", ");
   throw new Error(
-    `unknown pane_id ${JSON.stringify(String(paneId))} — valid session ids: ${valid || "(no sessions open)"}`,
+    `unknown pane_id ${JSON.stringify(String(paneId))} — valid sessions${
+      ctx.projectId ? " in this project" : ""
+    }: ${valid || "(no sessions open)"}`,
   );
 }
 
@@ -132,23 +163,73 @@ function stripNotes(items: NoteItem[]): ToolNoteItem[] {
 }
 
 /**
+ * The Conductor's default working directory: its project's folder. Errors
+ * when the call is unscoped (dev-hook) AND the spec omitted `cwd`.
+ */
+function defaultCwd(ctx: ToolCallContext): string {
+  const projectId = ctx.projectId ?? "";
+  const dir = useProjects.getState().projects[projectId]?.dir?.trim() ?? "";
+  if (!dir)
+    throw new Error(
+      "cwd omitted and no project folder available — pass an absolute cwd",
+    );
+  return dir;
+}
+
+/**
+ * Canonical form of a dir (symlinks, `/private` aliasing) via Rust, falling
+ * back to the plain normalized key when canonicalization fails (folder gone)
+ * — the same tolerant resolution the project store's dedupe uses.
+ */
+async function canonicalDirKey(dir: string): Promise<string> {
+  const key = normalizeDirKey(dir);
+  if (!key) return "";
+  try {
+    const canon = await invoke<string>("canonicalize_path", { path: key });
+    return normalizeDirKey(canon) || key;
+  } catch {
+    return key;
+  }
+}
+
+/**
  * Create one native session (marked conductor-spawned). Access defaults to
  * workspace-write for orchestrator-created sessions (the human still
  * decides approvals).
  *
- * Project assignment: the session's PROJECT is resolved from its `cwd`
- * (startSession → `openProject`, deduped by canonical path) — NOT from the
- * user's currently active tab. Rationale: the orchestrator may spawn into
- * any folder, and a session must always live under the tab of the folder it
- * actually works in; an unknown cwd opens its project tab WITHOUT stealing
- * the user's active one (spawnedBy: "conductor" → activate: false).
- * Unnamed sessions get a pool agent name, collision-free per project.
+ * Project assignment: an omitted `cwd` defaults to the Conductor's project
+ * folder; any cwd INSIDE the project root (canonicalized prefix check — a
+ * subfolder of the project is still this project's work) keeps the session
+ * attached to the Conductor's project. Only a genuinely FOREIGN cwd resolves
+ * its own project (startSession → `openProject`, deduped by canonical path)
+ * — NOT the user's currently active tab — and the tool result says so.
+ * Rationale: the orchestrator may spawn into any folder, and a session must
+ * always live under the tab of the folder it actually works in; an unknown
+ * cwd opens its project tab WITHOUT stealing the user's active one
+ * (spawnedBy: "conductor" → activate: false). Unnamed sessions get a pool
+ * agent name, collision-free per project.
  */
 async function createOneSession(
   spec: CreatePaneSpec,
+  ctx: ToolCallContext,
 ): Promise<{ result: CreatePaneResult; prompt?: { id: string; text: string } }> {
-  const cwd = typeof spec.cwd === "string" ? spec.cwd.trim() : "";
-  if (!cwd) throw new Error("cwd is required and must be a non-empty path");
+  const explicitCwd = typeof spec.cwd === "string" ? spec.cwd.trim() : "";
+  const cwd = explicitCwd || defaultCwd(ctx);
+  // cwd inside the Conductor's project root (incl. the root itself) → attach
+  // to its project directly; only genuinely foreign cwds resolve their own tab
+  const ownProjectDir =
+    ctx.projectId != null
+      ? (useProjects.getState().projects[ctx.projectId]?.dir?.trim() ?? "")
+      : "";
+  let withinOwnProject = ctx.projectId != null && explicitCwd === "";
+  if (!withinOwnProject && ctx.projectId != null && ownProjectDir) {
+    const [canonRoot, canonCwd] = await Promise.all([
+      canonicalDirKey(ownProjectDir),
+      canonicalDirKey(explicitCwd),
+    ]);
+    withinOwnProject = isDirWithin(canonRoot, canonCwd);
+  }
+  const projectId = withinOwnProject ? (ctx.projectId ?? undefined) : undefined;
   const model = typeof spec.model === "string" ? spec.model.trim() : "";
   if (model && !/^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(model))
     throw new Error(`invalid model "${model}" — letters, digits and . _ : / - only`);
@@ -160,14 +241,27 @@ async function createOneSession(
       ? { name: spec.name.trim() }
       : {}),
     projectDir: cwd,
+    ...(projectId ? { projectId } : {}),
     spawnedBy: "conductor",
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
     access: "workspace",
   });
-  const name = useVibe.getState().sessions[id]?.session.name ?? spec.name ?? null;
+  const entry = useVibe.getState().sessions[id];
+  const name = entry?.session.name ?? spec.name ?? null;
+  const result: CreatePaneResult = { id, name, cwd };
+  if (!withinOwnProject && ctx.projectId != null) {
+    // honest scoping note: a foreign cwd lives under ITS OWN project tab, so
+    // this Conductor's fleet tools won't see the session
+    const sessProject = entry?.session.projectId
+      ? useProjects.getState().projects[entry.session.projectId]
+      : undefined;
+    result.note = `cwd is outside this project — the session was opened under its own project tab${
+      sessProject ? ` "${sessProject.name}"` : ""
+    } and is NOT part of this Conductor's fleet`;
+  }
   return {
-    result: { id, name, cwd },
+    result,
     prompt:
       typeof spec.prompt === "string" && spec.prompt.trim()
         ? { id, text: spec.prompt }
@@ -187,16 +281,23 @@ function buildSummary(results: CreatePaneResult[]): string {
 export const executors: Record<OrchestratorToolName, ToolExecutor> = {
   // ---- read tools ----
 
-  fleet_snapshot: async () => {
-    const sessions = fleetSessions();
+  fleet_snapshot: async (_args, ctx) => {
+    const sessions = fleetSessions(ctx.projectId);
+    const project = ctx.projectId
+      ? (useProjects.getState().projects[ctx.projectId] ?? null)
+      : null;
     return {
+      // the Conductor's own project heads the snapshot (null = unscoped dev call)
+      project: project
+        ? { id: project.id, name: project.name, dir: project.dir }
+        : null,
       summary: fleetSummaryLine(sessions),
       sessions,
     };
   },
 
-  read_transcript: async (args) => {
-    const entry = requireSession(args.pane_id);
+  read_transcript: async (args, ctx) => {
+    const entry = requireSession(args.pane_id, ctx);
     const items = entry.order
       .map((id) => entry.items[id])
       .filter((i): i is NonNullable<typeof i> => !!i);
@@ -214,13 +315,13 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     };
   },
 
-  read_project_docs: async (args) => {
+  read_project_docs: async (args, ctx) => {
     const hasPane = typeof args.pane_id === "string" && args.pane_id.trim();
     const hasPath = typeof args.path === "string" && args.path.trim();
     if (!!hasPane === !!hasPath)
       throw new Error('exactly one of "pane_id" or "path" is required');
     const root = hasPane
-      ? requireSession(args.pane_id).session.projectDir
+      ? requireSession(args.pane_id, ctx).session.projectDir
       : (args.path as string).trim();
     if (!root)
       throw new Error("the session has no project directory — pass \"path\" instead");
@@ -240,7 +341,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     };
   },
 
-  git_status: async (args) => {
+  git_status: async (args, ctx) => {
     const hasPane = typeof args.pane_id === "string" && args.pane_id.trim();
     const hasPath = typeof args.path === "string" && args.path.trim();
     if (!!hasPane === !!hasPath)
@@ -248,7 +349,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     let cwd: string;
     let session: { id: string; name: string } | null = null;
     if (hasPane) {
-      const entry = requireSession(args.pane_id);
+      const entry = requireSession(args.pane_id, ctx);
       cwd = entry.session.projectDir;
       session = { id: entry.session.id, name: entry.session.name };
     } else {
@@ -284,7 +385,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
   // ---- write tools ----
 
   prompt_pane: async (args, ctx) => {
-    const entry = requireSession(args.pane_id);
+    const entry = requireSession(args.pane_id, ctx);
     const text = String(args.text ?? "");
     if (!text) throw new Error("text must not be empty");
     const id = entry.session.id;
@@ -310,13 +411,13 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     // sequential on purpose — each start spawns a codex process
     for (let i = 0; i < specs.length; i++) {
       try {
-        const { result, prompt } = await createOneSession(specs[i]);
+        const { result, prompt } = await createOneSession(specs[i], ctx);
         results[i] = result;
         if (prompt) prompts.push({ index: i, ...prompt });
       } catch (e) {
         results[i] = {
           error: e instanceof Error ? e.message : String(e),
-          cwd: typeof specs[i]?.cwd === "string" ? specs[i].cwd : null,
+          cwd: typeof specs[i]?.cwd === "string" ? (specs[i].cwd as string) : null,
           name: typeof specs[i]?.name === "string" ? specs[i].name : null,
         };
       }
@@ -352,12 +453,24 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
 
   // ---- memory tool ----
 
-  remember: async (args) => {
+  remember: async (args, ctx) => {
     const text = typeof args.text === "string" ? args.text.trim() : "";
     if (!text) throw new Error("nothing to remember: text must not be empty");
+    // scope "project" is the default — it needs the Conductor's project
+    // context; an unscoped (dev-hook) call without an explicit scope falls
+    // back to global instead of erroring
+    const requested =
+      args.scope === "global" || args.scope === "project"
+        ? args.scope
+        : undefined;
+    const scope = requested ?? (ctx.projectId ? "project" : "global");
+    if (scope === "project" && !ctx.projectId)
+      throw new Error(
+        'no project context for scope "project" — use scope "global"',
+      );
     // Rust enforces the caps + FIFO and returns an honest note (e.g. dropped
     // the oldest entry). The remember chip shows in the chat via tool_call/done.
-    const res = await appendMemory(text);
-    return { remembered: text, ...res };
+    const res = await appendMemory(text, scope, ctx.projectId ?? undefined);
+    return { remembered: text, scope, ...res };
   },
 };

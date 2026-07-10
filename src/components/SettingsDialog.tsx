@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Bot,
   ChevronDown,
@@ -31,6 +31,7 @@ import {
   type PersonaPreset,
 } from "@/lib/orchestrator/persona";
 import { readMemory, removeMemory } from "@/lib/orchestrator/memory";
+import { useProjects } from "@/lib/projects/store";
 import type { OrchestratorMemoryEntry } from "@/lib/orchestrator/types";
 import type { OrchestratorPersona } from "@/types";
 import { appDataDir, join } from "@tauri-apps/api/path";
@@ -443,25 +444,69 @@ function PersonaControls() {
 }
 
 /**
- * Curated-memory management: shows the stored facts with a count against the
- * cap and per-line delete. New entries are only ever added by the orchestrator
- * via its `remember` tool (transparent chip in the chat) — the file itself is
- * editable directly at the shown path.
+ * Curated-memory management (Phase 3: scoped): a global list plus one list
+ * per project — the toggle switches between Global and the ACTIVE project.
+ * Shows the stored facts with a count against the cap and per-line delete.
+ * New entries are only ever added by the orchestrator via its `remember`
+ * tool (transparent chip in the chat) — the files themselves are editable
+ * directly at the shown path.
  */
 function MemoryControls() {
+  const activeProjectId = useProjects((s) => s.activeProjectId);
+  const activeProjectName = useProjects((s) =>
+    s.activeProjectId ? (s.projects[s.activeProjectId]?.name ?? "") : "",
+  );
+  const [scope, setScope] = useState<"global" | "project">("global");
   const [entries, setEntries] = useState<OrchestratorMemoryEntry[] | null>(null);
   const [path, setPath] = useState<string | null>(null);
+  // stale-read guard: every scope/project switch mints a new token; only the
+  // matching response may land. Otherwise a slow read of the OLD scope can
+  // overwrite the new scope's list — and a delete would then hit the wrong
+  // fact at that stale index.
+  const readToken = useRef(0);
+  const [deleting, setDeleting] = useState(false);
+
+  // "project" without an open project degrades to global
+  const effectiveScope: "global" | "project" =
+    scope === "project" && activeProjectId ? "project" : "global";
 
   useEffect(() => {
     if (!IS_TAURI) return;
-    readMemory().then(setEntries, () => setEntries([]));
+    const token = ++readToken.current;
+    setEntries(null);
+    setDeleting(false);
+    readMemory(effectiveScope, activeProjectId ?? undefined).then(
+      (list) => {
+        if (readToken.current === token) setEntries(list);
+      },
+      () => {
+        if (readToken.current === token) setEntries([]);
+      },
+    );
+    const file =
+      effectiveScope === "project" && activeProjectId
+        ? `orchestrator-memory/${activeProjectId}.md`
+        : "orchestrator-memory/global.md";
     void appDataDir()
-      .then((dir) => join(dir, "orchestrator-memory.md"))
+      .then((dir) => join(dir, file))
       .then(setPath, () => {});
-  }, []);
+  }, [effectiveScope, activeProjectId]);
 
   const del = (index: number) => {
-    void removeMemory(index).then(setEntries, () => {});
+    if (deleting) return;
+    const token = readToken.current; // bound to the scope shown right now
+    setDeleting(true);
+    void removeMemory(index, effectiveScope, activeProjectId ?? undefined).then(
+      (list) => {
+        if (readToken.current === token) {
+          setEntries(list);
+          setDeleting(false);
+        }
+      },
+      () => {
+        if (readToken.current === token) setDeleting(false);
+      },
+    );
   };
 
   const count = entries?.length ?? 0;
@@ -473,8 +518,9 @@ function MemoryControls() {
         <>
           Durable facts the orchestrator chose to remember (preferences,
           corrections, recurring workflows) — injected into every new session.
-          The orchestrator writes these itself via its <code>remember</code>{" "}
-          tool; here you can review and prune them.
+          Global facts reach every project's Conductor; project facts only its
+          own. The orchestrator writes these itself via its{" "}
+          <code>remember</code> tool; here you can review and prune them.
           {path && (
             <>
               {" "}
@@ -485,7 +531,37 @@ function MemoryControls() {
       }
     >
       <div className="flex flex-col gap-1.5">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setScope("global")}
+              className={cn(
+                "focus-ring rounded-md border px-2 py-0.5 font-mono text-[10px]",
+                effectiveScope === "global"
+                  ? "border-ring/60 text-foreground"
+                  : "border-border text-muted-foreground hover:text-foreground",
+              )}
+            >
+              Global
+            </button>
+            <button
+              onClick={() => setScope("project")}
+              disabled={!activeProjectId}
+              title={
+                activeProjectId
+                  ? `Memory of "${activeProjectName}"`
+                  : "Open a project to see its memory"
+              }
+              className={cn(
+                "focus-ring max-w-40 truncate rounded-md border px-2 py-0.5 font-mono text-[10px] disabled:opacity-40",
+                effectiveScope === "project"
+                  ? "border-ring/60 text-foreground"
+                  : "border-border text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {activeProjectName || "Project"}
+            </button>
+          </div>
           <span className="font-mono text-[10px] text-faint">
             {count}/20 entries
           </span>
@@ -515,6 +591,7 @@ function MemoryControls() {
                 variant="ghost"
                 title="Forget this entry"
                 className="hover:text-destructive"
+                disabled={deleting}
                 onClick={() => del(i)}
               >
                 <Trash2 size={11} />

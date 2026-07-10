@@ -1,9 +1,10 @@
-// The Conductor stage (Phase 5) — the orchestrator chat rendered IN the Vibe
-// FocusStage (Orchestrator-first). It reuses the shared chat view + switcher
-// from components/orchestrator/ChatView, so this stage and the ⌘⇧O panel show
-// the SAME chat store, never a duplicate. The composer sends to the
-// orchestrator — unless the message starts with `@session`, which routes the
-// text directly to that native session instead.
+// The Conductor stage (Phase 5, project-scoped since Phase 3) — the
+// Conductor chat of the ACTIVE PROJECT rendered IN the Vibe FocusStage
+// (Orchestrator-first). It reuses the shared chat view + switcher from
+// components/orchestrator/ChatView (both filtered to the project), so every
+// surface shows the SAME chat store, never a duplicate. The composer sends
+// to the Conductor — unless the message starts with `@session`, which routes
+// the text directly to that native session instead.
 
 import {
   useEffect,
@@ -13,12 +14,17 @@ import {
   useState,
 } from "react";
 import { ArrowUp, Plus, Square } from "lucide-react";
-import { useOrchestrator } from "@/lib/orchestrator/chat-store";
+import {
+  activeChatIdFor,
+  useOrchestrator,
+} from "@/lib/orchestrator/chat-store";
 import {
   createChat,
+  ensureFreshProjectChat,
   interrupt,
   sendMessage as orchestratorSend,
 } from "@/lib/orchestrator/controller";
+import { useProjects } from "@/lib/projects/store";
 import { useVibe } from "@/lib/vibe/session-store";
 import { sendMessage as vibeSend } from "@/lib/vibe/controller";
 import {
@@ -39,29 +45,58 @@ import { cn } from "@/lib/utils";
 const MAX_ROWS_PX = 168; // ~6 lines
 
 export function ConductorStage() {
-  const activeChatId = useOrchestrator((s) => s.activeChatId);
+  const projectId = useProjects((s) => s.activeProjectId);
+  const activeChatId = useOrchestrator((s) =>
+    projectId ? activeChatIdFor(s, projectId) : null,
+  );
 
-  // the stage always shows a chat; createChat reuses a leftover empty one
+  // the stage always shows a chat of THIS project: the first visit per app
+  // run gets a fresh (or reused-empty) chat — yesterday's context must not
+  // absorb today's first order; later visits restore the remembered one
   useEffect(() => {
-    if (!activeChatId) createChat();
-  }, [activeChatId]);
+    if (projectId) ensureFreshProjectChat(projectId);
+  }, [projectId]);
+  useEffect(() => {
+    if (projectId && !activeChatId) createChat(projectId);
+  }, [projectId, activeChatId]);
 
   return (
     <div className="flex min-w-0 flex-1 flex-col">
-      <ConductorHeader chatId={activeChatId} />
+      <ConductorHeader chatId={activeChatId} projectId={projectId} />
       {activeChatId ? (
         <MessageList chatId={activeChatId} />
       ) : (
-        <div className="flex-1" />
+        <NoProjectNotice hasProject={!!projectId} />
       )}
-      <ConductorComposer chatId={activeChatId} />
+      <ConductorComposer chatId={activeChatId} projectId={projectId} />
     </div>
   );
 }
 
-function ConductorHeader({ chatId }: { chatId: string | null }) {
+function NoProjectNotice({ hasProject }: { hasProject: boolean }) {
+  if (hasProject) return <div className="flex-1" />;
+  return (
+    <div className="flex flex-1 items-center justify-center px-6">
+      <p className="max-w-64 text-center text-xs leading-relaxed text-muted-foreground">
+        Open a project to talk to its Conductor — every project tab has its
+        own.
+      </p>
+    </div>
+  );
+}
+
+function ConductorHeader({
+  chatId,
+  projectId,
+}: {
+  chatId: string | null;
+  projectId: string | null;
+}) {
   const busy = useOrchestrator((s) => (chatId ? !!s.busy[chatId] : false));
   const persona = useSwarm((s) => effectivePersona(s.settings.orchestratorPersona));
+  const projectName = useProjects((s) =>
+    projectId ? (s.projects[projectId]?.name ?? "") : "",
+  );
   return (
     <div className="flex items-center gap-2.5 border-b border-border px-4 py-2.5">
       {persona.emoji ? (
@@ -72,9 +107,14 @@ function ConductorHeader({ chatId }: { chatId: string | null }) {
       <span className="text-[13px] font-semibold text-foreground">
         {persona.name}
       </span>
-      <ChatSwitcher />
+      {projectName && (
+        <span className="min-w-0 truncate font-mono text-[10px] text-faint">
+          {projectName}
+        </span>
+      )}
+      <ChatSwitcher projectId={projectId} />
       <button
-        onClick={() => createChat()}
+        onClick={() => projectId && createChat(projectId)}
         title="New chat"
         className="focus-ring flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
       >
@@ -96,7 +136,13 @@ function ConductorHeader({ chatId }: { chatId: string | null }) {
   );
 }
 
-function ConductorComposer({ chatId }: { chatId: string | null }) {
+function ConductorComposer({
+  chatId,
+  projectId,
+}: {
+  chatId: string | null;
+  projectId: string | null;
+}) {
   const busy = useOrchestrator((s) => (chatId ? !!s.busy[chatId] : false));
   const personaName = useSwarm(
     (s) => effectivePersona(s.settings.orchestratorPersona).name,
@@ -104,16 +150,22 @@ function ConductorComposer({ chatId }: { chatId: string | null }) {
   const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
 
-  // stable session-order ref (only changes on create/drop) → build the mention
-  // candidates without a fresh-array selector (the useSyncExternalStore rule)
-  const order = useVibe((s) => s.order);
+  // primitive signature (joined scoped ids) → build the mention candidates in
+  // useMemo without a fresh-array selector (the useSyncExternalStore rule);
+  // @mentions target THIS project's sessions only
+  const idsSig = useVibe((s) =>
+    (projectId
+      ? s.order.filter((id) => s.sessions[id]?.session.projectId === projectId)
+      : s.order
+    ).join("|"),
+  );
   const candidates: MentionCandidate[] = useMemo(() => {
     const v = useVibe.getState();
-    return order.map((id) => ({
+    return (idsSig ? idsSig.split("|") : []).map((id) => ({
       id,
       name: v.sessions[id]?.session.name ?? id,
     }));
-  }, [order]);
+  }, [idsSig]);
 
   // auto-grow up to ~6 lines
   useLayoutEffect(() => {
@@ -144,12 +196,17 @@ function ConductorComposer({ chatId }: { chatId: string | null }) {
   const send = () => {
     const t = text.trim();
     if (!t) return;
-    // resolve against the LIVE session list (names may have changed since mount)
+    // resolve against the LIVE session list of THIS project (names may have
+    // changed since mount)
     const v = useVibe.getState();
-    const live: MentionCandidate[] = v.order.map((id) => ({
-      id,
-      name: v.sessions[id]?.session.name ?? id,
-    }));
+    const live: MentionCandidate[] = v.order
+      .filter(
+        (id) => !projectId || v.sessions[id]?.session.projectId === projectId,
+      )
+      .map((id) => ({
+        id,
+        name: v.sessions[id]?.session.name ?? id,
+      }));
     const mention = parseSessionMention(t, live);
     if (mention) {
       // a bare "@session" with no body: keep typing, don't send an empty turn
@@ -158,7 +215,8 @@ function ConductorComposer({ chatId }: { chatId: string | null }) {
       setText("");
       return;
     }
-    const id = chatId ?? createChat();
+    const id = chatId ?? createChat(projectId ?? undefined);
+    if (!id) return; // no project open — nothing to send to
     void orchestratorSend(id, t);
     setText("");
   };

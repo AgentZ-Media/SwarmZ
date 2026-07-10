@@ -33,6 +33,7 @@ import {
 import { useVibe } from "@/lib/vibe/session-store";
 import { focusSession } from "@/lib/vibe/controller";
 import {
+  activeChatIdFor,
   DEFAULT_CHAT_TITLE,
   useOrchestrator,
 } from "@/lib/orchestrator/chat-store";
@@ -588,17 +589,23 @@ function ChatContextGauge({ chatId }: { chatId: string }) {
 }
 
 /**
- * The chat switcher popover (title button + per-row switch/delete). Shared by
- * the panel header and the Conductor stage header. Deliberately sibling
- * BUTTONS, not a Radix menu — a nested delete inside a menuitem is
- * keyboard-unreachable.
+ * The chat switcher popover (title button + per-row switch/delete), scoped
+ * to ONE project's chats (Phase 3 — every project has its own Conductor).
+ * Deliberately sibling BUTTONS, not a Radix menu — a nested delete inside a
+ * menuitem is keyboard-unreachable.
  */
-export function ChatSwitcher() {
-  const chats = useOrchestrator((s) => s.chats);
-  const activeChatId = useOrchestrator((s) => s.activeChatId);
+export function ChatSwitcher({ projectId }: { projectId: string | null }) {
+  const allChats = useOrchestrator((s) => s.chats);
+  const activeChatId = useOrchestrator((s) =>
+    projectId ? activeChatIdFor(s, projectId) : null,
+  );
   const busy = useOrchestrator((s) => s.busy);
   const setActiveChat = useOrchestrator((s) => s.setActiveChat);
   const [open, setOpen] = useState(false);
+  // filter in render (the store array reference is stable between changes)
+  const chats = projectId
+    ? allChats.filter((c) => c.projectId === projectId)
+    : [];
   const active = chats.find((c) => c.id === activeChatId);
   if (chats.length === 0) return null;
 

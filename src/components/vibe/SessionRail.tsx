@@ -4,7 +4,7 @@ import { useVibe } from "@/lib/vibe/session-store";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { closeSession } from "@/lib/vibe/controller";
 import { useProjects } from "@/lib/projects/store";
-import { useOrchestrator } from "@/lib/orchestrator/chat-store";
+import { activeChatIdFor, useOrchestrator } from "@/lib/orchestrator/chat-store";
 import { useSwarm } from "@/store";
 import { effectivePersona } from "@/lib/orchestrator/persona";
 import {
@@ -70,23 +70,33 @@ export function SessionRail() {
 function ConductorCard() {
   const active = useVibeUi((s) => s.stageMode === "conductor");
   const setStageMode = useVibeUi((s) => s.setStageMode);
-  const running = useOrchestrator((s) => Object.values(s.busy).some(Boolean));
+  const projectId = useProjects((s) => s.activeProjectId);
+  // THIS project's Conductor: busy/pings/meta scoped to its chats
+  const running = useOrchestrator((s) =>
+    s.chats.some((c) => c.projectId === projectId && s.busy[c.id]),
+  );
   const pings = useOrchestrator((s) =>
     s.chats.reduce(
-      (n, c) => n + c.pendingPings.filter((p) => !p.delivered).length,
+      (n, c) =>
+        c.projectId === projectId
+          ? n + c.pendingPings.filter((p) => !p.delivered).length
+          : n,
       0,
     ),
   );
   // active-chat model/effort/ctx (display-only — the picker lives in the stage
   // header). Primitive selectors, so a streaming delta never re-renders the rail.
-  const model = useOrchestrator(
-    (s) => s.chats.find((c) => c.id === s.activeChatId)?.model,
-  );
-  const effort = useOrchestrator(
-    (s) => s.chats.find((c) => c.id === s.activeChatId)?.effort,
-  );
+  const model = useOrchestrator((s) => {
+    const id = projectId ? activeChatIdFor(s, projectId) : null;
+    return s.chats.find((c) => c.id === id)?.model;
+  });
+  const effort = useOrchestrator((s) => {
+    const id = projectId ? activeChatIdFor(s, projectId) : null;
+    return s.chats.find((c) => c.id === id)?.effort;
+  });
   const ctxPct = useOrchestrator((s) => {
-    const u = s.activeChatId ? s.tokenUsage[s.activeChatId] : null;
+    const id = projectId ? activeChatIdFor(s, projectId) : null;
+    const u = id ? s.tokenUsage[id] : null;
     const total = totalTokens(u?.last);
     const win = u?.modelContextWindow ?? 0;
     return win && total > 0 ? Math.round(Math.min(total / win, 1) * 100) : null;

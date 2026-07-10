@@ -25,7 +25,7 @@ Built with **React 19 + TypeScript + Tailwind v4** on Tauri 2 (Rust). Dark mode 
 ## ✨ What works in the current interim state
 
 - 🌈 **Native Codex sessions** — start a session on any folder (a git worktree folder works too), pick its model, reasoning effort and access (`workspace-write` or full). A left rail lists every session with its live signal (working / needs you / finished / idle) and diff counter; sessions resume their thread across app restarts.
-- 🤖 **Conductor (orchestrator)** — `⌘⇧O` focuses an AI team lead over the whole fleet: it inspects sessions and transcripts, checks git status, discovers your projects, prompts sessions and spins up new ones via tools — and pings you (and its own context) when a session it tasked finishes or waits for an approval. Runs on your ChatGPT subscription via the codex CLI. Persona (Maestro/Hive/Orchestrator presets, editable voice) + a small curated memory it writes via an explicit `remember` tool.
+- 🤖 **Conductor (orchestrator)** — `⌘⇧O` focuses an AI team lead PER PROJECT: each project tab gets its own Conductor (own process, own chats, own memory) that inspects that project's sessions and transcripts, checks git status, discovers your projects, prompts sessions and spins up new ones via project-scoped tools — and pings you (and its own context) when a session it tasked finishes or waits for an approval. Runs on your ChatGPT subscription via the codex CLI. Persona (Maestro/Hive/Orchestrator presets, editable voice) + a small curated memory it writes via an explicit `remember` tool (global + per-project scope).
 - ✅ **Approvals stay human** — session approvals surface as cards in the composer; the orchestrator can never approve anything itself.
 - 🗂️ **`@session` routing** — in the Conductor composer, `@name …` sends a message straight to that session instead of the orchestrator.
 - 📊 **Deck** — a slim status bar with the needs-you triage queue (`⌘⇧A` jumps to the oldest), a fleet event ticker, the account-level Codex plan meters and the orchestrator status dot.
@@ -52,7 +52,7 @@ Built with **React 19 + TypeScript + Tailwind v4** on Tauri 2 (Rust). Dark mode 
 
 ## 🏗️ Architecture
 
-See `AGENTS.md` (map + invariants) and `docs/ARCHITECTURE.md` (per-subsystem deep dive). Short version: a generic `codex app-server` host in Rust (`src-tauri/src/codex/`) drives one private process per session and one shared process for the orchestrator; the orchestrator's tools are defined once in Rust (`orchestrator/registry.rs`) and execute in the webview against the Zustand stores.
+See `AGENTS.md` (map + invariants) and `docs/ARCHITECTURE.md` (per-subsystem deep dive). Short version: a generic `codex app-server` host in Rust (`src-tauri/src/codex/`) drives one private process per session and one process per project for that project's Conductor (spawned lazily, reaped after 15 idle minutes, transparently resumed); the orchestrator's tools are defined once in Rust (`orchestrator/registry.rs`) and execute in the webview against the Zustand stores, scoped to the calling Conductor's project.
 
 ## 🤝 Contributing
 

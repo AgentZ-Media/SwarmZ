@@ -113,12 +113,21 @@ impl PendingRpc {
     }
 }
 
+/// How long a graceful shutdown (stdin EOF) may take before the child is
+/// force-killed — a codex that ignores the EOF must not linger as a zombie.
+const SHUTDOWN_KILL_AFTER_MS: u64 = 5_000;
+
 /// Handle to one running `codex app-server` process.
 pub struct Client {
-    stdin_tx: mpsc::UnboundedSender<String>,
+    /// Writer channel — `None` after `shutdown()` (closing it drops the
+    /// child's stdin → EOF → codex exits; the reader task then reaps it).
+    stdin_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
     pending: Arc<PendingRpc>,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
+    /// fired by the shutdown watchdog once the EOF grace period elapsed —
+    /// the reader task (which owns the child) then force-kills it
+    kill: Arc<tokio::sync::Notify>,
 }
 
 impl Client {
@@ -176,26 +185,42 @@ impl Client {
             });
         }
 
-        // reader: classify each line; owns the child for reaping on EOF
+        let kill = Arc::new(tokio::sync::Notify::new());
+
+        // reader: classify each line; owns the child for reaping on EOF and
+        // for the force-kill fallback (the kill notify fires when a graceful
+        // shutdown's EOF grace period elapsed)
         {
             let pending = pending.clone();
             let alive = alive.clone();
+            let kill = kill.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    match protocol::parse_line(&line) {
-                        Some(Incoming::Response { id, result }) => {
-                            if !pending.resolve(id, result) {
-                                eprintln!("[codex host] app-server response for unknown id {id} — ignored");
+                loop {
+                    tokio::select! {
+                        line = lines.next_line() => {
+                            let Ok(Some(line)) = line else { break };
+                            match protocol::parse_line(&line) {
+                                Some(Incoming::Response { id, result }) => {
+                                    if !pending.resolve(id, result) {
+                                        eprintln!("[codex host] app-server response for unknown id {id} — ignored");
+                                    }
+                                }
+                                Some(Incoming::ServerRequest { id, method, params }) => {
+                                    let _ = events.send(ServerEvent::Request { id, method, params });
+                                }
+                                Some(Incoming::Notification { method, params }) => {
+                                    let _ = events.send(ServerEvent::Notification { method, params });
+                                }
+                                None => {} // unknown/unparseable line: ignore silently
                             }
                         }
-                        Some(Incoming::ServerRequest { id, method, params }) => {
-                            let _ = events.send(ServerEvent::Request { id, method, params });
+                        _ = kill.notified() => {
+                            // graceful shutdown ignored — force-kill; the
+                            // stream then EOFs and the normal cleanup runs
+                            eprintln!("[codex host] app-server ignored stdin EOF — force-killing");
+                            let _ = child.start_kill();
                         }
-                        Some(Incoming::Notification { method, params }) => {
-                            let _ = events.send(ServerEvent::Notification { method, params });
-                        }
-                        None => {} // unknown/unparseable line: ignore silently
                     }
                 }
                 alive.store(false, Ordering::SeqCst);
@@ -206,15 +231,44 @@ impl Client {
         }
 
         Ok(Client {
-            stdin_tx,
+            stdin_tx: Mutex::new(Some(stdin_tx)),
             pending,
             next_id: AtomicU64::new(1),
             alive,
+            kill,
         })
     }
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Send one line to the writer task. Err = writer gone (shutdown/exited).
+    fn send_line(&self, line: String) -> Result<(), ()> {
+        match &*self.stdin_tx.lock() {
+            Some(tx) => tx.send(line).map_err(|_| ()),
+            None => Err(()),
+        }
+    }
+
+    /// Graceful shutdown: close the writer channel — the writer task ends,
+    /// the child's stdin drops (EOF) and codex exits; the reader task then
+    /// fails pending RPCs and emits `Exited`. A watchdog force-kills the
+    /// child if it ignores the EOF for `SHUTDOWN_KILL_AFTER_MS` (no zombies
+    /// until app quit). Idempotent.
+    pub fn shutdown(&self) {
+        let armed = self.stdin_tx.lock().take().is_some();
+        if !armed {
+            return; // already shut down — don't arm a second watchdog
+        }
+        let alive = self.alive.clone();
+        let kill = self.kill.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(SHUTDOWN_KILL_AFTER_MS)).await;
+            if alive.load(Ordering::SeqCst) {
+                kill.notify_waiters();
+            }
+        });
     }
 
     /// One request/response roundtrip with a timeout.
@@ -230,8 +284,7 @@ impl Client {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let rx = self.pending.register(id);
         if self
-            .stdin_tx
-            .send(protocol::request_line(id, method, &params))
+            .send_line(protocol::request_line(id, method, &params))
             .is_err()
         {
             self.pending.remove(id);
@@ -248,18 +301,16 @@ impl Client {
     }
 
     pub fn notify(&self, method: &str) {
-        let _ = self.stdin_tx.send(protocol::notification_line(method));
+        let _ = self.send_line(protocol::notification_line(method));
     }
 
     /// Answer a server-initiated request.
     pub fn respond(&self, id: &Value, result: &Value) {
-        let _ = self.stdin_tx.send(protocol::response_line(id, result));
+        let _ = self.send_line(protocol::response_line(id, result));
     }
 
     pub fn respond_error(&self, id: &Value, code: i64, message: &str) {
-        let _ = self
-            .stdin_tx
-            .send(protocol::error_response_line(id, code, message));
+        let _ = self.send_line(protocol::error_response_line(id, code, message));
     }
 }
 
@@ -541,6 +592,12 @@ impl Connection {
     pub fn unregister_thread(&self, thread_id: &str) {
         self.routes.remove(thread_id);
     }
+
+    /// Graceful process shutdown (see `Client::shutdown`) — the registered
+    /// sinks still receive their `Exited` once the reader observes EOF.
+    pub fn shutdown(&self) {
+        self.client.shutdown();
+    }
 }
 
 /// The per-connection router: forwards each raw server event to the sink
@@ -661,6 +718,17 @@ impl ProcessHost {
     /// The codex version of the last successful spawn (status reporting).
     pub async fn last_version(&self) -> Option<String> {
         self.state.lock().await.last_version.clone()
+    }
+
+    /// Gracefully end the slot's process (idle reaping): the connection is
+    /// dropped from the slot and its stdin closed — codex exits on EOF and
+    /// every registered sink hears `Exited`. The next `ensure()` respawns
+    /// with a bumped generation, so consumers transparently `thread/resume`.
+    pub async fn shutdown(&self) {
+        let mut st = self.state.lock().await;
+        if let Some(conn) = st.conn.take() {
+            conn.shutdown();
+        }
     }
 }
 

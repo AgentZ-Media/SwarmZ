@@ -817,25 +817,74 @@ export function focusSession(sessionId: string): void {
 }
 
 /**
+ * Align the Vibe selection + stage with one project: keep the current
+ * session if it already belongs there, else restore the project's REMEMBERED
+ * session (`activeIdByProject`), else its newest session; a session-less
+ * project (or `null` = no open project at all) lands on the Conductor stage.
+ * Shared by tab activation AND project-tab close (both must never leave the
+ * stage on another project's session).
+ */
+function alignStageToProject(projectId: string | null): void {
+  const v = useVibe.getState();
+  if (projectId === null) {
+    v.setActive(null);
+    useVibeUi.getState().setStageMode("conductor");
+    return;
+  }
+  const activeBelongs =
+    !!v.activeId && v.sessions[v.activeId]?.session.projectId === projectId;
+  if (activeBelongs) return;
+  const remembered = v.activeIdByProject[projectId];
+  const target =
+    remembered && v.sessions[remembered]?.session.projectId === projectId
+      ? remembered
+      : v.order.find((id) => v.sessions[id]?.session.projectId === projectId);
+  v.setActive(target ?? null);
+  if (!target && useVibeUi.getState().stageMode === "session")
+    useVibeUi.getState().setStageMode("conductor");
+}
+
+/**
  * Switch the active project tab (TitleBar click, ⌘1–9, palette) and align
- * the stage: the selection moves to the project's newest session when the
- * current one belongs elsewhere; a session-less project lands on the
- * Conductor stage.
+ * the stage (see `alignStageToProject`).
  */
 export function activateProject(projectId: string): void {
   const projects = useProjects.getState();
   if (!projects.projects[projectId]) return;
   projects.setActiveProject(projectId);
+  alignStageToProject(projectId);
+}
+
+/**
+ * Close a project TAB and realign the stage — the ONE close path (both the
+ * immediate close and the CloseProjectConfirm resolution go through here).
+ * Closing the ACTIVE tab moves the project store to a successor tab; without
+ * realignment the rail/header would show the successor while stage+composer
+ * keep operating on the closed project's session.
+ */
+export function closeProjectAndAlign(projectId: string): void {
+  const wasActive = useProjects.getState().activeProjectId === projectId;
+  useProjects.getState().closeProject(projectId);
+  if (!wasActive) return;
+  alignStageToProject(useProjects.getState().activeProjectId);
+}
+
+/**
+ * Close a project TAB, with a confirm line when work is still running:
+ * closing never blocks and never stops anything (sessions keep working in
+ * the background; the tab reopens with everything intact), but with N busy
+ * sessions the close goes through the CloseProjectConfirm dialog first.
+ */
+export function requestCloseProject(projectId: string): void {
   const v = useVibe.getState();
-  const activeBelongs =
-    !!v.activeId && v.sessions[v.activeId]?.session.projectId === projectId;
-  if (activeBelongs) return;
-  const first = v.order.find(
-    (id) => v.sessions[id]?.session.projectId === projectId,
-  );
-  v.setActive(first ?? null);
-  if (!first && useVibeUi.getState().stageMode === "session")
-    useVibeUi.getState().setStageMode("conductor");
+  const busyCount = v.order.filter(
+    (id) => v.sessions[id]?.session.projectId === projectId && v.busy[id],
+  ).length;
+  if (busyCount === 0) {
+    closeProjectAndAlign(projectId);
+    return;
+  }
+  useVibeUi.getState().setCloseProjectConfirm({ projectId, busyCount });
 }
 
 /** Activate the n-th open project tab (⌘1–⌘9). */

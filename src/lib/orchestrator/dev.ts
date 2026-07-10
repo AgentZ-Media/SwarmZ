@@ -76,18 +76,18 @@ if (import.meta.env.DEV) {
     tools: () => invoke<OrchestratorToolsResponse>("orchestrator_tools"),
     tool: (name, args = {}) =>
       invoke("orchestrator_run_tool", { tool: name, args }),
-    chatStart: () => {
+    chatStart: (project) => {
       ensureEventLog();
-      return chatStart();
+      return chatStart(project);
     },
     chatSend: (chatId, text) => {
       ensureEventLog();
       return chatSend(chatId, text);
     },
     chatInterrupt,
-    chatResume: (threadId) => {
+    chatResume: (threadId, project) => {
       ensureEventLog();
-      return chatResume(threadId);
+      return chatResume(threadId, project);
     },
     chatStatus,
   };

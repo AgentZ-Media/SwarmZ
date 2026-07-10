@@ -121,6 +121,9 @@ export interface OrchestratorToolRequest {
   args: Record<string, unknown>;
   /** BACKEND chat id of the triggering chat — null for dev-hook calls */
   chat_id?: string | null;
+  /** project of the Conductor instance behind the call — null = unscoped
+   * (dev-hook); executors scope session resolution + fleet_snapshot on it */
+  project_id?: string | null;
 }
 
 /** `read_notes` — NoteItems reduced to content (ids dropped). */
@@ -138,7 +141,8 @@ export interface PromptPaneResult {
 
 /** One session request inside `create_panes`. */
 export interface CreatePaneSpec {
-  cwd: string;
+  /** absolute working directory; omit = the Conductor's project folder */
+  cwd?: string;
   /** codex model id; omit = the user's default configuration */
   model?: string;
   /** model_reasoning_effort */
@@ -154,6 +158,9 @@ export interface CreatePaneResult {
   id?: string;
   name?: string | null;
   cwd?: string | null;
+  /** scoping note — set when a foreign cwd opened its own project tab (the
+   * session is then outside this Conductor's fleet) */
+  note?: string;
   /** prompt delivery note */
   warning?: string;
   /** set when this session failed to start */

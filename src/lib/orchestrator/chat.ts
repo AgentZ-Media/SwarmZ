@@ -62,6 +62,13 @@ export interface OrchestratorChatStatus {
   error?: string;
 }
 
+/** The wire shape of a chat's project context (Rust `ProjectContext`). */
+export interface ProjectContextWire {
+  id: string;
+  dir: string;
+  name: string;
+}
+
 /** The Settings codex-binary override, passed to every process-touching call. */
 function codexPath(): string {
   return useSwarm.getState().settings.codexPath ?? "";
@@ -72,11 +79,17 @@ function persona(): PersonaWire {
   return currentPersonaWire(useSwarm.getState().settings.orchestratorPersona);
 }
 
-/** Start a fresh orchestrator chat (spawns the app-server lazily). */
-export function chatStart(): Promise<OrchestratorChatRef> {
+/**
+ * Start a fresh Conductor chat on one project's instance (spawns that
+ * project's app-server lazily; the thread cwd is the project dir).
+ */
+export function chatStart(
+  project: ProjectContextWire,
+): Promise<OrchestratorChatRef> {
   return invoke<OrchestratorChatRef>("orchestrator_chat_start", {
     codexPath: codexPath(),
     persona: persona(),
+    project,
   });
 }
 
@@ -105,19 +118,28 @@ export function chatInterrupt(chatId: string): Promise<void> {
   return invoke("orchestrator_chat_interrupt", { chatId });
 }
 
-/** Reopen a persisted app-server thread as a chat (across app restarts). */
-export function chatResume(threadId: string): Promise<OrchestratorChatRef> {
+/** Reopen a persisted app-server thread as a chat (across app restarts) on
+ * its project's instance. */
+export function chatResume(
+  threadId: string,
+  project: ProjectContextWire,
+): Promise<OrchestratorChatRef> {
   return invoke<OrchestratorChatRef>("orchestrator_chat_resume", {
     threadId,
     persona: persona(),
+    project,
   });
 }
 
 /** Liveness + codex version + account summary. Never rejects for a dead
- * process — that comes back as `{ running: false, error }`. */
-export function chatStatus(): Promise<OrchestratorChatStatus> {
+ * process — that comes back as `{ running: false, error }`. Reuses any alive
+ * Conductor process; else spawns the given project's instance. */
+export function chatStatus(
+  project?: ProjectContextWire,
+): Promise<OrchestratorChatStatus> {
   return invoke<OrchestratorChatStatus>("orchestrator_chat_status", {
     codexPath: codexPath(),
+    project: project ?? null,
   });
 }
 

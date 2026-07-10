@@ -14,7 +14,7 @@ import { useProjects, openProjectIds } from "@/lib/projects/store";
 import { useVibe } from "@/lib/vibe/session-store";
 import { hasPendingApproval } from "@/lib/vibe/ui";
 import { useVibeUi } from "@/lib/vibe/ui-store";
-import { activateProject } from "@/lib/vibe/controller";
+import { activateProject, requestCloseProject } from "@/lib/vibe/controller";
 import { discoverProjects } from "@/lib/orchestrator/native";
 import { useUpdates } from "@/lib/updates";
 import { WorktreesButton } from "./WorktreePanel";
@@ -189,7 +189,6 @@ function ProjectTab({
   const name = useProjects((s) => s.projects[id]?.name ?? "");
   const dir = useProjects((s) => s.projects[id]?.dir ?? "");
   const active = useProjects((s) => s.activeProjectId === id);
-  const closeProject = useProjects((s) => s.closeProject);
   const renameProject = useProjects((s) => s.renameProject);
   const moveProject = useProjects((s) => s.moveProject);
   const stats = useProjectStats(id);
@@ -266,8 +265,8 @@ function ProjectTab({
       data-tauri-drag-region="false"
       onMouseDown={startReorder}
       onAuxClick={(e) => {
-        // middle-click closes, like browser tabs
-        if (e.button === 1) closeProject(id);
+        // middle-click closes, like browser tabs (busy → confirm line)
+        if (e.button === 1) requestCloseProject(id);
       }}
       className={cn(
         "no-drag group/tab flex h-7 max-w-44 shrink-0 items-center rounded-md border pr-1 transition-colors",
@@ -337,7 +336,7 @@ function ProjectTab({
         tabIndex={active ? 0 : -1}
         onClick={(e) => {
           e.stopPropagation();
-          closeProject(id);
+          requestCloseProject(id);
         }}
         onMouseDown={(e) => e.stopPropagation()}
         title="Close project tab (sessions are kept)"

@@ -18,6 +18,22 @@ export function normalizeDirKey(dir: string): string {
   return stripped === "" ? "/" : stripped;
 }
 
+/**
+ * Is `child` the same dir as `parent` or inside it? Segment-boundary-aware
+ * (`/a/bc` is NOT within `/a/b`), on normalized keys — callers canonicalize
+ * (symlinks, `/private` aliasing) BEFORE comparing when they can. Used by the
+ * orchestrator's create_panes to keep sessions spawned into a subfolder of
+ * the Conductor's project attached to that project.
+ */
+export function isDirWithin(parent: string, child: string): boolean {
+  const p = normalizeDirKey(parent);
+  const c = normalizeDirKey(child);
+  if (!p || !c) return false;
+  if (p === c) return true;
+  const prefix = p === "/" ? "/" : `${p}/`;
+  return c.startsWith(prefix);
+}
+
 /** Last path segment of a dir — the base for a project's display name. */
 export function dirBasename(dir: string): string {
   const key = normalizeDirKey(dir);

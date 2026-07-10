@@ -2,7 +2,11 @@ import { useEffect, useState } from "react";
 import { Dices, Folder, FolderOpen } from "lucide-react";
 import { pickDirectory } from "@/lib/transport";
 import { discoverProjects } from "@/lib/orchestrator/native";
-import { closeSession, startSession } from "@/lib/vibe/controller";
+import {
+  closeProjectAndAlign,
+  closeSession,
+  startSession,
+} from "@/lib/vibe/controller";
 import { useVibe } from "@/lib/vibe/session-store";
 import { pickAgentName } from "@/lib/vibe/names";
 import { useProjects } from "@/lib/projects/store";
@@ -265,6 +269,53 @@ export function NewVibeSessionDialog() {
 }
 
 /** Confirm dialog shown only when closing a busy session (a turn is running). */
+/**
+ * Confirm line for closing a project TAB while sessions are still busy.
+ * Closing never blocks and never stops anything — the sessions keep working
+ * in the background and the tab reopens with everything intact; the dialog
+ * only makes the busy count explicit before hiding them from view.
+ */
+export function CloseProjectConfirm() {
+  const confirm = useVibeUi((s) => s.closeProjectConfirm);
+  const setConfirm = useVibeUi((s) => s.setCloseProjectConfirm);
+  const name = useProjects((s) =>
+    confirm ? (s.projects[confirm.projectId]?.name ?? "") : "",
+  );
+
+  const open = !!confirm && !!name;
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && setConfirm(null)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Close “{name}”?</DialogTitle>
+          <DialogDescription>
+            {confirm?.busyCount === 1
+              ? "1 session in this project is still working."
+              : `${confirm?.busyCount ?? 0} sessions in this project are still working.`}{" "}
+            They keep running in the background — closing only hides the tab;
+            reopening the folder brings everything back.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="mt-5 flex justify-end gap-2">
+          <Button variant="ghost" onClick={() => setConfirm(null)}>
+            Keep it open
+          </Button>
+          <Button
+            onClick={() => {
+              // the ONE close path (see closeProjectAndAlign): close the tab
+              // AND realign stage/selection when it was the active project
+              if (confirm) closeProjectAndAlign(confirm.projectId);
+              setConfirm(null);
+            }}
+          >
+            Close tab
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export function CloseSessionConfirm() {
   const id = useVibeUi((s) => s.closeConfirmId);
   const setId = useVibeUi((s) => s.setCloseConfirmId);

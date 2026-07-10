@@ -15,6 +15,13 @@ SwarmZ wird ein reiner **Schwarm-Manager über `codex app-server`** (ChatGPT-Abo
 - **Design:** "SwarmZ Vibe v3" (Claude-Design-Projekt `930203eb`): Accent `#f0567c`, Geist/Geist Mono (lokal gebundelt), Conductor-Sidebar links (einklappbar/resizable), Fleet-Grid mit Agent-Karten, Fokus-View, Deck, Toasts. Claude-Runtime-Reste aus dem Design entfallen. User-Vorgaben überstimmen das Design; Weiterentwicklung erlaubt.
 - **Alt-Code wird komplett entfernt** (Git-History/`main` bewahren alles).
 
+## Vision-Präzisierung (User, 2026-07-10 nachträglich — GESETZT)
+
+1. **Das Design ist Grundkonzept, kein Endzustand.** Phase 6 baut daraus ein vollwertiges, ausgeklügeltes **Design-System** („Corporate Design"): Spacing-Skala, Typo-System, Sizing-Skala, Farbpaletten-System (Akzent + Ladder + Semantik), dokumentiert als Tokens, auf denen alles Weitere aufbaut. Zusätzlich: **App-Icon umfärben** auf den neuen Akzentton #f0567c (programmatisch, z. B. Python/ImageMagick — Hue-Shift der bestehenden Assets in src-tauri/icons/).
+2. **Der Orchestrator ist wie ein menschlicher Engineering-Lead.** Der User gibt Ziele („Ich möchte dieses Feature in dieser App"), NICHT Vorgehensanweisungen. Der Conductor entscheidet selbst: wie viele Agenten, welche Aufteilung, ob Webrecherche, ob er selbst einen Plan schreibt (er darf eigene Plan-/Analyse-Dokumente verfassen — Phase 4 gibt ihm dafür eine begrenzte Schreibfähigkeit, z. B. `write_plan` in einen Plan-Bereich; der „nie Code-Dateien editieren"-Guardrail bleibt), dass zurückreportet wird, und er holt AKTIV User-Feedback ein, wenn Richtungsentscheidungen anstehen.
+3. **Der Conductor lernt den User kennen.** Vorlieben, Schreibstil, wiederkehrende Anforderungen, typische Fehlerquellen — kontinuierlich ins (Projekt-/Global-)Memory. Präferenz-Beobachtungen darf er proaktiv speichern (sichtbar/löschbar in den Settings); Fakten weiterhin nach Bestätigung. Phase 4/5 verankern das in Kern-Doktrin + Memory-Mechanik.
+4. **Der Maßstab:** SwarmZ muss einen klaren Mehrwert gegenüber der Codex-App bieten — genau diese Selbstständigkeit, das Schwarm-Management und das Lernen sind der Grund, die App zu benutzen.
+
 ## Verifizierte Grundlagen (Analyse 2026-07-10)
 
 - Vibe-Subsystem (Session-Store/Controller/ItemFeed/DiffCard, `codex/` host+protocol+sessions, Tool-Bus, Persona-Compiler, Worktree-Primitiven) ist wiederverwendbar und der bestgetestete Teil des Baums.

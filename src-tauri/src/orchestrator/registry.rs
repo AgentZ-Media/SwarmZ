@@ -33,17 +33,17 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "fleet_snapshot",
-            description: "Current state of the whole fleet: every native Codex session (project, model, access, exact status working/idle/pending-approval, context usage) and a one-line summary. Cheap — call this first to orient yourself and to learn valid session ids.",
+            description: "Current state of YOUR project's fleet: every agent session of this project (name, model, access, exact status working/idle/pending-approval, context usage) plus the project header and a one-line summary. Cheap — call this first to orient yourself and to learn valid agent ids/names.",
             parameters: empty_params(),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
         ToolDefinition {
             name: "read_transcript",
-            description: "Read the conversation tail of one session: user/assistant messages and the structured steps ($ command → exit N, file changes +N −M, approvals, plan).",
+            description: "Read the conversation tail of one agent session in this project: user/assistant messages and the structured steps ($ command → exit N, file changes +N −M, approvals, plan).",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "session id (from fleet_snapshot)" },
+                    "pane_id": { "type": "string", "description": "agent session id, or its unique name within this project (from fleet_snapshot)" },
                     "tail_messages": { "type": "integer", "description": "return only the last N items (default: 20)" }
                 },
                 "required": ["pane_id"]
@@ -56,7 +56,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "session id — reads the docs of that session's project root" },
+                    "pane_id": { "type": "string", "description": "agent session id or unique name — reads the docs of that session's working root" },
                     "path": { "type": "string", "description": "absolute path of a project folder" }
                 }
             }),
@@ -70,11 +70,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "git_status",
-            description: "Live git snapshot of a session's project directory (or any absolute path): branch, inserted/deleted lines, untracked files, derived dirty flag. Pass EXACTLY ONE of pane_id or path. Returns git: null with a note when the folder is not a git repo.",
+            description: "Live git snapshot of an agent session's working directory (or any absolute path): branch, inserted/deleted lines, untracked files, derived dirty flag. Pass EXACTLY ONE of pane_id or path. Returns git: null with a note when the folder is not a git repo.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "session id (from fleet_snapshot)" },
+                    "pane_id": { "type": "string", "description": "agent session id or unique name (from fleet_snapshot)" },
                     "path": { "type": "string", "description": "absolute path of a folder" }
                 }
             }),
@@ -97,11 +97,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "prompt_pane",
-            description: "Send a prompt to a session: submits one turn to it. A busy session refuses — wait for it to finish, then prompt it.",
+            description: "Send a prompt to an agent session in this project: submits one turn to it. A busy agent refuses — wait for it to finish, then prompt it.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "session id (from fleet_snapshot)" },
+                    "pane_id": { "type": "string", "description": "agent session id or unique name (from fleet_snapshot)" },
                     "text": { "type": "string", "description": "the prompt text to deliver" }
                 },
                 "required": ["pane_id", "text"]
@@ -110,7 +110,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "create_panes",
-            description: "Create 1–8 new native Codex sessions. Each entry gets a working directory, optionally a model override (omit = the user's default configuration), a reasoning effort, a name, and an initial prompt (submitted as the session's first turn). Per-entry errors do not abort the batch.",
+            description: "Create 1–8 new agent sessions in this project. Each entry optionally gets a working directory (OMIT it for this project's folder), a model override (omit = the user's default configuration), a reasoning effort, a name (default: auto), and an initial prompt (submitted as the session's first turn). Per-entry errors do not abort the batch.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -121,13 +121,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "cwd": { "type": "string", "description": "absolute working directory for the session" },
+                                "cwd": { "type": "string", "description": "absolute working directory; OMIT for this project's folder" },
                                 "model": { "type": "string", "description": "codex model id; OMIT for the user's default configuration" },
                                 "reasoning": { "type": "string", "enum": ["minimal", "low", "medium", "high", "xhigh"], "description": "model_reasoning_effort — omit unless the user asks for it" },
                                 "name": { "type": "string", "description": "session name (default: auto)" },
                                 "prompt": { "type": "string", "description": "initial prompt, submitted as the first turn" }
-                            },
-                            "required": ["cwd"]
+                            }
                         }
                     }
                 },
@@ -137,11 +136,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "remember",
-            description: "Add one durable, user-relevant fact to your persistent memory (a small curated list injected into every future session). Store ONLY things worth keeping across sessions: stable user preferences, corrections you were given, model choices per task type, recurring workflows, and project facts that are NOT written in the repo. Do NOT store ephemeral fleet state (that lives in fleet_snapshot), repo documentation (use read_project_docs), secrets, or whole transcripts. If you are unsure whether a fact is worth remembering, do not call this — propose it to the user first and only store it after they confirm. The memory is capped; when it is full the oldest entry is dropped and the result says so.",
+            description: "Add one durable, user-relevant fact to your persistent memory (small curated lists injected into every future session). Scope \"project\" (the default) stores it for THIS project only; scope \"global\" stores it for every project — use global only for cross-project user preferences. Store ONLY things worth keeping across sessions: stable user preferences, corrections you were given, model choices per task type, recurring workflows, and project facts that are NOT written in the repo. Do NOT store ephemeral fleet state (that lives in fleet_snapshot), repo documentation (use read_project_docs), secrets, or whole transcripts. If you are unsure whether a fact is worth remembering, do not call this — propose it to the user first and only store it after they confirm. Each memory is capped; when it is full the oldest entry is dropped and the result says so.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "text": { "type": "string", "description": "the single fact to remember, as one concise sentence" }
+                    "text": { "type": "string", "description": "the single fact to remember, as one concise sentence" },
+                    "scope": { "type": "string", "enum": ["project", "global"], "description": "where to store it — omit for \"project\" (this project)" }
                 },
                 "required": ["text"]
             }),
@@ -271,11 +271,16 @@ mod tests {
     }
 
     #[test]
-    fn remember_requires_text() {
+    fn remember_requires_text_and_validates_scope() {
         let def = find_tool("remember").unwrap();
         let err = validate_args(&def, &json!({})).unwrap_err();
         assert!(err.contains("text"), "unexpected error: {err}");
         assert!(validate_args(&def, &json!({ "text": "reviews get high effort" })).is_ok());
+        // scope is optional but enum-checked
+        assert!(validate_args(&def, &json!({ "text": "x", "scope": "global" })).is_ok());
+        assert!(validate_args(&def, &json!({ "text": "x", "scope": "project" })).is_ok());
+        let err = validate_args(&def, &json!({ "text": "x", "scope": "everywhere" })).unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
     }
 
     #[test]
@@ -301,9 +306,8 @@ mod tests {
         // empty batch → minItems
         let err = validate_args(&def, &json!({ "panes": [] })).unwrap_err();
         assert!(err.contains("at least 1"), "unexpected error: {err}");
-        // per-item required cwd
-        let err = validate_args(&def, &json!({ "panes": [{ "name": "x" }] })).unwrap_err();
-        assert!(err.contains("cwd"), "unexpected error: {err}");
+        // cwd is OPTIONAL since Phase 3 — it defaults to the project folder
+        assert!(validate_args(&def, &json!({ "panes": [{ "name": "x" }] })).is_ok());
         // enum on reasoning
         let err = validate_args(
             &def,

@@ -19,6 +19,7 @@
 
 import { useVibe } from "@/lib/vibe/session-store";
 import { hasPendingApproval } from "@/lib/vibe/ui";
+import { useProjects } from "@/lib/projects/store";
 import type {
   OrchestratorPaneRef,
   OrchestratorPingRecord,
@@ -32,6 +33,7 @@ import {
   chatStatus,
   onChatEvent,
   type OrchestratorChatEvent,
+  type ProjectContextWire,
 } from "./chat";
 import {
   useOrchestrator,
@@ -151,14 +153,43 @@ function finalizeStream(chatId: string, st: StreamState, finalText?: string) {
 }
 
 /**
- * Live sessions whose id appears in the text (args summaries are one line).
- * The chip resolves the id to a session (focusSession) at click time.
+ * The project a store chat belongs to — `""` (legacy, unassigned) degrades
+ * to null = unscoped.
  */
-function paneRefsFromText(text: string): OrchestratorPaneRef[] {
+function chatProjectId(chatId: string): string | null {
+  return (
+    useOrchestrator.getState().chats.find((c) => c.id === chatId)?.projectId ||
+    null
+  );
+}
+
+/**
+ * Session ids in rail order, scoped to one project (null = all). The chip
+ * extraction and the create_panes order diff both scan THIS list — never the
+ * global one, or parallel activity in project B would attach B-chips to A's
+ * chats.
+ */
+function projectSessionIds(projectId: string | null): string[] {
+  const v = useVibe.getState();
+  return v.order.filter(
+    (id) =>
+      projectId === null || v.sessions[id]?.session.projectId === projectId,
+  );
+}
+
+/**
+ * Live sessions of the chat's project whose id appears in the text (args
+ * summaries are one line). The chip resolves the id to a session
+ * (focusSession) at click time.
+ */
+function paneRefsFromText(
+  text: string,
+  projectId: string | null,
+): OrchestratorPaneRef[] {
   if (!text) return [];
   const refs: OrchestratorPaneRef[] = [];
   const v = useVibe.getState();
-  for (const id of v.order) {
+  for (const id of projectSessionIds(projectId)) {
     if (text.includes(id))
       refs.push({ id, name: v.sessions[id]?.session.name ?? id });
   }
@@ -203,7 +234,8 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
       const tool = typeof data.tool === "string" ? data.tool : "tool";
       const argsSummary =
         typeof data.args_summary === "string" ? data.args_summary : "";
-      const paneRefs = paneRefsFromText(argsSummary);
+      const projectId = chatProjectId(chatId);
+      const paneRefs = paneRefsFromText(argsSummary, projectId);
       const messageId = store.appendMessage(chatId, {
         role: "tool",
         tool,
@@ -213,8 +245,10 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
       st.pendingTools.push({
         tool,
         messageId,
+        // project-scoped snapshot — a parallel create_panes in another
+        // project must never diff into this chat's chips
         sessionOrderBefore:
-          tool === "create_panes" ? [...useVibe.getState().order] : null,
+          tool === "create_panes" ? projectSessionIds(projectId) : null,
       });
       break;
     }
@@ -226,11 +260,12 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
       const patch: OrchestratorMessagePatch = { ok: data.ok !== false };
       if (pending.sessionOrderBefore) {
         // sessions born while create_panes ran become jump chips (the tool
-        // result never reaches the frontend, so diff the order)
+        // result never reaches the frontend, so diff the order) — scoped to
+        // the chat's project, like the before-snapshot
         const before = new Set(pending.sessionOrderBefore);
         const v = useVibe.getState();
         const created: OrchestratorPaneRef[] = [];
-        for (const id of v.order)
+        for (const id of projectSessionIds(chatProjectId(chatId)))
           if (!before.has(id))
             created.push({ id, name: v.sessions[id]?.session.name ?? id });
         if (created.length) {
@@ -311,9 +346,19 @@ function onSessionFinished(
   const now = Date.now();
   const last = lastPingAt.get(sessionId);
   if (last !== undefined && now - last < PING_FLAP_MS) return;
+  const sessionProject =
+    useVibe.getState().sessions[sessionId]?.session.projectId ?? null;
+  // session already gone from the store (removed between transition and
+  // ping) → no project to scope on. Skip instead of opening the filter — a
+  // null here must never broadcast the ping into every touching chat across
+  // foreign projects.
+  if (sessionProject === null) return;
   const orch = useOrchestrator.getState();
   let pinged = false;
   for (const chat of orch.chats) {
+    // pings stay within the Conductor's project — a chat never hears about
+    // sessions of OTHER projects, even if it somehow touched one
+    if (chat.projectId !== sessionProject) continue;
     const touched = chat.touchedPanes[sessionId];
     if (!touched) continue;
     // startup noise: the prompt just went in
@@ -412,12 +457,35 @@ function statusUpdateBlock(pings: OrchestratorPingRecord[]): string {
 // ---- public surface (used by the Conductor stage) ----
 
 /**
- * Create (or reuse an empty) chat, stamped with the CURRENT model/effort
- * settings — the stamp is fixed at creation; switching the setting only
- * affects new chats. The stage always goes through this instead of the raw
- * store action.
+ * The wire project context for a project id — resolved live from the project
+ * store. A lost project record degrades to an id-only context (Rust then
+ * falls back to the home dir as thread cwd).
  */
-export function createChat(): string {
+function projectWire(projectId: string): ProjectContextWire {
+  const p = useProjects.getState().projects[projectId];
+  return {
+    id: projectId,
+    dir: p?.dir ?? "",
+    name: p?.name ?? "",
+  };
+}
+
+/** The active project's wire context (null when no project is open). */
+function activeProjectWire(): ProjectContextWire | null {
+  const id = useProjects.getState().activeProjectId;
+  return id ? projectWire(id) : null;
+}
+
+/**
+ * Create (or reuse an empty) chat FOR ONE PROJECT (default: the active one),
+ * stamped with the CURRENT model/effort settings — the stamp is fixed at
+ * creation; switching the setting only affects new chats. The stage always
+ * goes through this instead of the raw store action. Returns null when no
+ * project exists to attach the chat to.
+ */
+export function createChat(projectId?: string): string | null {
+  const pid = projectId ?? useProjects.getState().activeProjectId;
+  if (!pid) return null;
   const { orchestratorCodexModel, orchestratorCodexEffort } =
     useSwarm.getState().settings;
   // chats get the Settings defaults (a per-chat override the picker can
@@ -425,24 +493,42 @@ export function createChat(): string {
   return useOrchestrator
     .getState()
     .newChat(
+      pid,
       orchestratorCodexModel?.trim() || undefined,
       orchestratorCodexEffort?.trim() || undefined,
     );
 }
 
+/** Projects whose stage already got its fresh-start chat this app run. */
+const freshenedProjects = new Set<string>();
+
+/**
+ * Fresh start per launch, per project: the first time a project's Conductor
+ * stage shows this app run, activate a new (or reused-empty) chat — so
+ * yesterday's chat context never silently absorbs today's first order. Old
+ * chats stay reachable in the switcher.
+ */
+export function ensureFreshProjectChat(projectId: string): void {
+  if (freshenedProjects.has(projectId)) return;
+  freshenedProjects.add(projectId);
+  createChat(projectId);
+}
+
 /**
  * Resolve the backend chat behind a store chat: reuse the in-process handle,
- * else resume the persisted thread (app restart), else start fresh. A failed
- * resume (thread rollout deleted) warns in the chat and falls back to a new
- * thread — the displayed history stays, the model's context doesn't.
+ * else resume the persisted thread (app restart) on the chat's PROJECT
+ * instance, else start fresh there. A failed resume (thread rollout deleted)
+ * warns in the chat and falls back to a new thread — the displayed history
+ * stays, the model's context doesn't.
  */
 async function ensureBackendChat(chatId: string): Promise<string> {
   const existing = backendByChat.get(chatId);
   if (existing) return existing;
   const chat = useOrchestrator.getState().chats.find((c) => c.id === chatId);
+  const project = projectWire(chat?.projectId ?? "");
   if (chat?.threadId) {
     try {
-      const ref = await chatResume(chat.threadId);
+      const ref = await chatResume(chat.threadId, project);
       link(chatId, ref.chat_id);
       useOrchestrator.getState().setChatThreadId(chatId, ref.thread_id);
       return ref.chat_id;
@@ -453,7 +539,7 @@ async function ensureBackendChat(chatId: string): Promise<string> {
       });
     }
   }
-  const ref = await chatStart();
+  const ref = await chatStart(project);
   link(chatId, ref.chat_id);
   useOrchestrator.getState().setChatThreadId(chatId, ref.thread_id);
   return ref.chat_id;
@@ -552,7 +638,7 @@ export function removeChat(chatId: string): void {
 export async function refreshStatus(): Promise<void> {
   const { setStatus } = useOrchestrator.getState();
   try {
-    setStatus(await chatStatus());
+    setStatus(await chatStatus(activeProjectWire() ?? undefined));
   } catch (err) {
     // chatStatus itself never rejects for a dead process — this is the
     // safety net for a broken invoke (e.g. non-Tauri dev context)

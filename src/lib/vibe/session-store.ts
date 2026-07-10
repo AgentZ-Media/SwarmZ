@@ -119,6 +119,7 @@ function snapshot(): PersistedVibeSessions {
           .map(persistOneItem),
       })),
     activeId: s.activeId,
+    activeIdByProject: s.activeIdByProject,
   };
 }
 
@@ -149,8 +150,15 @@ export interface VibeState {
   /** session order, newest first */
   order: string[];
   activeId: string | null;
+  /** remembered selection per project — `activateProject` restores it when
+   * switching tabs (persisted; entries validate on hydrate) */
+  activeIdByProject: Record<string, string>;
   /** sessions with a turn in flight — set by the controller (in-memory) */
   busy: Record<string, boolean>;
+  /** true once hydrateVibeSessions SUCCEEDED (incl. a fresh install) — the
+   * chat→project migration resolves touched sessions against this store and
+   * must not run before/without it. In-memory, never persisted. */
+  hydrated: boolean;
 
   setActive: (id: string | null) => void;
 
@@ -227,12 +235,27 @@ export const useVibe = create<VibeState>((set, get) => ({
   sessions: {},
   order: [],
   activeId: null,
+  activeIdByProject: {},
   busy: {},
+  hydrated: false,
 
   setActive: (id) => {
-    if (get().activeId === id) return;
-    if (id !== null && !get().sessions[id]) return;
-    set({ activeId: id });
+    const state = get();
+    if (state.activeId === id) return;
+    const entry = id !== null ? state.sessions[id] : undefined;
+    if (id !== null && !entry) return;
+    set({
+      activeId: id,
+      // remember the pick per project so a tab switch can restore it
+      ...(entry
+        ? {
+            activeIdByProject: {
+              ...state.activeIdByProject,
+              [entry.session.projectId]: id as string,
+            },
+          }
+        : {}),
+    });
     schedulePersist();
   },
 
@@ -268,7 +291,15 @@ export const useVibe = create<VibeState>((set, get) => ({
     for (const oid of state.order) {
       if (!order.includes(oid)) delete sessions[oid];
     }
-    set({ sessions, order, activeId: s.id });
+    set({
+      sessions,
+      order,
+      activeId: s.id,
+      activeIdByProject: {
+        ...state.activeIdByProject,
+        [s.projectId]: s.id,
+      },
+    });
     schedulePersist();
   },
 
@@ -279,10 +310,15 @@ export const useVibe = create<VibeState>((set, get) => ({
     const idx = state.order.indexOf(id);
     const { [id]: _gone, ...sessions } = state.sessions;
     const { [id]: _b, ...busy } = state.busy;
+    const activeIdByProject = { ...state.activeIdByProject };
+    for (const [pid, sid] of Object.entries(activeIdByProject)) {
+      if (sid === id) delete activeIdByProject[pid];
+    }
     set({
       sessions,
       order,
       busy,
+      activeIdByProject,
       activeId:
         state.activeId === id
           ? (order[Math.min(idx, order.length - 1)] ?? null)
@@ -624,9 +660,14 @@ export async function hydrateVibeSessions(): Promise<void> {
   try {
     data = await loadVibeSessions();
   } catch {
+    // load failed — `hydrated` stays false, downstream migrations skip
     return;
   }
-  if (!data) return;
+  if (!data) {
+    // fresh install: nothing persisted IS a successful hydration
+    useVibe.setState({ hydrated: true });
+    return;
+  }
   const sessions: Record<string, VibeSessionEntry> = {};
   const order: string[] = [];
   for (const raw of Array.isArray(data.sessions) ? data.sessions : []) {
@@ -697,14 +738,33 @@ export async function hydrateVibeSessions(): Promise<void> {
   // drop anything beyond the per-project cap
   for (const id of Object.keys(mergedSessions))
     if (!mergedOrder.includes(id)) delete mergedSessions[id];
+  // per-project selection map: only entries whose session survived AND still
+  // belongs to that project; live (pre-hydrate) picks win
+  const activeIdByProject: Record<string, string> = {};
+  const rawMap =
+    data.activeIdByProject && typeof data.activeIdByProject === "object"
+      ? data.activeIdByProject
+      : {};
+  for (const [pid, sid] of Object.entries(rawMap)) {
+    if (
+      typeof sid === "string" &&
+      mergedSessions[sid]?.session.projectId === pid
+    )
+      activeIdByProject[pid] = sid;
+  }
+  for (const [pid, sid] of Object.entries(state.activeIdByProject)) {
+    activeIdByProject[pid] = sid;
+  }
   useVibe.setState({
     sessions: mergedSessions,
     order: mergedOrder,
+    activeIdByProject,
     activeId:
       state.activeId ??
       (typeof data.activeId === "string" && mergedOrder.includes(data.activeId)
         ? data.activeId
         : (mergedOrder[0] ?? null)),
+    hydrated: true,
   });
   // the one-time migration result must survive a quit without further edits
   if (migrated || (data.version ?? 1) < 2) schedulePersist();

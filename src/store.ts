@@ -38,7 +38,11 @@ import {
   hydrateVibeSessions,
   useVibe,
 } from "@/lib/vibe/session-store";
-import { flushProjectsPersist, hydrateProjects } from "@/lib/projects/store";
+import {
+  flushProjectsPersist,
+  hydrateProjects,
+  useProjects,
+} from "@/lib/projects/store";
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
@@ -233,23 +237,35 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     } catch {
       /* ignore */
     }
-    try {
-      // orchestrator chats — hydrates its own store (chat-store.ts)
-      await hydrateOrchestratorChats();
-    } catch {
-      /* ignore */
-    }
+    // readiness for the chat→project migration: only when projects AND
+    // sessions hydrated cleanly may the chat hydrator reassign/persist — a
+    // transient load failure must never rewrite assignments on disk
+    let migrationReady = true;
     try {
       // project tabs — MUST hydrate before the vibe sessions: the session
       // migration assigns projectIds into this store
       await hydrateProjects();
     } catch {
-      /* ignore */
+      migrationReady = false;
     }
     try {
       // vibe native codex sessions — hydrates its own store (and runs the
       // schema-v2 project assignment against the hydrated project store)
       await hydrateVibeSessions();
+    } catch {
+      migrationReady = false;
+    }
+    // both hydrators also SWALLOW load failures internally (per-slice
+    // tolerance) — their `hydrated` flags are the authoritative success
+    // signal, the try/catch above only covers unexpected throws
+    migrationReady =
+      migrationReady &&
+      useProjects.getState().hydrated &&
+      useVibe.getState().hydrated;
+    try {
+      // orchestrator chats — LAST: the Phase-3 chat→project migration
+      // resolves against the hydrated project AND session stores
+      await hydrateOrchestratorChats({ migrationReady });
     } catch {
       /* ignore */
     }

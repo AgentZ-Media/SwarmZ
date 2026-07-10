@@ -184,85 +184,117 @@ async fn discover_projects(
 
 // ---- Orchestrator tool bus — see orchestrator/ ----
 
-/// The tool catalog + the orchestrator system instructions, both single-
-/// source in Rust. The catalog is handed to Codex as `dynamicTools` (and the
+/// The tool catalog + the Conductor system instructions, both single-source
+/// in Rust. The catalog is handed to Codex as `dynamicTools` (and the
 /// instructions as `developerInstructions`). `persona` is the current
-/// Settings persona (None = the Maestro seed); memory is read fresh so every
-/// consumer compiles the SAME instructions from one source.
+/// Settings persona (None = the Maestro seed), `project` the Conductor's
+/// project context (None = no project block — dev hook); memory (global +
+/// project) is read fresh so every consumer compiles the SAME instructions
+/// from one source.
 #[tauri::command]
 async fn orchestrator_tools(
     app: AppHandle,
     persona: Option<orchestrator::PersonaSpec>,
+    project: Option<orchestrator::ProjectContext>,
 ) -> serde_json::Value {
     let persona = persona.unwrap_or_default();
-    let memory = orchestrator_memory_block(&app).await;
+    let project = project.unwrap_or_default();
+    let memory = orchestrator_memory_blocks(&app, &project.id).await;
     serde_json::json!({
-        "instructions": orchestrator::build_instructions(&persona, &memory),
+        "instructions": orchestrator::build_instructions(&persona, &project, &memory),
         "tools": orchestrator::tool_definitions(),
     })
 }
 
-/// The app data dir (holds `swarmz.json` and `orchestrator-memory.md`).
+/// The app data dir (holds `swarmz.json` and `orchestrator-memory/`).
 fn orchestrator_data_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     app.path().app_data_dir().map_err(|e| e.to_string())
 }
 
-/// Render the curated memory as prompt-ready list lines (empty on failure).
-async fn orchestrator_memory_block(app: &AppHandle) -> String {
+/// Render both memory scopes as prompt-ready blocks (empty on failure).
+async fn orchestrator_memory_blocks(
+    app: &AppHandle,
+    project_id: &str,
+) -> orchestrator::MemoryBlocks {
     let Ok(dir) = orchestrator_data_dir(app) else {
-        return String::new();
+        return orchestrator::MemoryBlocks::default();
     };
+    let pid = project_id.to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        let entries = orchestrator::memory_read(&dir);
-        entries
-            .iter()
-            .map(|e| {
-                if e.date.is_empty() {
-                    format!("- {}", e.text)
-                } else {
-                    format!("- {} {}", e.date, e.text)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        let render = |entries: &[orchestrator::MemoryEntry]| {
+            entries
+                .iter()
+                .map(|e| {
+                    if e.date.is_empty() {
+                        format!("- {}", e.text)
+                    } else {
+                        format!("- {} {}", e.date, e.text)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let global = render(&orchestrator::memory_read(
+            &dir,
+            &orchestrator::MemoryScope::Global,
+        ));
+        // strict scope construction — invalid/reserved/empty ids read nothing
+        let project = match orchestrator::MemoryScope::project(&pid) {
+            Ok(scope) => render(&orchestrator::memory_read(&dir, &scope)),
+            Err(_) => String::new(),
+        };
+        orchestrator::MemoryBlocks { global, project }
     })
     .await
     .unwrap_or_default()
 }
 
-/// Read the curated orchestrator memory (Settings UI).
+/// Read one scope of the curated memory (Settings UI). `scope` ∈
+/// "global" | "project" (the latter needs `project_id`).
 #[tauri::command]
 async fn orchestrator_memory_read(
     app: AppHandle,
+    scope: String,
+    project_id: Option<String>,
 ) -> Result<Vec<orchestrator::MemoryEntry>, String> {
     let dir = orchestrator_data_dir(&app)?;
-    tauri::async_runtime::spawn_blocking(move || orchestrator::memory_read(&dir))
+    let scope = orchestrator::MemoryScope::parse(&scope, project_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || orchestrator::memory_read(&dir, &scope))
         .await
         .map_err(|e| e.to_string())
 }
 
-/// Append one fact to the curated memory (the `remember` tool executor). The
+/// Append one fact to a memory scope (the `remember` tool executor). The
 /// caps are enforced here; the result reports any FIFO drop.
 #[tauri::command]
 async fn orchestrator_memory_append(
     app: AppHandle,
     text: String,
+    scope: String,
+    project_id: Option<String>,
 ) -> Result<orchestrator::AppendResult, String> {
     let dir = orchestrator_data_dir(&app)?;
+    let scope = orchestrator::MemoryScope::parse(&scope, project_id.as_deref())?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    tauri::async_runtime::spawn_blocking(move || orchestrator::memory_append(&dir, &text, &today))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        orchestrator::memory_append(&dir, &scope, &text, &today)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-/// Remove one memory entry by index (Settings UI). Returns the remaining list.
+/// Remove one memory entry by index from a scope (Settings UI). Returns the
+/// remaining list.
 #[tauri::command]
 async fn orchestrator_memory_remove(
     app: AppHandle,
     index: usize,
+    scope: String,
+    project_id: Option<String>,
 ) -> Result<Vec<orchestrator::MemoryEntry>, String> {
     let dir = orchestrator_data_dir(&app)?;
-    tauri::async_runtime::spawn_blocking(move || orchestrator::memory_remove(&dir, index))
+    let scope = orchestrator::MemoryScope::parse(&scope, project_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || orchestrator::memory_remove(&dir, &scope, index))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -276,8 +308,9 @@ async fn orchestrator_run_tool(
     tool: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    // dev-hook surface — no chat context (executors skip touched-session tracking)
-    orchestrator::run_tool(&app, &tool, args, None).await
+    // dev-hook surface — no chat/project context (executors skip
+    // touched-session tracking and resolve sessions unscoped)
+    orchestrator::run_tool(&app, &tool, args, None, None).await
 }
 
 /// Webview → Rust leg of the roundtrip. Sync on purpose: it only resolves a
@@ -294,15 +327,17 @@ fn orchestrator_tool_response(id: String, ok: bool, payload: serde_json::Value) 
 // `codex app-server` child (spawned lazily; tokio::process — no blocking
 // work on the main thread). Progress streams as `orchestrator://chat-event`.
 
-/// Start a fresh orchestrator chat (app-server thread with dynamic tools).
-/// `codex_path` is the Settings codex-binary override, passed on every call.
+/// Start a fresh Conductor chat for one project (app-server thread with
+/// dynamic tools on that project's instance). `codex_path` is the Settings
+/// codex-binary override, passed on every call.
 #[tauri::command]
 async fn orchestrator_chat_start(
     app: AppHandle,
     codex_path: Option<String>,
     persona: Option<orchestrator::PersonaSpec>,
+    project: Option<orchestrator::ProjectContext>,
 ) -> Result<serde_json::Value, String> {
-    orchestrator::chat_start(&app, codex_path, persona).await
+    orchestrator::chat_start(&app, codex_path, persona, project).await
 }
 
 /// Send one user message; resolves with the final assistant text when the
@@ -324,24 +359,28 @@ async fn orchestrator_chat_interrupt(chat_id: String) -> Result<(), String> {
     orchestrator::chat_interrupt(&chat_id).await
 }
 
-/// Reopen a persisted app-server thread as a chat (thread/resume).
+/// Reopen a persisted app-server thread as a chat (thread/resume on its
+/// project's instance).
 #[tauri::command]
 async fn orchestrator_chat_resume(
     app: AppHandle,
     thread_id: String,
     persona: Option<orchestrator::PersonaSpec>,
+    project: Option<orchestrator::ProjectContext>,
 ) -> Result<serde_json::Value, String> {
-    orchestrator::chat_resume(&app, &thread_id, persona).await
+    orchestrator::chat_resume(&app, &thread_id, persona, project).await
 }
 
 /// Liveness + codex version + account summary. Never errors — spawn
-/// failures come back as `{ running: false, error }`.
+/// failures come back as `{ running: false, error }`. Reuses any alive
+/// Conductor process, else spawns the given project's (or a neutral probe).
 #[tauri::command]
 async fn orchestrator_chat_status(
     app: AppHandle,
     codex_path: Option<String>,
+    project: Option<orchestrator::ProjectContext>,
 ) -> serde_json::Value {
-    orchestrator::chat_status(&app, codex_path).await
+    orchestrator::chat_status(&app, codex_path, project).await
 }
 
 /// The model ids the installed codex offers (`model/list`, hidden entries
