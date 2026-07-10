@@ -1518,4 +1518,236 @@ mod tests {
 
         println!("==== conductor instances spike: all assertions passed ====");
     }
+
+    // ---- Phase-5 autonomy-loop spike ----
+    //
+    // Live end-to-end proof of the loop's substance against the REAL codex
+    // CLI: (1) a real AGENT session executes a small task in a scratch repo
+    // with the Phase-5 report `outputSchema` and returns a machine-readable
+    // status report; (2) a real CONDUCTOR thread (production instructions +
+    // dynamic tools) receives the exact `[agent finished]` autonomous wire
+    // text the trigger router builds (marker + report + diff line) and must
+    // act like a lead: acknowledge the work and report — without a user in
+    // the loop. The webview glue (trigger router, budget) is covered by the
+    // vitest suite; this spike proves the two real model turns around it.
+    // Ignored by default; run with:
+    //   SWARMZ_SPIKE_DIR=<scratch> cargo test phase5_autonomy_loop_spike -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn phase5_autonomy_loop_spike() {
+        use std::path::PathBuf;
+        let base = std::env::var("SWARMZ_SPIKE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("swarmz-phase5-loop-spike"));
+        let repo = base.join("repo");
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let repo_str = repo.to_string_lossy().into_owned();
+
+        // ---- (1) the agent: a real task turn constrained by the report schema
+        let report_schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "done": { "type": "boolean" },
+                "summary": { "type": "string" },
+                "files_changed": { "type": "array", "items": { "type": "string" } },
+                "tests_pass": { "type": ["boolean", "null"] },
+                "needs_human": { "type": "boolean" },
+                "question": { "type": ["string", "null"] },
+                "followups": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["done", "summary", "files_changed", "tests_pass", "needs_human", "question", "followups"]
+        });
+        let agent_host = ProcessHost::new();
+        let (agent_conn, _g) = agent_host.ensure().await.expect("spawn agent");
+        let started = agent_conn
+            .request(
+                "thread/start",
+                json!({
+                    "cwd": repo_str,
+                    "sandbox": "danger-full-access",
+                    "approvalPolicy": "never",
+                }),
+                THREAD_TIMEOUT_MS,
+            )
+            .await
+            .expect("agent thread/start");
+        let agent_tid = started
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let (atx, mut arx) = mpsc::unbounded_channel();
+        agent_conn.register_thread(&agent_tid, atx);
+        agent_conn
+            .request(
+                "turn/start",
+                json!({
+                    "threadId": agent_tid,
+                    "effort": "low",
+                    "input": [{ "type": "text", "text": "Create a file named GREETING.md in your current working directory containing the single line 'hello from the swarm'. End your work by filling the required status report." }],
+                    "outputSchema": report_schema,
+                }),
+                RPC_TIMEOUT_MS,
+            )
+            .await
+            .expect("agent turn/start");
+        let mut report_text = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, arx.recv())
+                .await
+                .expect("agent turn timed out")
+                .expect("agent sink closed");
+            match ev {
+                ThreadEvent::Request { responder, .. } => {
+                    responder.ok(&json!({ "decision": "accept" }))
+                }
+                ThreadEvent::Notification { method, params } => {
+                    if method == "item/completed"
+                        && params.pointer("/item/type").and_then(|v| v.as_str())
+                            == Some("agentMessage")
+                    {
+                        report_text = params
+                            .pointer("/item/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    if method == "turn/completed" {
+                        assert_eq!(
+                            params.pointer("/turn/status").and_then(|v| v.as_str()),
+                            Some("completed")
+                        );
+                        break;
+                    }
+                }
+                ThreadEvent::Exited => panic!("agent process exited mid-spike"),
+            }
+        }
+        let report: Value =
+            serde_json::from_str(report_text.trim()).expect("agent report must be pure JSON");
+        println!("[loop] agent report: {report}");
+        assert_eq!(report["done"], true, "agent must report done");
+        assert!(repo.join("GREETING.md").is_file(), "agent must have created the file");
+
+        // ---- (2) the Conductor: the [agent finished] autonomous turn
+        let project = ProjectContext {
+            id: "phase5-loop".into(),
+            dir: repo_str.clone(),
+            name: "phase5-loop".into(),
+        };
+        let cond_host = ProcessHost::new();
+        let (cond_conn, _g) = cond_host.ensure().await.expect("spawn conductor");
+        let cstarted = cond_conn
+            .request(
+                "thread/start",
+                thread_start_params(&PersonaSpec::default(), &project, &MemoryBlocks::default()),
+                THREAD_TIMEOUT_MS,
+            )
+            .await
+            .expect("conductor thread/start");
+        let cond_tid = cstarted
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let (ctx, mut crx) = mpsc::unbounded_channel();
+        cond_conn.register_thread(&cond_tid, ctx);
+        // the EXACT wire shape the trigger router builds (triggers-core.ts)
+        let wire = format!(
+            "[agent finished] Agent «Maya» (id spike-maya) finished its turn.\nStructured report: {report}\nWorking tree: no uncommitted changes reported\n\nThis is an autonomous turn — no user message triggered it. Act as the lead: judge the result (read_agent / git_status / review_agent when warranted), hand out follow-up tasks yourself when they clearly serve the user's standing goal, and close the loop with a compact report of what got done and what you suggest next. Escalate to the user only what genuinely needs their call."
+        );
+        cond_conn
+            .request(
+                "turn/start",
+                json!({ "threadId": cond_tid, "input": [{ "type": "text", "text": wire }] }),
+                RPC_TIMEOUT_MS,
+            )
+            .await
+            .expect("conductor turn/start");
+        let mut tool_calls: Vec<String> = Vec::new();
+        let mut final_message = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, crx.recv())
+                .await
+                .expect("conductor turn timed out")
+                .expect("conductor sink closed");
+            match ev {
+                ThreadEvent::Request { method, params, responder } => {
+                    if method == "item/tool/call" {
+                        let tool = params
+                            .get("tool")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        println!("[loop] conductor tool call: {tool}");
+                        // canned answers standing in for the webview executors
+                        let answer = match tool.as_str() {
+                            "fleet_snapshot" => json!({
+                                "project": { "id": "phase5-loop", "name": "phase5-loop", "dir": repo_str },
+                                "summary": "1 session · 0 working · 0 wait approval",
+                                "sessions": [{ "id": "spike-maya", "name": "Maya", "cwd": repo_str, "status": "idle", "worktree": null, "pendingApprovals": [] }],
+                                "worktrees": [], "timers": [],
+                            }),
+                            "git_status" => json!({
+                                "agent": { "id": "spike-maya", "name": "Maya" },
+                                "cwd": repo_str,
+                                "git": null,
+                                "note": format!("not a git repository: {repo_str}"),
+                            }),
+                            "read_agent" => json!({
+                                "agent": { "id": "spike-maya", "name": "Maya", "cwd": repo_str },
+                                "transcript": format!("user: create GREETING.md\nassistant: {}", report_text.trim()),
+                            }),
+                            _ => json!("spike: tool unavailable in this probe"),
+                        };
+                        tool_calls.push(tool);
+                        responder.ok(&adapter::tool_call_response(&Ok(answer)));
+                    } else {
+                        responder.error(-32601, "not supported by the spike");
+                    }
+                }
+                ThreadEvent::Notification { method, params } => match method.as_str() {
+                    "item/completed"
+                        if params.pointer("/item/type").and_then(|v| v.as_str())
+                            == Some("agentMessage") =>
+                    {
+                        final_message = params
+                            .pointer("/item/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    "turn/completed" => {
+                        assert_eq!(
+                            params.pointer("/turn/status").and_then(|v| v.as_str()),
+                            Some("completed")
+                        );
+                        break;
+                    }
+                    _ => {}
+                },
+                ThreadEvent::Exited => panic!("conductor process exited mid-spike"),
+            }
+        }
+        println!("[loop] conductor tool calls: {tool_calls:?}");
+        println!("[loop] conductor final message: {final_message}");
+        // the Conductor closed the loop: a non-empty lead-style report that
+        // references the agent by name (never the raw session id)
+        assert!(!final_message.trim().is_empty(), "conductor must report");
+        assert!(
+            final_message.contains("Maya"),
+            "the report must reference the agent by name: {final_message}"
+        );
+        assert!(
+            !final_message.contains("spike-maya"),
+            "raw session ids must not surface to the user: {final_message}"
+        );
+        println!("==== phase5 autonomy loop spike: all assertions passed ====");
+        std::fs::remove_dir_all(&base).ok();
+    }
 }

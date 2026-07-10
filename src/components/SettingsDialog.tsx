@@ -238,6 +238,18 @@ function OrchestratorSection() {
 
       <CodexDefaultsRows />
 
+      <Row
+        label="Auto-review finished lanes"
+        help="When an agent the Conductor tasked finishes work that changed code, a detached codex review runs automatically and its findings ride into the Conductor's report — you hear about reviewed work, not just finished work. Costs an extra review turn per lane."
+      >
+        <Switch
+          checked={!!settings.autoReviewFinishedLanes}
+          onCheckedChange={(v) =>
+            updateSettings({ autoReviewFinishedLanes: v })
+          }
+        />
+      </Row>
+
       <StackedRow
         label="Project scan folders"
         help="Extra folders (e.g. ~/Code) the orchestrator's project discovery shallow-scans for git repos when the model doesn't name its own — on top of your Codex session history and folders the app already knows."

@@ -851,12 +851,17 @@ fn thread_resume_params(thread_id: &str, profile: &SessionProfile) -> Value {
 /// turn/start params. `effort` (a per-turn override) rides on every turn when
 /// set; the sandbox/approval override is only attached when access changed
 /// since the last turn (keeps the object-form `sandboxPolicy` off the wire on
-/// ordinary turns).
+/// ordinary turns). `output_schema` (Phase 5) is the ONE-TURN-ONLY
+/// `outputSchema` param — a JSON Schema constraining the turn's FINAL
+/// assistant message (live-verified on 0.144.1); the orchestrator's
+/// `expect_report` tasks ride it so agents end with a machine-readable
+/// status report.
 fn turn_params(
     thread_id: &str,
     text: &str,
     profile: &SessionProfile,
     include_access_override: bool,
+    output_schema: Option<&Value>,
 ) -> Value {
     let mut p = json!({
         "threadId": thread_id,
@@ -874,6 +879,9 @@ fn turn_params(
     if include_access_override {
         p["sandboxPolicy"] = profile.access.sandbox_policy();
         p["approvalPolicy"] = json!(profile.access.approval_policy());
+    }
+    if let Some(schema) = output_schema {
+        p["outputSchema"] = schema.clone();
     }
     p
 }
@@ -1019,8 +1027,15 @@ pub async fn session_resume(
 /// Send one user message — NON-blocking: returns the turn id after the
 /// `turn/start` ack; the transcript + completion stream as events. One turn
 /// per session at a time (a busy session rejects). Transparently resumes after
-/// a private-process respawn.
-pub async fn session_send(app: &AppHandle, session_id: &str, text: &str) -> Result<Value, String> {
+/// a private-process respawn. `output_schema` (optional, Phase 5) constrains
+/// this ONE turn's final assistant message to a JSON Schema — the structured
+/// agent→Conductor status reports ride on it.
+pub async fn session_send(
+    app: &AppHandle,
+    session_id: &str,
+    text: &str,
+    output_schema: Option<Value>,
+) -> Result<Value, String> {
     // atomically claim the turn slot + snapshot what we need for the roundtrip
     let (host, sink, mut thread_id, gen_stored, override_pending, profile) = {
         let mut sessions = SESSIONS.lock();
@@ -1107,7 +1122,13 @@ pub async fn session_send(app: &AppHandle, session_id: &str, text: &str) -> Resu
         }
     }
 
-    let params = turn_params(&thread_id, text, &profile, override_pending);
+    let params = turn_params(
+        &thread_id,
+        text,
+        &profile,
+        override_pending,
+        output_schema.as_ref(),
+    );
     match conn
         .request("turn/start", params, host::RPC_TIMEOUT_MS)
         .await
@@ -1562,7 +1583,7 @@ mod tests {
         assert!(start.get("effort").is_none());
 
         // ordinary turn: model + effort ride along, no sandbox override on wire
-        let plain = turn_params("tn", "hi", &profile, false);
+        let plain = turn_params("tn", "hi", &profile, false, None);
         assert_eq!(plain["threadId"], "tn");
         assert_eq!(plain["input"][0]["text"], "hi");
         assert_eq!(plain["model"], "gpt-5.5");
@@ -1571,7 +1592,7 @@ mod tests {
         assert!(plain.get("approvalPolicy").is_none());
 
         // access changed: the object-form override is attached
-        let overridden = turn_params("tn", "hi", &profile, true);
+        let overridden = turn_params("tn", "hi", &profile, true, None);
         assert_eq!(overridden["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(overridden["approvalPolicy"], "on-request");
 
@@ -1582,9 +1603,21 @@ mod tests {
             effort: None,
             access: Access::Workspace,
         };
-        let bare_turn = turn_params("tn", "hi", &bare, false);
+        let bare_turn = turn_params("tn", "hi", &bare, false, None);
         assert!(bare_turn.get("model").is_none());
         assert!(bare_turn.get("effort").is_none());
+        // no schema → no outputSchema field on ordinary turns
+        assert!(plain.get("outputSchema").is_none());
+
+        // an output schema rides as the ONE-TURN-ONLY `outputSchema` param
+        let schema = json!({
+            "type": "object",
+            "properties": { "done": { "type": "boolean" } },
+            "required": ["done"],
+        });
+        let with_schema = turn_params("tn", "hi", &profile, false, Some(&schema));
+        assert_eq!(with_schema["outputSchema"], schema);
+        assert_eq!(with_schema["input"][0]["text"], "hi");
     }
 
     #[test]
@@ -2169,7 +2202,7 @@ mod tests {
             conn.register_thread(&thread_id, tx);
             conn.request(
                 "turn/start",
-                turn_params(&thread_id, "Run the shell command `sleep 30` and tell me when it finishes.", &profile, false),
+                turn_params(&thread_id, "Run the shell command `sleep 30` and tell me when it finishes.", &profile, false, None),
                 RPC_TIMEOUT_MS,
             )
             .await
@@ -2241,7 +2274,7 @@ mod tests {
             );
             conn.request(
                 "turn/start",
-                turn_params(&thread_id, &prompt, &profile, false),
+                turn_params(&thread_id, &prompt, &profile, false, None),
                 RPC_TIMEOUT_MS,
             )
             .await
@@ -2303,7 +2336,7 @@ mod tests {
             conn.register_thread(&thread_id, tx);
             conn.request(
                 "turn/start",
-                turn_params(&thread_id, "Run exactly this shell command and report its output: sh -c 'echo a; sleep 2; echo b'", &profile, false),
+                turn_params(&thread_id, "Run exactly this shell command and report its output: sh -c 'echo a; sleep 2; echo b'", &profile, false, None),
                 RPC_TIMEOUT_MS,
             )
             .await
@@ -2418,7 +2451,7 @@ mod tests {
             conn.register_thread(&tid, tx);
             conn.request(
                 "turn/start",
-                turn_params(&tid, prompt, &profile, false),
+                turn_params(&tid, prompt, &profile, false, None),
                 RPC_TIMEOUT_MS,
             )
             .await
@@ -2492,6 +2525,128 @@ mod tests {
         let branches = git(&repo, &["branch", "--list", "swarm/maya-shared-lane"]);
         assert!(branches.is_empty(), "branch must be gone after cleanup");
         println!("[iv] cleanup: dirty-gate refused → resolved → removed. all good");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // ---- Phase-5 outputSchema spike (live verification) ----
+    //
+    // Live proof against the REAL codex CLI (0.144.1) that `outputSchema`
+    // FORCES the turn's final assistant message into the agent-report shape
+    // SwarmZ's autonomy loop parses (src/lib/orchestrator/report.ts — the
+    // schema below mirrors AGENT_REPORT_SCHEMA field for field): a real agent
+    // session gets a tiny file-writing task with the schema attached; the
+    // final message must be pure JSON with the required report fields, and
+    // the reported work must actually exist on disk. Ignored by default
+    // (needs codex + login + network); run with:
+    //   SWARMZ_SPIKE_DIR=<scratch> cargo test phase5_output_schema_spike -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn phase5_output_schema_spike() {
+        use std::path::PathBuf;
+        let base = std::env::var("SWARMZ_SPIKE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("swarmz-phase5-spike"));
+        let cwd = base.join("agent");
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+
+        // mirror of src/lib/orchestrator/report.ts AGENT_REPORT_SCHEMA
+        let report_schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "done": { "type": "boolean", "description": "the task is complete" },
+                "summary": { "type": "string", "description": "what you did and what came out, 1-3 sentences" },
+                "files_changed": { "type": "array", "items": { "type": "string" }, "description": "paths you created or modified" },
+                "tests_pass": { "type": ["boolean", "null"], "description": "test outcome; null when no tests were run" },
+                "needs_human": { "type": "boolean", "description": "a human decision is required before the task can proceed/finish" },
+                "question": { "type": ["string", "null"], "description": "the question or decision you need answered, when needs_human is true" },
+                "followups": { "type": "array", "items": { "type": "string" }, "description": "follow-up tasks you recommend" }
+            },
+            "required": ["done", "summary", "files_changed", "tests_pass", "needs_human", "question", "followups"]
+        });
+
+        let profile = SessionProfile {
+            cwd: cwd.to_string_lossy().into_owned(),
+            model: None,
+            effort: Some("low".into()),
+            access: Access::Full,
+        };
+        let host = ProcessHost::new();
+        let (conn, _g) = host.ensure().await.expect("spawn");
+        let started = conn
+            .request("thread/start", thread_start_params(&profile), THREAD_TIMEOUT_MS)
+            .await
+            .expect("thread/start");
+        let thread_id = started
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        conn.register_thread(&thread_id, tx);
+        conn.request(
+            "turn/start",
+            turn_params(
+                &thread_id,
+                "Create a file named STATUS.md in your current working directory with the single line 'phase5 spike'. End your work by filling the required status report.",
+                &profile,
+                false,
+                Some(&report_schema),
+            ),
+            RPC_TIMEOUT_MS,
+        )
+        .await
+        .expect("turn/start with outputSchema");
+
+        let mut final_message = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("spike timed out")
+                .expect("sink closed");
+            match ev {
+                ThreadEvent::Request { responder, .. } => {
+                    responder.ok(&json!({ "decision": "accept" }))
+                }
+                ThreadEvent::Notification { method, params } => {
+                    if method == "item/completed"
+                        && params.pointer("/item/type").and_then(|v| v.as_str())
+                            == Some("agentMessage")
+                    {
+                        final_message = params
+                            .pointer("/item/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    if method == "turn/completed" {
+                        let status = params.pointer("/turn/status").and_then(|v| v.as_str());
+                        assert_eq!(status, Some("completed"));
+                        break;
+                    }
+                }
+                ThreadEvent::Exited => panic!("process exited mid-spike"),
+            }
+        }
+        println!("[phase5] final message: {final_message}");
+        // the final message MUST be pure JSON matching the report schema
+        let report: Value =
+            serde_json::from_str(final_message.trim()).expect("final message must be pure JSON");
+        assert!(report["done"].is_boolean(), "done must be a boolean");
+        assert!(report["summary"].is_string(), "summary must be a string");
+        assert!(report["needs_human"].is_boolean(), "needs_human must be a boolean");
+        assert!(report["files_changed"].is_array(), "files_changed must be an array");
+        assert!(report["followups"].is_array(), "followups must be an array");
+        assert_eq!(report["done"], true, "the tiny task must be done: {report}");
+        // and the reported work is real
+        let created = cwd.join("STATUS.md");
+        assert!(created.is_file(), "the agent must have created STATUS.md");
+        let content = std::fs::read_to_string(&created).unwrap();
+        assert!(content.contains("phase5 spike"), "unexpected content: {content}");
+        println!("[phase5] outputSchema forced a valid report — done={} summary={:?}", report["done"], report["summary"]);
         std::fs::remove_dir_all(&base).ok();
     }
 }

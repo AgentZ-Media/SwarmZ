@@ -137,7 +137,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                                 "model": { "type": "string", "description": "codex model id; OMIT for the default (gpt-5.6-sol)" },
                                 "effort": { "type": "string", "description": "reasoning effort (e.g. low, medium, high, xhigh); OMIT for medium" },
                                 "access": { "type": "string", "enum": ["workspace", "full"], "description": "sandbox level — omit for workspace (recommended)" },
-                                "name": { "type": "string", "description": "agent name (default: auto from the pool)" }
+                                "name": { "type": "string", "description": "agent name (default: auto from the pool)" },
+                                "expect_report": { "type": "boolean", "description": "true = the agent must end its task turn with a machine-readable status report (done, summary, files_changed, tests_pass, needs_human, question, followups) — set it for implementation tasks whose completion you will judge; the report reaches you with the agent-finished notice" }
                             },
                             "required": ["task", "worktree"]
                         }
@@ -154,7 +155,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "agent": agent_param(),
-                    "text": { "type": "string", "description": "the prompt text to deliver" }
+                    "text": { "type": "string", "description": "the prompt text to deliver" },
+                    "expect_report": { "type": "boolean", "description": "true = the agent must end this turn with a machine-readable status report (see spawn_agents). Applies only when the prompt starts a FRESH turn — a steered (busy) agent keeps its running turn's format" }
                 },
                 "required": ["agent", "text"]
             }),
@@ -510,6 +512,11 @@ mod tests {
         let err = validate_args(&def, &json!({ "agent": "maya" })).unwrap_err();
         assert!(err.contains("text"), "unexpected error: {err}");
         assert!(validate_args(&def, &json!({ "agent": "maya", "text": "hi" })).is_ok());
+        assert!(validate_args(
+            &def,
+            &json!({ "agent": "maya", "text": "hi", "expect_report": true })
+        )
+        .is_ok());
 
         let def = find_tool("decide_approval").unwrap();
         let err = validate_args(&def, &json!({ "agent": "maya" })).unwrap_err();
@@ -556,6 +563,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("one of"), "unexpected error: {err}");
+        // expect_report is a boolean (Phase 5 — structured status reports)
+        let err = validate_args(
+            &def,
+            &json!({ "agents": [{ "task": "x", "worktree": "none", "expect_report": "yes" }] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("expected boolean"), "unexpected error: {err}");
+        assert!(validate_args(
+            &def,
+            &json!({ "agents": [{ "task": "x", "worktree": "new", "expect_report": true }] })
+        )
+        .is_ok());
         assert!(validate_args(
             &def,
             &json!({ "agents": [

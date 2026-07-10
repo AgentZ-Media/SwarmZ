@@ -33,6 +33,16 @@ export type TimerDelivery = (
   projectId: string,
   note: string,
   missed: boolean,
+  /**
+   * The durable at-most-once claim, called by the delivery IMMEDIATELY
+   * BEFORE the dispatch — i.e. INSIDE the project's serialization chain,
+   * never before it (a quit while queued behind a long turn/review must
+   * re-fire the timer as missed, not drop it as possibly-delivered).
+   * Returns false when the timer no longer exists (cancelled while queued —
+   * e.g. by a cancel_timer call from the very turn the timer waited behind):
+   * the delivery must then abort without dispatching.
+   */
+  claim: () => Promise<boolean>,
 ) => Promise<TimerDeliveryOutcome>;
 
 let deliveryFn: TimerDelivery | null = null;
@@ -156,15 +166,20 @@ function setFiredAt(id: string, firedAt: number | undefined): void {
  * Fire one timer: deliver the autonomous Conductor turn in its project.
  * "delivered" removes the timer; "retry" (busy chat / open circuit breaker /
  * failed dispatch) re-arms in 30 s, BOUNDED — after MAX_BUSY_RETRIES the
- * timer expires with a visible notice; "drop" (project record gone) removes
- * it silently.
+ * timer expires with a visible notice; "drop" (project record gone, or the
+ * timer was cancelled while queued) removes it silently.
  *
  * Idempotency, two layers: an in-memory `firing` claim (double wakeups /
  * hydrate overlap deliver at most once per run), and the DURABLE `firedAt`
- * stamp persisted IMMEDIATELY BEFORE the dispatch — a crash between the
- * dispatch and the removal must not re-deliver the same `tm-*` on the next
- * launch (at-most-once by design; hydrate drops claimed timers with a
- * visible notice). A "retry" clears the stamp again (nothing ran).
+ * stamp persisted via the `claim` callback the DELIVERY invokes immediately
+ * before its dispatch — INSIDE the serialization chain, so a quit while the
+ * timer waits behind a long turn/review re-fires it as missed instead of
+ * dropping a never-delivered timer (at-most-once still holds: a crash
+ * between claim+dispatch and removal drops the claimed timer on hydrate,
+ * with a visible notice). The claim also RE-CHECKS existence — a timer
+ * cancelled while queued (e.g. by cancel_timer inside the very turn it
+ * waited behind) aborts instead of firing anyway. A "retry" clears the
+ * stamp again (nothing ran).
  */
 async function fireTimer(timer: ConductorTimer, missed: boolean): Promise<void> {
   if (firing.has(timer.id)) return; // already mid-fire in this run
@@ -173,10 +188,18 @@ async function fireTimer(timer: ConductorTimer, missed: boolean): Promise<void> 
     let outcome: TimerDeliveryOutcome = "drop";
     try {
       if (deliveryFn) {
-        // durable claim BEFORE the side effect
-        setFiredAt(timer.id, Date.now());
-        await flushConductorTimersPersist();
-        outcome = await deliveryFn(timer.projectId, timer.note, missed);
+        const claim = async (): Promise<boolean> => {
+          // cancelled while queued? (cancel_timer removed it from the store)
+          const exists = useConductorTimers
+            .getState()
+            .timers.some((t) => t.id === timer.id);
+          if (!exists) return false;
+          // durable claim, flushed BEFORE the side effect
+          setFiredAt(timer.id, Date.now());
+          await flushConductorTimersPersist();
+          return true;
+        };
+        outcome = await deliveryFn(timer.projectId, timer.note, missed, claim);
       } else {
         outcome = "retry"; // fire raced bootstrap — the delivery registers shortly
       }

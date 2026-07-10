@@ -433,14 +433,25 @@ function sanitizeMessage(raw: unknown): OrchestratorChatMessage | null {
     case "warning":
       return { id, at, role: m.role, text };
     case "system": {
-      // status pings carry the pinged pane (jump chip + "Review")
+      // status pings carry the pinged pane (jump chip + "Review");
+      // autonomous-turn markers carry `autonomous` + the trigger kind
       const paneRefs = sanitizePaneRefs(m.paneRefs);
+      const trigger =
+        m.trigger === "agent-finished" ||
+        m.trigger === "agent-blocked" ||
+        m.trigger === "approval" ||
+        m.trigger === "timer" ||
+        m.trigger === "idle"
+          ? m.trigger
+          : undefined;
       return {
         id,
         at,
         role: "system",
         text,
         ...(paneRefs.length ? { paneRefs } : {}),
+        ...(m.autonomous === true ? { autonomous: true } : {}),
+        ...(trigger ? { trigger } : {}),
       };
     }
     case "assistant":

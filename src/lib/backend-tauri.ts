@@ -12,6 +12,7 @@ import type {
   AppSettings,
   CodexAccountLimits,
   GitInfo,
+  PersistedAutonomyBudgets,
   PersistedConductorTimers,
   PersistedOrchestratorChats,
   PersistedProjects,
@@ -91,6 +92,23 @@ export const tauriBackend: Backend = {
   },
   saveProjects: async (data) => {
     await store.set("projects", data);
+    await store.save();
+  },
+
+  loadAutonomyBudgets: async () => {
+    try {
+      return (
+        (await store.get<PersistedAutonomyBudgets>("autonomyBudgets")) ?? null
+      );
+    } catch {
+      // unreadable = treated as empty; the budget only ever gets MORE
+      // permissive from that, and the caps re-establish themselves within
+      // one window — unlike the timers, nothing is lost forever
+      return null;
+    }
+  },
+  saveAutonomyBudgets: async (data) => {
+    await store.set("autonomyBudgets", data);
     await store.save();
   },
 

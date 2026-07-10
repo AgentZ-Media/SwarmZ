@@ -447,13 +447,16 @@ async fn vibe_session_resume(
 
 /// Send one user message — non-blocking; returns `{turn_id}` after the
 /// turn/start ack. The transcript + completion arrive as events.
+/// `output_schema` (optional) constrains this ONE turn's final assistant
+/// message to a JSON Schema (the structured agent→Conductor status reports).
 #[tauri::command]
 async fn vibe_session_send(
     app: AppHandle,
     session_id: String,
     text: String,
+    output_schema: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    codex::sessions::session_send(&app, &session_id, &text).await
+    codex::sessions::session_send(&app, &session_id, &text, output_schema).await
 }
 
 /// Interrupt the session's running turn (turn/interrupt).

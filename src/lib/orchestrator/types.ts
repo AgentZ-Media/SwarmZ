@@ -184,6 +184,9 @@ export interface SpawnAgentSpec {
   effort?: string;
   access?: "workspace" | "full";
   name?: string;
+  /** Phase 5: the task turn ends with a machine-readable status report
+   * (outputSchema-forced) that rides into the agent-finished turn */
+  expect_report?: boolean;
 }
 
 /** Per-agent outcome of `spawn_agents` — errors never abort the batch. */

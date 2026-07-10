@@ -44,6 +44,13 @@ import {
 } from "@/lib/worktree";
 import { useOrchestrator } from "./chat-store";
 import {
+  AGENT_REPORT_SCHEMA,
+  bindReportExpectation,
+  clearReportExpectation,
+  noteReportExpected,
+  REPORT_PROMPT_SUFFIX,
+} from "./report";
+import {
   fleetSummaryLine,
   sessionSnapshot,
   worktreeOccupancy,
@@ -357,7 +364,10 @@ async function spawnOneAgent(
   projectId: string,
   projectDir: string,
   reservedNames: Set<string>,
-): Promise<{ result: SpawnAgentResult; task?: { id: string; text: string } }> {
+): Promise<{
+  result: SpawnAgentResult;
+  task?: { id: string; text: string; expectReport: boolean };
+}> {
   const task = typeof spec.task === "string" ? spec.task.trim() : "";
   if (!task) throw new Error("task must not be empty");
   const model = typeof spec.model === "string" ? spec.model.trim() : "";
@@ -431,7 +441,7 @@ async function spawnOneAgent(
       branch: placement.worktree?.branch ?? null,
       shared: placement.worktree?.shared ?? false,
     },
-    task: { id, text: task },
+    task: { id, text: task, expectReport: spec.expect_report === true },
   };
 }
 
@@ -597,14 +607,45 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     const id = entry.session.id;
     const name = entry.session.name;
     assertNoDoublePrompt(id, name);
-    // steerMessageStrict routes by state: busy → turn/steer (mid-flight
-    // injection), idle → a fresh turn. Both STRICT — failures reject.
-    const how = await vibeSteerMessage(id, text);
+    // expect_report (Phase 5): the fresh turn is outputSchema-constrained so
+    // the agent ends with a machine-readable status report. Schema AND
+    // report suffix apply ONLY to FRESH turns (freshTurnText) — a steered
+    // running turn keeps its own format and must not receive a report
+    // instruction it has no schema/expectation for (documented in the
+    // registry description).
+    const expectReport = args.expect_report === true;
+    // registered BEFORE the send — a very fast completion event must not
+    // beat the registration and lose the structured parsing; cleared again
+    // on a steer (no schema applied) or a failed send
+    if (expectReport) noteReportExpected(id);
+    let how: { mode: "steered" | "queued"; turnId: string | null };
+    try {
+      // steerMessageStrict routes by state: busy → turn/steer (mid-flight
+      // injection), idle → a fresh turn. Both STRICT — failures reject.
+      how = await vibeSteerMessage(
+        id,
+        text,
+        expectReport
+          ? {
+              outputSchema:
+                AGENT_REPORT_SCHEMA as unknown as Record<string, unknown>,
+              freshTurnText: text + REPORT_PROMPT_SUFFIX,
+            }
+          : undefined,
+      );
+    } catch (err) {
+      if (expectReport) clearReportExpectation(id);
+      throw err;
+    }
+    if (expectReport) {
+      if (how.mode === "steered") clearReportExpectation(id);
+      else bindReportExpectation(id, how.turnId);
+    }
     notePromptDelivered(id, name, ctx);
     const result: PromptAgentResult = {
       delivered: true,
       agent: { id, name },
-      mode: how === "steered" ? "steered" : "turn",
+      mode: how.mode === "steered" ? "steered" : "turn",
     };
     return result;
   },
@@ -624,7 +665,12 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     );
 
     const results: SpawnAgentResult[] = new Array(specs.length);
-    const tasks: { index: number; id: string; text: string }[] = [];
+    const tasks: {
+      index: number;
+      id: string;
+      text: string;
+      expectReport: boolean;
+    }[] = [];
     // sequential on purpose — each start creates a worktree (git checkout)
     // and spawns a codex process; "shared:" placements may reference agents
     // spawned earlier in the SAME batch
@@ -654,9 +700,30 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     // still kick off in parallel. A lane that stays busy past the deadline
     // hands the remaining tasks back to the Conductor instead of starting a
     // second writer.
-    const deliver = async ({ index, id, text }: (typeof tasks)[number]) => {
+    const deliver = async ({
+      index,
+      id,
+      text,
+      expectReport,
+    }: (typeof tasks)[number]) => {
       try {
-        await vibeSendMessage(id, text);
+        // expect_report (Phase 5): the task turn is outputSchema-constrained
+        // so the agent ends with a machine-readable status report. The
+        // expectation registers BEFORE the send (a racing completion event
+        // must not lose the parsing), binds to the acked turn id after, and
+        // clears on a failed send (catch below).
+        if (expectReport) noteReportExpected(id);
+        const sent = await vibeSendMessage(
+          id,
+          expectReport ? text + REPORT_PROMPT_SUFFIX : text,
+          expectReport
+            ? {
+                outputSchema:
+                  AGENT_REPORT_SCHEMA as unknown as Record<string, unknown>,
+              }
+            : undefined,
+        );
+        if (expectReport) bindReportExpectation(id, sent.turnId);
         notePromptDelivered(
           id,
           useVibe.getState().sessions[id]?.session.name ??
@@ -666,6 +733,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         );
         return true;
       } catch (e) {
+        if (expectReport) clearReportExpectation(id);
         const r = results[index];
         if (r)
           r.warning = `task not delivered: ${e instanceof Error ? e.message : String(e)}`;

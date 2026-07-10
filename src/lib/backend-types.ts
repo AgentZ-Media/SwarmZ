@@ -2,6 +2,7 @@ import type {
   AppSettings,
   CodexAccountLimits,
   GitInfo,
+  PersistedAutonomyBudgets,
   PersistedConductorTimers,
   PersistedOrchestratorChats,
   PersistedProjects,
@@ -46,6 +47,10 @@ export interface Backend {
   /** Conductor follow-up timers — project-scoped, survive restarts. */
   loadConductorTimers(): Promise<PersistedConductorTimers | null>;
   saveConductorTimers(data: PersistedConductorTimers): Promise<void>;
+
+  /** Autonomy budgets / circuit breakers — a relaunch must not reset them. */
+  loadAutonomyBudgets(): Promise<PersistedAutonomyBudgets | null>;
+  saveAutonomyBudgets(data: PersistedAutonomyBudgets): Promise<void>;
 
   /**
    * Delete top-level swarmz.json keys (missing keys are a no-op) — the

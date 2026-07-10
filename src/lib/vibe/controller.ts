@@ -109,8 +109,13 @@ function invokeResume(
 function invokeSend(
   sessionId: string,
   text: string,
+  outputSchema?: Record<string, unknown>,
 ): Promise<{ turn_id: string | null }> {
-  return invoke("vibe_session_send", { sessionId, text });
+  return invoke("vibe_session_send", {
+    sessionId,
+    text,
+    outputSchema: outputSchema ?? null,
+  });
 }
 
 function invokeInterrupt(sessionId: string): Promise<void> {
@@ -338,6 +343,36 @@ function pushSessionEvent(sessionId: string, kind: FleetEventKind) {
   });
 }
 
+/**
+ * How a session's LAST turn ended (transient, per app run) — recorded BEFORE
+ * the busy flag clears, so the orchestrator's activity watcher (which reacts
+ * to the busy→idle transition) can distinguish a genuinely completed turn
+ * from a failed / interrupted / process-exited one and never report a
+ * crashed lane as success. `turnId` is the turn the outcome belongs to
+ * (null when codex never handed one out).
+ */
+export interface LastTurnOutcome {
+  outcome: "completed" | "interrupted" | "failed" | "exited";
+  turnId: string | null;
+}
+
+const lastTurnOutcomes = new Map<string, LastTurnOutcome>();
+
+/** The session's last turn outcome (null = no turn ended this app run). */
+export function lastTurnOutcomeOf(sessionId: string): LastTurnOutcome | null {
+  return lastTurnOutcomes.get(sessionId) ?? null;
+}
+
+/** Record how the current turn ended — MUST run before setBusy(false)
+ * (zustand subscribers fire synchronously on the busy transition). */
+function recordTurnOutcome(
+  sessionId: string,
+  outcome: LastTurnOutcome["outcome"],
+) {
+  const turnId = useVibe.getState().sessions[sessionId]?.turnId ?? null;
+  lastTurnOutcomes.set(sessionId, { outcome, turnId });
+}
+
 function handleEvent(sessionId: string, event: VibeSessionEvent) {
   const store = useVibe.getState();
   if (!store.sessions[sessionId]) return; // deleted mid-turn — late events no-op
@@ -440,6 +475,13 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
     }
     case "turn_completed": {
       finalizeStream(sessionId);
+      // outcome BEFORE the busy flip — the activity watcher reads it during
+      // the synchronous busy→idle subscription tick ("interrupted" is a
+      // deliberate stop, never an autonomous-loop "finished" event)
+      recordTurnOutcome(
+        sessionId,
+        data.status === "interrupted" ? "interrupted" : "completed",
+      );
       store.setBusy(sessionId, false);
       store.setTurnId(sessionId, null);
       pushSessionEvent(sessionId, "finished");
@@ -448,6 +490,7 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
     case "turn_failed": {
       finalizeStream(sessionId);
       warn(sessionId, `Turn failed: ${str(data.error) || "unknown error"}`);
+      recordTurnOutcome(sessionId, "failed");
       store.setBusy(sessionId, false);
       store.setTurnId(sessionId, null);
       pushSessionEvent(sessionId, "exited");
@@ -460,6 +503,7 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
     case "process_exited": {
       finalizeStream(sessionId);
       warn(sessionId, str(data.message) || "the session process exited");
+      recordTurnOutcome(sessionId, "exited");
       store.setBusy(sessionId, false);
       store.setTurnId(sessionId, null);
       break;
@@ -689,14 +733,16 @@ export async function resumeSession(sessionId: string): Promise<void> {
  * REJECTS — this is the orchestrator's delivery contract (`prompt_agent` /
  * `spawn_agents` tasks must never report `delivered:true` for a turn that
  * never started). Backend failures still surface as a warning item in the
- * transcript before rejecting, so the human sees them too.
+ * transcript before rejecting, so the human sees them too. Resolves with the
+ * acked turn id (the Phase-5 report expectations bind to it).
  */
 export async function sendMessageStrict(
   sessionId: string,
   text: string,
-): Promise<void> {
+  opts?: SendTurnOpts,
+): Promise<{ turnId: string | null }> {
   const trimmed = text.trim();
-  if (!trimmed) return;
+  if (!trimmed) return { turnId: null };
   const store = useVibe.getState();
   if (!store.sessions[sessionId])
     throw new Error(`unknown vibe session "${sessionId}"`);
@@ -709,7 +755,17 @@ export async function sendMessageStrict(
     kind: "user",
     text: trimmed,
   });
-  await deliverTurn(sessionId, trimmed);
+  return deliverTurn(sessionId, trimmed, opts);
+}
+
+/** Per-turn options of the strict send path. */
+export interface SendTurnOpts {
+  /**
+   * ONE-TURN-ONLY codex `outputSchema` — constrains the turn's FINAL
+   * assistant message to a JSON Schema (Phase 5: the structured
+   * agent→Conductor status reports).
+   */
+  outputSchema?: Record<string, unknown>;
 }
 
 /**
@@ -718,15 +774,20 @@ export async function sendMessageStrict(
  * backend, fire the turn. Rejects on every failure, after surfacing it as a
  * warning item.
  */
-async function deliverTurn(sessionId: string, trimmed: string): Promise<void> {
+async function deliverTurn(
+  sessionId: string,
+  trimmed: string,
+  opts?: SendTurnOpts,
+): Promise<{ turnId: string | null }> {
   const store = useVibe.getState();
   store.setBusy(sessionId, true);
   resetStream(sessionId);
   try {
     await resumeSession(sessionId);
-    await invokeSend(sessionId, trimmed);
+    const res = await invokeSend(sessionId, trimmed, opts?.outputSchema);
     // send returns after the turn/start ack — busy stays true until the turn
     // completion event clears it
+    return { turnId: res.turn_id ?? null };
   } catch (err) {
     useVibe.getState().setBusy(sessionId, false);
     warn(sessionId, `Send failed: ${errorText(err)}`);
@@ -776,22 +837,38 @@ export function waitForSessionIdle(
  * race never leaves a phantom "delivered-looking" item in the transcript.
  * Returns how the text was delivered. STRICT like sendMessageStrict.
  */
+/** Options of the steer path on top of the fresh-turn `SendTurnOpts`. */
+export interface SteerTurnOpts extends SendTurnOpts {
+  /**
+   * Text used ONLY when the delivery starts a FRESH turn (idle session /
+   * lost steer race) — e.g. the base prompt plus the report suffix. The
+   * plain `text` goes into an actual steer, where no report schema (and
+   * hence no report instruction) applies to the running turn.
+   */
+  freshTurnText?: string;
+}
+
 export async function steerMessageStrict(
   sessionId: string,
   text: string,
-): Promise<"steered" | "queued"> {
+  /** `outputSchema`/`freshTurnText` apply ONLY when the text starts a fresh
+   * turn (idle / lost steer race) — a steered running turn keeps its own
+   * output format */
+  opts?: SteerTurnOpts,
+): Promise<{ mode: "steered" | "queued"; turnId: string | null }> {
   const trimmed = text.trim();
-  if (!trimmed) return "queued";
+  if (!trimmed) return { mode: "queued", turnId: null };
+  const freshText = opts?.freshTurnText?.trim() || trimmed;
   const store = useVibe.getState();
   if (!store.sessions[sessionId])
     throw new Error(`unknown vibe session "${sessionId}"`);
   if (!store.busy[sessionId]) {
-    await sendMessageStrict(sessionId, trimmed);
-    return "queued";
+    const res = await sendMessageStrict(sessionId, freshText, opts);
+    return { mode: "queued", turnId: res.turnId };
   }
   ensureEvents();
   try {
-    await invokeSteer(sessionId, trimmed);
+    const res = await invokeSteer(sessionId, trimmed);
     // steered into the running turn — NOW mirror the text (confirmed)
     useVibe.getState().upsertItem(sessionId, {
       id: `user-${nanoid(8)}`,
@@ -799,7 +876,7 @@ export async function steerMessageStrict(
       kind: "user",
       text: trimmed,
     });
-    return "steered";
+    return { mode: "steered", turnId: res.turn_id ?? null };
   } catch (err) {
     const msg = errorText(err);
     if (msg.includes("steer-race:")) {
@@ -813,8 +890,8 @@ export async function steerMessageStrict(
           "steer lost the race and the session is busy again — re-send the prompt",
         );
       }
-      await sendMessageStrict(sessionId, trimmed);
-      return "queued";
+      const res = await sendMessageStrict(sessionId, freshText, opts);
+      return { mode: "queued", turnId: res.turnId };
     }
     warn(sessionId, `Steer failed: ${msg}`);
     throw err instanceof Error ? err : new Error(msg);
@@ -988,6 +1065,7 @@ export async function closeSession(sessionId: string): Promise<void> {
   mirrorUsageHistory(sessionId);
   resetStream(sessionId);
   streams.delete(sessionId);
+  lastTurnOutcomes.delete(sessionId);
   useVibe.getState().dropSession(sessionId);
 }
 

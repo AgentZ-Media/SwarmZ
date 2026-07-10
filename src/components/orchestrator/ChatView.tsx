@@ -236,6 +236,16 @@ function SystemRow({
         minute: "2-digit",
       })}
     >
+      {msg.autonomous && (
+        // Phase 5: autonomous-turn markers carry `autonomous` + the trigger
+        // kind — the interim chip; Phase 6 designs the real treatment
+        <span
+          title={`Autonomous turn (trigger: ${msg.trigger ?? "event"})`}
+          className="shrink-0 rounded border border-border bg-secondary/50 px-1.5 py-px font-mono text-[10px] text-muted-foreground"
+        >
+          ⚡ autonomous
+        </span>
+      )}
       {msg.paneRefs?.map((p) => <PaneChip key={p.id} pane={p} />)}
       {pane && (
         <button

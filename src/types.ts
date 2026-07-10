@@ -216,6 +216,13 @@ export interface AppSettings {
    * name/role/tone/principles reach the backend; emoji/accent are UI-only.
    */
   orchestratorPersona?: OrchestratorPersona;
+  /**
+   * Phase 5 auto-review: when a conductor-tasked agent finishes a lane that
+   * changed code, a detached codex review runs automatically BEFORE the
+   * Conductor's agent-finished turn — the findings ride into that turn, so
+   * the Conductor reports reviewed work. Off by default (reviews cost turns).
+   */
+  autoReviewFinishedLanes?: boolean;
 }
 
 /**
@@ -259,6 +266,18 @@ export interface QuickNotesData {
 
 // ---- Orchestrator chat ----
 
+/**
+ * What woke the Conductor for an autonomous turn (Phase 5 loop). Stamped on
+ * the turn's system marker message (`autonomous: true` + `trigger`) so the
+ * UI can render autonomous turns distinctly from user-triggered ones.
+ */
+export type AutonomousTriggerKind =
+  | "agent-finished"
+  | "agent-blocked"
+  | "approval"
+  | "timer"
+  | "idle";
+
 /** A session referenced by an orchestrator tool call — rendered as a jump chip. */
 export interface OrchestratorPaneRef {
   /** session id (chips hide themselves once the session is gone) */
@@ -296,6 +315,10 @@ export type OrchestratorChatMessage =
       text: string;
       /** the pinged session — jump chip + "Review" target */
       paneRefs?: OrchestratorPaneRef[];
+      /** true = this marker precedes an AUTONOMOUS Conductor turn (Phase 5) */
+      autonomous?: boolean;
+      /** what woke the Conductor — set together with `autonomous` */
+      trigger?: AutonomousTriggerKind;
     };
 
 /** A session this chat prompted (prompt_agent / spawn_agents startup task). */
@@ -534,6 +557,29 @@ export interface PersistedConductorTimers {
   /** shape version — bump when the persisted shape changes (missing = 1) */
   version?: number;
   timers: ConductorTimer[];
+}
+
+// ---- Autonomy budget (Phase 5) ----
+
+/**
+ * One project's persisted autonomy-budget state (lib/orchestrator/autonomy.ts).
+ * Persisted so an app relaunch/HMR can never mint a fresh autonomous-turn
+ * allowance or silently un-latch a tripped circuit breaker — only a real
+ * human message re-arms it.
+ */
+export interface PersistedAutonomyBudget {
+  /** autonomous-turn timestamps inside the rolling window */
+  firedAt: number[];
+  /** autonomous turns since the last human message */
+  consecutive: number;
+  /** breaker latched — survives restarts until a human message */
+  tripped: boolean;
+}
+
+/** Persisted shape of the autonomy budgets (store key `autonomyBudgets`). */
+export interface PersistedAutonomyBudgets {
+  version: 1;
+  projects: Record<string, PersistedAutonomyBudget>;
 }
 
 /** Per-turn token accounting (thread/tokenUsage/updated). */

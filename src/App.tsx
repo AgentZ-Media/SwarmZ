@@ -20,12 +20,14 @@ import { startOrchestratorBus } from "./lib/orchestrator/bus";
 import {
   deliverTimerTurn,
   notifyTimerNotice,
+  runAutonomousTurn,
   startVibeSessionActivityWatcher,
 } from "./lib/orchestrator/controller";
 import {
   registerTimerDelivery,
   registerTimerNotice,
 } from "./lib/orchestrator/timers";
+import { registerAutonomousRunner } from "./lib/orchestrator/triggers";
 import { vibeTriageEntries } from "./lib/vibe/triage";
 import { activateProjectByIndex, focusSession } from "./lib/vibe/controller";
 import { ensureNotifyPermission, notify } from "./lib/transport";
@@ -50,6 +52,10 @@ export default function App() {
     // notice sink makes expired/claim-dropped timers visible in the chat
     registerTimerDelivery(deliverTimerTurn);
     registerTimerNotice(notifyTimerNotice);
+    // the Phase-5 trigger router runs event-triggered autonomous turns
+    // (agent finished/blocked, approval escalation, idle) through the same
+    // budget-gated core — registered, not imported, to keep imports acyclic
+    registerAutonomousRunner(runAutonomousTurn);
     void hydrate();
     void ensureNotifyPermission().then((g) => (notifyGranted.current = g));
     const updates = useUpdates.getState();

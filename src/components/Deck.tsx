@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { History } from "lucide-react";
 import { useLimits } from "@/lib/limits";
 import { useFleetEvents, type FleetEvent } from "@/lib/events";
@@ -7,6 +13,11 @@ import { vibeTriageEntries } from "@/lib/vibe/triage";
 import { focusSession } from "@/lib/vibe/controller";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { useOrchestrator } from "@/lib/orchestrator/chat-store";
+import {
+  autonomyTripped,
+  subscribeAutonomy,
+} from "@/lib/orchestrator/autonomy";
+import { useProjects } from "@/lib/projects/store";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { Tip } from "./ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -395,9 +406,11 @@ function Meters() {
 // ---- 4. Orchestrator status dot ----
 
 /**
- * `orch` + dot: `--attn` when a chat has undelivered pings (a chat needs
- * attention), `--ring` while a turn runs, faint otherwise. Click activates
- * the Conductor stage (same routing as ⌘⇧O).
+ * `orch` + dot: `--destructive` when the ACTIVE project's autonomy circuit
+ * breaker is latched (autonomous turns paused until the human writes),
+ * `--attn` when a chat has undelivered pings (a chat needs attention),
+ * `--ring` while a turn runs, faint otherwise. Click activates the Conductor
+ * stage (same routing as ⌘⇧O).
  */
 function OrchestratorDot() {
   const running = useOrchestrator((s) =>
@@ -406,19 +419,29 @@ function OrchestratorDot() {
   const needsAttention = useOrchestrator((s) =>
     s.chats.some((c) => c.pendingPings.some((p) => !p.delivered)),
   );
+  const activeProjectId = useProjects((s) => s.activeProjectId);
+  // the breaker state lives outside any zustand store (autonomy.ts) — a
+  // primitive-boolean snapshot keeps the selector contract intact
+  const tripped = useSyncExternalStore(subscribeAutonomy, () =>
+    activeProjectId ? autonomyTripped(activeProjectId) : false,
+  );
   const stageMode = useVibeUi((s) => s.stageMode);
   const active = stageMode === "conductor";
 
-  const color = needsAttention
-    ? "var(--attn)"
-    : running
-      ? "var(--ring)"
-      : "var(--faint)";
-  const label = needsAttention
-    ? "Orchestrator — a chat needs attention"
-    : running
-      ? "Orchestrator — running"
-      : "Orchestrator — idle";
+  const color = tripped
+    ? "var(--destructive)"
+    : needsAttention
+      ? "var(--attn)"
+      : running
+        ? "var(--ring)"
+        : "var(--faint)";
+  const label = tripped
+    ? "Orchestrator — autonomy paused (budget exhausted; send a message to resume)"
+    : needsAttention
+      ? "Orchestrator — a chat needs attention"
+      : running
+        ? "Orchestrator — running"
+        : "Orchestrator — idle";
 
   return (
     <Tip label={`${label} (⌘⇧O)`}>

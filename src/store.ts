@@ -9,10 +9,12 @@ import { nanoid } from "nanoid";
 import {
   deleteStoreKeys,
   IS_TAURI,
+  loadAutonomyBudgets,
   loadQuickNotes,
   loadSchemaVersion,
   loadSettings,
   loadUsageHistory,
+  saveAutonomyBudgets,
   saveQuickNotes,
   saveSchemaVersion,
   saveSettings,
@@ -47,6 +49,11 @@ import {
   flushConductorTimersPersist,
   hydrateConductorTimers,
 } from "@/lib/orchestrator/timers";
+import {
+  hydrateAutonomyBudgets,
+  registerAutonomyPersist,
+  serializeAutonomyBudgets,
+} from "@/lib/orchestrator/autonomy";
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
@@ -63,6 +70,35 @@ function schedulePersistHistory() {
     void saveUsageHistory(entries);
   }, 1500);
 }
+
+// ---- autonomy-budget persistence (the pure module registers a dirty sink;
+// the actual load/save lives here next to the other slices) ----
+
+let persistAutonomyTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleAutonomyPersist() {
+  if (persistAutonomyTimer) return;
+  persistAutonomyTimer = setTimeout(() => {
+    persistAutonomyTimer = null;
+    void saveAutonomyBudgets(serializeAutonomyBudgets());
+  }, 300);
+}
+
+/** Write a pending autonomy-budget debounce NOW (flushAllPersists). */
+async function flushAutonomyPersist(): Promise<void> {
+  if (!persistAutonomyTimer) return;
+  clearTimeout(persistAutonomyTimer);
+  persistAutonomyTimer = null;
+  try {
+    await saveAutonomyBudgets(serializeAutonomyBudgets());
+  } catch {
+    /* never block quitting on a failed write */
+  }
+}
+
+// Registered at module init — every budget mutation (reserve/release/trip/
+// human re-arm) marks the slice dirty so a relaunch sees the same state.
+registerAutonomyPersist(scheduleAutonomyPersist);
 
 /**
  * Write every debounced slice NOW — quit must not lose any debounce window.
@@ -89,6 +125,8 @@ export async function flushAllPersists(): Promise<void> {
       flushProjectsPersist(),
       // the conductor timers keep their own debounced slice
       flushConductorTimersPersist(),
+      // the autonomy budgets keep their own debounced slice
+      flushAutonomyPersist(),
     ]);
   } catch {
     /* never block quitting on a failed write */
@@ -244,6 +282,17 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       }
     } catch {
       /* ignore */
+    }
+    try {
+      // autonomy budgets — FIRST, before the project hydration: every
+      // autonomous delivery path (trigger router eligibility, timer
+      // delivery) gates on the projects store being hydrated, so budgets
+      // restored here are guaranteed in place before any turn can pass the
+      // budget check. A relaunch must never mint a fresh allowance or
+      // un-latch a tripped breaker without a human message.
+      hydrateAutonomyBudgets(await loadAutonomyBudgets());
+    } catch {
+      /* unreadable = empty; the caps re-establish within one window */
     }
     // readiness for the chat→project migration: only when projects AND
     // sessions hydrated cleanly may the chat hydrator reassign/persist — a
