@@ -1,7 +1,7 @@
-// Orchestrator tool bus (Phase 2) + brain (Phase 3). Pieces:
+// Orchestrator tool bus + brain. Pieces:
 //   - registry.rs — the single-source tool catalog (names, descriptions,
-//     JSON-Schema parameters, timeouts) that the LLM providers receive
-//     (Codex app-server dynamicTools today, OpenRouter tools in Phase 6).
+//     JSON-Schema parameters, timeouts) handed to the Codex app-server as
+//     dynamicTools.
 //   - bus.rs — the Rust↔webview roundtrip: tools execute in the webview
 //     (that's where the store lives); Rust emits `orchestrator://tool-request`
 //     and awaits the `orchestrator_tool_response` command.
@@ -10,10 +10,6 @@
 //     strategy (a)), the registry declared as dynamicTools (adapter.rs),
 //     tool callbacks answered via `run_tool`, streaming
 //     `orchestrator://chat-event`s.
-//   - openrouter.rs — brain provider B (Phase 6): one streamed OpenRouter
-//     chat-completion call per loop iteration (the tool LOOP runs in the
-//     webview, src/lib/orchestrator/openrouter-loop.ts), emitting the same
-//     `delta` chat events + a per-chat stream cancel.
 //
 // `run_tool` is the internal API the brain calls; the
 // `orchestrator_run_tool` command (lib.rs) exposes the same surface to the
@@ -23,7 +19,6 @@ mod adapter;
 mod appserver;
 mod bus;
 mod memory;
-mod openrouter;
 mod persona;
 mod registry;
 
@@ -35,7 +30,6 @@ pub use memory::{
     append as memory_append, read_entries as memory_read, remove as memory_remove, AppendResult,
     MemoryEntry,
 };
-pub use openrouter::{cancel as openrouter_cancel, chat_completion as openrouter_chat_completion};
 pub use persona::{build_instructions, PersonaSpec};
 pub use registry::tool_definitions;
 

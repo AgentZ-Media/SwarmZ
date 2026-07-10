@@ -63,9 +63,6 @@ function ConductorCard() {
   );
   // active-chat model/effort/ctx (display-only — the picker lives in the stage
   // header). Primitive selectors, so a streaming delta never re-renders the rail.
-  const provider = useOrchestrator(
-    (s) => s.chats.find((c) => c.id === s.activeChatId)?.provider ?? "codex",
-  );
   const model = useOrchestrator(
     (s) => s.chats.find((c) => c.id === s.activeChatId)?.model,
   );
@@ -78,11 +75,7 @@ function ConductorCard() {
     const win = u?.modelContextWindow ?? 0;
     return win && total > 0 ? Math.round(Math.min(total / win, 1) * 100) : null;
   });
-  const modelLabel = model
-    ? prettyModel(model)
-    : provider === "codex"
-      ? "default model"
-      : "";
+  const modelLabel = model ? prettyModel(model) : "default model";
   const persona = useSwarm((s) => effectivePersona(s.settings.orchestratorPersona));
   return (
     <button
@@ -113,14 +106,12 @@ function ConductorCard() {
         {running ? "▸ working" : "the fleet conductor"}
       </div>
 
-      {(modelLabel || (provider === "codex" && effort) || ctxPct !== null) && (
+      {(modelLabel || effort || ctxPct !== null) && (
         <div className="mt-1 flex items-center gap-1.5 font-mono text-[9px] tabular-nums text-faint">
           {modelLabel && (
             <span className="min-w-0 truncate">{modelLabel}</span>
           )}
-          {provider === "codex" && effort && (
-            <span className="shrink-0">· {effort}</span>
-          )}
+          {effort && <span className="shrink-0">· {effort}</span>}
           {ctxPct !== null && (
             <span
               className={cn(

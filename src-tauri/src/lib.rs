@@ -1,99 +1,24 @@
 mod codex;
 mod codex_usage;
 mod git;
-mod limits;
-mod localstt;
-mod openrouter;
 mod orchestrator;
-mod project;
 mod projects;
-mod pty;
 mod storefile;
 mod transcript;
-mod usage;
 mod worktree;
 
-use notify::RecursiveMode;
-use notify_debouncer_mini::new_debouncer;
-use pty::{PtyManager, SharedPtyManager};
-use std::sync::Arc;
-use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, State};
-use usage::{SessionUsage, UsageTotals};
+use codex_usage::{SessionUsage, UsageTotals};
+use tauri::{AppHandle, Emitter, Manager};
 
-// pty_spawn/write/resize stay sync: they are fast (write is a channel send
-// into the per-session writer thread, never a blocking PTY write — see
-// pty.rs) and their main-thread serialization is what keeps spawn-before-
-// write and keystroke ordering guarantees. Only kill goes off-thread: it can
-// sleep ~250 ms in portable-pty's SIGHUP grace loop.
+// Usage commands run off the main thread: the per-file cache makes them
+// cheap in steady state, but the first call after launch parses the backlog
+// under ~/.codex/sessions.
 #[tauri::command]
-fn pty_spawn(
-    app: AppHandle,
-    state: State<'_, SharedPtyManager>,
-    id: String,
-    cwd: Option<String>,
-    startup: Option<String>,
-    cols: u16,
-    rows: u16,
-) -> Result<(), String> {
-    state.spawn(app, id, cwd, startup, cols, rows)
-}
-
-#[tauri::command]
-fn pty_write(state: State<'_, SharedPtyManager>, id: String, data: String) -> Result<(), String> {
-    state.write(&id, &data)
-}
-
-#[tauri::command]
-fn pty_resize(
-    state: State<'_, SharedPtyManager>,
-    id: String,
-    cols: u16,
-    rows: u16,
-) -> Result<(), String> {
-    state.resize(&id, cols, rows)
-}
-
-#[tauri::command]
-async fn pty_kill(state: State<'_, SharedPtyManager>, id: String) -> Result<(), String> {
-    let manager = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || manager.kill(&id))
+async fn usage_for_dir(cwd: String) -> Option<SessionUsage> {
+    tauri::async_runtime::spawn_blocking(move || codex_usage::usage_for_dir(&cwd))
         .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn pty_has_children(
-    state: State<'_, SharedPtyManager>,
-    id: String,
-) -> Result<bool, String> {
-    let manager = Arc::clone(state.inner());
-    // subprocess work (pgrep) — keep it off the async runtime's core threads
-    tauri::async_runtime::spawn_blocking(move || manager.has_children(&id))
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn project_commands(cwd: String) -> Vec<project::DetectedCommand> {
-    // file reads — keep them off the async runtime's core threads
-    tauri::async_runtime::spawn_blocking(move || project::detect(&cwd))
-        .await
-        .unwrap_or_default()
-}
-
-// Usage commands run off the main thread: the incremental cache makes them
-// cheap in steady state, but the *first* call after launch parses the whole
-// backlog under ~/.claude/projects — easily hundreds of MB for heavy users.
-#[tauri::command]
-async fn usage_for_dir(cwd: String, runtime: Option<String>) -> Option<SessionUsage> {
-    tauri::async_runtime::spawn_blocking(move || match runtime.as_deref() {
-        Some("codex") => codex_usage::usage_for_dir(&cwd),
-        _ => usage::usage_for_dir(&cwd),
-    })
-    .await
-    .ok()
-    .flatten()
+        .ok()
+        .flatten()
 }
 
 #[tauri::command]
@@ -102,21 +27,14 @@ async fn usage_for_session(
     since: f64,
     session: Option<String>,
     exclude: Option<Vec<String>>,
-    runtime: Option<String>,
 ) -> Option<SessionUsage> {
-    tauri::async_runtime::spawn_blocking(move || match runtime.as_deref() {
-        Some("codex") => codex_usage::usage_for_session(
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_usage::usage_for_session(
             &cwd,
             since as u64,
             session.as_deref(),
             exclude.as_deref().unwrap_or(&[]),
-        ),
-        _ => usage::usage_for_session(
-            &cwd,
-            since as u64,
-            session.as_deref(),
-            exclude.as_deref().unwrap_or(&[]),
-        ),
+        )
     })
     .await
     .ok()
@@ -125,40 +43,9 @@ async fn usage_for_session(
 
 #[tauri::command]
 async fn usage_totals() -> Result<UsageTotals, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let mut totals = usage::usage_totals();
-        let codex = codex_usage::usage_totals();
-        totals.runtime = None;
-        totals.total_cost_usd += codex.total_cost_usd;
-        totals.input_tokens += codex.input_tokens;
-        totals.output_tokens += codex.output_tokens;
-        totals.cache_creation_tokens += codex.cache_creation_tokens;
-        totals.cache_read_tokens += codex.cache_read_tokens;
-        totals.reasoning_output_tokens += codex.reasoning_output_tokens;
-        totals.message_count += codex.message_count;
-        totals.session_count += codex.session_count;
-        for cm in codex.by_model {
-            if let Some(existing) = totals.by_model.iter_mut().find(|m| m.model == cm.model) {
-                existing.input_tokens += cm.input_tokens;
-                existing.output_tokens += cm.output_tokens;
-                existing.cache_creation_tokens += cm.cache_creation_tokens;
-                existing.cache_read_tokens += cm.cache_read_tokens;
-                existing.reasoning_output_tokens += cm.reasoning_output_tokens;
-                existing.message_count += cm.message_count;
-                existing.cost_usd += cm.cost_usd;
-            } else {
-                totals.by_model.push(cm);
-            }
-        }
-        totals
-    })
+    tauri::async_runtime::spawn_blocking(codex_usage::usage_totals)
         .await
         .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn subscription_limits() -> Result<Option<limits::SubscriptionLimits>, String> {
-    limits::fetch_limits().await
 }
 
 /// Account-level Codex rate limits: the newest `rate_limits` event across all
@@ -172,89 +59,8 @@ async fn codex_account_limits() -> codex_usage::CodexAccountLimits {
         .unwrap_or_default()
 }
 
-#[tauri::command]
-async fn openrouter_key_status() -> openrouter::KeyStatus {
-    openrouter::key_status().await
-}
-
-#[tauri::command]
-async fn openrouter_set_key(key: String) -> Result<openrouter::KeyStatus, String> {
-    // subprocess work (security CLI) — keep it off the async runtime's core threads
-    tauri::async_runtime::spawn_blocking(move || openrouter::set_key(&key))
-        .await
-        .map_err(|e| e.to_string())??;
-    Ok(openrouter::key_status().await)
-}
-
-#[tauri::command]
-async fn openrouter_clear_key() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(openrouter::clear_key)
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn openrouter_models() -> Result<Vec<openrouter::ModelInfo>, String> {
-    openrouter::models().await
-}
-
-#[tauri::command]
-async fn openrouter_transcribe(
-    audio: String,
-    format: String,
-    model: String,
-    language: Option<String>,
-) -> Result<openrouter::TranscriptionResult, String> {
-    openrouter::transcribe(audio, format, model, language).await
-}
-
-#[tauri::command]
-async fn openrouter_cleanup(
-    text: String,
-    model: String,
-    prompt: String,
-) -> Result<String, String> {
-    openrouter::cleanup(text, model, prompt).await
-}
-
-#[tauri::command]
-fn local_stt_status() -> localstt::LocalSttStatus {
-    localstt::status()
-}
-
-#[tauri::command]
-async fn local_stt_download(app: AppHandle) -> Result<(), String> {
-    localstt::download(app).await
-}
-
-#[tauri::command]
-fn local_stt_cancel_download() {
-    localstt::cancel_download();
-}
-
-#[tauri::command]
-async fn local_stt_remove() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(localstt::remove)
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-fn local_stt_unload() {
-    localstt::unload();
-}
-
-#[tauri::command]
-async fn local_stt_transcribe(audio: String) -> Result<openrouter::TranscriptionResult, String> {
-    // model load + inference are seconds of CPU work — keep them off the
-    // async runtime's core threads
-    tauri::async_runtime::spawn_blocking(move || localstt::transcribe(&audio))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
 /// Does this absolute path point at an existing file? Powers the inline
-/// validation of the claude/git binary overrides in Settings — a typo there
+/// validation of the codex/git binary overrides in Settings — a typo there
 /// would otherwise silently degrade several features at once.
 #[tauri::command]
 async fn path_is_file(path: String) -> bool {
@@ -318,13 +124,11 @@ async fn worktree_list(
         .map_err(|e| e.to_string())
 }
 
-// ---- Orchestrator sensing (Phase 1) — read-only, see transcript.rs / projects.rs ----
+// ---- Orchestrator sensing — read-only, see transcript.rs / projects.rs ----
 
 #[tauri::command]
 async fn transcript_read(
-    cwd: String,
     session_id: String,
-    runtime: String,
     tail_messages: Option<usize>,
     max_bytes: Option<u64>,
     include_first_user_message: Option<bool>,
@@ -338,7 +142,7 @@ async fn transcript_read(
             include_first_user_message: include_first_user_message
                 .unwrap_or(defaults.include_first_user_message),
         };
-        transcript::read(&cwd, &session_id, &runtime, &opts)
+        transcript::read(&session_id, &opts)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -362,14 +166,13 @@ async fn discover_projects(
         .map_err(|e| e.to_string())
 }
 
-// ---- Orchestrator tool bus (Phase 2) — see orchestrator/ ----
+// ---- Orchestrator tool bus — see orchestrator/ ----
 
 /// The tool catalog + the orchestrator system instructions, both single-
-/// source in Rust. Phase 3 hands the tools to Codex `dynamicTools` (and the
-/// instructions as `developerInstructions`); the Phase-6 OpenRouter loop
-/// fetches BOTH through this command for its wire messages. `persona` is the
-/// current Settings persona (None = the Maestro seed); memory is read fresh
-/// so both provider paths compile the SAME instructions from one source.
+/// source in Rust. The catalog is handed to Codex as `dynamicTools` (and the
+/// instructions as `developerInstructions`). `persona` is the current
+/// Settings persona (None = the Maestro seed); memory is read fresh so every
+/// consumer compiles the SAME instructions from one source.
 #[tauri::command]
 async fn orchestrator_tools(
     app: AppHandle,
@@ -457,7 +260,7 @@ async fn orchestrator_run_tool(
     tool: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    // dev-hook surface — no chat context (executors skip touched-pane tracking)
+    // dev-hook surface — no chat context (executors skip touched-session tracking)
     orchestrator::run_tool(&app, &tool, args, None).await
 }
 
@@ -469,7 +272,7 @@ fn orchestrator_tool_response(id: String, ok: bool, payload: serde_json::Value) 
     orchestrator::resolve_tool_response(&id, ok, payload);
 }
 
-// ---- Orchestrator brain (Phase 3) — see orchestrator/appserver.rs ----
+// ---- Orchestrator brain — see orchestrator/appserver.rs ----
 //
 // All async: they await JSON-RPC roundtrips against the long-lived
 // `codex app-server` child (spawned lazily; tokio::process — no blocking
@@ -532,41 +335,15 @@ async fn codex_list_models(app: AppHandle) -> Result<Vec<String>, String> {
     orchestrator::list_models(&app).await
 }
 
-// ---- Orchestrator brain, provider B (Phase 6) — see orchestrator/openrouter.rs ----
-
-/// One streamed OpenRouter chat-completion call for the webview tool loop.
-/// Content tokens emit as `orchestrator://chat-event` deltas under `chat_id`
-/// (the STORE chat id); resolves with the assembled assistant message
-/// `{ content, tool_calls, finish_reason }`. The key stays in the keychain —
-/// it never reaches JS.
-#[tauri::command]
-async fn openrouter_chat_completion(
-    app: AppHandle,
-    chat_id: String,
-    model: String,
-    messages: serde_json::Value,
-    tools: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    orchestrator::openrouter_chat_completion(&app, chat_id, model, messages, tools).await
-}
-
-/// Cancel the chat's in-flight OpenRouter stream (the completion resolves
-/// with `finish_reason: "cancelled"`, keeping the partial content). Sync on
-/// purpose: it only flips an atomic flag.
-#[tauri::command]
-fn openrouter_chat_cancel(chat_id: String) {
-    orchestrator::openrouter_cancel(&chat_id);
-}
-
-// ---- Vibe-Mode native Codex sessions (Phase 2) — see codex/sessions.rs ----
+// ---- Native Codex sessions — see codex/sessions.rs ----
 //
 // All async: they await JSON-RPC roundtrips against a PRIVATE `codex
-// app-server` child per session (strategy b — crash isolation). Progress
-// streams as `vibe://session-event` `{session_id, kind, data}`. `session_id`
-// is assigned by the frontend (it keys the store's VibeSession); `codex_path`
+// app-server` child per session (crash isolation). Progress streams as
+// `vibe://session-event` `{session_id, kind, data}`. `session_id` is
+// assigned by the frontend (it keys the store's VibeSession); `codex_path`
 // is the Settings codex-binary override, passed on the start/resume calls.
 
-/// Start a fresh Vibe session (dedicated process + thread/start). `access`
+/// Start a fresh session (dedicated process + thread/start). `access`
 /// ∈ workspace | full maps to the sandbox/approval policy. Returns `{thread_id}`.
 #[tauri::command]
 async fn vibe_session_start(
@@ -658,77 +435,8 @@ async fn vibe_session_close(session_id: String) -> Result<(), String> {
     codex::sessions::session_close(&session_id).await
 }
 
-fn start_usage_watcher(app: AppHandle) {
-    let claude_dir = usage::claude_projects_dir().filter(|d| d.exists());
-    let codex_dir = dirs::home_dir()
-        .map(|h| h.join(".codex").join("sessions"))
-        .filter(|d| d.exists());
-    let mut roots = Vec::new();
-    if let Some(d) = claude_dir.clone() {
-        roots.push(d);
-    }
-    if let Some(d) = codex_dir {
-        roots.push(d);
-    }
-    if roots.is_empty() {
-        return;
-    }
-    std::thread::spawn(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut debouncer = match new_debouncer(Duration::from_millis(600), tx) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        for root in &roots {
-            let _ = debouncer.watcher().watch(root, RecursiveMode::Recursive);
-        }
-        // keep the debouncer alive for the lifetime of this thread.
-        // Emit the *project dir names* that changed so the frontend can skip
-        // refreshes for sessions it isn't displaying (an empty list means
-        // "unknown / everything", e.g. after a pricing refresh).
-        for res in rx {
-            if let Ok(events) = res {
-                let mut dirs: Vec<String> = events
-                    .iter()
-                    .filter_map(|e| {
-                        let dir = claude_dir.as_ref()?;
-                        e.path
-                            .strip_prefix(dir)
-                            .ok()?
-                            .components()
-                            .next()
-                            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    })
-                    .collect();
-                dirs.sort();
-                dirs.dedup();
-                let _ = app.emit("usage://changed", dirs);
-            }
-        }
-        drop(debouncer);
-    });
-}
-
-/// Pull live model pricing once per run; retry while offline, refresh daily.
-fn start_pricing_refresher(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        loop {
-            let delay = if usage::refresh_pricing().await {
-                // empty list = "everything changed" (all costs were repriced)
-                let _ = app.emit("usage://changed", Vec::<String>::new());
-                std::time::Duration::from_secs(24 * 60 * 60)
-            } else {
-                std::time::Duration::from_secs(5 * 60)
-            };
-            tokio::time::sleep(delay).await;
-        }
-    });
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let manager: SharedPtyManager = Arc::new(PtyManager::new());
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -738,33 +446,18 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         // remember window size/position/maximized across restarts
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .manage(manager.clone())
         .setup(move |app| {
             // before the webview can touch the store: rescue a corrupt
             // swarmz.json / refresh its backup (see storefile.rs)
             if let Ok(dir) = app.path().app_data_dir() {
                 storefile::rescue(&dir);
             }
-            start_usage_watcher(app.handle().clone());
-            start_pricing_refresher(app.handle().clone());
             Ok(())
         })
-        .on_window_event(move |_window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                manager.kill_all();
-            }
-        })
         .invoke_handler(tauri::generate_handler![
-            pty_spawn,
-            pty_write,
-            pty_resize,
-            pty_kill,
-            pty_has_children,
-            project_commands,
             usage_for_dir,
             usage_for_session,
             usage_totals,
-            subscription_limits,
             codex_account_limits,
             path_is_file,
             git_info,
@@ -787,8 +480,6 @@ pub fn run() {
             orchestrator_chat_resume,
             orchestrator_chat_status,
             codex_list_models,
-            openrouter_chat_completion,
-            openrouter_chat_cancel,
             vibe_session_start,
             vibe_session_resume,
             vibe_session_send,
@@ -797,24 +488,12 @@ pub fn run() {
             vibe_session_set_access,
             vibe_session_set_model_effort,
             vibe_session_close,
-            openrouter_key_status,
-            openrouter_set_key,
-            openrouter_clear_key,
-            openrouter_models,
-            openrouter_transcribe,
-            openrouter_cleanup,
-            local_stt_status,
-            local_stt_download,
-            local_stt_cancel_download,
-            local_stt_remove,
-            local_stt_unload,
-            local_stt_transcribe,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|app, event| {
             // ⌘Q / menu quit (code Some(0)): hand the decision to the frontend,
-            // which warns when agents are still working and closes the window
+            // which warns when sessions are still working and closes the window
             // on confirm (→ ExitRequested with code None, which passes here).
             // prevent_exit() is a built-in no-op for the updater's restart
             // (RESTART_EXIT_CODE), so updates keep working.

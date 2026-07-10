@@ -1,9 +1,9 @@
-// Orchestrator sensing commands (Phase 1) — native-only direct `invoke`
-// wrappers, same pattern as lib/worktree.ts. All read-only.
+// Orchestrator sensing commands — native-only direct `invoke` wrappers, same
+// pattern as lib/worktree.ts. All read-only.
 
 import { invoke } from "@tauri-apps/api/core";
 import { useSwarm, type SwarmState } from "@/store";
-import type { AgentRuntime, PresetLayoutNode } from "@/types";
+import { useVibe } from "@/lib/vibe/session-store";
 import type {
   KnownFolder,
   ProjectDocs,
@@ -12,14 +12,13 @@ import type {
 } from "./types";
 
 /**
- * Read the readable tail of an agent session (user/assistant text, tool
- * one-liners, compaction summaries, the first user prompt). The backend
- * seek-tails huge files — safe to call against any session size.
+ * Read the readable tail of a codex session file on disk (user/assistant
+ * text, tool one-liners). The backend seek-tails huge files — safe to call
+ * against any session size. (The orchestrator's read_transcript tool renders
+ * live sessions from the store instead — this reads rollout files.)
  */
 export function readTranscript(args: {
-  cwd: string;
   sessionId: string;
-  runtime: AgentRuntime | string;
   /** return the LAST n messages (default 20) */
   tailMessages?: number;
   /** hard cap on bytes read from the file end (default 1 MiB) */
@@ -28,9 +27,7 @@ export function readTranscript(args: {
   includeFirstUserMessage?: boolean;
 }): Promise<TranscriptView> {
   return invoke<TranscriptView>("transcript_read", {
-    cwd: args.cwd,
     sessionId: args.sessionId,
-    runtime: args.runtime,
     tailMessages: args.tailMessages,
     maxBytes: args.maxBytes,
     includeFirstUserMessage: args.includeFirstUserMessage,
@@ -43,15 +40,6 @@ export function readTranscript(args: {
  */
 export function projectDocs(root: string): Promise<ProjectDocs> {
   return invoke<ProjectDocs>("project_docs", { root });
-}
-
-/** Every preset pane cwd in a preset layout tree. */
-function presetCwds(node: PresetLayoutNode, out: string[]): void {
-  if (node.type === "pane") {
-    if (node.cwd) out.push(node.cwd);
-    return;
-  }
-  for (const child of node.children) presetCwds(child, out);
 }
 
 /**
@@ -67,14 +55,10 @@ export function collectKnownFolders(state: SwarmState): KnownFolder[] {
     seen.add(p);
     known.push({ path: p, source });
   };
-  for (const id of state.workspaceOrder)
-    add(state.workspaces[id]?.defaultCwd, "workspace");
-  for (const profile of state.profiles) add(profile.defaultCwd, "profile");
-  for (const preset of state.workspacePresets) {
-    const cwds: string[] = [];
-    presetCwds(preset.layout, cwds);
-    for (const cwd of cwds) add(cwd, "preset");
-  }
+  // live session project dirs
+  const vibe = useVibe.getState();
+  for (const id of vibe.order)
+    add(vibe.sessions[id]?.session.projectDir, "session");
   for (const folder of Object.keys(state.quickNotes.folders))
     add(folder, "notes");
   for (const root of state.settings.worktreeRepos ?? [])
@@ -84,9 +68,9 @@ export function collectKnownFolders(state: SwarmState): KnownFolder[] {
 }
 
 /**
- * Discover project folders: Claude/Codex session history + the app's known
- * folders (collected from the live store) + an optional shallow scan of
- * `scanRoots` for git repos. Sorted by last activity, most recent first.
+ * Discover project folders: Codex session history + the app's known folders
+ * (collected from the live stores) + an optional shallow scan of `scanRoots`
+ * for git repos. Sorted by last activity, most recent first.
  */
 export function discoverProjects(
   scanRoots: string[] = [],

@@ -1,7 +1,6 @@
 @import "tailwindcss";
 @import "@fontsource-variable/inter";
 @import "@fontsource-variable/jetbrains-mono";
-@import "@xterm/xterm/css/xterm.css";
 /* Vibe-Mode diff rendering — structure + a bundled hljs token theme, scoped to
    the lib's own `.diff-tailwindcss-wrapper`. Its block colours are re-themed to
    the SwarmZ tokens further down (see "Vibe diff view"). */
@@ -181,26 +180,6 @@ body {
 .focus-ring:focus-visible {
   outline: none;
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--ring) 40%, transparent);
-}
-
-/* xterm tweaks */
-.xterm {
-  padding: 10px 12px;
-  height: 100%;
-}
-.xterm-viewport {
-  background-color: transparent !important;
-}
-.xterm-viewport::-webkit-scrollbar {
-  width: 8px;
-}
-/* xterm 6's scrollbar toggles a bare `visible` class on its scrollbar node —
-   Tailwind's `.visible` utility (generated for WorkspaceLayer) turns that into
-   `visibility: visible`, which punches through the `invisible` wrapper of
-   inactive workspaces: hidden terminals' scrollbar thumbs float over the
-   active grid. Pin it to the ancestor; xterm fades via opacity anyway. */
-.xterm .xterm-scrollable-element > .visible {
-  visibility: inherit;
 }
 
 /* busy is quiet: a barely-there hairline sweeping under a working pane's

@@ -1,6 +1,6 @@
-import { Loader2, Terminal } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { useSwarm } from "@/store";
-import { agentIsBusy, resolveQuitConfirm } from "@/lib/quit";
+import { resolveQuitConfirm } from "@/lib/quit";
 import { useVibe } from "@/lib/vibe/session-store";
 import { Button } from "./ui/button";
 import {
@@ -13,29 +13,19 @@ import {
 
 /**
  * Raised when the app is about to close while quitting would lose something:
- * An agent still working in one or more panes (the run gets interrupted), or —
- * with restore-on-launch disabled — terminals that are simply still open.
+ * one or more sessions with a turn still running (the run gets interrupted).
  */
 export function QuitConfirmDialog() {
   const quitConfirm = useSwarm((s) => s.quitConfirm);
-  const agents = useSwarm((s) => s.agents);
-  const floats = useSwarm((s) => s.floatingTerminals);
   const vibeSessions = useVibe((s) => s.sessions);
 
-  // blocker ids are agent panes, floating terminals (floats block when a
-  // process still runs in them — never restored) or busy Vibe sessions
   const listed = (quitConfirm ?? [])
     .map((id) => {
-      const a = agents[id];
-      if (a) return { id, name: a.name, cwd: a.cwd, busy: agentIsBusy(a) };
-      const f = floats[id];
-      if (f) return { id, name: f.name, cwd: f.cwd, busy: true };
       const v = vibeSessions[id]?.session;
-      if (v) return { id, name: v.name, cwd: v.projectDir, busy: true };
+      if (v) return { id, name: v.name, cwd: v.projectDir };
       return null;
     })
     .filter((e): e is NonNullable<typeof e> => !!e);
-  const busyCount = listed.filter((e) => e.busy).length;
 
   return (
     <Dialog
@@ -48,13 +38,9 @@ export function QuitConfirmDialog() {
         <DialogHeader>
           <DialogTitle>Quit SwarmZ?</DialogTitle>
           <DialogDescription>
-            {busyCount > 0
-              ? busyCount === 1
-                ? "An agent is still working — quitting will interrupt it."
-                : `${busyCount} agents are still working — quitting will interrupt them.`
-              : listed.length === 1
-                ? "A terminal is still open — it won't be restored on the next launch."
-                : `${listed.length} terminals are still open — they won't be restored on the next launch.`}
+            {listed.length === 1
+              ? "A session is still working — quitting will interrupt it."
+              : `${listed.length} sessions are still working — quitting will interrupt them.`}
           </DialogDescription>
         </DialogHeader>
 
@@ -64,19 +50,10 @@ export function QuitConfirmDialog() {
               key={a.id}
               className="flex items-center gap-2 rounded-md border border-border bg-secondary/40 px-2 py-1.5 font-mono text-[11px] text-foreground"
             >
-              {a.busy ? (
-                <Loader2
-                  size={12}
-                  className="shrink-0 animate-spin text-warning"
-                />
-              ) : (
-                <Terminal size={12} className="shrink-0 text-muted-foreground" />
-              )}
+              <Loader2 size={12} className="shrink-0 animate-spin text-warning" />
               <span className="truncate">{a.name}</span>
               {a.cwd && (
-                <span className="ml-auto truncate pl-2 text-faint">
-                  {a.cwd}
-                </span>
+                <span className="ml-auto truncate pl-2 text-faint">{a.cwd}</span>
               )}
             </li>
           ))}

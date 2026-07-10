@@ -15,8 +15,6 @@ import type {
   OrchestratorPaneRef,
   OrchestratorPingRecord,
   OrchestratorTouchedPane,
-  OrchestratorWireMessage,
-  OrchestratorWireToolCall,
   PersistedOrchestratorChats,
   VibeTokenUsage,
 } from "@/types";
@@ -30,16 +28,6 @@ export const MAX_CHAT_MESSAGES = 200;
 export const MAX_CHATS = 30;
 /** Per-chat ping cap (delivered + undelivered) — oldest drop first. */
 export const MAX_PENDING_PINGS = 20;
-/**
- * OpenRouter wire-history cap (Phase 6) — oldest wire messages drop first.
- * A capped history simply loses old context, like any long chat; the model
- * never sees a `tool` result whose assistant call was cut (leading orphans
- * are trimmed after the cap).
- */
-export const MAX_WIRE_MESSAGES = 60;
-export const PANEL_DEFAULT_WIDTH = 380;
-export const PANEL_MIN_WIDTH = 300;
-export const PANEL_MAX_WIDTH = 640;
 export const DEFAULT_CHAT_TITLE = "New chat";
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
@@ -60,22 +48,6 @@ export interface OrchestratorMessagePatch {
   paneRefs?: OrchestratorPaneRef[];
 }
 
-function clampWidth(width: number): number {
-  return Math.min(PANEL_MAX_WIDTH, Math.max(PANEL_MIN_WIDTH, Math.round(width)));
-}
-
-/**
- * Apply the wire-history cap: newest MAX_WIRE_MESSAGES, then drop leading
- * `tool` results — a tool message without its preceding assistant tool_calls
- * message is invalid OpenAI wire history.
- */
-function capWire(wire: OrchestratorWireMessage[]): OrchestratorWireMessage[] {
-  const capped = wire.slice(-MAX_WIRE_MESSAGES);
-  let start = 0;
-  while (start < capped.length && capped[start].role === "tool") start++;
-  return start > 0 ? capped.slice(start) : capped;
-}
-
 // Chats stream store patches every ~80 ms — batch the (whole-file) disk
 // writes a bit wider than the grid snapshot's debounce.
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -86,8 +58,6 @@ function snapshot(): PersistedOrchestratorChats {
     version: 1,
     chats: s.chats,
     activeId: s.activeChatId,
-    panelOpen: s.panelOpen,
-    panelWidth: s.panelWidth,
   };
 }
 
@@ -116,10 +86,6 @@ export interface OrchestratorState {
   /** all chats, newest first */
   chats: OrchestratorChat[];
   activeChatId: string | null;
-  /** the right sidebar (⌘⇧O) — persisted */
-  panelOpen: boolean;
-  /** panel width in px, clamped 300–640 — persisted */
-  panelWidth: number;
   /** chats with a turn in flight — set by the controller (in-memory) */
   busy: Record<string, boolean>;
   /** latest per-chat token accounting (in-memory, never persisted) — codex
@@ -128,21 +94,14 @@ export interface OrchestratorState {
   /** codex app-server availability, checked on first panel open (in-memory) */
   status: OrchestratorChatStatus | null;
 
-  setPanelOpen: (open: boolean) => void;
-  togglePanel: () => void;
-  setPanelWidth: (width: number) => void;
   /**
-   * Create a chat (reusing an existing empty one) and activate it. Provider
-   * + model are stamped here and stay fixed for the chat's lifetime; a
-   * reused EMPTY chat is re-stamped with the current values (it has no
-   * history yet, so it must follow the current setting). Callers go through
-   * controller.ts `createChat()`, which reads the settings.
+   * Create a chat (reusing an existing empty one) and activate it. Model +
+   * effort are stamped here as the chat's initial override; a reused EMPTY
+   * chat is re-stamped with the current values (it has no history yet, so it
+   * must follow the current setting). Callers go through controller.ts
+   * `createChat()`, which reads the settings.
    */
-  newChat: (
-    provider?: "codex" | "openrouter",
-    model?: string,
-    effort?: string,
-  ) => string;
+  newChat: (model?: string, effort?: string) => string;
   /**
    * Remove a chat from SwarmZ. The codex thread rollout stays on disk —
    * deliberate; it just never gets resumed again.
@@ -151,9 +110,8 @@ export interface OrchestratorState {
   setActiveChat: (id: string) => void;
   setStatus: (status: OrchestratorChatStatus | null) => void;
   /**
-   * Override this chat's model / reasoning effort (persisted). A codex chat
-   * carries them into its next turn/start; an OpenRouter chat only uses
-   * `model` (effort is ignored there). `undefined` clears back to the default.
+   * Override this chat's model / reasoning effort (persisted) — carried into
+   * its next turn/start. `undefined` clears back to the default.
    */
   setChatModelEffort: (
     chatId: string,
@@ -174,15 +132,8 @@ export interface OrchestratorState {
     patch: OrchestratorMessagePatch,
   ) => void;
 
-  // Phase-6 OpenRouter wire history
-  /** append wire messages (applies the cap; persisted with the chat) */
-  appendWireMessages: (
-    chatId: string,
-    messages: OrchestratorWireMessage[],
-  ) => void;
-
-  // Phase-5 status pings
-  /** remember that this chat prompted a pane (prompt_pane / startup prompt) */
+  // status pings
+  /** remember that this chat prompted a session (prompt_pane / create_panes) */
   recordTouchedPane: (chatId: string, paneId: string, name: string) => void;
   /** record an undelivered ping (cap MAX_PENDING_PINGS, oldest dropped) */
   addPendingPing: (
@@ -196,44 +147,26 @@ export interface OrchestratorState {
 export const useOrchestrator = create<OrchestratorState>((set, get) => ({
   chats: [],
   activeChatId: null,
-  panelOpen: false,
-  panelWidth: PANEL_DEFAULT_WIDTH,
   busy: {},
   tokenUsage: {},
   status: null,
 
-  setPanelOpen: (open) => {
-    if (get().panelOpen === open) return;
-    set({ panelOpen: open });
-    schedulePersist();
-  },
-  togglePanel: () => get().setPanelOpen(!get().panelOpen),
-  setPanelWidth: (width) => {
-    const clamped = clampWidth(width);
-    if (get().panelWidth === clamped) return;
-    set({ panelWidth: clamped });
-    schedulePersist();
-  },
-
-  newChat: (provider = "codex", model, effort) => {
+  newChat: (model, effort) => {
     const s = get();
     // don't stack empties — the + button reuses an untouched chat. "Untouched"
     // means no user/assistant turn (system pings + warnings don't count, or a
     // restart would stack a new chat behind that noise). A reusable-empty chat
-    // has no backend thread yet, so re-stamping provider/model/effort to the
-    // CURRENT setting is safe (and what the user expects after switching it).
+    // has no backend thread yet, so re-stamping model/effort to the CURRENT
+    // setting is safe (and what the user expects after switching it).
     const empty = s.chats.find((c) => isReusableEmptyChat(c));
     if (empty) {
-      const stamp =
-        (empty.provider ?? "codex") !== provider ||
-        empty.model !== model ||
-        empty.effort !== effort;
+      const stamp = empty.model !== model || empty.effort !== effort;
       if (s.activeChatId !== empty.id || stamp) {
         set({
           activeChatId: empty.id,
           chats: stamp
             ? s.chats.map((c) =>
-                c.id === empty.id ? { ...c, provider, model, effort } : c,
+                c.id === empty.id ? { ...c, model, effort } : c,
               )
             : s.chats,
         });
@@ -243,7 +176,6 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
     }
     const chat: OrchestratorChat = {
       id: nanoid(8),
-      provider,
       threadId: null,
       ...(model !== undefined ? { model } : {}),
       ...(effort !== undefined ? { effort } : {}),
@@ -369,18 +301,6 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
             }
           : c,
       ),
-    });
-    schedulePersist();
-  },
-
-  appendWireMessages: (chatId, messages) => {
-    if (!messages.length) return;
-    const s = get();
-    const chat = s.chats.find((c) => c.id === chatId);
-    if (!chat) return; // chat deleted mid-turn — late appends are a no-op
-    const wire = capWire([...(chat.wire ?? []), ...messages]);
-    set({
-      chats: s.chats.map((c) => (c.id === chatId ? { ...c, wire } : c)),
     });
     schedulePersist();
   },
@@ -515,56 +435,6 @@ function sanitizeTouchedPanes(
   return out;
 }
 
-function sanitizeWireToolCalls(raw: unknown): OrchestratorWireToolCall[] {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter((c): c is OrchestratorWireToolCall => {
-    const t = c as OrchestratorWireToolCall | null;
-    return (
-      !!t &&
-      typeof t.id === "string" &&
-      typeof t.name === "string" &&
-      typeof t.arguments_json === "string"
-    );
-  });
-}
-
-/** Persisted OpenRouter wire history, entry by entry (malformed dropped). */
-function sanitizeWire(raw: unknown): OrchestratorWireMessage[] {
-  if (!Array.isArray(raw)) return [];
-  const out: OrchestratorWireMessage[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== "object") continue;
-    const m = entry as Record<string, unknown>;
-    switch (m.role) {
-      case "user":
-        if (typeof m.content === "string")
-          out.push({ role: "user", content: m.content });
-        break;
-      case "assistant": {
-        const content = typeof m.content === "string" ? m.content : null;
-        const toolCalls = sanitizeWireToolCalls(m.tool_calls);
-        out.push({
-          role: "assistant",
-          content,
-          ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
-        });
-        break;
-      }
-      case "tool":
-        if (typeof m.tool_call_id === "string" && typeof m.content === "string")
-          out.push({
-            role: "tool",
-            tool_call_id: m.tool_call_id,
-            content: m.content,
-          });
-        break;
-      default:
-        break; // system messages are never persisted; unknown roles drop
-    }
-  }
-  return capWire(out);
-}
-
 /** Persisted ping records, entry by entry (malformed entries dropped). */
 function sanitizePings(raw: unknown): OrchestratorPingRecord[] {
   if (!Array.isArray(raw)) return [];
@@ -609,20 +479,21 @@ export async function hydrateOrchestratorChats(): Promise<void> {
         .map(sanitizeMessage)
         .filter((m): m is OrchestratorChatMessage => m !== null)
         .slice(-MAX_CHAT_MESSAGES);
-      const wire = sanitizeWire(raw.wire);
+      // pre-rebuild chats may carry `provider`/`wire` (OpenRouter era) — both
+      // are dropped tolerantly here; codex is the only brain now. An old
+      // OpenRouter chat keeps its visible history but its `model` stamp is
+      // cleared (it named an OpenRouter model id, not a codex one).
+      const wasOpenRouter =
+        (raw as { provider?: unknown }).provider === "openrouter";
       chats.push({
         id: raw.id,
-        ...(raw.provider === "codex" || raw.provider === "openrouter"
-          ? { provider: raw.provider }
-          : {}),
         threadId: typeof raw.threadId === "string" ? raw.threadId : null,
-        ...(typeof raw.model === "string" && raw.model
+        ...(typeof raw.model === "string" && raw.model && !wasOpenRouter
           ? { model: raw.model }
           : {}),
         ...(typeof raw.effort === "string" && raw.effort
           ? { effort: raw.effort }
           : {}),
-        ...(wire.length ? { wire } : {}),
         title:
           typeof raw.title === "string" && raw.title.trim()
             ? raw.title
@@ -653,14 +524,11 @@ export async function hydrateOrchestratorChats(): Promise<void> {
   // fold multiple reusable-empty chats (the reload race + old-bug pollution)
   // into one before it hits the store — "at most one empty chat" invariant
   const collapsed = collapseEmptyChats(merged, mergedActive);
+  // pre-rebuild persists may carry panelOpen/panelWidth (the removed ⌘⇧O
+  // side panel) — ignored tolerantly
   useOrchestrator.setState({
     chats: collapsed.chats,
     activeChatId: collapsed.activeId,
-    panelOpen:
-      typeof data.panelOpen === "boolean" ? data.panelOpen : state.panelOpen,
-    panelWidth: clampWidth(
-      typeof data.panelWidth === "number" ? data.panelWidth : state.panelWidth,
-    ),
   });
   // persist the cleaned list so the on-disk pollution heals immediately (not
   // only after the next interaction)

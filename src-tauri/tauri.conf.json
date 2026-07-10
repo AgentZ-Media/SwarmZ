@@ -40,8 +40,8 @@
       "icons/icon.ico"
     ],
     "category": "DeveloperTool",
-    "shortDescription": "Run, tile and monitor a swarm of Claude Code agents.",
-    "longDescription": "SwarmZ — run, tile and monitor parallel Claude Code agents in real terminals, with live token and cost tracking. 100% local.",
+    "shortDescription": "Run and monitor a swarm of native Codex agents.",
+    "longDescription": "SwarmZ — run and monitor parallel native Codex agents (codex app-server sessions) with structured transcripts, diffs and approvals. App state stays local; model traffic goes to OpenAI via the Codex CLI.",
     "createUpdaterArtifacts": true
   },
   "plugins": {

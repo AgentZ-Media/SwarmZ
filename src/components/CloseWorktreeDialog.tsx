@@ -10,18 +10,16 @@ import {
 } from "./ui/dialog";
 
 /**
- * Raised when a worktree pane is closed while the worktree still holds work
- * (uncommitted changes or commits no other branch has): keep the worktree on
- * disk (it stays reachable in the title-bar worktree panel), or delete the
- * folder and its branch for good. Clean worktrees never get here — they are
- * removed silently with the pane.
+ * Raised (via `requestCloseWorktree`) when a worktree is being finished while
+ * it still holds work (uncommitted changes or commits no other branch has):
+ * keep the worktree on disk (it stays reachable in the title-bar worktree
+ * panel), or delete the folder and its branch for good. Clean worktrees never
+ * get here — they are removed silently. Dormant in the Phase-1 interim state;
+ * Phase 4 wires session-worktree close into this flow.
  */
 export function CloseWorktreeDialog() {
   const confirm = useSwarm((s) => s.closeWorktreeConfirm);
   const resolve = useSwarm((s) => s.resolveCloseWorktree);
-  const agent = useSwarm((s) =>
-    s.closeWorktreeConfirm ? s.agents[s.closeWorktreeConfirm.agentId] : undefined,
-  );
 
   const status = confirm?.status;
   const reasons: string[] = [];
@@ -40,16 +38,16 @@ export function CloseWorktreeDialog() {
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Close {agent?.name ?? "agent"}?</DialogTitle>
+          <DialogTitle>Remove worktree?</DialogTitle>
           <DialogDescription>
-            This pane works in a git worktree that still holds {reasons.join(" and ")}.
+            This git worktree still holds {reasons.join(" and ")}.
           </DialogDescription>
         </DialogHeader>
 
         <div className="mb-4 flex items-center gap-2 rounded-md border border-border bg-secondary/40 px-2 py-1.5 font-mono text-[11px] text-foreground">
           <FolderGit2 size={12} className="shrink-0 text-faint" />
           <span className="truncate">
-            {status?.branch ?? agent?.worktree?.branch}
+            {status?.branch ?? confirm?.meta.branch}
           </span>
         </div>
 

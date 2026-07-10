@@ -1,7 +1,6 @@
-// Payload types of the orchestrator sensing commands (Phase 1) and the tool
-// bus (Phase 2) — keep in sync with the serde structs in
-// src-tauri/src/transcript.rs / projects.rs / orchestrator/ (field names
-// arrive snake_case, like the usage payloads in types.ts).
+// Payload types of the orchestrator sensing commands and the tool bus —
+// keep in sync with the serde structs in src-tauri/src/transcript.rs /
+// projects.rs / orchestrator/ (field names arrive snake_case).
 
 /** One transcript entry. Tool activity is a one-line summary, never a payload. */
 export interface TranscriptMessage {
@@ -13,11 +12,11 @@ export interface TranscriptMessage {
   kind: "text" | "tool";
 }
 
-/** Result of `transcript_read` — the readable tail of one agent session. */
+/** Result of `transcript_read` — the readable tail of one codex session file. */
 export interface TranscriptView {
   /** the session's first real user message (the Ursprungsprompt), capped */
   first_user_message: string | null;
-  /** compaction summaries (Claude `type:"summary"` lines) in the read window */
+  /** compaction summaries in the read window */
   summaries: string[];
   messages: TranscriptMessage[];
   /** true when the byte cap cut the file or the tail limit dropped messages */
@@ -43,7 +42,7 @@ export interface ProjectDocs {
 /** A folder the frontend already knows, passed into `discover_projects`. */
 export interface KnownFolder {
   path: string;
-  /** where it came from: "workspace" | "profile" | "preset" | "notes" | … */
+  /** where it came from: "session" | "notes" | "worktree-repo" | … */
   source: string;
 }
 
@@ -58,13 +57,13 @@ export interface ProjectEntry {
   exists: boolean;
 }
 
-// ---- Tool bus (Phase 2) ----
+// ---- Tool bus ----
 //
 // Tool names/schemas live in ONE place: the Rust registry
 // (src-tauri/src/orchestrator/registry.rs). The TS side mirrors the NAMES
 // only (executor lookup + typing); schemas are never duplicated here.
 
-/** The V1 tool names — must match the Rust registry exactly. */
+/** The tool names — must match the Rust registry exactly. */
 export const ORCHESTRATOR_TOOL_NAMES = [
   "fleet_snapshot",
   "read_transcript",
@@ -72,10 +71,8 @@ export const ORCHESTRATOR_TOOL_NAMES = [
   "read_notes",
   "git_status",
   "list_projects",
-  "list_blueprints",
   "prompt_pane",
   "create_panes",
-  "create_workspace",
   "remember",
 ] as const;
 
@@ -110,8 +107,7 @@ export interface OrchestratorToolDefinition {
 /**
  * Response of `orchestrator_tools`: the single-source system instructions
  * (compiled by `persona::build_instructions` — persona + memory + operative
- * core) plus the tool catalog — the OpenRouter loop consumes both, the dev
- * hook exposes the whole object.
+ * core) plus the tool catalog — the dev hook exposes the whole object.
  */
 export interface OrchestratorToolsResponse {
   instructions: string;
@@ -127,13 +123,6 @@ export interface OrchestratorToolRequest {
   chat_id?: string | null;
 }
 
-/** Pane identity echoed in tool responses. */
-export interface ToolPaneRef {
-  id: string;
-  name: string;
-  runtime: string;
-}
-
 /** `read_notes` — NoteItems reduced to content (ids dropped). */
 export interface ToolNoteItem {
   text: string;
@@ -143,61 +132,36 @@ export interface ToolNoteItem {
 /** `prompt_pane` result. */
 export interface PromptPaneResult {
   delivered: true;
-  pane: ToolPaneRef;
-  /** the pane's activity right before the paste */
-  activity_at_send: "busy" | "idle" | "waiting" | null;
+  session: { id: string; name: string };
   submitted: boolean;
-  /** set when the pane was busy — the text queued in the CLI's input */
-  warning?: string;
-  /** set when review mode (orchestratorAutoSubmit off) blocked the submit */
-  note?: string;
 }
 
-/** One pane request inside `create_panes`. */
+/** One session request inside `create_panes`. */
 export interface CreatePaneSpec {
   cwd: string;
-  /** create a native Vibe-Mode Codex session instead of a terminal pane */
-  native?: boolean;
-  runtime?: "claude" | "codex" | "shell";
-  profile_id?: string;
-  /** model id appended to the startup (claude: --model, codex: -m); omit = default config */
+  /** codex model id; omit = the user's default configuration */
   model?: string;
-  /** codex-only: model_reasoning_effort */
+  /** model_reasoning_effort */
   reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
   name?: string;
-  /** initial prompt, submitted once the agent CLI is ready */
+  /** initial prompt, submitted as the session's first turn */
   prompt?: string;
-  /** run the pane in a fresh git worktree of the repo at cwd */
-  worktree?: boolean;
-  /** worktree branch; omitted = generated */
-  branch?: string;
-  /** place this pane next to an existing one (targeted split; ignores
-   * arrangement/workspace distribution). Not applicable to native sessions. */
-  beside?: { pane_id: string; direction?: "right" | "below" };
 }
 
-/** Per-pane outcome of `create_panes` — errors never abort the batch. */
+/** Per-session outcome of `create_panes` — errors never abort the batch. */
 export interface CreatePaneResult {
   /** set on success */
   id?: string;
   name?: string | null;
   cwd?: string | null;
-  worktree?: { root: string; branch: string } | null;
-  /** true when this entry created a native Vibe session (not a terminal pane) */
-  native?: boolean;
-  /** the workspace this pane landed in (terminal panes only) */
-  workspace_id?: string;
-  workspace_name?: string;
-  /** prompt delivery note (e.g. the pane never became ready) */
+  /** prompt delivery note */
   warning?: string;
-  /** set when this pane failed (worktree creation, unknown profile, …) */
+  /** set when this session failed to start */
   error?: string;
 }
 
 export interface CreatePanesResult {
-  /** primary target workspace (the first bucket) */
-  workspace_id: string;
-  panes: CreatePaneResult[];
-  /** honest, human-readable account of where panes landed and any overflow */
+  sessions: CreatePaneResult[];
+  /** honest, human-readable account of what was created */
   summary?: string;
 }

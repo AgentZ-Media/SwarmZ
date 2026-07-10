@@ -1,6 +1,5 @@
 // Git worktree support — branch-name generator + the native commands.
-// Native-only direct `invoke` (skips the backend interface, like openrouter.ts
-// and dnd.ts).
+// Native-only direct `invoke` (skips the backend interface).
 // Pure module on purpose: the store imports it, so it must not import the store.
 
 import { invoke } from "@tauri-apps/api/core";

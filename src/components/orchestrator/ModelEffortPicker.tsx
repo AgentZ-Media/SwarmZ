@@ -40,7 +40,7 @@ export function ModelEffortPicker({
   effort?: string;
   /** recently-used model ids to offer (recentCodexModels) */
   models: string[];
-  /** hide the effort section (OpenRouter chats have no reasoning effort) */
+  /** hide the effort section */
   showEffort?: boolean;
   onApply: (next: ModelEffortSelection) => void;
   align?: "start" | "center" | "end";

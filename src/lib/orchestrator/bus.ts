@@ -1,10 +1,10 @@
-// Webview half of the orchestrator tool bus (Phase 2). Rust validates a tool
-// call against the registry, emits `orchestrator://tool-request` and awaits
-// our `orchestrator_tool_response` command (see src-tauri/src/orchestrator/).
+// Webview half of the orchestrator tool bus. Rust validates a tool call
+// against the registry, emits `orchestrator://tool-request` and awaits our
+// `orchestrator_tool_response` command (see src-tauri/src/orchestrator/).
 // We look up the executor, run it, and ALWAYS respond — an unanswered
 // request would burn its full timeout on the Rust side.
 //
-// Registered once from App.tsx, same pattern as lib/dnd.ts / lib/quit.ts.
+// Registered once from App.tsx, same pattern as lib/quit.ts.
 
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";

@@ -31,14 +31,12 @@ export function toolActivityLabel(
       return "Checked git";
     case "list_projects":
       return "Looked up projects";
-    case "list_blueprints":
-      return "Looked up models";
     case "prompt_pane":
       return first ? `Prompted «${first}»` : "Prompted an agent";
     case "create_panes":
-      return n > 0 ? `Started ${n} agent${n === 1 ? "" : "s"}` : "Started agents";
-    case "create_workspace":
-      return "Created workspace";
+      return n > 0
+        ? `Started ${n} session${n === 1 ? "" : "s"}`
+        : "Started sessions";
     case "remember":
       return "Noted to memory";
     default:

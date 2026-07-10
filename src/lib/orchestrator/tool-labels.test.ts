@@ -15,8 +15,6 @@ describe("toolActivityLabel", () => {
     expect(toolActivityLabel("read_notes")).toBe("Read notes");
     expect(toolActivityLabel("git_status")).toBe("Checked git");
     expect(toolActivityLabel("list_projects")).toBe("Looked up projects");
-    expect(toolActivityLabel("list_blueprints")).toBe("Looked up models");
-    expect(toolActivityLabel("create_workspace")).toBe("Created workspace");
     expect(toolActivityLabel("remember")).toBe("Noted to memory");
   });
 
@@ -34,12 +32,12 @@ describe("toolActivityLabel", () => {
 
   it("pluralizes create_panes by count", () => {
     expect(toolActivityLabel("create_panes", { count: 1 })).toBe(
-      "Started 1 agent",
+      "Started 1 session",
     );
     expect(toolActivityLabel("create_panes", { count: 3 })).toBe(
-      "Started 3 agents",
+      "Started 3 sessions",
     );
-    expect(toolActivityLabel("create_panes")).toBe("Started agents");
+    expect(toolActivityLabel("create_panes")).toBe("Started sessions");
   });
 
   it("falls back for unknown tools", () => {

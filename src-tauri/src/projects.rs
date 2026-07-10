@@ -1,17 +1,15 @@
-//! Orchestrator sensing (Phase 1): project discovery. Merges every place a
-//! project folder can be known from — Claude Code history (`~/.claude/projects`,
-//! real cwd read from the jsonl because the encoded dir name is lossy), Codex
-//! rollout history (`~/.codex/sessions` session_meta), folders the frontend
-//! already knows (workspaces, profiles, presets, notes, worktree repos, last
-//! used folder) and an optional shallow filesystem scan for git repos — into
-//! one deduped, recency-sorted list. Read-only: stat/mtime plus head-reads of
-//! single jsonl files, never full parses.
+//! Orchestrator sensing: project discovery. Merges every place a project
+//! folder can be known from — Codex rollout history (`~/.codex/sessions`
+//! session_meta), folders the frontend already knows (sessions, notes,
+//! worktree repos, last used folder) and an optional shallow filesystem scan
+//! for git repos — into one deduped, recency-sorted list. Read-only:
+//! stat/mtime plus head-reads of single jsonl files, never full parses.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use walkdir::WalkDir;
 
 /// Bytes read from a jsonl head when looking for the cwd field.
@@ -116,38 +114,6 @@ fn add_entry(
     };
 }
 
-/// Claude source: one project per `~/.claude/projects/*` dir. The dir name is
-/// a lossy cwd encoding (`/`+`.` → `-`), so the REAL cwd comes from the head
-/// of the newest jsonl inside; last activity is that file's mtime.
-fn add_claude_projects(map: &mut HashMap<String, ProjectEntry>, root: &Path) {
-    let Ok(dirs) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in dirs.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let mut newest: Option<(i64, PathBuf)> = None;
-        for f in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let p = f.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let mt = file_modified_ms(&p).unwrap_or(0);
-            if newest.as_ref().map(|(m, _)| mt > *m).unwrap_or(true) {
-                newest = Some((mt, p));
-            }
-        }
-        let Some((mtime, path)) = newest else {
-            continue;
-        };
-        if let Some(cwd) = cwd_from_jsonl_head(&path) {
-            add_entry(map, &cwd, Some(mtime), "claude");
-        }
-    }
-}
-
 /// Codex source: every rollout under `~/.codex/sessions` carries the cwd in
 /// its `session_meta` head line; per-cwd last activity = newest file mtime.
 fn add_codex_projects(map: &mut HashMap<String, ProjectEntry>, root: &Path) {
@@ -198,17 +164,13 @@ fn scan_dir(map: &mut HashMap<String, ProjectEntry>, dir: &Path, depth: u32) {
 }
 
 /// Merge all sources; see the module docs. Roots are injectable for tests —
-/// the Tauri command passes the real `~/.claude` / `~/.codex` locations.
+/// the Tauri command passes the real `~/.codex` location.
 pub fn discover(
-    claude_projects_root: Option<&Path>,
     codex_sessions_root: Option<&Path>,
     scan_roots: &[String],
     known: &[KnownFolder],
 ) -> Vec<ProjectEntry> {
     let mut map: HashMap<String, ProjectEntry> = HashMap::new();
-    if let Some(root) = claude_projects_root {
-        add_claude_projects(&mut map, root);
-    }
     if let Some(root) = codex_sessions_root {
         add_codex_projects(&mut map, root);
     }
@@ -236,18 +198,18 @@ fn sort_entries(entries: &mut [ProjectEntry]) {
     });
 }
 
-/// Command-level entry with the real home-dir roots.
+/// Command-level entry with the real home-dir root.
 pub fn discover_default(scan_roots: &[String], known: &[KnownFolder]) -> Vec<ProjectEntry> {
-    let claude = crate::usage::claude_projects_dir().filter(|d| d.is_dir());
     let codex = dirs::home_dir()
         .map(|h| h.join(".codex").join("sessions"))
         .filter(|d| d.is_dir());
-    discover(claude.as_deref(), codex.as_deref(), scan_roots, known)
+    discover(codex.as_deref(), scan_roots, known)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_dir() -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -280,7 +242,6 @@ mod tests {
         fs::create_dir_all(&wt).unwrap();
 
         let entries = discover(
-            None,
             None,
             &[],
             &[
@@ -316,44 +277,12 @@ mod tests {
         fs::create_dir_all(dir.join("node_modules/pkg/.git")).unwrap();
         fs::create_dir_all(dir.join(".hidden/repo/.git")).unwrap();
 
-        let entries = discover(None, None, &[dir.to_string_lossy().into_owned()], &[]);
+        let entries = discover(None, &[dir.to_string_lossy().into_owned()], &[]);
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
         assert!(paths.contains(&dir.join("one").to_string_lossy().as_ref()));
         assert!(paths.contains(&dir.join("group/two").to_string_lossy().as_ref()));
         assert_eq!(entries.len(), 2, "unexpected entries: {paths:?}");
         assert!(entries.iter().all(|e| e.sources == vec!["scan"]));
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn claude_source_reads_real_cwd_from_newest_jsonl() {
-        let dir = temp_dir();
-        let proj = dir.join("cwd-of-repo");
-        fs::create_dir_all(&proj).unwrap();
-        let claude = dir.join("claude-projects");
-        let encoded = claude.join("-cwd-of-repo");
-        fs::create_dir_all(&encoded).unwrap();
-        fs::write(
-            encoded.join("s1.jsonl"),
-            format!(
-                "{}\n{}\n",
-                r#"{"type":"queue-operation","operation":"enqueue"}"#,
-                format!(
-                    r#"{{"type":"user","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
-                    proj.to_string_lossy()
-                ),
-            ),
-        )
-        .unwrap();
-        // an empty project dir must simply be skipped
-        fs::create_dir_all(claude.join("-empty-project")).unwrap();
-
-        let entries = discover(Some(&claude), None, &[], &[]);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].path, proj.to_string_lossy());
-        assert_eq!(entries[0].sources, vec!["claude"]);
-        assert!(entries[0].last_activity.is_some());
-        assert!(entries[0].exists);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -373,7 +302,7 @@ mod tests {
         )
         .unwrap();
 
-        let entries = discover(None, Some(&dir.join("sessions")), &[], &[]);
+        let entries = discover(Some(&dir.join("sessions")), &[], &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, proj.to_string_lossy());
         assert_eq!(entries[0].sources, vec!["codex"]);
@@ -400,10 +329,10 @@ mod tests {
         // activity merge takes the max
         let mut map = HashMap::new();
         add_entry(&mut map, &old.to_string_lossy(), Some(1000), "codex");
-        add_entry(&mut map, &old.to_string_lossy(), Some(5000), "claude");
+        add_entry(&mut map, &old.to_string_lossy(), Some(5000), "session");
         let e = map.into_values().next().unwrap();
         assert_eq!(e.last_activity, Some(5000));
-        assert_eq!(e.sources, vec!["codex", "claude"]);
+        assert_eq!(e.sources, vec!["codex", "session"]);
         fs::remove_dir_all(&dir).ok();
     }
 }

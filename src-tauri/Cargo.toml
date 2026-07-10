@@ -28,30 +28,15 @@ tauri-plugin-process = "2"
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-portable-pty = "0.8"
-notify = "6"
-notify-debouncer-mini = "0.4"
 dirs = "5"
 parking_lot = "0.12"
 once_cell = "1"
 chrono = { version = "0.4", features = ["serde"] }
 walkdir = "2"
-base64 = "0.22"
-# both already in the tree via tauri / tauri-plugin-updater
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }
 # "sync" for the orchestrator bus's oneshot pending map (orchestrator/bus.rs);
-# "process"/"io-util"/"rt" for the long-lived `codex app-server` child and its
-# stdio pump tasks (orchestrator/appserver.rs)
+# "process"/"io-util"/"rt" for the long-lived `codex app-server` children and
+# their stdio pump tasks (codex/host.rs)
 tokio = { version = "1", features = ["time", "sync", "process", "io-util", "rt"] }
-futures-util = "0.3"
-# local speech-to-text (Parakeet via ONNX Runtime) — "onnx" only, so no
-# whisper.cpp/cmake; ort pulls prebuilt onnxruntime binaries at build time
-transcribe-rs = { version = "0.3.11", default-features = false, features = ["onnx"] }
-# verify the downloaded STT model files (already in the tree transitively)
-sha2 = "0.10"
-# macOS Keychain for the OpenRouter key — the Security framework (unlike the
-# `security` CLI) keeps the key out of argv and ACLs the item to this binary
-security-framework = "3"
 
 [dev-dependencies]
 # async unit tests for the orchestrator bus (#[tokio::test])

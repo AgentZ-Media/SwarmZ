@@ -9,6 +9,7 @@ import {
   X,
 } from "lucide-react";
 import { useSwarm } from "@/store";
+import { useVibe } from "@/lib/vibe/session-store";
 import { ScrollArea } from "./ui/misc";
 import { cn, folderName, shortPath } from "@/lib/utils";
 import type { NoteItem } from "@/types";
@@ -26,7 +27,7 @@ export function QuickNotesPanel() {
   const moveNote = useSwarm((s) => s.moveNote);
   const clearDoneNotes = useSwarm((s) => s.clearDoneNotes);
 
-  // scope (null = global) defaults to the active pane's project at open time
+  // scope (null = global) defaults to the active session's project at open time
   const [scope, setScope] = useState<string | null>(null);
   // remembered so the active project keeps its chip even while it has no notes
   const [projectRoot, setProjectRoot] = useState<string | null>(null);
@@ -37,7 +38,11 @@ export function QuickNotesPanel() {
 
   useEffect(() => {
     if (!open) return;
-    const root = useSwarm.getState().activeProjectRoot();
+    // the active vibe session's project scopes the notes
+    const v = useVibe.getState();
+    const root = v.activeId
+      ? (v.sessions[v.activeId]?.session.projectDir ?? null)
+      : null;
     setProjectRoot(root);
     setScope(root);
     // capture should be instant — focus the input once the drawer mounted
@@ -45,7 +50,7 @@ export function QuickNotesPanel() {
   }, [open]);
 
   // Escape closes the drawer; capture + stopPropagation so window-level
-  // handlers (fleet exit in WorkspaceLayer) don't react to the same press
+  // handlers don't react to the same press
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {

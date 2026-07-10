@@ -1,7 +1,6 @@
-// Shared orchestrator chat rendering (Phase 5) — the message list, message
-// rows, tool/system chips, pane/session jump chips and the chat switcher.
-// Extracted from OrchestratorPanel so BOTH the ⌘⇧O side panel and the Vibe
-// Conductor stage render the SAME chat store without duplicating the view.
+// Shared orchestrator chat rendering — the message list, message rows,
+// tool/system chips, session jump chips and the chat switcher. Rendered by
+// the Conductor stage (the app's one orchestrator surface).
 
 import {
   Fragment,
@@ -15,14 +14,12 @@ import {
 import {
   BookOpen,
   Bot,
-  Boxes,
   Brain,
   Check,
   ChevronDown,
   ChevronRight,
   FolderSearch,
   GitBranch,
-  LayoutGrid,
   MessageSquare,
   Radar,
   ScrollText,
@@ -33,7 +30,6 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { useSwarm } from "@/store";
 import { useVibe } from "@/lib/vibe/session-store";
 import { focusSession } from "@/lib/vibe/controller";
 import {
@@ -41,7 +37,6 @@ import {
   useOrchestrator,
 } from "@/lib/orchestrator/chat-store";
 import { removeChat, sendMessage } from "@/lib/orchestrator/controller";
-import { DEFAULT_ORCHESTRATOR_MODEL } from "@/lib/orchestrator/openrouter-loop";
 import {
   activityCountLabel,
   groupChatMessages,
@@ -51,7 +46,6 @@ import {
 } from "@/lib/orchestrator/tool-labels";
 import { recentCodexModels } from "@/lib/orchestrator/models";
 import { VIBE_CTX_WARN, totalTokens } from "@/lib/vibe/ui";
-import { focusTerm } from "@/lib/term-host";
 import { OrchestratorMarkdown } from "../OrchestratorMarkdown";
 import { ModelEffortPicker } from "./ModelEffortPicker";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
@@ -70,20 +64,11 @@ type ToolMessage = Extract<OrchestratorChatMessage, { role: "tool" }>;
 
 const EMPTY_MESSAGES: OrchestratorChatMessage[] = [];
 
-/**
- * Tiny provider/model indicator (Phase 6) — a chat keeps its brain for life,
- * so this shows what THIS chat runs on ("codex" / "openrouter · <model>").
- */
-export function ProviderBadge({ chatId }: { chatId: string }) {
-  const label = useOrchestrator((s) => {
-    const chat = s.chats.find((c) => c.id === chatId);
-    return (chat?.provider ?? "codex") === "openrouter"
-      ? `openrouter · ${chat?.model || DEFAULT_ORCHESTRATOR_MODEL}`
-      : "codex";
-  });
+/** Tiny brain indicator — every chat runs on codex. */
+export function ProviderBadge() {
   return (
     <div className="truncate pb-1 text-center font-mono text-[9px] tracking-wide text-faint">
-      {label}
+      codex
     </div>
   );
 }
@@ -108,7 +93,7 @@ export function MessageList({ chatId }: { chatId: string }) {
     stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
   };
 
-  if (messages.length === 0) return <EmptyChat chatId={chatId} />;
+  if (messages.length === 0) return <EmptyChat />;
 
   const last = messages[messages.length - 1];
   // feedback between send and the first delta — unless a streaming message
@@ -129,7 +114,7 @@ export function MessageList({ chatId }: { chatId: string }) {
       className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-4 py-4"
     >
       <div className={cn("mx-auto flex w-full flex-col gap-4", CHAT_MAX_W)}>
-        <ProviderBadge chatId={chatId} />
+        <ProviderBadge />
         {groups.map((g) => {
           const at = g.kind === "message" ? g.msg.at : g.tools[0].at;
           const showT = lastAt === 0 || at - lastAt > 5 * 60_000;
@@ -347,10 +332,8 @@ const STEP_ICON: Record<string, LucideIcon> = {
   read_notes: StickyNote,
   git_status: GitBranch,
   list_projects: FolderSearch,
-  list_blueprints: Boxes,
   prompt_pane: MessageSquare,
   create_panes: Sparkles,
-  create_workspace: LayoutGrid,
   remember: Brain,
 };
 
@@ -499,27 +482,16 @@ function StepRow({
 }
 
 /**
- * "→ name" jump chip. The id may be a pane (jump via focusAgent/focusTerm,
- * the command-palette pattern) OR a native session (focusSession switches to
- * Vibe Mode and selects it). Resolves live and hides once the target is gone.
+ * "→ name" jump chip: a native session (focusSession selects it). Resolves
+ * live and hides once the target is gone.
  */
 function PaneChip({ pane }: { pane: OrchestratorPaneRef }) {
-  const agentName = useSwarm((s) => s.agents[pane.id]?.name);
-  const sessionName = useVibe((s) => s.sessions[pane.id]?.session.name);
-  const name = agentName ?? sessionName;
+  const name = useVibe((s) => s.sessions[pane.id]?.session.name);
   if (!name) return null;
-  const isSession = !agentName && !!sessionName;
   return (
     <button
-      onClick={() => {
-        if (isSession) {
-          focusSession(pane.id);
-        } else {
-          useSwarm.getState().focusAgent(pane.id);
-          focusTerm(pane.id);
-        }
-      }}
-      title={`Jump to ${isSession ? "session" : "pane"} "${name}"`}
+      onClick={() => focusSession(pane.id)}
+      title={`Jump to session "${name}"`}
       className="focus-ring flex shrink-0 items-center rounded border border-border bg-secondary/50 px-1.5 py-px font-mono text-[10px] text-muted-foreground transition-colors hover:border-ring/60 hover:text-foreground"
     >
       → {name}
@@ -527,7 +499,7 @@ function PaneChip({ pane }: { pane: OrchestratorPaneRef }) {
   );
 }
 
-function EmptyChat({ chatId }: { chatId: string }) {
+function EmptyChat() {
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center px-6">
       <div className="max-w-60 text-center">
@@ -536,11 +508,11 @@ function EmptyChat({ chatId }: { chatId: string }) {
           Talk to the orchestrator about your fleet.
         </p>
         <p className="mt-1 text-[11px] leading-relaxed text-faint">
-          It can inspect panes and transcripts, check git status, prompt
-          agents, and spin up new panes, sessions or workspaces.
+          It can inspect sessions and transcripts, check git status, prompt
+          agents, and spin up new sessions.
         </p>
         <div className="mt-2.5">
-          <ProviderBadge chatId={chatId} />
+          <ProviderBadge />
         </div>
       </div>
     </div>
@@ -548,16 +520,11 @@ function EmptyChat({ chatId }: { chatId: string }) {
 }
 
 /**
- * Header meta for a chat: the model/effort chip (opens the shared picker) + the
- * context gauge. Shared by the Conductor stage and the ⌘⇧O panel header. Codex
- * chats edit model + effort; OpenRouter chats edit model only (no effort). The
- * gauge appears once Block 2's token_usage event feeds `tokenUsage` — defensive
- * until then (renders nothing).
+ * Header meta for a chat: the model/effort chip (opens the shared picker) +
+ * the context gauge. The gauge appears once the token_usage event feeds
+ * `tokenUsage` — defensive until then (renders nothing).
  */
 export function ChatMeta({ chatId }: { chatId: string }) {
-  const provider = useOrchestrator(
-    (s) => s.chats.find((c) => c.id === chatId)?.provider ?? "codex",
-  );
   const model = useOrchestrator(
     (s) => s.chats.find((c) => c.id === chatId)?.model,
   );
@@ -565,16 +532,8 @@ export function ChatMeta({ chatId }: { chatId: string }) {
     (s) => s.chats.find((c) => c.id === chatId)?.effort,
   );
   const setChatModelEffort = useOrchestrator((s) => s.setChatModelEffort);
-  const isCodex = provider === "codex";
-  const models = useMemo(
-    () => (isCodex ? recentCodexModels() : []),
-    [isCodex],
-  );
-  const label = model
-    ? prettyModel(model)
-    : isCodex
-      ? "default model"
-      : prettyModel(DEFAULT_ORCHESTRATOR_MODEL);
+  const models = useMemo(() => recentCodexModels(), []);
+  const label = model ? prettyModel(model) : "default model";
 
   return (
     <div className="flex shrink-0 items-center gap-1.5">
@@ -582,7 +541,7 @@ export function ChatMeta({ chatId }: { chatId: string }) {
         model={model}
         effort={effort}
         models={models}
-        showEffort={isCodex}
+        showEffort
         onApply={(next) => setChatModelEffort(chatId, next)}
       >
         <button
@@ -590,7 +549,7 @@ export function ChatMeta({ chatId }: { chatId: string }) {
           className="focus-ring flex items-center gap-1 rounded-full border border-border bg-secondary px-2 py-0.5 font-mono text-[9px] text-muted-foreground transition-colors hover:border-ring/50 hover:text-foreground"
         >
           <span className="max-w-28 truncate">{label}</span>
-          {isCodex && effort && <span className="text-faint">· {effort}</span>}
+          {effort && <span className="text-faint">· {effort}</span>}
           <ChevronDown size={9} className="text-faint" />
         </button>
       </ModelEffortPicker>

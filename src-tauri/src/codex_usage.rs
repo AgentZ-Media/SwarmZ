@@ -1,11 +1,82 @@
-use crate::usage::{CodexRateLimitWindow, CodexRateLimits, ModelUsage, SessionUsage, UsageTotals};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+// ---- shared usage types ----
+//
+// Formerly in usage.rs (the Claude parser, removed in the codex-only
+// rebuild). Codex runs on the ChatGPT subscription, so `cost_usd` stays 0 —
+// there is no pricing table anymore.
+
+#[derive(Clone, Serialize, Default)]
+pub struct ModelUsage {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub message_count: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Clone, Serialize, Default)]
+pub struct SessionUsage {
+    pub runtime: Option<String>,
+    pub activity: Option<String>,
+    pub session_id: String,
+    pub cwd: Option<String>,
+    pub primary_model: Option<String>,
+    pub title: Option<String>,
+    pub git_branch: Option<String>,
+    pub last_activity: Option<String>,
+    /// current context occupancy = the latest turn's full prompt
+    pub context_tokens: u64,
+    /// context window of the model that served that turn
+    pub context_limit: u64,
+    pub message_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub cost_usd: f64,
+    pub by_model: Vec<ModelUsage>,
+    pub codex_limits: Option<CodexRateLimits>,
+}
+
+#[derive(Clone, Serialize, Default)]
+pub struct CodexRateLimitWindow {
+    pub utilization: Option<f64>,
+    pub resets_at: Option<String>,
+    pub window_minutes: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Default)]
+pub struct CodexRateLimits {
+    pub primary: Option<CodexRateLimitWindow>,
+    pub secondary: Option<CodexRateLimitWindow>,
+    pub plan_type: Option<String>,
+}
+
+#[derive(Clone, Serialize, Default)]
+pub struct UsageTotals {
+    pub runtime: Option<String>,
+    pub total_cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub message_count: u64,
+    pub session_count: u64,
+    pub by_model: Vec<ModelUsage>,
+}
 
 #[derive(Clone)]
 struct CachedSession {

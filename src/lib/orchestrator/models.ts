@@ -1,8 +1,7 @@
-// Shared model + effort sources for the on-the-fly pickers (Vibe sessions,
-// orchestrator codex chats, Settings defaults). The recently-used Codex model
-// ids are derived from REAL usage on this machine — the same honest source the
-// `list_blueprints` executor exposes to the orchestrator — so the picker never
-// shows a stale hardcoded catalog.
+// Shared model + effort sources for the on-the-fly pickers (sessions,
+// orchestrator chats, Settings defaults). The recently-used Codex model ids
+// are derived from REAL usage on this machine (the persisted usage history),
+// so the picker never shows a stale hardcoded catalog.
 
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
@@ -23,10 +22,9 @@ export const CODEX_EFFORTS = [
 export type CodexEffort = (typeof CODEX_EFFORTS)[number];
 
 /**
- * Recently-used Codex model ids on this machine, newest signal first. Reads the
- * open panes' usage plus the persisted usage history (mirrors the
- * `list_blueprints` executor). Pure over the passed state so it stays cheap in
- * a selector; the no-arg overload reads the live store.
+ * Recently-used Codex model ids on this machine, newest signal first. Reads
+ * the persisted usage history. Pure over the passed state so it stays cheap
+ * in a selector; the no-arg overload reads the live store.
  */
 export function recentCodexModels(
   state: ReturnType<typeof useSwarm.getState> = useSwarm.getState(),
@@ -34,12 +32,10 @@ export function recentCodexModels(
   const seen = new Set<string>();
   const add = (runtime: string | undefined, model: string | undefined | null) => {
     if (!model) return;
-    if (runtime === "codex") seen.add(model);
+    // runtime-less entries predate the rebuild (Claude parser) — their model
+    // ids must never reach the codex picker (they'd go out as turn overrides)
+    if ((runtime ?? "claude") === "codex") seen.add(model);
   };
-  for (const a of Object.values(state.agents)) {
-    add(a.runtime, a.usage?.primary_model ?? undefined);
-    for (const m of a.usage?.by_model ?? []) add(a.runtime, m.model);
-  }
   const history = Object.values(state.usageHistory)
     .sort((a, b) => b.last_updated - a.last_updated)
     .slice(0, 120);

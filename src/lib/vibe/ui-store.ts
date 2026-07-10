@@ -8,7 +8,7 @@ import { create } from "zustand";
 /**
  * Which surface the FocusStage shows: the pinned Conductor (the orchestrator
  * chat, Orchestrator-first) or the selected native session. Default
- * "conductor" — entering Vibe Mode without an explicit session pick lands on
+ * "conductor" — starting without an explicit session pick lands on
  * the conductor. Transient in-memory, like the dialog flags.
  */
 export type VibeStageMode = "conductor" | "session";

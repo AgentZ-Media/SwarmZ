@@ -1,5 +1,13 @@
 # SwarmZ Design System
 
+> **⚠️ Legacy / interim (rebuild `codex-only-v1`):** parts of this document
+> still describe pre-rebuild surfaces (terminal grid, workspace tabs,
+> orchestrator side panel). The tokens and the signal triad still apply; do
+> NOT build new UI against the removed surfaces (see
+> `docs/plans/rebuild-codex-only-v1.md`). The design doc is replaced by the
+> "SwarmZ Vibe v3" system in Phase 6.
+
+
 Dark-only, near-monochrome, shadcn-based. Hierarchy comes from **luminance and
 spacing**, not hue. Color is rationed to a small set of *signals* with fixed
 meanings — the signal triad below.

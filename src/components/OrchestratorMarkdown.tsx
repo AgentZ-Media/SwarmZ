@@ -1,5 +1,5 @@
 // Tiny dependency-free markdown renderer for orchestrator assistant messages
-// (OrchestratorPanel.tsx). Deliberately a small subset — headings, lists,
+// (ChatView.tsx). Deliberately a small subset — headings, lists,
 // fenced code, inline code/bold/italic, links — rendered as React nodes (no
 // innerHTML, so model output can never inject markup). Unclosed markers in a
 // still-streaming message simply render literally until the closing half

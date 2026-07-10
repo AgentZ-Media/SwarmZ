@@ -792,10 +792,10 @@ mod tests {
         assert!(instructions.contains("SwarmZ Orchestrator"));
         // persona header is compiled in ahead of the operative core
         assert!(instructions.contains("Maestro"));
-        // the layout/placement guidance is single-source here (grid awareness)
-        assert!(instructions.contains("Layout & placement"));
+        // the session doctrine is single-source here
+        assert!(instructions.contains("Session approvals are decided by the HUMAN"));
         let tools = start["dynamicTools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 9);
 
         // memory snapshot flows into developerInstructions when present
         let with_mem = thread_start_params(&persona, "- 2026-07-07 reviews go to Opus");

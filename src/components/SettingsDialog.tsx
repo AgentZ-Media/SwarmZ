@@ -3,62 +3,25 @@ import {
   Bot,
   ChevronDown,
   ExternalLink,
-  Folder,
   FolderCog,
   FolderOpen,
   Info,
-  LayoutTemplate,
-  Mic,
-  Minus,
-  Pencil,
   Plus,
   RefreshCw,
   RotateCcw,
-  ScrollText,
-  SquareTerminal,
   Trash2,
-  X,
   type LucideIcon,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "./ui/select";
 import { Switch } from "./ui/switch";
 import { Textarea } from "./ui/textarea";
-import {
-  DEFAULT_CODEX_STARTUP,
-  DEFAULT_FONT_SIZE,
-  DEFAULT_RUNTIME,
-  MAX_FONT_SIZE,
-  MIN_FONT_SIZE,
-  defaultStartupForRuntime,
-  presetKey,
-  useSwarm,
-} from "@/store";
+import { useSwarm } from "@/store";
 import { useUpdates } from "@/lib/updates";
 import { IS_TAURI, openUrl, pickDirectory } from "@/lib/transport";
 import { prettyModel } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
-
-// native-only direct invoke (like lib/openrouter.ts) — validates the binary
-// path overrides below
-const pathIsFile = (path: string) => invoke<boolean>("path_is_file", { path });
-import {
-  DEFAULT_CLEANUP_MODEL,
-  DEFAULT_CLEANUP_PROMPT,
-  DEFAULT_STT_MODEL,
-  clearOpenrouterKey,
-  fetchOpenrouterModels,
-  setOpenrouterKey,
-} from "@/lib/openrouter";
-import { DEFAULT_ORCHESTRATOR_MODEL } from "@/lib/orchestrator/openrouter-loop";
 import { recentCodexModels } from "@/lib/orchestrator/models";
 import { ModelEffortPicker } from "./orchestrator/ModelEffortPicker";
 import {
@@ -71,52 +34,17 @@ import { readMemory, removeMemory } from "@/lib/orchestrator/memory";
 import type { OrchestratorMemoryEntry } from "@/lib/orchestrator/types";
 import type { OrchestratorPersona } from "@/types";
 import { appDataDir, join } from "@tauri-apps/api/path";
-import { listMicrophones } from "@/lib/dictation";
-import {
-  LOCAL_STT_DOWNLOAD_MB,
-  LOCAL_STT_MODEL_NAME,
-  LOCAL_STT_MODEL_URL,
-  LOCAL_STT_RAM_GB,
-  cancelLocalSttDownload,
-  downloadLocalSttModel,
-  fetchLocalSttStatus,
-  onLocalSttProgress,
-  removeLocalSttModel,
-  unloadLocalSttModel,
-} from "@/lib/local-stt";
-import {
-  collectPresetPanes,
-  removePresetPane,
-  updatePresetPane,
-} from "@/lib/presets";
-import { PresetThumbnail } from "./PresetThumbnail";
-import { cn, folderName, shortPath } from "@/lib/utils";
-import type {
-  CustomCommand,
-  OpenrouterModel,
-  PresetPaneNode,
-  WorkspacePreset,
-  AgentRuntime,
-} from "@/types";
+import { cn, shortPath } from "@/lib/utils";
+
+// native-only direct invoke — validates the binary path overrides below
+const pathIsFile = (path: string) => invoke<boolean>("path_is_file", { path });
 
 const REPO_URL = "https://github.com/AgentZ-Media/SwarmZ";
 const AGENTZ_URL = "https://linktr.ee/deragentz";
 
-type SectionId =
-  | "terminal"
-  | "presets"
-  | "commands"
-  | "voice"
-  | "orchestrator"
-  | "updates"
-  | "paths"
-  | "about";
+type SectionId = "orchestrator" | "updates" | "paths" | "about";
 
 const SECTIONS: { id: SectionId; label: string; icon: LucideIcon }[] = [
-  { id: "terminal", label: "Terminal", icon: SquareTerminal },
-  { id: "presets", label: "Presets", icon: LayoutTemplate },
-  { id: "commands", label: "Commands", icon: ScrollText },
-  { id: "voice", label: "Voice", icon: Mic },
   { id: "orchestrator", label: "Orchestrator", icon: Bot },
   { id: "updates", label: "Updates", icon: RefreshCw },
   { id: "paths", label: "Paths", icon: FolderCog },
@@ -130,7 +58,7 @@ export function SettingsDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const [section, setSection] = useState<SectionId>("terminal");
+  const [section, setSection] = useState<SectionId>("orchestrator");
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -161,13 +89,7 @@ export function SettingsDialog({
           </nav>
 
           <div className="min-h-0 overflow-y-auto p-5">
-            {section === "terminal" && <TerminalSection />}
-            {section === "presets" && <PresetsSection />}
-            {section === "commands" && <CommandsSection />}
-            {section === "voice" && <VoiceSection />}
-            {section === "orchestrator" && (
-              <OrchestratorSection onShowVoice={() => setSection("voice")} />
-            )}
+            {section === "orchestrator" && <OrchestratorSection />}
             {section === "updates" && <UpdatesSection />}
             {section === "paths" && <PathsSection />}
             {section === "about" && <AboutSection />}
@@ -241,1122 +163,13 @@ function StackedRow({
   );
 }
 
-// ---- Terminal ----
-
-function TerminalSection() {
-  const settings = useSwarm((s) => s.settings);
-  const updateSettings = useSwarm((s) => s.updateSettings);
-
-  const size = settings.defaultFontSize ?? DEFAULT_FONT_SIZE;
-  const stepSize = (delta: number) =>
-    updateSettings({
-      defaultFontSize: Math.min(
-        MAX_FONT_SIZE,
-        Math.max(MIN_FONT_SIZE, size + delta),
-      ),
-    });
-
-  const defaultRuntime = settings.defaultRuntime ?? DEFAULT_RUNTIME;
-  const startup =
-    settings.defaultStartup ?? defaultStartupForRuntime(defaultRuntime);
-  const setDefaultRuntime = (runtime: AgentRuntime) =>
-    updateSettings({ defaultRuntime: runtime, defaultStartup: undefined });
-
-  return (
-    <>
-      <SectionHeader
-        title="Terminal"
-        sub="Defaults for every agent pane — individual panes can still deviate."
-      />
-
-      <Row
-        label="Restore agents on launch"
-        help={
-          <>
-            Reopen the last grid on start and resume each pane's agent
-            conversation (
-            <code className="font-mono text-muted-foreground">
-              claude --resume
-            </code>{" "}
-            or{" "}
-            <code className="font-mono text-muted-foreground">
-              codex resume
-            </code>
-            ). Floating terminals don't come back.
-          </>
-        }
-      >
-        <Switch
-          checked={settings.restoreAgents === true}
-          onCheckedChange={(v) => updateSettings({ restoreAgents: v })}
-          label="Restore agents on launch"
-        />
-      </Row>
-
-      <Row
-        label="Default app"
-        help="Preselected when creating a new pane. Changing it resets the default startup command to that app's built-in command; profiles and manual edits can still override it per pane."
-      >
-        <Select
-          value={defaultRuntime}
-          onValueChange={(v) => setDefaultRuntime(v as AgentRuntime)}
-        >
-          <SelectTrigger className="w-44">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="codex">Codex</SelectItem>
-            <SelectItem value="claude">Claude Code</SelectItem>
-            <SelectItem value="shell">Plain shell</SelectItem>
-          </SelectContent>
-        </Select>
-      </Row>
-
-      <Row
-        label="Default font size"
-        help="Applies to all panes without their own zoom. ⌘+ / ⌘− zooms a single pane, ⌘0 resets it."
-      >
-        <Button
-          size="icon"
-          variant="outline"
-          className="h-7 w-7"
-          onClick={() => stepSize(-0.5)}
-          disabled={size <= MIN_FONT_SIZE}
-        >
-          <Minus size={13} />
-        </Button>
-        <span className="w-12 text-center font-mono text-xs tabular-nums text-foreground">
-          {size}px
-        </span>
-        <Button
-          size="icon"
-          variant="outline"
-          className="h-7 w-7"
-          onClick={() => stepSize(0.5)}
-          disabled={size >= MAX_FONT_SIZE}
-        >
-          <Plus size={13} />
-        </Button>
-        {settings.defaultFontSize !== undefined &&
-          settings.defaultFontSize !== DEFAULT_FONT_SIZE && (
-            <Button
-              size="icon"
-              variant="ghost"
-              className="h-7 w-7"
-              title="Reset to default"
-              onClick={() => updateSettings({ defaultFontSize: undefined })}
-            >
-              <RotateCcw size={13} />
-            </Button>
-          )}
-      </Row>
-
-      <StackedRow
-        label="Default startup command"
-        help={
-          <>
-            Prefilled in the New Agent dialog for the selected default app;
-            picking a profile there still overrides it. Leave empty for a plain
-            shell. Codex defaults to full-access mode (
-            <code className="font-mono text-muted-foreground">
-              dangerously-bypass-approvals-and-sandbox
-            </code>
-            ).
-            {settings.defaultStartup !== undefined && (
-              <>
-                {" "}
-                <button
-                  className="text-ring hover:underline"
-                  onClick={() => updateSettings({ defaultStartup: undefined })}
-                >
-                  Reset to default
-                </button>
-              </>
-            )}
-          </>
-        }
-      >
-        <Input
-          value={startup}
-          onChange={(e) =>
-            updateSettings({
-              // typing the built-in default back restores the "unset" state
-              defaultStartup:
-                e.target.value === defaultStartupForRuntime(defaultRuntime)
-                  ? undefined
-                  : e.target.value,
-            })
-          }
-          className="font-mono text-xs"
-          placeholder="(leave empty for a plain shell)"
-        />
-        {defaultRuntime === "codex" && startup !== DEFAULT_CODEX_STARTUP && (
-          <p className="mt-1.5 text-[11px] text-warning">
-            This custom command overrides the built-in Codex YOLO default.
-          </p>
-        )}
-      </StackedRow>
-    </>
-  );
-}
-
-// ---- Presets ----
-
-function PresetsSection() {
-  const presets = useSwarm((s) => s.workspacePresets);
-  const updateWorkspacePreset = useSwarm((s) => s.updateWorkspacePreset);
-  const deleteWorkspacePreset = useSwarm((s) => s.deleteWorkspacePreset);
-
-  return (
-    <>
-      <SectionHeader
-        title="Workspace presets"
-        sub="Grid blueprints loadable from any empty workspace. Save new ones via ⌘K → “Save workspace as preset”."
-      />
-      <p className="mb-2 text-[11px] leading-relaxed text-faint">
-        A pane without a fixed folder inherits the one asked for when the
-        preset loads. The starter presets leave the command unset — they follow
-        the default startup command; an explicitly empty command is a plain
-        shell.
-      </p>
-
-      {presets.length === 0 && (
-        <p className="border-t border-border py-3 text-[11px] text-faint">
-          No presets yet.
-        </p>
-      )}
-      {presets.map((preset) => (
-        <PresetEditor
-          key={preset.id}
-          preset={preset}
-          onChange={updateWorkspacePreset}
-          onDelete={() => deleteWorkspacePreset(preset.id)}
-        />
-      ))}
-    </>
-  );
-}
-
-/** One preset: rename inline, edit each pane's folder/command, remove panes. */
-function PresetEditor({
-  preset,
-  onChange,
-  onDelete,
-}: {
-  preset: WorkspacePreset;
-  onChange: (preset: WorkspacePreset) => void;
-  onDelete: () => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const panes = collectPresetPanes(preset.layout);
-
-  const patchPane = (
-    paneId: string,
-    patch: Partial<Omit<PresetPaneNode, "type" | "id">>,
-  ) =>
-    onChange({ ...preset, layout: updatePresetPane(preset.layout, paneId, patch) });
-
-  const removePane = (paneId: string) => {
-    const layout = removePresetPane(preset.layout, paneId);
-    if (layout) onChange({ ...preset, layout });
-  };
-
-  return (
-    <div className="border-t border-border py-3">
-      <div className="flex items-center gap-3">
-        <button
-          onClick={() => setExpanded((e) => !e)}
-          title={expanded ? "Collapse" : "Edit panes"}
-          className="shrink-0"
-        >
-          <PresetThumbnail layout={preset.layout} className="h-10 w-14" />
-        </button>
-        <Input
-          value={preset.name}
-          onChange={(e) => onChange({ ...preset, name: e.target.value })}
-          onBlur={(e) => {
-            // a preset must keep an identifiable name — empty would leave a
-            // blank card on the empty-workspace screen
-            if (!e.target.value.trim()) onChange({ ...preset, name: "Preset" });
-          }}
-          className="h-8 max-w-48 text-xs"
-        />
-        <span className="ml-auto shrink-0 font-mono text-[10px] text-faint">
-          {panes.length} pane{panes.length === 1 ? "" : "s"}
-        </span>
-        <Button
-          size="xs"
-          variant="ghost"
-          title={expanded ? "Collapse" : "Edit panes"}
-          onClick={() => setExpanded((e) => !e)}
-        >
-          <Pencil size={11} />
-        </Button>
-        <Button
-          size="xs"
-          variant="ghost"
-          title="Delete preset"
-          className="hover:text-destructive"
-          onClick={onDelete}
-        >
-          <Trash2 size={11} />
-        </Button>
-      </div>
-
-      {expanded && (
-        <div className="mt-2 flex flex-col gap-1.5">
-          {panes.map((pane, i) => (
-            <div
-              key={pane.id}
-              className="flex items-center gap-2 rounded-md border border-border bg-secondary/40 p-1.5"
-            >
-              <span className="w-5 shrink-0 text-center font-mono text-[10px] text-faint">
-                {i + 1}
-              </span>
-              <button
-                onClick={() => {
-                  void pickDirectory().then((dir) => {
-                    if (dir) patchPane(pane.id, { cwd: dir });
-                  });
-                }}
-                title={pane.cwd ?? "Inherits the folder chosen when loading"}
-                className="flex h-7 w-36 shrink-0 items-center gap-1.5 rounded-md border border-border bg-secondary/60 px-2 text-left transition-colors hover:border-input"
-              >
-                {pane.cwd ? (
-                  <>
-                    <FolderOpen
-                      size={12}
-                      className="shrink-0 text-muted-foreground"
-                    />
-                    <span className="truncate font-mono text-[10px] text-foreground">
-                      {shortPath(pane.cwd)}
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <Folder size={12} className="shrink-0 text-faint" />
-                    <span className="truncate text-[10px] text-faint">
-                      Inherit folder
-                    </span>
-                  </>
-                )}
-              </button>
-              {pane.cwd && (
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  title="Inherit the folder chosen when loading"
-                  onClick={() => patchPane(pane.id, { cwd: undefined })}
-                >
-                  <X size={11} />
-                </Button>
-              )}
-              <Input
-                value={pane.startup ?? ""}
-                onChange={(e) => patchPane(pane.id, { startup: e.target.value })}
-                placeholder={
-                  pane.startup === undefined
-                    ? "default startup command"
-                    : "(empty = plain shell)"
-                }
-                className="h-7 flex-1 font-mono text-[10px]"
-                spellCheck={false}
-              />
-              <Button
-                size="xs"
-                variant="ghost"
-                title="Remove pane"
-                className="hover:text-destructive"
-                disabled={panes.length === 1}
-                onClick={() => removePane(pane.id)}
-              >
-                <Trash2 size={11} />
-              </Button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ---- Commands ----
-
-function CommandsSection() {
-  const customCommands = useSwarm((s) => s.customCommands);
-  // a folder picked via "Add folder…" that has no saved command yet — shown
-  // as an empty group with the editor open until something is saved
-  const [pendingFolder, setPendingFolder] = useState<string | null>(null);
-
-  const folderKeys = Object.keys(customCommands.folders).sort();
-  if (pendingFolder && !folderKeys.includes(pendingFolder))
-    folderKeys.push(pendingFolder);
-
-  return (
-    <>
-      <SectionHeader
-        title="Commands"
-        sub="Prompt snippets for the insert picker (⌘⇧K) — pasted into the active pane, not run."
-      />
-      <p className="mb-2 text-[11px] leading-relaxed text-faint">
-        Placeholders are filled from the target pane when inserting:{" "}
-        <code className="font-mono text-muted-foreground">
-          {"{{folder}} {{cwd}} {{branch}} {{agent}}"}
-        </code>{" "}
-        — <code className="font-mono text-muted-foreground">{"{{input:Label}}"}</code>{" "}
-        asks for a value first.
-      </p>
-
-      <CommandGroup
-        title="Global"
-        help="Available in every pane"
-        folderKey={null}
-        commands={customCommands.global}
-      />
-
-      {folderKeys.map((key) => (
-        <CommandGroup
-          key={key}
-          title={folderName(key)}
-          help={shortPath(key)}
-          folderKey={key}
-          commands={customCommands.folders[key] ?? []}
-          startEditing={key === pendingFolder}
-          onEditorClosed={() => {
-            if (key === pendingFolder) setPendingFolder(null);
-          }}
-        />
-      ))}
-
-      <div className="border-t border-border py-3">
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => {
-            void pickDirectory().then((dir) => {
-              if (dir) setPendingFolder(presetKey(dir));
-            });
-          }}
-        >
-          <Plus size={13} /> Add folder…
-        </Button>
-      </div>
-    </>
-  );
-}
-
-/** One scope (global or a project folder): its commands + inline add/edit. */
-function CommandGroup({
-  title,
-  help,
-  folderKey,
-  commands,
-  startEditing,
-  onEditorClosed,
-}: {
-  title: string;
-  help: string;
-  folderKey: string | null;
-  commands: CustomCommand[];
-  startEditing?: boolean;
-  onEditorClosed?: () => void;
-}) {
-  const saveCustomCommand = useSwarm((s) => s.saveCustomCommand);
-  const deleteCustomCommand = useSwarm((s) => s.deleteCustomCommand);
-  // id being edited, "new" for a fresh one, null = no editor open
-  const [editing, setEditing] = useState<string | null>(
-    startEditing ? "new" : null,
-  );
-
-  const closeEditor = () => {
-    setEditing(null);
-    onEditorClosed?.();
-  };
-
-  return (
-    <div className="border-t border-border py-3">
-      <div className="flex items-baseline justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-[13px] font-medium text-foreground">{title}</div>
-          <div className="truncate font-mono text-[10px] text-faint">{help}</div>
-        </div>
-        {editing === null && (
-          <Button size="sm" variant="ghost" onClick={() => setEditing("new")}>
-            <Plus size={13} /> Add command
-          </Button>
-        )}
-      </div>
-
-      <div className="mt-2 flex flex-col gap-1">
-        {commands.length === 0 && editing === null && (
-          <p className="px-1 text-[11px] text-faint">No commands yet.</p>
-        )}
-        {commands.map((c) =>
-          editing === c.id ? (
-            <CommandEditor
-              key={c.id}
-              initial={c}
-              onSave={(label, text) => {
-                saveCustomCommand(folderKey, label, text, c.id);
-                closeEditor();
-              }}
-              onCancel={closeEditor}
-            />
-          ) : (
-            <div
-              key={c.id}
-              className="group flex items-center gap-2 rounded-md px-1.5 py-1 hover:bg-accent/50"
-            >
-              <span className="shrink-0 text-[13px] text-foreground">
-                {c.label}
-              </span>
-              <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-faint">
-                {c.text.replace(/\s+/g, " ")}
-              </span>
-              <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  title="Edit"
-                  onClick={() => setEditing(c.id)}
-                >
-                  <Pencil size={11} />
-                </Button>
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  title="Delete"
-                  className="hover:text-destructive"
-                  onClick={() => deleteCustomCommand(folderKey, c.id)}
-                >
-                  <Trash2 size={11} />
-                </Button>
-              </span>
-            </div>
-          ),
-        )}
-        {editing === "new" && (
-          <CommandEditor
-            onSave={(label, text) => {
-              saveCustomCommand(folderKey, label, text);
-              closeEditor();
-            }}
-            onCancel={closeEditor}
-          />
-        )}
-      </div>
-    </div>
-  );
-}
-
-function CommandEditor({
-  initial,
-  onSave,
-  onCancel,
-}: {
-  initial?: CustomCommand;
-  onSave: (label: string, text: string) => void;
-  onCancel: () => void;
-}) {
-  const [label, setLabel] = useState(initial?.label ?? "");
-  const [text, setText] = useState(initial?.text ?? "");
-  return (
-    <div className="flex flex-col gap-2 rounded-md border border-border bg-secondary/40 p-2.5">
-      <Input
-        autoFocus
-        value={label}
-        onChange={(e) => setLabel(e.target.value)}
-        placeholder="Label"
-        className="h-8 text-xs"
-      />
-      <Textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        placeholder={"Run the tests in {{folder}} and fix every failure."}
-        className="min-h-16 font-mono text-xs"
-        onKeyDown={(e) => {
-          if (e.key === "Escape") {
-            e.stopPropagation();
-            onCancel();
-          }
-        }}
-      />
-      <div className="flex justify-end gap-2">
-        <Button size="sm" variant="ghost" onClick={onCancel}>
-          Cancel
-        </Button>
-        <Button
-          size="sm"
-          disabled={!text.trim()}
-          onClick={() => onSave(label, text)}
-        >
-          Save
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-// ---- Voice ----
-
-/** Small two-way segmented control (hold / toggle). */
-function Segmented<T extends string>({
-  value,
-  options,
-  onChange,
-}: {
-  value: T;
-  options: { value: T; label: string }[];
-  onChange: (v: T) => void;
-}) {
-  return (
-    <div className="flex gap-1">
-      {options.map((o) => (
-        <button
-          key={o.value}
-          onClick={() => onChange(o.value)}
-          className={cn(
-            "rounded-md border px-2.5 py-1 text-xs transition-colors",
-            value === o.value
-              ? "border-ring/60 bg-ring/15 text-foreground"
-              : "border-border bg-secondary/60 text-muted-foreground hover:text-foreground",
-          )}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function VoiceSection() {
-  const settings = useSwarm((s) => s.settings);
-  const updateSettings = useSwarm((s) => s.updateSettings);
-  const status = useSwarm((s) => s.openrouterStatus);
-  const setOpenrouterStatus = useSwarm((s) => s.setOpenrouterStatus);
-
-  const [keyInput, setKeyInput] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [keyError, setKeyError] = useState<string | null>(null);
-  // null until the picker was opened — enumerating may open the mic for a
-  // moment (WebKit label unlock), so it only happens on explicit interaction
-  const [mics, setMics] = useState<
-    { deviceId: string; label: string }[] | null
-  >(null);
-  const [models, setModels] = useState<OpenrouterModel[] | null>(null);
-
-  // the catalog is public (no key needed) and cached for an hour in Rust
-  useEffect(() => {
-    if (!IS_TAURI) return;
-    fetchOpenrouterModels().then(setModels, () => setModels(null));
-  }, []);
-
-  if (!IS_TAURI) {
-    return (
-      <>
-        <SectionHeader
-          title="Voice"
-          sub="Dictate prompts into any pane via OpenRouter speech-to-text."
-        />
-        <p className="border-t border-border py-3 text-xs leading-relaxed text-muted-foreground">
-          Voice dictation ships with the native macOS app.
-        </p>
-      </>
-    );
-  }
-
-  const saveKey = async () => {
-    const key = keyInput.trim();
-    if (!key) return;
-    setSaving(true);
-    setKeyError(null);
-    try {
-      const st = await setOpenrouterKey(key);
-      setOpenrouterStatus(st);
-      setKeyInput("");
-    } catch (e) {
-      setKeyError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const removeKey = async () => {
-    try {
-      await clearOpenrouterKey();
-      setOpenrouterStatus({ present: false, valid: false });
-    } catch (e) {
-      setKeyError(String(e));
-    }
-  };
-
-  const local = (settings.dictationEngine ?? "openrouter") === "local";
-
-  const keyStatusLine = keyError ? (
-    <span className="text-destructive">{keyError}</span>
-  ) : !status?.present ? (
-    local
-      ? "No key set — optional with the local engine; only the cleanup pass uses OpenRouter."
-      : "No key set — the dictation mic stays hidden until one is added."
-  ) : status.valid === true ? (
-    <span className="text-success">
-      {local
-        ? "Key valid — transcript cleanup is available."
-        : "Key valid — voice dictation is enabled."}
-    </span>
-  ) : status.valid === false ? (
-    <span className="text-destructive">
-      {local
-        ? "Key stored, but OpenRouter rejected it — cleanup stays off."
-        : "Key stored, but OpenRouter rejected it — dictation stays off."}
-    </span>
-  ) : (
-    "Key stored — couldn't verify it right now (offline?). Dictation stays enabled."
-  );
-
-  const cleanupModel = settings.dictationCleanupModel ?? DEFAULT_CLEANUP_MODEL;
-  const cleanupPrompt =
-    settings.dictationCleanupPrompt ?? DEFAULT_CLEANUP_PROMPT;
-
-  // until the list is loaded the saved selection still needs an item to
-  // resolve against; once loaded, an unplugged saved mic keeps an entry so
-  // the selection stays visible instead of silently jumping to default
-  const micId = settings.dictationMicId;
-  const savedMic = micId
-    ? {
-        deviceId: micId,
-        label: settings.dictationMicLabel || "Saved microphone",
-        missing: !!mics && !mics.some((m) => m.deviceId === micId),
-      }
-    : null;
-  const micOptions: { deviceId: string; label: string; missing?: boolean }[] =
-    mics
-      ? savedMic?.missing
-        ? [...mics, savedMic]
-        : mics
-      : savedMic
-        ? [savedMic]
-        : [];
-
-  return (
-    <>
-      <SectionHeader
-        title="Voice"
-        sub="Dictate prompts into any pane — hold ⌘ (or click a pane's mic) and speak; the transcript is pasted into the terminal."
-      />
-
-      <Row
-        label="Transcription engine"
-        help="Cloud sends the recording to OpenRouter (API key required). Local runs NVIDIA Parakeet fully on-device — nothing leaves the machine and no key is needed to transcribe."
-      >
-        <Segmented
-          value={local ? "local" : "openrouter"}
-          options={[
-            { value: "openrouter", label: "Cloud (OpenRouter)" },
-            { value: "local", label: "Local (Parakeet)" },
-          ]}
-          onChange={(v) => {
-            updateSettings({
-              dictationEngine: v === "openrouter" ? undefined : v,
-            });
-            // switching back to cloud frees the ~2 GB resident model
-            if (v === "openrouter")
-              void unloadLocalSttModel()
-                .then(() => fetchLocalSttStatus())
-                .then((st) => useSwarm.getState().setLocalSttStatus(st))
-                .catch(() => {});
-          }}
-        />
-      </Row>
-
-      {local && <LocalModelRow />}
-
-      <StackedRow
-        label="OpenRouter API key"
-        help={
-          <>
-            {keyStatusLine} Stored in the macOS Keychain, never on disk — all
-            requests are made natively.
-          </>
-        }
-      >
-        <div className="flex items-center gap-2">
-          <Input
-            type="password"
-            value={keyInput}
-            onChange={(e) => setKeyInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void saveKey();
-            }}
-            className="font-mono text-xs"
-            placeholder={
-              status?.present ? "••••••••  (replace key)" : "sk-or-…"
-            }
-            spellCheck={false}
-          />
-          <Button
-            size="sm"
-            disabled={!keyInput.trim() || saving}
-            onClick={() => void saveKey()}
-          >
-            {saving ? "Checking…" : "Save"}
-          </Button>
-          {status?.present && (
-            <Button size="sm" variant="outline" onClick={() => void removeKey()}>
-              Remove
-            </Button>
-          )}
-        </div>
-      </StackedRow>
-
-      <Row
-        label="Microphone"
-        help="Input device used for recordings. System default follows the input selected in macOS Sound settings; an unplugged device falls back to the default."
-      >
-        <Select
-          value={micId ?? "default"}
-          onValueChange={(v) => {
-            if (v === "default")
-              updateSettings({
-                dictationMicId: undefined,
-                dictationMicLabel: undefined,
-              });
-            else
-              updateSettings({
-                dictationMicId: v,
-                dictationMicLabel: micOptions.find((m) => m.deviceId === v)
-                  ?.label,
-              });
-          }}
-          onOpenChange={(o) => {
-            // re-enumerate on every open so newly plugged mics show up
-            if (o) void listMicrophones().then(setMics, () => setMics([]));
-          }}
-        >
-          <SelectTrigger className="w-56 text-xs [&>span]:truncate">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="default">System default</SelectItem>
-            {micOptions.map((m) => (
-              <SelectItem key={m.deviceId} value={m.deviceId}>
-                {m.label}
-                {m.missing ? " (not connected)" : ""}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </Row>
-
-      <Row
-        label="Hotkey behavior"
-        help="Hold: keep plain ⌘ pressed and speak — recording starts after a brief moment (so ⌘-shortcuts never trigger it), release to transcribe. Toggle: ⌘⇧M starts and stops. Recordings under ~1 s are discarded; the cap is 5 minutes."
-      >
-        <Segmented
-          value={settings.dictationHotkeyMode ?? "hold"}
-          options={[
-            { value: "hold", label: "Hold" },
-            { value: "toggle", label: "Toggle" },
-          ]}
-          onChange={(v) => updateSettings({ dictationHotkeyMode: v })}
-        />
-      </Row>
-
-      <Row
-        label="Submit automatically"
-        help="Press Enter right after pasting the transcript. Off = review first, submit yourself."
-      >
-        <Switch
-          checked={!!settings.dictationAutoSubmit}
-          onCheckedChange={(v) => updateSettings({ dictationAutoSubmit: v })}
-          label="Submit automatically"
-        />
-      </Row>
-
-      <Row
-        label="Clean up transcripts"
-        help={
-          local
-            ? "Polish the raw transcript with an LLM (filler words, punctuation) before pasting. Runs via OpenRouter — needs a key above even with the local engine."
-            : "Polish the raw transcript with an LLM (filler words, punctuation) before pasting. Adds a little latency per dictation."
-        }
-      >
-        <Switch
-          checked={!!settings.dictationCleanup}
-          onCheckedChange={(v) => updateSettings({ dictationCleanup: v })}
-          label="Clean up transcripts"
-        />
-      </Row>
-
-      {settings.dictationCleanup && (
-        <>
-          <StackedRow
-            label="Cleanup model"
-            help={
-              <>
-                Any text model on OpenRouter — suggestions come from the live
-                catalog{models ? ` (${models.length} models)` : ""}.
-                {settings.dictationCleanupModel !== undefined && (
-                  <>
-                    {" "}
-                    <button
-                      className="text-ring hover:underline"
-                      onClick={() =>
-                        updateSettings({ dictationCleanupModel: undefined })
-                      }
-                    >
-                      Reset to default
-                    </button>
-                  </>
-                )}
-              </>
-            }
-          >
-            <>
-              <Input
-                value={cleanupModel}
-                onChange={(e) =>
-                  updateSettings({
-                    dictationCleanupModel:
-                      e.target.value === DEFAULT_CLEANUP_MODEL
-                        ? undefined
-                        : e.target.value,
-                  })
-                }
-                list="openrouter-models"
-                className="font-mono text-xs"
-                placeholder={DEFAULT_CLEANUP_MODEL}
-                spellCheck={false}
-              />
-              <datalist id="openrouter-models">
-                {models?.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name}
-                  </option>
-                ))}
-              </datalist>
-            </>
-          </StackedRow>
-
-          <StackedRow
-            label="Cleanup prompt"
-            help={
-              <>
-                System prompt of the cleanup pass. Keep the no-translation rule
-                — dictation should work in every language.
-                {settings.dictationCleanupPrompt !== undefined && (
-                  <>
-                    {" "}
-                    <button
-                      className="text-ring hover:underline"
-                      onClick={() =>
-                        updateSettings({ dictationCleanupPrompt: undefined })
-                      }
-                    >
-                      Reset to default
-                    </button>
-                  </>
-                )}
-              </>
-            }
-          >
-            <Textarea
-              value={cleanupPrompt}
-              onChange={(e) =>
-                updateSettings({
-                  dictationCleanupPrompt:
-                    e.target.value === DEFAULT_CLEANUP_PROMPT
-                      ? undefined
-                      : e.target.value,
-                })
-              }
-              className="min-h-32 font-mono text-xs"
-              spellCheck={false}
-            />
-          </StackedRow>
-        </>
-      )}
-
-      {!local && (
-        <StackedRow
-          label="Transcription model"
-          help={
-            <>
-              OpenRouter speech-to-text model used for dictation.
-              {settings.dictationSttModel !== undefined && (
-                <>
-                  {" "}
-                  <button
-                    className="text-ring hover:underline"
-                    onClick={() =>
-                      updateSettings({ dictationSttModel: undefined })
-                    }
-                  >
-                    Reset to default
-                  </button>
-                </>
-              )}
-            </>
-          }
-        >
-          <Input
-            value={settings.dictationSttModel ?? DEFAULT_STT_MODEL}
-            onChange={(e) =>
-              updateSettings({
-                dictationSttModel:
-                  e.target.value === DEFAULT_STT_MODEL
-                    ? undefined
-                    : e.target.value,
-              })
-            }
-            className="font-mono text-xs"
-            placeholder={DEFAULT_STT_MODEL}
-            spellCheck={false}
-          />
-        </StackedRow>
-      )}
-    </>
-  );
-}
-
-/**
- * Status / download card of the local speech model (engine "local"). The
- * download streams from Hugging Face in Rust; progress arrives aggregated
- * over all model files via `localstt://progress`.
- */
-function LocalModelRow() {
-  const status = useSwarm((s) => s.localSttStatus);
-  const setLocalSttStatus = useSwarm((s) => s.setLocalSttStatus);
-  const [downloading, setDownloading] = useState(false);
-  const [progress, setProgress] = useState<{
-    downloaded: number;
-    total: number;
-  } | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const unlisten = onLocalSttProgress(setProgress);
-    return () => void unlisten.then((f) => f());
-  }, []);
-
-  const refresh = () =>
-    fetchLocalSttStatus()
-      .then(setLocalSttStatus)
-      .catch(() => {});
-
-  // a download started earlier keeps running in Rust while this dialog is
-  // closed — re-sync on open so the row doesn't show a stale state
-  useEffect(() => void refresh(), []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const download = async () => {
-    setError(null);
-    setDownloading(true);
-    setProgress({ downloaded: 0, total: status?.totalBytes ?? 0 });
-    try {
-      await downloadLocalSttModel();
-    } catch (e) {
-      // a user-initiated cancel is not an error worth showing
-      if (!String(e).includes("cancelled")) setError(String(e));
-    } finally {
-      setDownloading(false);
-      setProgress(null);
-      void refresh();
-    }
-  };
-
-  const remove = async () => {
-    setError(null);
-    try {
-      await removeLocalSttModel();
-    } catch (e) {
-      setError(String(e));
-    }
-    void refresh();
-  };
-
-  const totalMb = Math.round((status?.totalBytes ?? 0) / 1e6) || LOCAL_STT_DOWNLOAD_MB;
-  const pct = progress?.total
-    ? Math.min(100, Math.round((progress.downloaded / progress.total) * 100))
-    : 0;
-
-  return (
-    <StackedRow
-      label="Local model"
-      help={
-        <>
-          <button
-            className="text-ring hover:underline"
-            onClick={() => void openUrl(LOCAL_STT_MODEL_URL)}
-          >
-            {LOCAL_STT_MODEL_NAME}
-          </button>{" "}
-          by NVIDIA — multilingual (25 languages), runs on-device via ONNX
-          Runtime; nothing to install besides the one-time {totalMb} MB
-          download. Transcribing takes roughly {LOCAL_STT_RAM_GB} GB of free
-          RAM; the model loads on the first dictation and stays in memory
-          until the engine is switched back to Cloud.
-          {error && (
-            <>
-              {" "}
-              <span className="text-destructive">{error}</span>
-            </>
-          )}
-        </>
-      }
-    >
-      {status?.installed ? (
-        <div className="flex items-center gap-3">
-          <span className="text-xs text-success">
-            Installed ({totalMb} MB on disk)
-            {status.loaded ? " — loaded in RAM" : ""}
-          </span>
-          <Button size="sm" variant="outline" onClick={() => void remove()}>
-            Remove
-          </Button>
-        </div>
-      ) : downloading || status?.downloading ? (
-        <div className="flex items-center gap-3">
-          <div className="h-1.5 w-48 overflow-hidden rounded-full bg-secondary">
-            <div
-              className="h-full rounded-full bg-ring transition-[width] duration-300"
-              style={{ width: `${pct}%` }}
-            />
-          </div>
-          <span className="text-xs tabular-nums text-muted-foreground">
-            {pct}%
-          </span>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => void cancelLocalSttDownload()}
-          >
-            Cancel
-          </Button>
-        </div>
-      ) : (
-        <Button size="sm" onClick={() => void download()}>
-          Download model ({totalMb} MB)
-        </Button>
-      )}
-    </StackedRow>
-  );
-}
-
 // ---- Orchestrator ----
 
 /**
- * Phase-6 orchestrator knobs. The provider/model choice applies to NEW
- * chats only (a chat keeps its brain for life); auto-submit, busy policy
- * and scan roots take effect immediately — they are read live by the tool
- * executors. The OpenRouter key row only SURFACES the shared key status —
- * the key itself is managed once, in the Voice section (`onShowVoice`
- * jumps there), so there is exactly one key field app-wide.
- */
-/**
- * Codex-provider defaults NEW orchestrator chats are stamped with (a per-chat
- * override the model picker can still change per chat). Same model source as
- * the picker — recently-used ids on this machine + free text. Empty = the
- * user's plain codex config.
+ * Codex defaults NEW orchestrator chats are stamped with (a per-chat override
+ * the model picker can still change per chat). Same model source as the
+ * picker — recently-used ids on this machine + free text. Empty = the user's
+ * plain codex config.
  */
 function CodexDefaultsRows() {
   const settings = useSwarm((s) => s.settings);
@@ -1366,7 +179,7 @@ function CodexDefaultsRows() {
   return (
     <Row
       label="Default model & effort"
-      help="Model and reasoning effort new codex chats start on — the same picker (Available · Recent · Custom) each chat's header uses. Every chat can still change it per turn. Default = your plain codex config."
+      help="Model and reasoning effort new chats start on — the same picker (Available · Recent · Custom) each chat's header uses. Every chat can still change it per turn. Default = your plain codex config."
     >
       <ModelEffortPicker
         model={model}
@@ -1381,7 +194,7 @@ function CodexDefaultsRows() {
         }
       >
         <button
-          title="Default model & reasoning effort for new codex chats"
+          title="Default model & reasoning effort for new chats"
           className="focus-ring flex items-center gap-1 rounded-full border border-border bg-secondary px-2.5 py-1 font-mono text-[11px] text-muted-foreground transition-colors hover:border-ring/50 hover:text-foreground"
         >
           <span className="max-w-40 truncate">
@@ -1395,28 +208,18 @@ function CodexDefaultsRows() {
   );
 }
 
-function OrchestratorSection({ onShowVoice }: { onShowVoice: () => void }) {
+function OrchestratorSection() {
   const settings = useSwarm((s) => s.settings);
   const updateSettings = useSwarm((s) => s.updateSettings);
-  const keyStatus = useSwarm((s) => s.openrouterStatus);
-  const [models, setModels] = useState<OpenrouterModel[] | null>(null);
 
-  const provider = settings.orchestratorProvider ?? "codex";
-  const model = settings.orchestratorModel ?? DEFAULT_ORCHESTRATOR_MODEL;
   const scanRoots = settings.orchestratorScanRoots ?? [];
-
-  // same public catalog as the dictation cleanup picker (cached in Rust)
-  useEffect(() => {
-    if (!IS_TAURI || provider !== "openrouter") return;
-    fetchOpenrouterModels().then(setModels, () => setModels(null));
-  }, [provider]);
 
   if (!IS_TAURI) {
     return (
       <>
         <SectionHeader
           title="Orchestrator"
-          sub="The AI team lead behind the chat sidebar (⌘⇧O)."
+          sub="The AI team lead behind the Conductor stage (⌘⇧O)."
         />
         <p className="border-t border-border py-3 text-xs leading-relaxed text-muted-foreground">
           The orchestrator ships with the native macOS app.
@@ -1429,155 +232,14 @@ function OrchestratorSection({ onShowVoice }: { onShowVoice: () => void }) {
     <>
       <SectionHeader
         title="Orchestrator"
-        sub="The AI team lead behind the chat sidebar (⌘⇧O) — which brain drives it and how it may touch your panes."
+        sub="The AI team lead behind the Conductor stage (⌘⇧O) — runs on your ChatGPT subscription via the codex CLI."
       />
 
-      <Row
-        label="Brain"
-        help={
-          <>
-            Codex runs on your ChatGPT subscription via the codex CLI;
-            OpenRouter uses your own API key (from the Voice section) with any
-            model you pick. Applies to <em>new</em> chats — existing chats keep
-            the brain they were started with.
-            {provider === "openrouter" && !keyStatus?.present && (
-              <>
-                {" "}
-                <span className="text-warning">
-                  No OpenRouter API key stored yet — see the key row below,
-                  orchestrator chats can't start without it.
-                </span>
-              </>
-            )}
-          </>
-        }
-      >
-        <Segmented
-          value={provider}
-          options={[
-            { value: "codex", label: "Codex" },
-            { value: "openrouter", label: "OpenRouter" },
-          ]}
-          onChange={(v) =>
-            updateSettings({
-              orchestratorProvider: v === "codex" ? undefined : v,
-            })
-          }
-        />
-      </Row>
-
-      {provider === "openrouter" && (
-        <StackedRow
-          label="Model"
-          help={
-            <>
-              Any tool-calling model on OpenRouter — suggestions come from the
-              live catalog{models ? ` (${models.length} models)` : ""}. New
-              chats capture the model at creation.
-              {settings.orchestratorModel !== undefined && (
-                <>
-                  {" "}
-                  <button
-                    className="text-ring hover:underline"
-                    onClick={() =>
-                      updateSettings({ orchestratorModel: undefined })
-                    }
-                  >
-                    Reset to default
-                  </button>
-                </>
-              )}
-            </>
-          }
-        >
-          <>
-            <Input
-              value={model}
-              onChange={(e) =>
-                updateSettings({
-                  orchestratorModel:
-                    e.target.value === DEFAULT_ORCHESTRATOR_MODEL
-                      ? undefined
-                      : e.target.value,
-                })
-              }
-              list="orchestrator-openrouter-models"
-              className="font-mono text-xs"
-              placeholder={DEFAULT_ORCHESTRATOR_MODEL}
-              spellCheck={false}
-            />
-            <datalist id="orchestrator-openrouter-models">
-              {models?.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name}
-                </option>
-              ))}
-            </datalist>
-          </>
-        </StackedRow>
-      )}
-
-      {provider === "codex" && <CodexDefaultsRows />}
-
-      <Row
-        label="OpenRouter API key"
-        help={
-          <>
-            {!keyStatus?.present ? (
-              "No key stored."
-            ) : keyStatus.valid === true ? (
-              <span className="text-success">Key valid.</span>
-            ) : keyStatus.valid === false ? (
-              <span className="text-destructive">
-                Key stored, but OpenRouter rejected it.
-              </span>
-            ) : (
-              "Key stored — couldn't verify it right now."
-            )}{" "}
-            One key is shared app-wide (voice dictation + orchestrator) and
-            managed in the Voice section.
-          </>
-        }
-      >
-        <Button size="sm" variant="outline" onClick={onShowVoice}>
-          Manage in Voice
-        </Button>
-      </Row>
-
-      <Row
-        label="Auto-submit prompts"
-        help="Let the orchestrator press Enter on prompts it types into panes. Off = review mode: text is pasted into the pane but never submitted — you review and press Enter yourself."
-      >
-        <Switch
-          checked={settings.orchestratorAutoSubmit !== false}
-          onCheckedChange={(v) =>
-            updateSettings({ orchestratorAutoSubmit: v ? undefined : false })
-          }
-          label="Auto-submit prompts"
-        />
-      </Row>
-
-      <Row
-        label="Busy panes"
-        help="What happens when the orchestrator prompts a pane that is still working: Deliver queues the text in the pane's input (the model gets a warning), Refuse rejects the prompt so the model waits instead."
-      >
-        <Segmented
-          value={settings.orchestratorBusyPolicy ?? "deliver"}
-          options={[
-            { value: "deliver", label: "Deliver" },
-            { value: "refuse", label: "Refuse" },
-          ]}
-          onChange={(v) =>
-            updateSettings({
-              orchestratorBusyPolicy: v === "deliver" ? undefined : v,
-            })
-          }
-        />
-      </Row>
+      <CodexDefaultsRows />
 
       <StackedRow
         label="Project scan folders"
-        help="Extra folders (e.g. ~/Code) the orchestrator's project discovery shallow-scans for git repos when the model doesn't name its own — on top of your Claude/Codex session history and folders the app already knows."
+        help="Extra folders (e.g. ~/Code) the orchestrator's project discovery shallow-scans for git repos when the model doesn't name its own — on top of your Codex session history and folders the app already knows."
       >
         <div className="flex flex-col gap-1.5">
           {scanRoots.map((root) => (
@@ -1769,9 +431,7 @@ function PersonaControls() {
             <Button
               size="sm"
               variant="outline"
-              onClick={() =>
-                updateSettings({ orchestratorPersona: undefined })
-              }
+              onClick={() => updateSettings({ orchestratorPersona: undefined })}
             >
               <RotateCcw size={12} /> Reset to {DEFAULT_PERSONA.name}
             </Button>
@@ -1888,8 +548,7 @@ function UpdatesSection() {
           sub="Keep SwarmZ up to date from GitHub Releases."
         />
         <p className="border-t border-border py-3 text-xs leading-relaxed text-muted-foreground">
-          In-app updates ship with the native macOS app. The web build simply
-          follows your local checkout — pull and restart the engine to update.
+          In-app updates ship with the native macOS app.
         </p>
       </>
     );
@@ -1965,10 +624,9 @@ function UpdatesSection() {
 // ---- Paths ----
 
 /**
- * Binary-path override input: edits stay local until blur/Enter (a half-typed
- * path must never reach the live 7s git polling), and the persisted value is
- * stat'ed via the backend — a typo'd path silently degrades several features
- * at once, so it gets an inline error instead.
+ * Binary-path override input: edits stay local until blur/Enter, and the
+ * persisted value is stat'ed via the backend — a typo'd path silently
+ * degrades several features at once, so it gets an inline error instead.
  */
 function BinaryPathInput({
   value,
@@ -2037,33 +695,13 @@ function PathsSection() {
       />
 
       <StackedRow
-        label="Claude binary"
-        help={
-          <>
-            Absolute path to the{" "}
-            <code className="font-mono text-muted-foreground">claude</code>{" "}
-            binary. When set, it replaces a leading{" "}
-            <code className="font-mono text-muted-foreground">claude</code> in
-            startup commands — other commands are untouched.
-          </>
-        }
-      >
-        <BinaryPathInput
-          value={settings.claudePath ?? ""}
-          placeholder="claude — resolved by your login shell"
-          onCommit={(v) => updateSettings({ claudePath: v })}
-        />
-      </StackedRow>
-
-      <StackedRow
         label="Codex binary"
         help={
           <>
             Absolute path to the{" "}
             <code className="font-mono text-muted-foreground">codex</code>{" "}
-            binary. When set, it replaces a leading{" "}
-            <code className="font-mono text-muted-foreground">codex</code> in
-            startup commands — other commands are untouched.
+            binary used to spawn the app-server behind sessions and the
+            orchestrator.
           </>
         }
       >
@@ -2076,7 +714,7 @@ function PathsSection() {
 
       <StackedRow
         label="Git binary"
-        help="Used for the read-only git status in pane headers (branch, ±lines, untracked)."
+        help="Used for the read-only git status and the worktree management."
       >
         <BinaryPathInput
           value={settings.gitPath ?? ""}
@@ -2127,8 +765,8 @@ function AboutSection() {
             </span>
           </div>
           <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-            Run, tile and monitor a swarm of Claude Code and Codex agents — real
-            terminals, live tokens &amp; cost. 100% local.
+            Run and monitor a swarm of native Codex agents — live sessions,
+            approvals, tokens &amp; cost. 100% local.
           </p>
         </div>
       </div>

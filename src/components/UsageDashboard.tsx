@@ -9,25 +9,10 @@ import {
   modelAccent,
   prettyModel,
 } from "@/lib/utils";
-import type { AgentRuntime, ModelUsage, UsageHistoryEntry } from "@/types";
+import type { ModelUsage, UsageHistoryEntry } from "@/types";
 
-type Scope = "session" | "alltime";
-
-interface UsageSource {
-  runtime?: AgentRuntime;
-  message_count: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_tokens: number;
-  cache_read_tokens: number;
-  reasoning_output_tokens?: number;
-  cost_usd: number;
-  by_model: ModelUsage[];
-}
-
-function aggregate(sources: UsageSource[]) {
+function aggregate(sources: UsageHistoryEntry[]) {
   const models = new Map<string, ModelUsage>();
-  const runtimes = new Map<AgentRuntime, number>();
   let cost = 0,
     input = 0,
     output = 0,
@@ -46,8 +31,6 @@ function aggregate(sources: UsageSource[]) {
     cacheRead += u.cache_read_tokens;
     reasoning += u.reasoning_output_tokens ?? 0;
     messages += u.message_count;
-    const runtime = u.runtime ?? "claude";
-    runtimes.set(runtime, (runtimes.get(runtime) ?? 0) + 1);
     for (const bm of u.by_model) {
       const e =
         models.get(bm.model) ??
@@ -86,19 +69,11 @@ function aggregate(sources: UsageSource[]) {
     cost,
     tokens: input + output + cacheWrite + cacheRead,
     output,
-    cacheRead,
     reasoning,
     messages,
     sessions,
     byModel,
-    byRuntime: [...runtimes.entries()].sort((a, b) => b[1] - a[1]),
   };
-}
-
-function runtimeLabel(runtime: AgentRuntime): string {
-  if (runtime === "codex") return "Codex";
-  if (runtime === "claude") return "Claude";
-  return "Shell";
 }
 
 function formatDay(ms: number) {
@@ -120,18 +95,19 @@ function formatDay(ms: number) {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+/**
+ * All-time Codex usage of sessions launched inside SwarmZ (persisted history;
+ * entries from the pre-rebuild Claude/shell era are filtered out of view).
+ */
 export function UsageDashboard() {
   const open = useSwarm((s) => s.dashboardOpen);
   const setOpen = useSwarm((s) => s.setDashboardOpen);
-  const agents = useSwarm((s) => s.agents);
-  const order = useSwarm((s) => s.order);
   const usageHistory = useSwarm((s) => s.usageHistory);
   const clearUsageHistory = useSwarm((s) => s.clearUsageHistory);
-  const [scope, setScope] = useState<Scope>("session");
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Escape closes the drawer; capture + stopPropagation so window-level
-  // handlers (fleet exit in WorkspaceLayer) don't react to the same press
+  // handlers don't react to the same press
   useEffect(() => {
     if (!open) return;
     panelRef.current?.focus();
@@ -148,36 +124,18 @@ export function UsageDashboard() {
     return () => window.removeEventListener("keydown", onKey, true);
   }, [open, setOpen]);
 
-  // "session": ONLY what was produced inside SwarmZ since this app start —
-  // the sum of each open agent's own session usage.
-  const sessionAgg = useMemo(
-    () =>
-      aggregate(
-        order
-          .map((id) => agents[id]?.usage)
-          .filter((u): u is NonNullable<typeof u> => !!u),
-      ),
-    [agents, order],
-  );
-
-  // "alltime": everything ever launched inside SwarmZ, persisted across app
-  // restarts. Live sessions are mirrored into the history as they run, so the
-  // current session is already included.
   const historyEntries = useMemo(
     () =>
-      Object.values(usageHistory).sort(
-        (a, b) => b.last_updated - a.last_updated,
-      ),
+      Object.values(usageHistory)
+        // entries without a runtime predate the rebuild (Claude parser) — hide them
+        .filter((e) => (e.runtime ?? "claude") === "codex")
+        .sort((a, b) => b.last_updated - a.last_updated),
     [usageHistory],
   );
-  const alltimeAgg = useMemo(
-    () => aggregate(historyEntries),
-    [historyEntries],
-  );
+  const agg = useMemo(() => aggregate(historyEntries), [historyEntries]);
 
   if (!open) return null;
 
-  const agg = scope === "session" ? sessionAgg : alltimeAgg;
   const maxModelCost = Math.max(1, ...agg.byModel.map((m) => m.cost_usd), 1);
 
   return (
@@ -197,9 +155,8 @@ export function UsageDashboard() {
           <div>
             <h2 className="text-sm font-semibold tracking-tight">Usage</h2>
             <p className="text-[11px] text-faint">
-              {scope === "session"
-                ? "This SwarmZ session · agents launched here"
-                : "All time · everything launched in SwarmZ"}
+              All time · recorded Codex history (new entries return with the
+              Phase-2 session accounting)
             </p>
           </div>
           <button
@@ -208,29 +165,6 @@ export function UsageDashboard() {
           >
             <X size={16} />
           </button>
-        </div>
-
-        {/* scope toggle */}
-        <div className="flex gap-1 border-b border-border px-4 py-2">
-          {(
-            [
-              ["session", "Session"],
-              ["alltime", "All time"],
-            ] as [Scope, string][]
-          ).map(([key, label]) => (
-            <button
-              key={key}
-              onClick={() => setScope(key)}
-              className={cn(
-                "focus-ring rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-                scope === key
-                  ? "bg-accent text-foreground"
-                  : "text-faint hover:text-foreground",
-              )}
-            >
-              {label}
-            </button>
-          ))}
         </div>
 
         <ScrollArea className="flex-1">
@@ -252,24 +186,11 @@ export function UsageDashboard() {
                 accent="var(--chart-2)"
               />
               <Stat
-                label={agg.reasoning > 0 ? "Reasoning" : "Cache read"}
-                value={formatTokens(agg.reasoning > 0 ? agg.reasoning : agg.cacheRead)}
-                sub={agg.reasoning > 0 ? "Codex output" : "Claude cache"}
+                label="Reasoning"
+                value={formatTokens(agg.reasoning)}
+                sub="Codex output"
               />
             </div>
-
-            {agg.byRuntime.length > 0 && (
-              <div className="flex flex-wrap gap-1.5">
-                {agg.byRuntime.map(([runtime, count]) => (
-                  <span
-                    key={runtime}
-                    className="rounded-md border border-border bg-card px-2 py-1 text-[11px] text-muted-foreground"
-                  >
-                    {runtimeLabel(runtime)} · {count}
-                  </span>
-                ))}
-              </div>
-            )}
 
             {/* per-model breakdown */}
             <div>
@@ -325,67 +246,11 @@ export function UsageDashboard() {
               </div>
             </div>
 
-            {scope === "session" ? (
-              <SessionAgentList />
-            ) : (
-              <HistoryList
-                entries={historyEntries}
-                onClear={clearUsageHistory}
-              />
-            )}
+            <HistoryList entries={historyEntries} onClear={clearUsageHistory} />
           </div>
         </ScrollArea>
       </div>
     </>
-  );
-}
-
-function SessionAgentList() {
-  const agents = useSwarm((s) => s.agents);
-  const order = useSwarm((s) => s.order);
-  return (
-    <div>
-      <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-faint">
-        Open agents
-      </div>
-      <div className="space-y-1.5">
-        {order.length === 0 && (
-          <p className="text-xs text-faint">No agents running.</p>
-        )}
-        {order.map((id) => {
-          const a = agents[id];
-          if (!a) return null;
-          const u = a.usage;
-          const tok = u
-            ? u.input_tokens +
-              u.output_tokens +
-              u.cache_creation_tokens +
-              u.cache_read_tokens
-            : 0;
-          return (
-            <div
-              key={id}
-              className="flex items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1.5"
-            >
-              <span
-                className="h-1.5 w-1.5 shrink-0 rounded-full"
-                style={{ backgroundColor: a.color }}
-              />
-              <span className="flex-1 truncate text-xs">{a.name}</span>
-              <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] text-faint">
-                {runtimeLabel(a.runtime ?? "claude")}
-              </span>
-              <span className="shrink-0 whitespace-nowrap font-mono text-[10px] tabular-nums text-muted-foreground">
-                {formatTokens(tok)}
-              </span>
-              <span className="min-w-12 shrink-0 whitespace-nowrap text-right font-mono text-[10px] tabular-nums text-foreground">
-                {u && u.cost_usd > 0 ? formatUsd(u.cost_usd) : "—"}
-              </span>
-            </div>
-          );
-        })}
-      </div>
-    </div>
   );
 }
 
@@ -435,9 +300,7 @@ function HistoryList({
                 : "text-faint hover:bg-accent hover:text-foreground",
             )}
             title={
-              armed
-                ? "Click again to reset"
-                : "Reset all-time usage statistics"
+              armed ? "Click again to reset" : "Reset all-time usage statistics"
             }
           >
             <Trash2 size={11} /> {armed ? "Reset all-time stats?" : "Reset"}
@@ -456,15 +319,12 @@ function HistoryList({
             e.cache_read_tokens;
           return (
             <div
-              key={`${e.runtime ?? "claude"}:${e.session_id}`}
+              key={`${e.runtime ?? "codex"}:${e.session_id}`}
               className="flex items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1.5"
             >
               <History size={11} className="shrink-0 text-faint" />
               <span className="flex-1 truncate text-xs" title={e.cwd ?? undefined}>
                 {e.agent_name}
-              </span>
-              <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] text-faint">
-                {runtimeLabel(e.runtime ?? "claude")}
               </span>
               <span className="shrink-0 whitespace-nowrap font-mono text-[10px] tabular-nums text-faint">
                 {formatDay(e.last_updated)}

@@ -1,8 +1,7 @@
-// Vibe-Mode session controller (Phase 2 data layer) — bridges the native
-// Codex session plumbing (the `vibe_session_*` Tauri commands + the
-// `vibe://session-event` stream, codex/sessions.rs) and the session store,
-// OUTSIDE React (the lib/term-host.ts / orchestrator/controller.ts pattern).
-// No UI here — Phase 3 wires the panel. Responsibilities:
+// Session controller — bridges the native Codex session plumbing (the
+// `vibe_session_*` Tauri commands + the `vibe://session-event` stream,
+// codex/sessions.rs) and the session store, OUTSIDE React (the
+// orchestrator/controller.ts pattern). No UI here. Responsibilities:
 //   · typed `invoke` wrappers for the eight session commands (native-only,
 //     direct invoke like lib/worktree.ts) + the one event listener
 //   · map streamed session events into normalized store items, batching the
@@ -298,17 +297,14 @@ function warn(sessionId: string, text: string) {
   });
 }
 
-/** Mirror a session lifecycle moment into the shared Deck ticker (source=vibe;
- * the ticker jumps into Vibe Mode for these). */
+/** Mirror a session lifecycle moment into the shared Deck ticker. */
 function pushSessionEvent(sessionId: string, kind: FleetEventKind) {
   const entry = useVibe.getState().sessions[sessionId];
   if (!entry) return;
   pushFleetEvent({
     kind,
-    paneId: sessionId,
-    paneName: entry.session.name,
-    workspaceId: "",
-    source: "vibe",
+    sessionId,
+    sessionName: entry.session.name,
   });
 }
 
@@ -519,18 +515,27 @@ export async function resumeSession(sessionId: string): Promise<void> {
 }
 
 /**
- * Send one user message (non-blocking backend): append the user item, ensure
- * the backend session is live, fire the turn. Progress streams as events; busy
- * is cleared by the turn's completion event, not here. A busy session ignores.
+ * Deliver one user message (non-blocking backend): append the user item,
+ * ensure the backend session is live, fire the turn. Progress streams as
+ * events; busy is cleared by the turn's completion event, not here.
+ *
+ * STRICT: every failure (unknown/busy session, resume/start/send errors)
+ * REJECTS — this is the orchestrator's delivery contract (`prompt_pane` /
+ * `create_panes` prompts must never report `delivered:true` for a turn that
+ * never started). Backend failures still surface as a warning item in the
+ * transcript before rejecting, so the human sees them too.
  */
-export async function sendMessage(
+export async function sendMessageStrict(
   sessionId: string,
   text: string,
 ): Promise<void> {
   const trimmed = text.trim();
   if (!trimmed) return;
   const store = useVibe.getState();
-  if (!store.sessions[sessionId] || store.busy[sessionId]) return;
+  if (!store.sessions[sessionId])
+    throw new Error(`unknown vibe session "${sessionId}"`);
+  if (store.busy[sessionId])
+    throw new Error("session is busy — one turn at a time");
   ensureEvents();
   store.upsertItem(sessionId, {
     id: `user-${nanoid(8)}`,
@@ -548,6 +553,24 @@ export async function sendMessage(
   } catch (err) {
     useVibe.getState().setBusy(sessionId, false);
     warn(sessionId, `Send failed: ${errorText(err)}`);
+    throw err instanceof Error ? err : new Error(errorText(err));
+  }
+}
+
+/**
+ * The human/UI send path: same delivery, but failures never reject — a
+ * backend failure is already visible in the transcript (the warning item),
+ * and a busy/unknown session stays a silent no-op (the composer is disabled
+ * while busy anyway).
+ */
+export async function sendMessage(
+  sessionId: string,
+  text: string,
+): Promise<void> {
+  try {
+    await sendMessageStrict(sessionId, text);
+  } catch {
+    /* surfaced as a warning item in the transcript */
   }
 }
 
@@ -632,14 +655,13 @@ export async function closeSession(sessionId: string): Promise<void> {
 }
 
 /**
- * Bring a session into view: switch the app to Vibe Mode and select it —
- * the Deck triage/ticker and cross-session jumps route through here.
+ * Bring a session into view: select it and leave the Conductor stage — the
+ * Deck triage/ticker and cross-session jumps route through here.
  */
 export function focusSession(sessionId: string): void {
   if (!useVibe.getState().sessions[sessionId]) return;
-  useSwarm.getState().setUiMode("vibe");
   useVibe.getState().setActive(sessionId);
-  // a jump targets a session — leave the Conductor stage (Phase 5)
+  // a jump targets a session — leave the Conductor stage
   useVibeUi.getState().setStageMode("session");
 }
 

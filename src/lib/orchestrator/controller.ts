@@ -1,36 +1,29 @@
-// Orchestrator chat controller (Phase 4) — bridges the Phase-3 chat plumbing
-// (chat.ts commands + event stream) and the chat store, OUTSIDE React (the
-// lib/term-host.ts / lib/dictation.ts pattern). Responsibilities:
+// Orchestrator chat controller — bridges the chat plumbing (chat.ts
+// commands + event stream) and the chat store, OUTSIDE React (the
+// vibe/controller.ts pattern). Responsibilities:
 //   · lazily create the backend chat behind a store chat, or resume its
 //     persisted codex thread (threadId) after an app restart
 //   · map streamed chat events into store messages, batching the word-level
 //     `delta` events (~80 ms flushes → ≤ ~12 store writes/s per chat)
 //   · per-chat busy flag (one turn at a time — the backend enforces it too)
 //     and interrupt
-//   · pane jump chips: tool args referencing live pane ids, plus panes born
-//     during a create_panes call (order diff — the tool RESULT flows
-//     Rust → codex and never reaches the frontend), attach `paneRefs` to the
-//     tool message for the UI
-//   · status pings (Phase 5): watch agents' activity OUTSIDE React; a
-//     touched pane finishing (busy → idle/waiting) pings its owning chat(s)
-//     with a persisted system message, and undelivered pings are injected
-//     into the WIRE text of the next send (never into the stored bubble)
-//   · provider routing (Phase 6): every chat carries a fixed provider,
-//     stamped at creation (`createChat`). Codex chats go through the
-//     app-server plumbing above; OpenRouter chats run the webview tool loop
-//     (openrouter-loop.ts), which synthesizes the SAME chat events through
-//     `handleEvent` — delta batching, tool chips and pane-ref diffs are
-//     shared, not duplicated. Rust streams OpenRouter deltas under the
-//     STORE chat id, so the backend↔chat map self-links those chats.
+//   · session jump chips: tool args referencing live session ids, plus
+//     sessions born during a create_panes call (order diff — the tool RESULT
+//     flows Rust → codex and never reaches the frontend), attach `paneRefs`
+//     to the tool message for the UI
+//   · status pings: watch sessions' busy/approval state OUTSIDE React; a
+//     touched session finishing (busy → idle) or raising an approval pings
+//     its owning chat(s) with a persisted system message, and undelivered
+//     pings are injected into the WIRE text of the next send (never into the
+//     stored bubble)
 
-import { useSwarm } from "@/store";
 import { useVibe } from "@/lib/vibe/session-store";
 import { hasPendingApproval } from "@/lib/vibe/ui";
 import type {
-  ClaudeActivity,
   OrchestratorPaneRef,
   OrchestratorPingRecord,
 } from "@/types";
+import { useSwarm } from "@/store";
 import {
   chatInterrupt,
   chatResume,
@@ -44,12 +37,6 @@ import {
   useOrchestrator,
   type OrchestratorMessagePatch,
 } from "./chat-store";
-import {
-  DEFAULT_ORCHESTRATOR_MODEL,
-  dropOpenRouterChat,
-  interruptOpenRouterTurn,
-  runOpenRouterTurn,
-} from "./openrouter-loop";
 
 /** Trailing-edge delta flush — word-level deltas never write per event. */
 const DELTA_FLUSH_MS = 80;
@@ -76,9 +63,7 @@ export function chatIdForBackend(
 interface PendingTool {
   tool: string;
   messageId: string;
-  /** pane order snapshot around a create_panes call, for the ref diff */
-  orderBefore: string[] | null;
-  /** native-session order snapshot around a create_panes call (native:true) */
+  /** session order snapshot around a create_panes call, for the ref diff */
   sessionOrderBefore: string[] | null;
 }
 
@@ -166,18 +151,12 @@ function finalizeStream(chatId: string, st: StreamState, finalText?: string) {
 }
 
 /**
- * Live panes AND native sessions whose id appears in the text (args summaries
- * are one line). Session ids and pane ids share one flat namespace of jump
- * chips — the chip resolves the id to a pane (focusAgent) or session
- * (focusSession) at click time (see PaneChip in the chat view).
+ * Live sessions whose id appears in the text (args summaries are one line).
+ * The chip resolves the id to a session (focusSession) at click time.
  */
 function paneRefsFromText(text: string): OrchestratorPaneRef[] {
   if (!text) return [];
-  const s = useSwarm.getState();
   const refs: OrchestratorPaneRef[] = [];
-  for (const id of s.order) {
-    if (text.includes(id)) refs.push({ id, name: s.agents[id]?.name ?? id });
-  }
   const v = useVibe.getState();
   for (const id of v.order) {
     if (text.includes(id))
@@ -234,8 +213,6 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
       st.pendingTools.push({
         tool,
         messageId,
-        orderBefore:
-          tool === "create_panes" ? [...useSwarm.getState().order] : null,
         sessionOrderBefore:
           tool === "create_panes" ? [...useVibe.getState().order] : null,
       });
@@ -247,24 +224,15 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
       if (idx < 0) break;
       const [pending] = st.pendingTools.splice(idx, 1);
       const patch: OrchestratorMessagePatch = { ok: data.ok !== false };
-      if (pending.orderBefore || pending.sessionOrderBefore) {
-        // panes AND native sessions born while create_panes ran become jump
-        // chips (the tool result never reaches the frontend, so diff the order)
-        const s = useSwarm.getState();
+      if (pending.sessionOrderBefore) {
+        // sessions born while create_panes ran become jump chips (the tool
+        // result never reaches the frontend, so diff the order)
+        const before = new Set(pending.sessionOrderBefore);
+        const v = useVibe.getState();
         const created: OrchestratorPaneRef[] = [];
-        if (pending.orderBefore) {
-          const before = new Set(pending.orderBefore);
-          for (const id of s.order)
-            if (!before.has(id))
-              created.push({ id, name: s.agents[id]?.name ?? id });
-        }
-        if (pending.sessionOrderBefore) {
-          const before = new Set(pending.sessionOrderBefore);
-          const v = useVibe.getState();
-          for (const id of v.order)
-            if (!before.has(id))
-              created.push({ id, name: v.sessions[id]?.session.name ?? id });
-        }
+        for (const id of v.order)
+          if (!before.has(id))
+            created.push({ id, name: v.sessions[id]?.session.name ?? id });
         if (created.length) {
           const message = useOrchestrator
             .getState()
@@ -297,7 +265,7 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
       break;
     }
     case "token_usage": {
-      // in-memory context accounting for the chat's context gauge (Block 2)
+      // in-memory context accounting for the chat's context gauge
       store.setChatTokenUsage(chatId, {
         total: (data.total as Record<string, number>) ?? null,
         last: (data.last as Record<string, number>) ?? null,
@@ -317,102 +285,58 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
   }
 }
 
-// ---- status pings (Phase 5) ----
+// ---- status pings ----
 
-/** A repeated finish of the same pane within this window is flapping — skip. */
+/** A repeated finish of the same session within this window is flapping — skip. */
 const PING_FLAP_MS = 3_000;
 /** Transitions within this window of the chat's prompt are startup noise. */
 const PROMPT_SETTLE_MS = 2_000;
 
-/** last observed activity per pane id (transition detection) */
-const prevActivity = new Map<string, ClaudeActivity | undefined>();
-/** last emitted ping per pane id (flap debounce, across chats) */
+/** last emitted ping per session id (flap debounce, across chats) */
 const lastPingAt = new Map<string, number>();
-let lastAgents: unknown = null;
-let pingsStarted = false;
 
 /**
- * A touched pane finished (busy → idle/waiting): ping every chat that
- * prompted it — persisted system message (jump chip + "Review" via
- * paneRefs) plus an undelivered ping record for the next send's context
- * injection. Runs regardless of the chat's turn state; a running turn just
- * means the ping rides along with the NEXT send (never auto-starts a turn).
+ * A touched session finished (busy → idle) or waits on an approval: ping
+ * every chat that prompted it — persisted system message (jump chip +
+ * "Review" via paneRefs) plus an undelivered ping record for the next send's
+ * context injection. Runs regardless of the chat's turn state; a running
+ * turn just means the ping rides along with the NEXT send (never auto-starts
+ * a turn).
  */
-function onPaneFinished(
-  paneId: string,
-  paneName: string,
+function onSessionFinished(
+  sessionId: string,
+  sessionName: string,
   activity: "idle" | "waiting",
 ): void {
   const now = Date.now();
-  const last = lastPingAt.get(paneId);
+  const last = lastPingAt.get(sessionId);
   if (last !== undefined && now - last < PING_FLAP_MS) return;
   const orch = useOrchestrator.getState();
   let pinged = false;
   for (const chat of orch.chats) {
-    const touched = chat.touchedPanes[paneId];
+    const touched = chat.touchedPanes[sessionId];
     if (!touched) continue;
-    // startup noise: the prompt just went in; the CLI bouncing through
-    // idle/waiting while it takes over is not a "finished"
+    // startup noise: the prompt just went in
     if (now - touched.lastPromptAt < PROMPT_SETTLE_MS) continue;
-    const name = paneName || touched.name;
+    const name = sessionName || touched.name;
     orch.appendMessage(chat.id, {
       role: "system",
       text:
         activity === "waiting"
           ? `«${name}» waiting for input`
           : `«${name}» finished`,
-      paneRefs: [{ id: paneId, name }],
+      paneRefs: [{ id: sessionId, name }],
     });
-    orch.addPendingPing(chat.id, { paneId, paneName: name, activity, at: now });
+    orch.addPendingPing(chat.id, {
+      paneId: sessionId,
+      paneName: name,
+      activity,
+      at: now,
+    });
     pinged = true;
   }
-  if (pinged) lastPingAt.set(paneId, now);
+  if (pinged) lastPingAt.set(sessionId, now);
 }
-
-/**
- * Watch agents' activity in the main store (OUTSIDE React, like the bus).
- * Started once from App.tsx next to startOrchestratorBus; returns a stop
- * function. Only busy → idle/waiting transitions of panes some chat touched
- * become pings — everything else just updates the transition memory.
- */
-export function startOrchestratorActivityWatcher(): () => void {
-  if (pingsStarted) return () => {};
-  pingsStarted = true;
-  // seed so panes already busy at start ping on their NEXT transition, and
-  // pre-existing idle states never ping retroactively
-  lastAgents = useSwarm.getState().agents;
-  prevActivity.clear();
-  for (const [id, a] of Object.entries(useSwarm.getState().agents))
-    prevActivity.set(id, a.activity);
-  const unsub = useSwarm.subscribe((state) => {
-    if (state.agents === lastAgents) return; // cheap out for unrelated updates
-    lastAgents = state.agents;
-    for (const [id, agent] of Object.entries(state.agents)) {
-      const prev = prevActivity.get(id);
-      const activity = agent.activity;
-      if (prev === activity) continue;
-      prevActivity.set(id, activity);
-      if (prev === "busy" && (activity === "idle" || activity === "waiting"))
-        onPaneFinished(id, agent.name, activity);
-    }
-    for (const id of prevActivity.keys())
-      if (!state.agents[id]) {
-        prevActivity.delete(id);
-        lastPingAt.delete(id);
-      }
-  });
-  return () => {
-    pingsStarted = false;
-    unsub();
-  };
-}
-
-// ---- native-session pings (Phase 5) ----
-//
-// The session analogue of the pane activity watcher: a touched native session
-// finishing its turn (busy → idle) or raising a pending approval pings its
-// owning chat(s) through the SAME onPaneFinished machinery (session ids are
-// just ids in touchedPanes). Flap + settle guards are shared.
 
 /** last observed busy flag per session id */
 const prevSessBusy = new Map<string, boolean>();
@@ -421,10 +345,10 @@ const prevSessPending = new Map<string, boolean>();
 let vibePingsStarted = false;
 
 /**
- * Watch native sessions' busy/approval transitions OUTSIDE React (the vibe
- * store is a plain zustand store, like the main one). Started once from
- * App.tsx next to startOrchestratorActivityWatcher; returns a stop function.
- * Only sessions some chat touched (prompt_pane / create_panes native) ping.
+ * Watch sessions' busy/approval transitions OUTSIDE React (the vibe store is
+ * a plain zustand store). Started once from App.tsx next to
+ * startOrchestratorBus; returns a stop function. Only sessions some chat
+ * touched (prompt_pane / create_panes) ping.
  */
 export function startVibeSessionActivityWatcher(): () => void {
   if (vibePingsStarted) return () => {};
@@ -448,10 +372,10 @@ export function startVibeSessionActivityWatcher(): () => void {
       prevSessPending.set(id, pending);
       const name = entry.session.name;
       // a new pending approval waits on the human ("waiting" variant)
-      if (pPending === false && pending) onPaneFinished(id, name, "waiting");
+      if (pPending === false && pending) onSessionFinished(id, name, "waiting");
       // turn genuinely finished (busy → idle, nothing waiting)
       else if (pBusy === true && !busy && !pending)
-        onPaneFinished(id, name, "idle");
+        onSessionFinished(id, name, "idle");
     }
     for (const id of prevSessBusy.keys())
       if (!state.sessions[id]) {
@@ -485,33 +409,22 @@ function statusUpdateBlock(pings: OrchestratorPingRecord[]): string {
   return `[Status update] ${lines.join("\n")}`;
 }
 
-// ---- public surface (used by OrchestratorPanel) ----
+// ---- public surface (used by the Conductor stage) ----
 
 /**
- * Create (or reuse an empty) chat, stamped with the CURRENT provider/model
- * settings — the stamp is fixed for the chat's lifetime; switching the
- * setting only affects new chats. The panel always goes through this
- * instead of the raw store action.
+ * Create (or reuse an empty) chat, stamped with the CURRENT model/effort
+ * settings — the stamp is fixed at creation; switching the setting only
+ * affects new chats. The stage always goes through this instead of the raw
+ * store action.
  */
 export function createChat(): string {
-  const {
-    orchestratorProvider,
-    orchestratorModel,
-    orchestratorCodexModel,
-    orchestratorCodexEffort,
-  } = useSwarm.getState().settings;
-  const provider = orchestratorProvider ?? "codex";
-  if (provider === "openrouter") {
-    return useOrchestrator
-      .getState()
-      .newChat(provider, orchestratorModel?.trim() || DEFAULT_ORCHESTRATOR_MODEL);
-  }
-  // codex chats get the Settings defaults (a per-chat override the picker can
+  const { orchestratorCodexModel, orchestratorCodexEffort } =
+    useSwarm.getState().settings;
+  // chats get the Settings defaults (a per-chat override the picker can
   // change later); empty defaults = no stamp = the user's plain codex config
   return useOrchestrator
     .getState()
     .newChat(
-      provider,
       orchestratorCodexModel?.trim() || undefined,
       orchestratorCodexEffort?.trim() || undefined,
     );
@@ -555,7 +468,7 @@ function errorText(err: unknown): string {
  * the turn into the store. One turn per chat at a time — a busy chat's send
  * is ignored (the UI shows a stop button instead).
  *
- * Phase 5: undelivered status pings are marked delivered and prepended as a
+ * Undelivered status pings are marked delivered and prepended as a
  * `[Status update]` block to the WIRE text only — the stored user bubble
  * stays the raw text (the pings are already visible as system messages).
  * Rust's chat_send additionally prepends its `[fleet status: …]` line; both
@@ -584,29 +497,15 @@ export async function sendMessage(chatId: string, text: string): Promise<void> {
   const st = streamOf(chatId);
   st.turnFailed = false;
   // collect-and-mark just before the wire write: pings arriving after this
-  // point stay undelivered and ride along with the NEXT send. Ping injection
-  // is provider-agnostic — it happens before the routing below.
+  // point stay undelivered and ride along with the NEXT send.
   const pings = useOrchestrator.getState().takePendingPings(chatId);
   const wireText = pings.length
     ? `${statusUpdateBlock(pings)}\n\n${trimmed}`
     : trimmed;
   try {
-    if ((chat.provider ?? "codex") === "openrouter") {
-      // Rust streams this chat's deltas under the STORE chat id — self-link
-      // so the shared event listener routes them (and executors resolve the
-      // chat context through the same map as codex tool calls)
-      link(chatId, chatId);
-      // the loop synthesizes every other event through handleEvent, so tool
-      // chips / stream finalization / turn state reuse the codex plumbing
-      await runOpenRouterTurn(chatId, wireText, {
-        emit: (kind, data) =>
-          handleEvent(chatId, { chat_id: chatId, kind, data }),
-      });
-    } else {
-      const backendId = await ensureBackendChat(chatId);
-      // per-chat model/effort ride along as a turn/start override
-      await chatSend(backendId, wireText, chat.model, chat.effort);
-    }
+    const backendId = await ensureBackendChat(chatId);
+    // per-chat model/effort ride along as a turn/start override
+    await chatSend(backendId, wireText, chat.model, chat.effort);
   } catch (err) {
     // a turn_failed event already surfaced its own warning; everything else
     // (spawn failure, dead process, resume+start both failing) lands here
@@ -624,23 +523,15 @@ export async function sendMessage(chatId: string, text: string): Promise<void> {
 
 /** Stop the chat's running turn (its send resolves as "interrupted"). */
 export function interrupt(chatId: string): void {
-  const chat = useOrchestrator.getState().chats.find((c) => c.id === chatId);
-  if ((chat?.provider ?? "codex") === "openrouter") {
-    interruptOpenRouterTurn(chatId);
-    return;
-  }
   const backendId = backendByChat.get(chatId);
   if (backendId) void chatInterrupt(backendId).catch(() => {});
 }
 
 /**
  * Delete a chat: interrupt a running turn, drop the controller state, then
- * remove it from the store. The codex thread rollout stays on disk; an
- * OpenRouter chat's wire history goes down with the chat.
+ * remove it from the store. The codex thread rollout stays on disk.
  */
 export function removeChat(chatId: string): void {
-  const chat = useOrchestrator.getState().chats.find((c) => c.id === chatId);
-  if ((chat?.provider ?? "codex") === "openrouter") dropOpenRouterChat(chatId);
   const backendId = backendByChat.get(chatId);
   if (backendId) {
     if (useOrchestrator.getState().busy[chatId]) interrupt(chatId);
@@ -655,7 +546,7 @@ export function removeChat(chatId: string): void {
 
 /**
  * Check codex availability (spawns the app-server lazily) into the store —
- * run on first panel open so a dead/logged-out codex shows a quiet notice
+ * run on first stage open so a dead/logged-out codex shows a quiet notice
  * instead of the first send erroring.
  */
 export async function refreshStatus(): Promise<void> {
