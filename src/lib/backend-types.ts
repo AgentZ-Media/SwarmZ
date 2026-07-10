@@ -112,6 +112,13 @@ export interface Backend {
   loadSettings(): Promise<AppSettings | null>;
   saveSettings(settings: AppSettings): Promise<void>;
 
+  /**
+   * Top-level `schemaVersion` key of swarmz.json — the migration anchor
+   * (see lib/schema-version.ts). null = pre-versioning store.
+   */
+  loadSchemaVersion(): Promise<number | null>;
+  saveSchemaVersion(version: number): Promise<void>;
+
   /** Workspace tabs (name/order/defaultCwd) — agents inside are in-memory. */
   loadWorkspaces(): Promise<PersistedWorkspaces | null>;
   saveWorkspaces(ws: PersistedWorkspaces): Promise<void>;

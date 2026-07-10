@@ -193,6 +193,18 @@ export const tauriBackend: Backend = {
     await store.save();
   },
 
+  loadSchemaVersion: async () => {
+    try {
+      return (await store.get<number>("schemaVersion")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveSchemaVersion: async (version) => {
+    await store.set("schemaVersion", version);
+    await store.save();
+  },
+
   loadWorkspaces: async () => {
     try {
       return (await store.get<PersistedWorkspaces>("workspaces")) ?? null;

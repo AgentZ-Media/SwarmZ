@@ -40,7 +40,6 @@ export type VibeSessionEventKind =
   | "delta"
   | "message"
   | "item_started"
-  | "item_updated"
   | "item_completed"
   | "item_output_delta"
   | "turn_diff"
@@ -358,7 +357,6 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
       break;
     }
     case "item_started":
-    case "item_updated":
     case "item_completed": {
       const item = toVibeItem(data.item);
       if (item) store.upsertItem(sessionId, item);

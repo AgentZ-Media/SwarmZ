@@ -266,7 +266,10 @@ impl Client {
 /// initialize (experimentalApi — required for dynamicTools) + `initialized`.
 /// Returns the server's userAgent (carries the codex version). The
 /// clientInfo name "SwarmZ" also lands as `originator` in the session
-/// rollouts — that is how SwarmZ-born sessions are recognizable on disk.
+/// rollouts — that is how SwarmZ-born sessions are recognizable on disk
+/// (live-verified on 0.144.1: `session_meta.payload.originator` echoes the
+/// clientInfo name, while `source` is always "vscode" for app-server
+/// clients — never use `source` for own-session detection).
 pub async fn handshake(client: &Client) -> Result<String, String> {
     let res = client
         .request(
@@ -688,8 +691,9 @@ impl ResumeError {
 }
 
 /// Does this error text mean "the server does not know this thread"?
-/// "no rollout found" is what codex 0.142.5 actually answers (live-verified
-/// in the session spike: `no rollout found for thread id … (code -32600)`);
+/// "no rollout found" is what codex actually answers — live-verified on
+/// 0.142.5 and re-verified verbatim on 0.144.1
+/// (`no rollout found for thread id … (code -32600)`);
 /// the other substrings follow t3code's recoverable-resume matcher for
 /// robustness across versions.
 pub fn is_unknown_thread_error(err: &str) -> bool {
@@ -787,7 +791,7 @@ mod tests {
     #[test]
     fn unknown_thread_errors_are_classified() {
         for msg in [
-            // verbatim live answer from codex 0.142.5 (session spike)
+            // verbatim live answer from codex (0.142.5 spike, re-verified on 0.144.1)
             "no rollout found for thread id 019f0000-0000-7000-8000-000000000000 (code -32600)",
             "thread not found (code -32600)",
             "Unknown thread id 019f…",

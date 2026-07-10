@@ -19,7 +19,7 @@
 //     id after the `turn/start` ack; the transcript + completion arrive as
 //     events (many sessions run in parallel, the UI is event-driven).
 //
-// Access → sandbox mapping (exact wire strings verified against the 0.142.5
+// Access → sandbox mapping (exact wire strings verified against the 0.144.1
 // protocol reference): `workspace` = sandbox `workspace-write` +
 // approvalPolicy `on-request` (codex asks before writes/network it isn't sure
 // about); `full` = sandbox `danger-full-access` + approvalPolicy `never`.
@@ -85,7 +85,7 @@ impl Access {
     }
 
     /// `SandboxPolicy` object (the tagged form turn/start overrides expect —
-    /// NOT the `SandboxMode` string). Shapes match the 0.142.5 response form.
+    /// NOT the `SandboxMode` string). Shapes match the 0.144.1 response form.
     fn sandbox_policy(self) -> Value {
         match self {
             Access::Workspace => json!({
@@ -199,7 +199,9 @@ fn normalize_item(item: &Value) -> Value {
 /// `vibe://session-event`, or None for the ones we ignore. Pure: the SHARED
 /// bookkeeping (turn id, busy) is done by the caller. `agentMessage` items are
 /// routed to `delta`/`message` (the streaming bubble), everything else to
-/// `item_started`/`item_updated`/`item_completed`.
+/// `item_started`/`item_completed`. There is NO `item/updated` in the
+/// protocol (verified against the 0.142.5 AND 0.144.1 schemas + live runs —
+/// items only ever fire started/completed plus their typed deltas).
 fn map_notification(method: &str, params: &Value) -> Option<(&'static str, Value)> {
     match method {
         "turn/started" => {
@@ -211,8 +213,8 @@ fn map_notification(method: &str, params: &Value) -> Option<(&'static str, Value
             Some(("delta", json!({ "item_id": params.get("itemId"), "text": text })))
         }
         // commandExecution output streams incrementally while a command runs —
-        // live-verified in the Phase-2 spike (item/updated never fired; this
-        // did). The store appends it to the command item's output.
+        // live-verified in the Phase-2 spike. The store appends it to the
+        // command item's output.
         "item/commandExecution/outputDelta" => {
             let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             Some(("item_output_delta", json!({ "item_id": params.get("itemId"), "delta": delta })))
@@ -223,16 +225,6 @@ fn map_notification(method: &str, params: &Value) -> Option<(&'static str, Value
                 return None; // the streaming bubble is driven by deltas
             }
             Some(("item_started", json!({ "item": normalize_item(item) })))
-        }
-        // item/updated is not in the generated schema for 0.142.5 but is
-        // handled defensively (growing aggregatedOutput / plan mutations) —
-        // harmless if it never fires.
-        "item/updated" => {
-            let item = params.get("item")?;
-            if item.get("type").and_then(|v| v.as_str()) == Some("agentMessage") {
-                return None;
-            }
-            Some(("item_updated", json!({ "item": normalize_item(item) })))
         }
         "item/completed" => {
             let item = params.get("item")?;
@@ -869,7 +861,8 @@ mod tests {
         }
     }
 
-    // fixture lines captured from real codex 0.142.5 (same shapes as protocol.rs)
+    // fixture lines captured from real codex runs — shapes re-verified
+    // unchanged on 0.144.1 (same shapes as protocol.rs)
     const FIX_DELTA: &str = r#"{"method":"item/agentMessage/delta","params":{"threadId":"t","turnId":"tn","itemId":"msg_1","delta":"He"}}"#;
     const FIX_CMD_STARTED: &str = r#"{"method":"item/started","params":{"item":{"type":"commandExecution","id":"call_1","command":"/bin/zsh -lc 'ls'","cwd":"/tmp","status":"inProgress","commandActions":[{"type":"listFiles","command":"ls","path":null}],"aggregatedOutput":null,"exitCode":null,"durationMs":null},"threadId":"t","turnId":"tn","startedAtMs":1}}"#;
     const FIX_CMD_COMPLETED: &str = r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"call_1","command":"/bin/zsh -lc 'ls'","cwd":"/tmp","status":"completed","aggregatedOutput":"total 8\n","exitCode":0,"durationMs":3},"threadId":"t","turnId":"tn","completedAtMs":2}}"#;
@@ -1079,8 +1072,8 @@ mod tests {
     // Live verification of the three open Phase-1 questions against the REAL
     // codex CLI, at the host layer (no AppHandle needed): (a) turn/interrupt →
     // turn/completed status "interrupted"; (b) a declined approval and how the
-    // turn proceeds; (c) whether item/commandExecution/outputDelta (or a
-    // growing item/updated) streams while a command runs. Ignored by default
+    // turn proceeds; (c) whether item/commandExecution/outputDelta streams
+    // while a command runs. Ignored by default
     // (needs codex + login + network — CI stays green); run with:
     //   cargo test sessions_spike -- --ignored --nocapture
 
@@ -1224,7 +1217,7 @@ mod tests {
             println!("[b] turn continued to status={status} after the decline");
         }
 
-        // (c) OUTPUT STREAMING — does outputDelta / a growing item/updated fire?
+        // (c) OUTPUT STREAMING — does outputDelta fire while a command runs?
         {
             println!("\n==== (c) command output streaming ====");
             let profile = SessionProfile {
@@ -1251,7 +1244,6 @@ mod tests {
             .expect("turn/start");
 
             let mut output_deltas = 0usize;
-            let mut item_updates = 0usize;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
             loop {
                 let ev = tokio::time::timeout_at(deadline, rx.recv()).await.expect("timeout").expect("closed");
@@ -1261,9 +1253,6 @@ mod tests {
                         if method == "item/commandExecution/outputDelta" {
                             output_deltas += 1;
                         }
-                        if method == "item/updated" {
-                            item_updates += 1;
-                        }
                         if method == "turn/completed" {
                             break;
                         }
@@ -1271,7 +1260,7 @@ mod tests {
                     ThreadEvent::Exited => panic!("[c] process exited mid-spike"),
                 }
             }
-            println!("[c] outputDelta notifications: {output_deltas}, item/updated notifications: {item_updates}");
+            println!("[c] outputDelta notifications: {output_deltas}");
             // observational: whether streaming fires informs Phase 3, not a hard assert
         }
 

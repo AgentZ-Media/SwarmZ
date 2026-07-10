@@ -43,8 +43,9 @@ use crate::codex::host::{
 };
 
 /// The dynamic-tools protocol is experimental; this is the version the
-/// integration spike verified end-to-end. Mentioned in the version guard.
-const KNOWN_GOOD_VERSION: &str = "0.142.5";
+/// integration spike verified end-to-end (originally 0.142.5, re-verified
+/// live on 0.144.1 in the Phase-0 probes). Mentioned in the version guard.
+const KNOWN_GOOD_VERSION: &str = "0.144.1";
 
 // System instructions are compiled per session from persona + memory + the
 // hard-wired operative core (see `super::persona::build_instructions`) and

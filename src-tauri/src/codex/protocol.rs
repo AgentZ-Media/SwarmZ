@@ -1,10 +1,10 @@
 // Wire protocol for `codex app-server`: JSON-RPC 2.0 over newline-delimited
 // stdio — WITHOUT the `"jsonrpc":"2.0"` header field. Verified against codex
-// 0.142.5 (the server neither sends nor expects it).
+// 0.144.1 (the server neither sends nor expects it).
 //
 // This module is pure (no process, no tauri): message framing and the
 // incoming-line classifier only. Everything here is unit-tested against
-// fixture lines captured from real codex 0.142.5 runs — including the
+// fixture lines captured from real codex 0.144.1 runs — including the
 // notification shapes the native session integration (Vibe Mode) consumes
 // (command executions, file changes, diffs, token usage, approvals).
 // Consumer-specific payload adapters live with their consumer (e.g. the
@@ -94,44 +94,51 @@ pub fn error_response_line(id: &Value, code: i64, message: &str) -> String {
 mod tests {
     use super::*;
 
-    // ---- fixture lines captured from real `codex app-server` 0.142.5 runs ----
-    // (paths and long outputs shortened; structure and key names verbatim)
+    // ---- fixture lines captured from real `codex app-server` 0.144.1 runs ----
+    // (paths and long outputs shortened; structure and key names verbatim —
+    // regenerate via the Phase-0 probe, see docs/codex-protocol/README.md)
 
-    const FIX_RESPONSE: &str = r#"{"id":3,"result":{"turn":{"id":"019f3bb5-7c19-7333-b5c4-82061b6ad4e1","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}"#;
-    const FIX_TOOL_CALL: &str = r#"{"method":"item/tool/call","id":0,"params":{"threadId":"019f3bb5-7b8c-7da1-a256-0a2549b0454f","turnId":"019f3bb5-7c19-7333-b5c4-82061b6ad4e1","callId":"call_MRL4QG5Mmi1BTmRl0FsxfdFe","namespace":null,"tool":"ping","arguments":{}}}"#;
-    const FIX_DELTA: &str = r#"{"method":"item/agentMessage/delta","params":{"threadId":"019f3d01-7098-7341-a5a9-88ad8245e07f","turnId":"019f3d01-712a-7e61-907d-89bb92f8d1cf","itemId":"msg_019daad29134e9a1016a4d0eb7018081918d350eb572ede66c","delta":"I"}}"#;
-    const FIX_TURN_DONE: &str = r#"{"method":"turn/completed","params":{"threadId":"019f3bb5-7b8c-7da1-a256-0a2549b0454f","turn":{"id":"019f3bb5-7c19-7333-b5c4-82061b6ad4e1","items":[],"itemsView":"notLoaded","status":"completed","error":null,"startedAt":1783413177,"completedAt":1783413181,"durationMs":4383}}}"#;
-    const FIX_ERROR: &str = r#"{"id":7,"error":{"code":-32600,"message":"thread not found"}}"#;
+    const FIX_RESPONSE: &str = r#"{"id":3,"result":{"turn":{"id":"019f4b76-9fe0-7dc3-9795-1e346aec8b52","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}"#;
+    const FIX_TOOL_CALL: &str = r#"{"method":"item/tool/call","id":0,"params":{"threadId":"019f4b76-9f78-76b0-b852-a3e40bfe2899","turnId":"019f4b76-c454-7e43-bd89-6d7b224ca155","callId":"call_jOEnHhJPmxLUXHp0zSYiN3zr","namespace":null,"tool":"ping","arguments":{}}}"#;
+    const FIX_DELTA: &str = r#"{"method":"item/agentMessage/delta","params":{"threadId":"019f4b76-9f78-76b0-b852-a3e40bfe2899","turnId":"019f4b76-9fe0-7dc3-9795-1e346aec8b52","itemId":"msg_0c69c793a26cdd57016a50c237f7e48191a7bff8e94026a521","delta":"I"}}"#;
+    const FIX_TURN_DONE: &str = r#"{"method":"turn/completed","params":{"threadId":"019f4b76-9f78-76b0-b852-a3e40bfe2899","turn":{"id":"019f4b76-9fe0-7dc3-9795-1e346aec8b52","items":[],"itemsView":"notLoaded","status":"completed","error":null,"startedAt":1783677493,"completedAt":1783677499,"durationMs":6733}}}"#;
+    // verbatim live answer to `thread/resume` with an unknown thread id — the
+    // string host.rs's ResumeError::ThreadNotFound classifier matches on
+    const FIX_ERROR: &str = r#"{"id":7,"error":{"code":-32600,"message":"no rollout found for thread id 019f0000-0000-7000-8000-000000000000"}}"#;
 
-    // item lifecycle around a commandExecution item (run-A): started with
-    // status inProgress / null output, completed with aggregatedOutput+exitCode
-    const FIX_CMD_STARTED: &str = r#"{"method":"item/started","params":{"item":{"type":"commandExecution","id":"call_o8hWKlCoCOgSRo987XU58FUQ","command":"/bin/zsh -lc 'ls -la'","cwd":"/tmp/worktest-a","processId":"31794","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"listFiles","command":"ls -la","path":null}],"aggregatedOutput":null,"exitCode":null,"durationMs":null},"threadId":"019f3d01-7098-7341-a5a9-88ad8245e07f","turnId":"019f3d01-712a-7e61-907d-89bb92f8d1cf","startedAtMs":1783434938103}}"#;
-    const FIX_CMD_COMPLETED: &str = r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"call_o8hWKlCoCOgSRo987XU58FUQ","command":"/bin/zsh -lc 'ls -la'","cwd":"/tmp/worktest-a","processId":"31794","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"listFiles","command":"ls -la","path":null}],"aggregatedOutput":"total 8\n-rw-r--r--@ 1 user wheel 3 Jul 7 16:35 hello.txt\n","exitCode":0,"durationMs":0},"threadId":"019f3d01-7098-7341-a5a9-88ad8245e07f","turnId":"019f3d01-712a-7e61-907d-89bb92f8d1cf","completedAtMs":1783434938103}}"#;
+    // item lifecycle around a commandExecution item: started with status
+    // inProgress / null output, completed with aggregatedOutput+exitCode
+    const FIX_CMD_STARTED: &str = r#"{"method":"item/started","params":{"item":{"type":"commandExecution","id":"call_5FXYCWwnM4a2QSwyadQUeD5A","command":"/bin/zsh -lc 'ls -la'","cwd":"/tmp/phase0-demo","processId":"28252","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"listFiles","command":"ls -la","path":null}],"aggregatedOutput":null,"exitCode":null,"durationMs":null},"threadId":"019f4b76-9f78-76b0-b852-a3e40bfe2899","turnId":"019f4b76-9fe0-7dc3-9795-1e346aec8b52","startedAtMs":1783677499004}}"#;
+    const FIX_CMD_COMPLETED: &str = r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"call_5FXYCWwnM4a2QSwyadQUeD5A","command":"/bin/zsh -lc 'ls -la'","cwd":"/tmp/phase0-demo","processId":"28252","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"listFiles","command":"ls -la","path":null}],"aggregatedOutput":"total 16\n-rw-r--r--@ 1 user wheel 3 Jul 10 11:58 hello.txt\n","exitCode":0,"durationMs":0},"threadId":"019f4b76-9f78-76b0-b852-a3e40bfe2899","turnId":"019f4b76-9fe0-7dc3-9795-1e346aec8b52","completedAtMs":1783677499004}}"#;
 
-    // fileChange item (run-A): changes[].kind is the tagged PatchChangeKind
-    // object; for "add" the diff is the RAW new content, not a unified diff
-    const FIX_FILECHANGE_STARTED: &str = r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"call_ee95UPJLeYsSl91AgvLbYt9X","changes":[{"path":"/tmp/worktest-a/hello.txt","kind":{"type":"add"},"diff":"hi\n"}],"status":"inProgress"},"threadId":"019f3d01-7098-7341-a5a9-88ad8245e07f","turnId":"019f3d01-712a-7e61-907d-89bb92f8d1cf","startedAtMs":1783434935651}}"#;
-    const FIX_FILECHANGE_COMPLETED: &str = r#"{"method":"item/completed","params":{"item":{"type":"fileChange","id":"call_ee95UPJLeYsSl91AgvLbYt9X","changes":[{"path":"/tmp/worktest-a/hello.txt","kind":{"type":"add"},"diff":"hi\n"}],"status":"completed"},"threadId":"019f3d01-7098-7341-a5a9-88ad8245e07f","turnId":"019f3d01-712a-7e61-907d-89bb92f8d1cf","completedAtMs":1783434935766}}"#;
+    // fileChange item: changes[].kind is the tagged PatchChangeKind object;
+    // for "add" the diff is the RAW new content, not a unified diff
+    const FIX_FILECHANGE_STARTED: &str = r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"call_W2ko4MT9Gsxp3G61wgPK5Qfr","changes":[{"path":"/tmp/phase0-demo/hello.txt","kind":{"type":"add"},"diff":"hi\n"}],"status":"inProgress"},"threadId":"019f4b76-9f78-76b0-b852-a3e40bfe2899","turnId":"019f4b76-9fe0-7dc3-9795-1e346aec8b52","startedAtMs":1783677496982}}"#;
+    const FIX_FILECHANGE_COMPLETED: &str = r#"{"method":"item/completed","params":{"item":{"type":"fileChange","id":"call_W2ko4MT9Gsxp3G61wgPK5Qfr","changes":[{"path":"/tmp/phase0-demo/hello.txt","kind":{"type":"add"},"diff":"hi\n"}],"status":"completed"},"threadId":"019f4b76-9f78-76b0-b852-a3e40bfe2899","turnId":"019f4b76-9fe0-7dc3-9795-1e346aec8b52","completedAtMs":1783677497097}}"#;
 
-    // the aggregated unified diff of the whole turn (run-A, fired 4×)
-    const FIX_TURN_DIFF: &str = r#"{"method":"turn/diff/updated","params":{"threadId":"019f3d01-7098-7341-a5a9-88ad8245e07f","turnId":"019f3d01-712a-7e61-907d-89bb92f8d1cf","diff":"diff --git a/hello.txt b/hello.txt\nnew file mode 100644\n--- /dev/null\n+++ b/hello.txt\n@@ -0,0 +1 @@\n+hi\n"}}"#;
+    // the aggregated unified diff of the whole turn (fired several times per
+    // turn) — NEW on 0.144.x: the diff now includes the `index <sha>..<sha>`
+    // line 0.142.5 omitted (git-standard; downstream parsers must tolerate it)
+    const FIX_TURN_DIFF: &str = r#"{"method":"turn/diff/updated","params":{"threadId":"019f4b76-9f78-76b0-b852-a3e40bfe2899","turnId":"019f4b76-9fe0-7dc3-9795-1e346aec8b52","diff":"diff --git a/hello.txt b/hello.txt\nnew file mode 100644\nindex 0000000000000000000000000000000000000000..45b983be36b73c0788dc9cbcb76cbb80fc7bb057\n--- /dev/null\n+++ b/hello.txt\n@@ -0,0 +1 @@\n+hi\n"}}"#;
 
-    // NOT live-captured: turn/plan/updated never fired in the 0.142.5 probe
-    // runs — this line is constructed from the generated schema
-    // (TurnPlanUpdatedNotification: explanation:string|null, plan:TurnPlanStep[])
-    const FIX_TURN_PLAN: &str = r#"{"method":"turn/plan/updated","params":{"threadId":"019f3d01-7098-7341-a5a9-88ad8245e07f","turnId":"019f3d01-712a-7e61-907d-89bb92f8d1cf","explanation":null,"plan":[{"step":"Write the file","status":"completed"},{"step":"Run the command","status":"inProgress"}]}}"#;
+    // live-captured on 0.144.1 (a turn that calls the update_plan tool) — on
+    // 0.142.5 this shape was only schema-derived, now it is wire-verified
+    const FIX_TURN_PLAN: &str = r#"{"method":"turn/plan/updated","params":{"threadId":"019f4b76-9f78-76b0-b852-a3e40bfe2899","turnId":"019f4b76-ba5c-7461-8f28-66b888fcac32","explanation":null,"plan":[{"step":"Draft concise 2-step plan","status":"completed"},{"step":"Report completion to user","status":"inProgress"}]}}"#;
 
-    // per-thread token usage (run-A, fired multiple times per turn):
+    // per-thread token usage (fired multiple times per turn):
     // total = cumulative over the thread, last = the last turn
-    const FIX_TOKEN_USAGE: &str = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"019f3d01-7098-7341-a5a9-88ad8245e07f","turnId":"019f3d01-712a-7e61-907d-89bb92f8d1cf","tokenUsage":{"total":{"totalTokens":15043,"inputTokens":14992,"cachedInputTokens":4992,"outputTokens":51,"reasoningOutputTokens":0},"last":{"totalTokens":15043,"inputTokens":14992,"cachedInputTokens":4992,"outputTokens":51,"reasoningOutputTokens":0},"modelContextWindow":258400}}}"#;
+    const FIX_TOKEN_USAGE: &str = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"019f4b76-9f78-76b0-b852-a3e40bfe2899","turnId":"019f4b76-9fe0-7dc3-9795-1e346aec8b52","tokenUsage":{"total":{"totalTokens":13613,"inputTokens":13510,"cachedInputTokens":3456,"outputTokens":103,"reasoningOutputTokens":31},"last":{"totalTokens":13613,"inputTokens":13510,"cachedInputTokens":3456,"outputTokens":103,"reasoningOutputTokens":31},"modelContextWindow":258400}}}"#;
 
-    // account-level rate limits (run-A) — note: NO threadId in params
-    const FIX_RATE_LIMITS: &str = r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":1783452933},"secondary":{"usedPercent":13,"windowDurationMins":10080,"resetsAt":1783705917},"credits":null,"individualLimit":null,"planType":"pro","rateLimitReachedType":null}}}"#;
+    // account-level rate limits — note: NO threadId in params
+    const FIX_RATE_LIMITS: &str = r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":1783693777},"secondary":{"usedPercent":0,"windowDurationMins":10080,"resetsAt":1784280577},"credits":null,"individualLimit":null,"planType":"pro","rateLimitReachedType":null}}}"#;
 
-    // command approval server request (run-D): numeric id 0, human-readable
-    // reason, the shell line + parsed actions, and the live-only extra
-    // `availableDecisions` (not in the generated schema — don't rely on it)
-    const FIX_CMD_APPROVAL: &str = r#"{"method":"item/commandExecution/requestApproval","id":0,"params":{"threadId":"019f3d03-8b98-7c32-ad34-36d666c71dd8","turnId":"019f3d03-8c08-7241-874e-2686e0ec7f04","itemId":"call_KgTwkJVDRr0mqb8XA5Ym1cee","startedAtMs":1783435074869,"environmentId":"local","reason":"Do you want to allow creating approval_probe.txt in the current directory?","command":"/bin/zsh -lc 'touch approval_probe.txt'","cwd":"/tmp/worktest-b","commandActions":[{"type":"unknown","command":"touch approval_probe.txt"}],"proposedExecpolicyAmendment":["touch"],"availableDecisions":["accept",{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["touch"]}},"cancel"]}}"#;
+    // command approval server request (workspace-write + on-request, write
+    // OUTSIDE the workspace): human-readable reason, the shell line + parsed
+    // actions, and the live-only extra `availableDecisions` (not in the
+    // generated schema — don't rely on it). Server-request ids share ONE
+    // numeric sequence per connection (an item/tool/call took id 0 before
+    // this request in the capture run, hence id 1 here).
+    const FIX_CMD_APPROVAL: &str = r#"{"method":"item/commandExecution/requestApproval","id":1,"params":{"threadId":"019f4b76-9f78-76b0-b852-a3e40bfe2899","turnId":"019f4b76-ccbe-7333-9a26-cfe0e6bfd5a7","itemId":"call_g6HWIiHACv5R4CB1IuYsQYvT","startedAtMs":1783677508243,"environmentId":"local","reason":"Do you want to allow creating the requested marker file outside the workspace?","command":"/bin/zsh -lc 'touch /Users/user/swarmz_phase0_outside.marker'","cwd":"/tmp/phase0-demo","commandActions":[{"type":"unknown","command":"touch /Users/user/swarmz_phase0_outside.marker"}],"proposedExecpolicyAmendment":["touch","/Users/user/swarmz_phase0_outside.marker"],"availableDecisions":["accept",{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["touch","/Users/user/swarmz_phase0_outside.marker"]}},"cancel"]}}"#;
 
     #[test]
     fn parses_a_response() {
@@ -183,7 +190,7 @@ mod tests {
             Some(Incoming::Response { id, result }) => {
                 assert_eq!(id, 7);
                 let e = result.expect_err("error result");
-                assert!(e.contains("thread not found"), "{e}");
+                assert!(e.contains("no rollout found"), "{e}");
                 assert!(e.contains("-32600"), "{e}");
             }
             other => panic!("expected Response, got {other:?}"),
@@ -318,9 +325,9 @@ mod tests {
             Some(Incoming::Notification { method, params }) => {
                 assert_eq!(method, "thread/tokenUsage/updated");
                 let usage = &params["tokenUsage"];
-                assert_eq!(usage["total"]["totalTokens"], 15043);
-                assert_eq!(usage["total"]["cachedInputTokens"], 4992);
-                assert_eq!(usage["last"]["outputTokens"], 51);
+                assert_eq!(usage["total"]["totalTokens"], 13613);
+                assert_eq!(usage["total"]["cachedInputTokens"], 3456);
+                assert_eq!(usage["last"]["outputTokens"], 103);
                 assert_eq!(usage["modelContextWindow"], 258400);
             }
             other => panic!("expected Notification, got {other:?}"),
@@ -333,7 +340,7 @@ mod tests {
                 let rl = &params["rateLimits"];
                 assert_eq!(rl["limitId"], "codex");
                 assert_eq!(rl["primary"]["windowDurationMins"], 300);
-                assert_eq!(rl["secondary"]["usedPercent"], 13);
+                assert_eq!(rl["secondary"]["windowDurationMins"], 10080);
                 assert_eq!(rl["planType"], "pro");
             }
             other => panic!("expected Notification, got {other:?}"),
@@ -349,13 +356,17 @@ mod tests {
             }
             other => panic!("expected ServerRequest, got {other:?}"),
         };
-        // server-request ids are their own numeric sequence starting at 0
-        assert_eq!(id, json!(0));
+        // server-request ids are ONE numeric sequence per connection starting
+        // at 0 (a tool call consumed 0 before this approval in the capture)
+        assert_eq!(id, json!(1));
         assert!(params["threadId"].is_string());
         // itemId links the approval to its commandExecution item
         assert!(params["itemId"].as_str().unwrap().starts_with("call_"));
         assert!(params["reason"].as_str().unwrap().contains("allow"));
-        assert_eq!(params["command"], "/bin/zsh -lc 'touch approval_probe.txt'");
+        assert_eq!(
+            params["command"],
+            "/bin/zsh -lc 'touch /Users/user/swarmz_phase0_outside.marker'"
+        );
         // availableDecisions is a live-only extra (absent from the generated
         // schema) — parse defensively, never require it
         let decisions = params["availableDecisions"].as_array().unwrap();
@@ -363,11 +374,12 @@ mod tests {
         assert!(decisions.iter().any(|d| d.get("acceptWithExecpolicyAmendment").is_some()));
 
         // the four plain response decisions (CommandExecutionApprovalDecision)
-        // — "accept"/"decline" live-verified on 0.142.5
+        // — "accept"/"decline" live-verified on 0.144.1 (a decline marks the
+        // command item status:"declined" and the turn continues)
         for decision in ["accept", "acceptForSession", "decline", "cancel"] {
             let line = response_line(&id, &json!({ "decision": decision }));
             let v: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(v["id"], 0);
+            assert_eq!(v["id"], 1);
             assert_eq!(v["result"]["decision"], decision);
             assert!(v.get("jsonrpc").is_none());
         }

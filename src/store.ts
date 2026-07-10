@@ -7,6 +7,7 @@ import {
   loadGrid,
   loadProfiles,
   loadQuickNotes,
+  loadSchemaVersion,
   loadSettings,
   loadUsageHistory,
   loadWorkspacePresets,
@@ -17,11 +18,13 @@ import {
   saveGrid,
   saveProfiles,
   saveQuickNotes,
+  saveSchemaVersion,
   saveSettings,
   saveUsageHistory,
   saveWorkspacePresets,
   saveWorkspaces,
 } from "@/lib/transport";
+import { normalizeSchemaVersion } from "@/lib/schema-version";
 import type {
   Agent,
   AgentRuntime,
@@ -826,6 +829,17 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   },
 
   hydrate: async () => {
+    try {
+      // schemaVersion — the migration anchor (lib/schema-version.ts): a
+      // pre-versioning/invalid store is stamped with the current version;
+      // a valid (even newer) version is left untouched. No migrations yet.
+      const { version, stamp } = normalizeSchemaVersion(
+        await loadSchemaVersion(),
+      );
+      if (stamp) await saveSchemaVersion(version);
+    } catch {
+      /* ignore */
+    }
     try {
       const settings = await loadSettings();
       if (settings) set({ settings: normalizeLoadedSettings(settings) });
