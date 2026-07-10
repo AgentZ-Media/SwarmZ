@@ -3580,6 +3580,7 @@ version = "0.5.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
+ "libc",
  "once_cell",
  "parking_lot",
  "serde",

@@ -1,5 +1,5 @@
 // Compact, cheap text rendering of a native Vibe session's transcript for the
-// orchestrator's read_transcript tool (Phase 5). Pure: items in → text out, no
+// orchestrator's read_agent tool. Pure: items in → text out, no
 // React / store — so the executor and unit tests share one implementation.
 //
 // The goal is DENSE and cheap, like the pane transcript tails: user/assistant

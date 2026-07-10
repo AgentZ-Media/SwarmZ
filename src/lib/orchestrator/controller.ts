@@ -8,7 +8,7 @@
 //   · per-chat busy flag (one turn at a time — the backend enforces it too)
 //     and interrupt
 //   · session jump chips: tool args referencing live session ids, plus
-//     sessions born during a create_panes call (order diff — the tool RESULT
+//     sessions born during a spawn_agents call (order diff — the tool RESULT
 //     flows Rust → codex and never reaches the frontend), attach `paneRefs`
 //     to the tool message for the UI
 //   · status pings: watch sessions' busy/approval state OUTSIDE React; a
@@ -39,6 +39,12 @@ import {
   useOrchestrator,
   type OrchestratorMessagePatch,
 } from "./chat-store";
+import { timerWireText } from "./timers-core";
+import {
+  checkAutonomyBudget,
+  noteAutonomousTurn,
+  noteHumanTurn,
+} from "./autonomy";
 
 /** Trailing-edge delta flush — word-level deltas never write per event. */
 const DELTA_FLUSH_MS = 80;
@@ -65,7 +71,7 @@ export function chatIdForBackend(
 interface PendingTool {
   tool: string;
   messageId: string;
-  /** session order snapshot around a create_panes call, for the ref diff */
+  /** session order snapshot around a spawn_agents call, for the ref diff */
   sessionOrderBefore: string[] | null;
 }
 
@@ -165,7 +171,7 @@ function chatProjectId(chatId: string): string | null {
 
 /**
  * Session ids in rail order, scoped to one project (null = all). The chip
- * extraction and the create_panes order diff both scan THIS list — never the
+ * extraction and the spawn_agents order diff both scan THIS list — never the
  * global one, or parallel activity in project B would attach B-chips to A's
  * chats.
  */
@@ -245,10 +251,10 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
       st.pendingTools.push({
         tool,
         messageId,
-        // project-scoped snapshot — a parallel create_panes in another
+        // project-scoped snapshot — a parallel spawn_agents in another
         // project must never diff into this chat's chips
         sessionOrderBefore:
-          tool === "create_panes" ? projectSessionIds(projectId) : null,
+          tool === "spawn_agents" ? projectSessionIds(projectId) : null,
       });
       break;
     }
@@ -259,7 +265,7 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
       const [pending] = st.pendingTools.splice(idx, 1);
       const patch: OrchestratorMessagePatch = { ok: data.ok !== false };
       if (pending.sessionOrderBefore) {
-        // sessions born while create_panes ran become jump chips (the tool
+        // sessions born while spawn_agents ran become jump chips (the tool
         // result never reaches the frontend, so diff the order) — scoped to
         // the chat's project, like the before-snapshot
         const before = new Set(pending.sessionOrderBefore);
@@ -393,7 +399,7 @@ let vibePingsStarted = false;
  * Watch sessions' busy/approval transitions OUTSIDE React (the vibe store is
  * a plain zustand store). Started once from App.tsx next to
  * startOrchestratorBus; returns a stop function. Only sessions some chat
- * touched (prompt_pane / create_panes) ping.
+ * touched (prompt_agent / spawn_agents) ping.
  */
 export function startVibeSessionActivityWatcher(): () => void {
   if (vibePingsStarted) return () => {};
@@ -417,7 +423,28 @@ export function startVibeSessionActivityWatcher(): () => void {
       prevSessPending.set(id, pending);
       const name = entry.session.name;
       // a new pending approval waits on the human ("waiting" variant)
-      if (pPending === false && pending) onSessionFinished(id, name, "waiting");
+      if (pPending === false && pending) {
+        onSessionFinished(id, name, "waiting");
+        // Phase 4: ROUTINE approvals additionally escalate to the session's
+        // Conductor as an autonomous decide_approval turn (destructive ones
+        // stay human-only — card + Deck + the ping above)
+        const projectId = entry.session.projectId;
+        if (projectId) {
+          for (const iid of entry.order) {
+            const item = entry.items[iid];
+            if (
+              item?.kind === "approval" &&
+              item.status === "pending" &&
+              item.escalation === "routine"
+            ) {
+              escalateApprovalToConductor(id, name, projectId, {
+                id: item.id,
+                summary: approvalSummary(item.payload),
+              });
+            }
+          }
+        }
+      }
       // turn genuinely finished (busy → idle, nothing waiting)
       else if (pBusy === true && !busy && !pending)
         onSessionFinished(id, name, "idle");
@@ -579,6 +606,27 @@ export async function sendMessage(chatId: string, text: string): Promise<void> {
     );
   }
   store.appendMessage(chatId, { role: "user", text: trimmed });
+  // a human message resets the project's autonomy budget (consecutive cap +
+  // a latched circuit breaker) — the human is back in the loop
+  const projectId = chatProjectId(chatId);
+  if (projectId) noteHumanTurn(projectId);
+  await dispatchTurn(chatId, trimmed);
+}
+
+/**
+ * The turn-dispatch core shared by the user send path and the autonomous
+ * turns (timers, approval escalations): claim busy, prepend undelivered
+ * status pings to the WIRE text, resolve the backend chat, run the turn.
+ * Callers append their own visible message (user bubble / system marker)
+ * BEFORE dispatching. Returns whether the turn actually ran — a failed
+ * dispatch (codex unavailable, spawn failure) must NOT count as delivered
+ * (timers stay alive and retry instead of silently vanishing).
+ */
+async function dispatchTurn(chatId: string, wireBody: string): Promise<boolean> {
+  const store = useOrchestrator.getState();
+  const chat = store.chats.find((c) => c.id === chatId);
+  if (!chat || store.busy[chatId]) return false;
+  ensureEvents();
   store.setBusy(chatId, true);
   const st = streamOf(chatId);
   st.turnFailed = false;
@@ -586,12 +634,13 @@ export async function sendMessage(chatId: string, text: string): Promise<void> {
   // point stay undelivered and ride along with the NEXT send.
   const pings = useOrchestrator.getState().takePendingPings(chatId);
   const wireText = pings.length
-    ? `${statusUpdateBlock(pings)}\n\n${trimmed}`
-    : trimmed;
+    ? `${statusUpdateBlock(pings)}\n\n${wireBody}`
+    : wireBody;
   try {
     const backendId = await ensureBackendChat(chatId);
     // per-chat model/effort ride along as a turn/start override
     await chatSend(backendId, wireText, chat.model, chat.effort);
+    return true;
   } catch (err) {
     // a turn_failed event already surfaced its own warning; everything else
     // (spawn failure, dead process, resume+start both failing) lands here
@@ -602,9 +651,166 @@ export async function sendMessage(chatId: string, text: string): Promise<void> {
         text: `Send failed: ${errorText(err)}`,
       });
     }
+    return false;
   } finally {
     useOrchestrator.getState().setBusy(chatId, false);
   }
+}
+
+// ---- autonomous turns (Phase 4: timers + approval escalation) ----
+//
+// These are the FIRST autonomous Conductor turns — Phase 5 builds the full
+// event loop (cooldown settings, richer triggers) on this seam. Until then
+// two narrow triggers exist, each with its own dedupe, and both are visibly
+// marked in the chat (a system message precedes every autonomous turn).
+// EVERY autonomous turn passes the per-project autonomy budget (autonomy.ts:
+// max 5 consecutive without a human message, max 20 per rolling hour) — an
+// exhausted budget trips a visible circuit breaker that only a human message
+// resets. This is the HARD cap against prompt-injected approval cascades.
+
+/** Minimum gap between autonomous turns per chat (burst damping). */
+const AUTONOMOUS_MIN_GAP_MS = 5_000;
+const lastAutonomousAt = new Map<string, number>();
+
+/**
+ * Resolve (or create) the Conductor chat an autonomous turn for a project
+ * lands in. Null = no project record (nothing to talk to).
+ */
+function autonomousChatFor(projectId: string): string | null {
+  if (!useProjects.getState().projects[projectId]) return null;
+  const s = useOrchestrator.getState();
+  return activeChatIdForProject(s.chats, s.activeByProject, projectId) ?? createChat(projectId);
+}
+
+/** The project's active chat id (remembered, else newest) — local helper. */
+function activeChatIdForProject(
+  chats: { id: string; projectId: string }[],
+  activeByProject: Record<string, string>,
+  projectId: string,
+): string | null {
+  const remembered = activeByProject[projectId];
+  if (
+    remembered &&
+    chats.some((c) => c.id === remembered && c.projectId === projectId)
+  ) {
+    return remembered;
+  }
+  return chats.find((c) => c.projectId === projectId)?.id ?? null;
+}
+
+/**
+ * Run one autonomous Conductor turn: a visible system marker + the wire
+ * text, no user bubble. Returns "delivered", "retry" (chat busy, throttled,
+ * budget exhausted or the dispatch failed — try again later) or "drop" (no
+ * project/chat to deliver into).
+ */
+async function runAutonomousTurn(
+  projectId: string,
+  marker: string,
+  wireText: string,
+): Promise<"delivered" | "retry" | "drop"> {
+  const chatId = autonomousChatFor(projectId);
+  if (!chatId) return "drop";
+  const store = useOrchestrator.getState();
+  if (store.busy[chatId]) return "retry";
+  const last = lastAutonomousAt.get(chatId);
+  if (last !== undefined && Date.now() - last < AUTONOMOUS_MIN_GAP_MS) {
+    return "retry";
+  }
+  // the HARD autonomy cap (per project) — a fresh trip is announced once,
+  // visibly, in the chat; only a human message re-arms the breaker
+  const verdict = checkAutonomyBudget(projectId);
+  if (!verdict.ok) {
+    if (verdict.freshTrip) {
+      store.appendMessage(chatId, {
+        role: "system",
+        text: `⛔ Autonomy budget exhausted — ${verdict.reason}. Autonomous turns are paused until you send a message.`,
+      });
+    }
+    return "retry";
+  }
+  noteAutonomousTurn(projectId);
+  lastAutonomousAt.set(chatId, Date.now());
+  store.appendMessage(chatId, { role: "system", text: marker });
+  // a failed dispatch (codex unavailable, spawn failure) is NOT "delivered"
+  // — the caller keeps its trigger (timers stay persisted and retry)
+  const ok = await dispatchTurn(chatId, wireText);
+  return ok ? "delivered" : "retry";
+}
+
+/**
+ * A Conductor timer fired (lib/orchestrator/timers.ts): deliver the
+ * autonomous follow-up turn in the timer's project. "retry" keeps the timer
+ * alive (the timers module re-arms in 30 s, bounded). A NOT-YET-HYDRATED
+ * projects store answers "retry", never "drop" — a load failure must not
+ * make missing project records look authoritative and eat the timer.
+ */
+export async function deliverTimerTurn(
+  projectId: string,
+  note: string,
+  missed: boolean,
+): Promise<"delivered" | "retry" | "drop"> {
+  if (!useProjects.getState().hydrated) return "retry";
+  return runAutonomousTurn(
+    projectId,
+    `⏰ Timer fired: ${note}`,
+    timerWireText(note, missed),
+  );
+}
+
+/**
+ * A timer could not be delivered (bounded retries exhausted / an at-most-once
+ * claim was dropped on hydrate): make the state VISIBLE as a system message
+ * in the project's Conductor chat — never a silent disappearance.
+ */
+export function notifyTimerNotice(projectId: string, text: string): void {
+  const chatId = autonomousChatFor(projectId);
+  if (!chatId) return;
+  useOrchestrator.getState().appendMessage(chatId, { role: "system", text });
+}
+
+/** Approvals already escalated to a Conductor turn (dedupe per approval). */
+const escalatedApprovals = new Set<string>();
+
+/**
+ * Escalate one ROUTINE approval to the session's Conductor: an autonomous
+ * turn asking it to decide via decide_approval (or leave it to the human on
+ * doubt). Destructive approvals never come here — they stay human-only
+ * (card + Deck + the existing "waiting" ping). Busy chats skip — the
+ * pending-ping mechanism already carries the approval into the next turn.
+ */
+function escalateApprovalToConductor(
+  sessionId: string,
+  sessionName: string,
+  projectId: string,
+  approval: { id: string; summary: string },
+): void {
+  if (escalatedApprovals.has(approval.id)) return;
+  escalatedApprovals.add(approval.id);
+  const marker = `⚑ Approval escalated: «${sessionName}» (routine)`;
+  const wire = `[approval escalation] Agent «${sessionName}» is waiting on a ROUTINE approval (agent id ${sessionId}). Request: ${approval.summary}\n\nDecide it now with decide_approval (accept when it serves the agent's task, decline when it does not) — or, if you are in doubt, leave it to the user and tell them. This is an autonomous turn.`;
+  void runAutonomousTurn(projectId, marker, wire).then((outcome) => {
+    // a busy/throttled chat rides on the existing ping instead — allow a
+    // later re-escalation only if the approval is still pending then
+    if (outcome === "retry") escalatedApprovals.delete(approval.id);
+  });
+}
+
+/** One-line summary of an approval request payload (command or file paths). */
+function approvalSummary(payload: Record<string, unknown>): string {
+  const command = typeof payload.command === "string" ? payload.command : "";
+  if (command) return command.slice(0, 200);
+  const changes = Array.isArray(payload.changes) ? payload.changes : [];
+  const paths = changes
+    .map((c) =>
+      c && typeof c === "object" && typeof (c as { path?: unknown }).path === "string"
+        ? ((c as { path: string }).path)
+        : null,
+    )
+    .filter((p): p is string => !!p);
+  if (paths.length) return `file change: ${paths.join(", ")}`.slice(0, 200);
+  const reason = typeof payload.reason === "string" ? payload.reason : "";
+  return (reason || "unknown request").slice(0, 200);
 }
 
 /** Stop the chat's running turn (its send resolves as "interrupted"). */

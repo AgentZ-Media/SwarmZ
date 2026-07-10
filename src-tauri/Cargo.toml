@@ -37,6 +37,8 @@ walkdir = "2"
 # "process"/"io-util"/"rt" for the long-lived `codex app-server` children and
 # their stdio pump tasks (codex/host.rs)
 tokio = { version = "1", features = ["time", "sync", "process", "io-util", "rt"] }
+# O_NOFOLLOW opens for the plan documents (plans.rs no-follow confinement)
+libc = "0.2"
 
 [dev-dependencies]
 # async unit tests for the orchestrator bus (#[tokio::test])

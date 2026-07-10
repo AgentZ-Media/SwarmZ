@@ -43,6 +43,10 @@ import {
   hydrateProjects,
   useProjects,
 } from "@/lib/projects/store";
+import {
+  flushConductorTimersPersist,
+  hydrateConductorTimers,
+} from "@/lib/orchestrator/timers";
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
@@ -83,6 +87,8 @@ export async function flushAllPersists(): Promise<void> {
       flushVibePersist(),
       // the project tabs keep their own debounced slice
       flushProjectsPersist(),
+      // the conductor timers keep their own debounced slice
+      flushConductorTimersPersist(),
     ]);
   } catch {
     /* never block quitting on a failed write */
@@ -153,7 +159,9 @@ export interface SwarmState {
   /** remember a repo root for the worktree scan (persisted in settings) */
   registerWorktreeRepo: (root: string) => void;
   /** delete a worktree from the management panel (folder + branch) */
-  deleteWorktree: (entry: WorktreeEntry) => Promise<void>;
+  /** `force` defaults to true (user-confirmed panel deletions); silent
+   * cleanup paths pass false → Rust re-checks and refuses late dirt. */
+  deleteWorktree: (entry: WorktreeEntry, force?: boolean) => Promise<void>;
   /** delete every safe, unattached worktree currently shown in the panel */
   cleanupSafeWorktrees: (root?: string) => Promise<void>;
   /**
@@ -269,6 +277,13 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     } catch {
       /* ignore */
     }
+    try {
+      // conductor timers — after projects (drop decisions) AND chats
+      // (missed timers fire autonomous turns into the project chats)
+      await hydrateConductorTimers();
+    } catch {
+      /* ignore */
+    }
     // initial worktree scan — restores the title-bar panel/icon
     void get().refreshWorktrees();
   },
@@ -348,12 +363,13 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     void get().refreshWorktrees();
   },
 
-  deleteWorktree: async (entry) => {
+  deleteWorktree: async (entry, force = true) => {
     try {
       await removeWorktree({
         root: entry.root,
         path: entry.path,
         branch: entry.branch,
+        force,
         gitBin: get().settings.gitPath?.trim() || undefined,
       });
     } catch {
@@ -377,20 +393,24 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         (!root || entry.root === root) &&
         !openPaths.has(entry.path) &&
         !entry.dirty &&
-        entry.ahead === 0,
+        entry.ahead === 0 &&
+        !entry.ahead_unknown,
     );
     if (entries.length === 0) return;
     const gitBin = state.settings.gitPath?.trim() || undefined;
     await Promise.allSettled(
       entries.map(async (entry) => {
         try {
-          // re-check at execution time — the panel data may be minutes old
+          // re-check at execution time — the panel data may be minutes old;
+          // an UNKNOWN ahead count refuses (fail closed)
           const st = await worktreeStatus(entry.path, gitBin);
-          if (st.exists && (st.dirty || st.ahead > 0)) return;
+          if (st.exists && (st.dirty || st.ahead > 0 || st.ahead_unknown)) return;
+          // non-force: Rust re-checks once more inside the removal call
           await removeWorktree({
             root: entry.root,
             path: entry.path,
             branch: entry.branch,
+            force: false,
             gitBin,
           });
         } catch {
@@ -411,17 +431,22 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       return;
     }
     if (!status.exists) return; // folder gone — nothing left to decide
-    if (!status.dirty && status.ahead === 0) {
-      // clean — remove silently (re-checked just now)
-      await get().deleteWorktree({
-        root: meta.root,
-        repo: "",
-        path,
-        branch: meta.branch,
-        dirty: false,
-        ahead: 0,
-        missing: false,
-      });
+    if (!status.dirty && status.ahead === 0 && !status.ahead_unknown) {
+      // clean — remove silently (re-checked just now; non-force so Rust
+      // refuses work that appears between this check and the removal)
+      await get().deleteWorktree(
+        {
+          root: meta.root,
+          repo: "",
+          path,
+          branch: meta.branch,
+          dirty: false,
+          ahead: 0,
+          ahead_unknown: false,
+          missing: false,
+        },
+        false,
+      );
       return;
     }
     set({ closeWorktreeConfirm: { meta, path, status } });
@@ -431,11 +456,12 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     const confirm = get().closeWorktreeConfirm;
     set({ closeWorktreeConfirm: null });
     if (!confirm || choice !== "delete") return;
-    // explicit user decision — no re-check
+    // explicit user decision — no re-check, force
     void removeWorktree({
       root: confirm.meta.root,
       path: confirm.path,
       branch: confirm.meta.branch,
+      force: true,
       gitBin: get().settings.gitPath?.trim() || undefined,
     })
       .catch(() => {})

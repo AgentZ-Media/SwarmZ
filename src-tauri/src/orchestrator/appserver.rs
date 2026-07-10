@@ -1137,7 +1137,8 @@ mod tests {
         // the approval doctrine is single-source here
         assert!(instructions.contains("the HUMAN holds final authority over what an agent may do"));
         let tools = start["dynamicTools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), crate::orchestrator::tool_definitions().len());
+        assert!(tools.iter().any(|t| t["name"] == "spawn_agents"));
 
         // memory snapshots flow into developerInstructions when present
         let with_mem = thread_start_params(

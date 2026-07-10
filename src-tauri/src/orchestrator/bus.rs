@@ -193,8 +193,8 @@ mod tests {
         let err = run_tool_via(
             &pending,
             |_req| panic!("must not emit for invalid args"),
-            "prompt_pane",
-            json!({ "pane_id": "abc" }), // text missing
+            "prompt_agent",
+            json!({ "agent": "abc" }), // text missing
             None,
             None,
             None,
@@ -261,17 +261,17 @@ mod tests {
                 Ok(())
             },
             "git_status",
-            json!({ "pane_id": "nope" }),
+            json!({ "agent": "nope" }),
             None,
             None,
             Some(5_000),
         );
         let respond = async {
             let id = rx.recv().unwrap();
-            pending.resolve(&id, Err("unknown pane_id \"nope\"".into()));
+            pending.resolve(&id, Err("unknown agent \"nope\"".into()));
         };
         let (result, ()) = tokio::join!(call, respond);
-        assert!(result.unwrap_err().contains("unknown pane_id"));
+        assert!(result.unwrap_err().contains("unknown agent"));
     }
 
     #[tokio::test]

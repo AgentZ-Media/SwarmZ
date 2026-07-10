@@ -15,7 +15,7 @@ import type {
 /**
  * Read the readable tail of a codex session file on disk (user/assistant
  * text, tool one-liners). The backend seek-tails huge files — safe to call
- * against any session size. (The orchestrator's read_transcript tool renders
+ * against any session size. (The orchestrator's read_agent tool renders
  * live sessions from the store instead — this reads rollout files.)
  */
 export function readTranscript(args: {

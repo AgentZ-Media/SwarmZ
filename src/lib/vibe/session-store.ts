@@ -173,6 +173,17 @@ export interface VibeState {
     id: string,
     patch: { model?: string; effort?: string },
   ) => void;
+  /**
+   * Re-home the session (worktree assignment, Phase 4): new working
+   * directory + worktree meta in one identity-preserving patch. The backend
+   * cwd switch (thread/settings/update) is the controller's job.
+   */
+  assignWorktree: (
+    id: string,
+    patch: { projectDir: string; worktree: VibeSessionWorktree | null },
+  ) => void;
+  /** flip the shared flag of a session's worktree meta (co-tenant joined) */
+  setWorktreeShared: (id: string, shared: boolean) => void;
 
   // ---- turn state (controller) ----
   setBusy: (id: string, busy: boolean) => void;
@@ -372,6 +383,34 @@ export const useVibe = create<VibeState>((set, get) => ({
               ...e.session,
               ...(model !== undefined ? { model } : { model: undefined }),
               ...(effort !== undefined ? { effort } : { effort: undefined }),
+            },
+          },
+    );
+    if (!patch) return;
+    set(patch);
+    schedulePersist();
+  },
+
+  assignWorktree: (id, { projectDir, worktree }) => {
+    const patch = withEntry(get(), id, (e) =>
+      e.session.projectDir === projectDir && e.session.worktree === worktree
+        ? e
+        : { ...e, session: { ...e.session, projectDir, worktree } },
+    );
+    if (!patch) return;
+    set(patch);
+    schedulePersist();
+  },
+
+  setWorktreeShared: (id, shared) => {
+    const patch = withEntry(get(), id, (e) =>
+      !e.session.worktree || e.session.worktree.shared === shared
+        ? e
+        : {
+            ...e,
+            session: {
+              ...e.session,
+              worktree: { ...e.session.worktree, shared },
             },
           },
     );
@@ -632,6 +671,10 @@ function sanitizeItem(raw: unknown): VibeItem | null {
         kind: "approval",
         approvalKind,
         status,
+        // routing class survives hydration; anything else = destructive
+        ...(m.escalation === "routine" || m.escalation === "destructive"
+          ? { escalation: m.escalation }
+          : {}),
         payload:
           m.payload && typeof m.payload === "object"
             ? (m.payload as Record<string, unknown>)

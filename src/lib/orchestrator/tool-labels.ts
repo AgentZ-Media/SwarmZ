@@ -21,7 +21,7 @@ export function toolActivityLabel(
   switch (tool) {
     case "fleet_snapshot":
       return "Checked the fleet";
-    case "read_transcript":
+    case "read_agent":
       return first ? `Read «${first}»` : "Read a transcript";
     case "read_project_docs":
       return "Read project docs";
@@ -31,12 +31,42 @@ export function toolActivityLabel(
       return "Checked git";
     case "list_projects":
       return "Looked up projects";
-    case "prompt_pane":
+    case "prompt_agent":
       return first ? `Prompted «${first}»` : "Prompted an agent";
-    case "create_panes":
+    case "spawn_agents":
       return n > 0
-        ? `Started ${n} session${n === 1 ? "" : "s"}`
-        : "Started sessions";
+        ? `Spawned ${n} agent${n === 1 ? "" : "s"}`
+        : "Spawned agents";
+    case "interrupt_agent":
+      return first ? `Stopped «${first}»` : "Stopped an agent";
+    case "close_agent":
+      return first ? `Closed «${first}»` : "Closed an agent";
+    case "set_agent_config":
+      return first ? `Retuned «${first}»` : "Retuned an agent";
+    case "review_agent":
+      return first ? `Reviewed «${first}»` : "Ran a code review";
+    case "decide_approval":
+      return first ? `Decided an approval for «${first}»` : "Decided an approval";
+    case "create_worktree":
+      return "Created a worktree";
+    case "assign_worktree":
+      return first ? `Moved «${first}» to a worktree` : "Assigned a worktree";
+    case "worktree_status":
+      return "Checked worktrees";
+    case "cleanup_worktree":
+      return "Cleaned up a worktree";
+    case "set_timer":
+      return "Set a timer";
+    case "list_timers":
+      return "Checked timers";
+    case "cancel_timer":
+      return "Cancelled a timer";
+    case "write_plan":
+      return "Wrote a plan";
+    case "list_plans":
+      return "Checked plans";
+    case "read_plan":
+      return "Read a plan";
     case "remember":
       return "Noted to memory";
     default:

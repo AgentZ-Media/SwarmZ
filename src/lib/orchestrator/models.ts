@@ -9,7 +9,8 @@ import { useSwarm } from "@/store";
 
 /**
  * Reasoning-effort values codex accepts (turn/start `effort` override). Kept in
- * sync with the create_panes reasoning enum in `executors.ts`. Ordered low →
+ * sync with the efforts the pickers offer (agent efforts are an open,
+ * catalog-driven string on the wire since Phase 4). Ordered low →
  * high for display.
  */
 export const CODEX_EFFORTS = [

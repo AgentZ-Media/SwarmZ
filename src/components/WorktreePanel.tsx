@@ -52,7 +52,8 @@ export function WorktreesButton() {
     else groups.push({ root: e.root, repo: e.repo, entries: [e] });
   }
   const safeCount = worktrees.filter(
-    (e) => !openPaths.has(e.path) && !e.dirty && e.ahead === 0,
+    (e) =>
+      !openPaths.has(e.path) && !e.dirty && e.ahead === 0 && !e.ahead_unknown,
   ).length;
 
   return (
@@ -133,7 +134,8 @@ function WorktreeRow({
   const [armed, setArmed] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
-  const risky = entry.dirty || entry.ahead > 0;
+  // an UNCOMPUTABLE ahead count counts as risky too (fail closed)
+  const risky = entry.dirty || entry.ahead > 0 || entry.ahead_unknown;
 
   const onOpen = () => {
     close();
@@ -208,7 +210,14 @@ function WorktreeRow({
                   ↑{entry.ahead} local-only
                 </span>
               )}
-              {!entry.dirty && entry.ahead === 0 && <span>clean</span>}
+              {entry.ahead_unknown && (
+                <span className="rounded bg-warning/15 px-1 text-warning">
+                  state unknown
+                </span>
+              )}
+              {!entry.dirty && entry.ahead === 0 && !entry.ahead_unknown && (
+                <span>clean</span>
+              )}
             </>
           )}
         </div>

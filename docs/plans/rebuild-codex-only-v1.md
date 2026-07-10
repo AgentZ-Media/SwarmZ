@@ -76,15 +76,35 @@ Session-only, alle mit Rust-Schema + Webview-Executor + Persona-Doku + Tests:
 2. TitleBar: Projekt-Tabs, Needs-you-Pill (⌘⇧A cycle), ⌘K, Settings, New Agent; Drag-Region-Invariante beibehalten.
 3. Conductor-Sidebar (⌘B, resizable): ChatView v2 mit Aktivitätsblöcken (Tool-Steps + Agent-Chips), Pings mit Jump/Review, Modell/Effort-Picker, ctx-Anzeige, `@agent`-Mentions, Stop.
 4. Fleet-Grid: Agent-Karten (Status-Triade, Name, Worktree/Projekt, ±Diff, Mini-Feed, Quick-Approval, Mini-Composer), Filter-Chips, „working"-Sweep.
-5. Fokus-View: Feed (ItemFeed/DiffCard wiederverwenden, restylen), Plan-Panel, Approval-Takeover (⏎/⎋), Cross-Agent-Banner, Wide-Modus.
+5. Fokus-View: Feed (ItemFeed/DiffCard restylen), Plan-Panel, Approval-Takeover (⏎/⎋), Cross-Agent-Banner, Wide-Modus.
+5a. **Diff-Engine-Wechsel auf `@pierre/diffs`** (Entscheidung 10.07.2026 nach Tiefenanalyse — belegt hochwertigste Langzeit-Lösung): Shiki-Highlighting (VSCode-treu) statt lowlight, PR-skalierbares Virtualized-Rendering (unsere 512-KB-Caps/Truncation entfallen), eingebaute Review-Primitives (Accept/Reject-Hunks, Zeilen-Selektion + Annotationen, Streaming) — mappen direkt auf Approval-Takeover + „Zeilen markieren → Session prompten". Auf STABLE (1.2.x) pinnen, NICHT Beta; kein t3code-Patch nötig (der ist Editor-only). GATE: eintägiger WKWebView-Spike (Shadow DOM/WASM/virtua-Row-Höhenstabilität) VOR dem Umbau; scheitert er → Fallback `@git-diff-view/shiki` (nur Highlight-Upgrade). Bleibt: `src/lib/vibe/diff.ts` Zahlen-Schicht + `diff.test.ts` (engine-unabhängig). Ersetzt: `diff-worker.ts`/`diff-highlight.ts` → pierre `WorkerPoolContextProvider` (in VibeLayer, poolSize 2), DiffBody → `<FileDiff>`, lowlight/`@git-diff-view/*` raus; Theme via `registerCustomCSSVariableTheme` auf die #f0567c-Tokens. Phase 7 (GitHub-PR-View) erbt diese Engine.
 6. Deck v2 (projektübergreifend), Toasts, New-Agent-Dialog (Projekt implizit, Name random vorausgefüllt), Close-Confirm mit Kontextzeilen, Command-Palette v2, Settings v2 (Autonomie-Level, Approval-Politik, Auto-Review, Timer, Defaults).
 7. Performance-Invarianten: Identity-Preservation der Items, Primitive-Signatur-Selektoren, Delta-Batching — unverändert pflichtig.
 
-### Phase 7 — Feinschliff, Doku, Absicherung
+### Phase 7 — GitHub-Integration (umfassend, opt-in)
+Ziel: SwarmZ erkennt und managt den GitHub-Kontext eines Projekts über die lokal installierte `gh`-CLI — read-only-Erkennung ohne eigenen Login-Flow, Schreib-/Automatik-Aktionen opt-in per Settings. Eigenes Panel + Diff-View in der Phase-6-Designsprache.
+
+**7.1 Backend (Rust, `github.rs` — Muster von `git.rs`/`worktree.rs`: Subprozess-Timeouts, `spawn_blocking`):**
+- Read-only-Erkennung: `gh_auth_status` (installiert? eingeloggt? Username, Scopes — via `gh auth status`/`gh api user`), `gh_repo_info` (GitHub-Remote des Projekts: owner/repo, HTTPS-Link, Default-Branch, Sichtbarkeit — via `gh repo view --json` bzw. Remote-Parsing), `gh_pr_list` (offene PRs: Nummer, Titel, Autor, Branch, Draft, mergeable, Review-Decision, Checks-Status — `gh pr list --json`), `gh_pr_view` (Detail: Checks, Reviews, geänderte Dateien, Diff), `gh_pr_checks` (CI-Status).
+- Schreib-Ops (GATED: nur bei aktivierter Integration + Freigabe-Doktrin): `gh_pr_create`, `gh_pr_comment`, `gh_pr_review` (approve/request-changes/comment), `gh_pr_ready`/`gh_pr_merge` (merge ist DESTRUKTIV → hart mensch-pflichtig via Approval-Klassifizierung aus Phase 4).
+- PR-Status-Watcher (opt-in): Poll je aktivem Repo (Intervall in Settings), Änderungen (Checks grün/rot, neue Reviews, mergeable) → Event `github://pr-changed`, feedet Deck-Ticker + autonome Conductor-Turns.
+
+**7.2 Orchestrator-Tools (Conductor kann handeln, alle gated):**
+- `github_status` (Auth + Repo + offene-PR-Kurzlage), `list_prs`, `read_pr` (mit Diff), `create_pr` (Agent aus einem Worktree-Branch beauftragen — nutzt die Worktree/Branch-Kette aus Phase 4), `review_pr` (Agent/`review_agent`-Maschinerie auf den PR-Diff ansetzen → strukturierter Review, optional als `gh_pr_review` gepostet), `watch_pr` (Monitoring via Timer-/Autonomie-Loop aus Phase 4/5), `comment_pr`.
+- Persona-Doktrin (HINZUGEFÜGT, gated): Bei aktiver Integration behandelt der Conductor GitHub als Teil des Projekt-Workspaces — kennt Repo + offene PRs, schlägt PRs vor wenn Arbeit landet, kann Agenten fürs PR-Review/Monitoring einteilen. Merge/force bleiben mensch-pflichtig.
+
+**7.3 Frontend (Panel + Diff-View in Phase-6-Design):**
+- GitHub-Panel (analog WorktreePanel): Repo-Kopf mit klickbarem Link + Auth-Chip (Username), Liste offener PRs mit Status-Badges (Checks grün/rot, Review-Decision, mergeable/Draft), Klick → PR-Detail mit Diff-View (DiffCard/`vibe/diff.ts`-Maschinerie wiederverwenden).
+- Settings-Sektion „GitHub": Master-Toggle (ganze Automatik an/aus), Auto-Review-PRs-Toggle, Auto-Watch-Intervall, „PR bei fertiger Lane vorschlagen"-Toggle. Bei OFF: keine Automatik, keine gh-Schreib-Tools — der User kann Codex weiterhin explizit „mach X bei GitHub" sagen (gh ist lokal in der Sandbox).
+- Deck: dezenter PR-Indikator (offene PRs / rote Checks) pro aktivem Projekt.
+
+**7.4 Sicherheit & Reuse:** Schreib-Ops laufen durch die Phase-4-Approval-Klassifizierung (Kommentar/Review = eher routine, merge/force/close = destruktiv → Mensch). Reuse: `git.rs`-Subprozess-Muster, Worktree-Branch→PR, DiffCard/`diff.ts`, Timer für Watch-Intervalle, `review_agent` für PR-Reviews. Kein OAuth/eigener Login — ausschließlich der lokale `gh`-Zustand. `gh`-Abwesenheit/nicht-eingeloggt sauber degradieren (Panel zeigt Hinweis, Tools melden „gh not available/authenticated").
+
+### Phase 8 — Feinschliff, Doku, Absicherung
 1. `compact` bei hohem ctx (Conductor + Agenten), steer-UX-Politur, ggf. `fork` für Varianten.
 2. Quit-Guard v2, Store-Rescue-Tests, Updater-Pfad unangetastet verifizieren.
-3. `AGENTS.md`, `docs/ARCHITECTURE.md`, `README.md`, `DESIGN.md` vollständig neu geschrieben.
-4. Live-E2E gegen das Abo: echtes Testprojekt — Conductor bekommt eine unzerlegten Auftrag, zerlegt selbst, spawnt Agenten in Worktrees, Timer feuert, Review läuft, Approval eskaliert korrekt.
+3. `AGENTS.md`, `docs/ARCHITECTURE.md`, `README.md`, `DESIGN.md` vollständig neu geschrieben (inkl. GitHub-Integration).
+4. Live-E2E gegen das Abo: echtes Testprojekt — Conductor bekommt einen unzerlegten Auftrag, zerlegt selbst, spawnt Agenten in Worktrees, Timer feuert, Review läuft, Approval eskaliert korrekt, (bei aktiver Integration) PR-Flow durchgespielt.
 5. Release: Versionen sync, Release-Notes, Tag (nach Freigabe).
 
 ## Offene bewusste Brüche

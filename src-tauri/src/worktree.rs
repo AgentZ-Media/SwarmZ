@@ -57,6 +57,10 @@ pub struct WorktreeStatus {
     /// commits reachable only from this branch (not on any other local
     /// branch or any remote) — deleting the branch would lose them
     pub ahead: u64,
+    /// the ahead count could NOT be computed (git error/timeout) — callers
+    /// gating a deletion on `ahead` must treat this as "may hold work"
+    /// (fail closed), never as 0
+    pub ahead_unknown: bool,
     pub branch: Option<String>,
 }
 
@@ -80,6 +84,8 @@ pub struct WorktreeEntry {
     pub branch: String,
     pub dirty: bool,
     pub ahead: u64,
+    /// the ahead count could not be computed — treat as "may hold work"
+    pub ahead_unknown: bool,
     /// registered with git but the folder is gone (prunable)
     pub missing: bool,
 }
@@ -246,8 +252,10 @@ pub fn add(
 }
 
 /// Commits reachable only from `branch` — not from any other local branch
-/// and not from any remote. Works from any directory of the repo.
-fn branch_ahead(bin: &str, cwd: &Path, branch: &str) -> u64 {
+/// and not from any remote. Works from any directory of the repo. None =
+/// could not compute (git error/timeout) — callers must FAIL CLOSED, never
+/// substitute 0.
+fn branch_ahead(bin: &str, cwd: &Path, branch: &str) -> Option<u64> {
     run(
         bin,
         cwd,
@@ -263,7 +271,6 @@ fn branch_ahead(bin: &str, cwd: &Path, branch: &str) -> u64 {
     )
     .ok()
     .and_then(|s| s.parse().ok())
-    .unwrap_or(0)
 }
 
 /// Would closing this worktree lose anything? Uncommitted changes (tracked
@@ -283,7 +290,9 @@ pub fn status(path: &str, bin_override: Option<&str>) -> WorktreeStatus {
         // a worktree we can't read counts as dirty — never silent-delete it
         .unwrap_or(true);
     // commits reachable only from this branch: not from any other local
-    // branch and not from any remote (a pushed branch is safe to delete)
+    // branch and not from any remote (a pushed branch is safe to delete).
+    // An UNCOMPUTABLE count is surfaced as ahead_unknown (fail closed at the
+    // deletion gates), never silently as 0.
     let ahead = match &branch {
         Some(b) => branch_ahead(bin, p, b),
         None => run(
@@ -292,35 +301,83 @@ pub fn status(path: &str, bin_override: Option<&str>) -> WorktreeStatus {
             &["rev-list", "--count", "HEAD", "--not", "--branches", "--remotes"],
         )
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0),
+        .and_then(|s| s.parse().ok()),
     };
 
     WorktreeStatus {
         exists: true,
         dirty,
-        ahead,
+        ahead: ahead.unwrap_or(0),
+        ahead_unknown: ahead.is_none(),
         branch,
     }
 }
 
-/// Remove the worktree folder and delete its branch. `force` discards
-/// uncommitted changes / local-only commits — callers gate it on `status` or an
-/// explicit user confirmation. A hand-deleted folder is pruned instead.
+/// Remove the worktree folder and delete its branch.
+///
+/// `force: true` discards uncommitted changes / local-only commits — for
+/// explicitly user-confirmed deletions only. `force: false` is the GATED
+/// path (the Conductor's cleanup_worktree and the silent clean-safe flows):
+/// the status is re-checked HERE, inside the same call as the removal —
+/// dirty, local-only commits or an UNCOMPUTABLE ahead count refuse — and the
+/// `git worktree remove` runs WITHOUT `--force`, so git itself refuses work
+/// that appeared between the check and the removal (the TOCTOU net; the
+/// copied gitignored env files don't block a non-force removal).
 pub fn remove(
     root: &str,
     path: &str,
     branch: &str,
+    force: bool,
     bin_override: Option<&str>,
 ) -> Result<(), String> {
     let bin = git_bin(bin_override);
     let root_p = Path::new(root);
     if Path::new(path).exists() {
-        // --force always: the copied env files are untracked, and our own
-        // status check / the user's confirmation is the actual safety gate
-        run(bin, root_p, &["worktree", "remove", "--force", path])?;
+        if force {
+            run(bin, root_p, &["worktree", "remove", "--force", path])?;
+        } else {
+            // final re-check + removal in ONE call — unknown status = refusal
+            let st = status(path, bin_override);
+            if st.dirty {
+                return Err("refused: the worktree has uncommitted changes".into());
+            }
+            if st.ahead_unknown {
+                return Err(
+                    "refused: could not verify the branch's commits — resolve manually".into(),
+                );
+            }
+            if st.ahead > 0 {
+                return Err(format!(
+                    "refused: branch \"{branch}\" holds {} local-only commit(s)",
+                    st.ahead
+                ));
+            }
+            run(bin, root_p, &["worktree", "remove", path])
+                .map_err(|e| format!("git refused the removal (worktree not clean?): {e}"))?;
+        }
     } else {
         let _ = run(bin, root_p, &["worktree", "prune"]);
+        if !force {
+            // a hand-deleted FOLDER may leave a branch holding commits
+            // nothing else reaches — the gated path refuses to -D it then
+            match branch_ahead(bin, root_p, branch) {
+                Some(0) => {}
+                Some(n) => {
+                    return Err(format!(
+                        "refused: branch \"{branch}\" holds {n} local-only commit(s) — the folder is gone but the branch stays"
+                    ))
+                }
+                None => {
+                    // branch already gone entirely? then nothing to delete
+                    if run(bin, root_p, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).is_ok() {
+                        return Err(
+                            "refused: could not verify the branch's commits — resolve manually".into(),
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+        }
     }
     // best-effort: the branch may be checked out elsewhere or already gone
     let _ = run(bin, root_p, &["branch", "-D", branch]);
@@ -366,11 +423,10 @@ pub fn list(roots: &[String], bin_override: Option<&str>) -> WorktreeScan {
                 // folder gone, but the branch may still hold commits nothing
                 // else reaches — compute ahead from the main repo so the
                 // panel treats the row as risky instead of one-click cleanup
+                let ahead = branch.as_deref().and_then(|b| branch_ahead(bin, root_p, b));
                 WorktreeStatus {
-                    ahead: branch
-                        .as_deref()
-                        .map(|b| branch_ahead(bin, root_p, b))
-                        .unwrap_or(0),
+                    ahead: ahead.unwrap_or(0),
+                    ahead_unknown: ahead.is_none(),
                     ..WorktreeStatus::default()
                 }
             } else {
@@ -383,6 +439,7 @@ pub fn list(roots: &[String], bin_override: Option<&str>) -> WorktreeScan {
                 branch: branch.or(st.branch).unwrap_or_else(|| "(detached)".into()),
                 dirty: st.dirty,
                 ahead: st.ahead,
+                ahead_unknown: st.ahead_unknown,
                 missing: prunable || !st.exists,
             });
         }
@@ -458,8 +515,12 @@ mod tests {
         assert_eq!(scan.entries[0].branch, "test/brave-falcon-7341");
         assert_eq!(scan.entries[0].ahead, 1);
 
-        // remove deletes folder + branch even with local-only work (force)
-        remove(&cwd, &info.path, &info.branch, None).unwrap();
+        // the GATED removal refuses local-only work…
+        let err = remove(&cwd, &info.path, &info.branch, false, None).unwrap_err();
+        assert!(err.contains("local-only commit"), "{err}");
+        assert!(Path::new(&info.path).exists());
+        // …force deletes folder + branch even with local-only work
+        remove(&cwd, &info.path, &info.branch, true, None).unwrap();
         assert!(!Path::new(&info.path).exists());
         assert!(run(
             git_bin(None),
@@ -470,6 +531,55 @@ mod tests {
         assert!(list(&[cwd], None).entries.is_empty());
 
         fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn gated_remove_refuses_dirt_and_unknown_state() {
+        let repo = temp_repo();
+        let cwd = repo.to_string_lossy().into_owned();
+        let info = add(&cwd, "test/gated", true, None).unwrap();
+
+        // dirty tracked file → the gated removal refuses, force succeeds
+        fs::write(Path::new(&info.path).join("a.txt"), "changed").unwrap();
+        let err = remove(&cwd, &info.path, &info.branch, false, None).unwrap_err();
+        assert!(err.contains("uncommitted"), "{err}");
+        assert!(Path::new(&info.path).exists());
+
+        // clean again → the gated removal passes (the copied gitignored .env
+        // does NOT block a non-force `git worktree remove`)
+        fs::write(Path::new(&info.path).join("a.txt"), "hi").unwrap();
+        assert!(Path::new(&info.path).join(".env").exists());
+        remove(&cwd, &info.path, &info.branch, false, None).unwrap();
+        assert!(!Path::new(&info.path).exists());
+
+        // hand-deleted folder + local-only commits → gated refuses branch -D
+        let info2 = add(&cwd, "test/gated2", false, None).unwrap();
+        fs::write(Path::new(&info2.path).join("a.txt"), "wt").unwrap();
+        run(git_bin(None), Path::new(&info2.path), &["commit", "-qam", "wt"]).unwrap();
+        fs::remove_dir_all(&info2.path).unwrap();
+        let err = remove(&cwd, &info2.path, &info2.branch, false, None).unwrap_err();
+        assert!(err.contains("local-only"), "{err}");
+        assert!(run(
+            git_bin(None),
+            &repo,
+            &["rev-parse", "--verify", "refs/heads/test/gated2"],
+        )
+        .is_ok(), "the branch must survive the refused gated cleanup");
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn status_marks_uncomputable_ahead_as_unknown() {
+        // a plain directory that is NOT a git repo: dirty (can't read) and
+        // ahead unknown — the gates must refuse, never treat this as clean
+        let dir = std::env::temp_dir().join(format!("swarmz-wt-nogit-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let st = status(&dir.to_string_lossy(), None);
+        assert!(st.exists);
+        assert!(st.dirty, "unreadable state must count as dirty");
+        assert!(st.ahead_unknown, "uncomputable ahead must be flagged");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

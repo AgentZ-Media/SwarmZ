@@ -113,6 +113,11 @@ export interface WorktreeStatus {
   dirty: boolean;
   /** commits reachable only from this branch — deleting it would lose them */
   ahead: number;
+  /**
+   * the ahead count could NOT be computed (git error/timeout) — deletion
+   * gates must treat this as "may hold work" (fail closed), never as 0
+   */
+  ahead_unknown: boolean;
   branch: string | null;
 }
 
@@ -125,6 +130,8 @@ export interface WorktreeEntry {
   branch: string;
   dirty: boolean;
   ahead: number;
+  /** the ahead count could not be computed — treat as "may hold work" */
+  ahead_unknown: boolean;
   /** registered with git but the folder is gone (prunable) */
   missing: boolean;
 }
@@ -291,7 +298,7 @@ export type OrchestratorChatMessage =
       paneRefs?: OrchestratorPaneRef[];
     };
 
-/** A session this chat prompted (prompt_pane / create_panes startup prompt). */
+/** A session this chat prompted (prompt_agent / spawn_agents startup task). */
 export interface OrchestratorTouchedPane {
   /** session name at prompt time (fallback once it is gone) */
   name: string;
@@ -482,10 +489,52 @@ export type VibeItem =
       kind: "approval";
       approvalKind: "command" | "fileChange";
       status: VibeApprovalStatus;
+      /**
+       * Conductor routing class (classified in Rust, conservative):
+       * "routine" = the Conductor may decide it via decide_approval,
+       * "destructive" = hard human-only. Missing (pre-Phase-4 items) =
+       * treated as destructive.
+       */
+      escalation?: "routine" | "destructive";
       /** the raw request params (itemId, reason, command, cwd, …) */
       payload: Record<string, unknown>;
     }
   | { id: string; at: number; kind: "warning"; text: string };
+
+// ---- Conductor timers ----
+
+/**
+ * One Conductor follow-up timer (the `set_timer` tool). Project-scoped;
+ * persisted (store key `conductorTimers`) so timers survive app restarts —
+ * they only FIRE while the app runs, missed ones fire on the next launch.
+ * Firing delivers an autonomous Conductor turn in the timer's project with
+ * `note` as context (lib/orchestrator/timers.ts).
+ */
+export interface ConductorTimer {
+  id: string;
+  /** owning project (`Project.id`) — fires into that project's Conductor */
+  projectId: string;
+  /** what future-you should do — the fired turn's context */
+  note: string;
+  /** fire time, epoch ms */
+  at: number;
+  createdAt: number;
+  /**
+   * Durable at-most-once claim: stamped (and flushed) IMMEDIATELY BEFORE the
+   * autonomous turn dispatches. A persisted timer carrying `firedAt` on the
+   * next hydrate may already have delivered (crash between dispatch and
+   * removal) — it is dropped instead of double-delivered. Cleared again when
+   * a dispatch reports retry (not delivered).
+   */
+  firedAt?: number;
+}
+
+/** Persisted shape of the Conductor timers (store key `conductorTimers`). */
+export interface PersistedConductorTimers {
+  /** shape version — bump when the persisted shape changes (missing = 1) */
+  version?: number;
+  timers: ConductorTimer[];
+}
 
 /** Per-turn token accounting (thread/tokenUsage/updated). */
 export interface VibeTokenUsage {

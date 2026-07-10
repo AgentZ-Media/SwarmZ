@@ -2,6 +2,7 @@ import type {
   AppSettings,
   CodexAccountLimits,
   GitInfo,
+  PersistedConductorTimers,
   PersistedOrchestratorChats,
   PersistedProjects,
   PersistedVibeSessions,
@@ -41,6 +42,10 @@ export interface Backend {
   /** Project tabs — projects (open + closed) and the active tab. */
   loadProjects(): Promise<PersistedProjects | null>;
   saveProjects(data: PersistedProjects): Promise<void>;
+
+  /** Conductor follow-up timers — project-scoped, survive restarts. */
+  loadConductorTimers(): Promise<PersistedConductorTimers | null>;
+  saveConductorTimers(data: PersistedConductorTimers): Promise<void>;
 
   /**
    * Delete top-level swarmz.json keys (missing keys are a no-op) — the

@@ -12,6 +12,7 @@ import type {
   AppSettings,
   CodexAccountLimits,
   GitInfo,
+  PersistedConductorTimers,
   PersistedOrchestratorChats,
   PersistedProjects,
   PersistedVibeSessions,
@@ -90,6 +91,20 @@ export const tauriBackend: Backend = {
   },
   saveProjects: async (data) => {
     await store.set("projects", data);
+    await store.save();
+  },
+
+  loadConductorTimers: async () => {
+    // a store READ ERROR must throw (the hydrate keeps its in-memory state
+    // and persists nothing then) — only a genuinely missing key is null.
+    // Swallowing the error here would make "unreadable" look like "fresh
+    // install" and let the hydrate persist every timer away.
+    return (
+      (await store.get<PersistedConductorTimers>("conductorTimers")) ?? null
+    );
+  },
+  saveConductorTimers: async (data) => {
+    await store.set("conductorTimers", data);
     await store.save();
   },
 

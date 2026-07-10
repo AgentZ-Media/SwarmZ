@@ -18,26 +18,57 @@ describe("toolActivityLabel", () => {
     expect(toolActivityLabel("remember")).toBe("Noted to memory");
   });
 
-  it("weaves in the pane/session name for transcript + prompt", () => {
-    expect(toolActivityLabel("read_transcript", { names: ["api"] })).toBe(
+  it("weaves in the agent name for transcript + prompt", () => {
+    expect(toolActivityLabel("read_agent", { names: ["api"] })).toBe(
       "Read «api»",
     );
-    expect(toolActivityLabel("prompt_pane", { names: ["worker-2"] })).toBe(
+    expect(toolActivityLabel("prompt_agent", { names: ["worker-2"] })).toBe(
       "Prompted «worker-2»",
     );
     // no name resolved yet → generic
-    expect(toolActivityLabel("read_transcript")).toBe("Read a transcript");
-    expect(toolActivityLabel("prompt_pane")).toBe("Prompted an agent");
+    expect(toolActivityLabel("read_agent")).toBe("Read a transcript");
+    expect(toolActivityLabel("prompt_agent")).toBe("Prompted an agent");
   });
 
-  it("pluralizes create_panes by count", () => {
-    expect(toolActivityLabel("create_panes", { count: 1 })).toBe(
-      "Started 1 session",
+  it("pluralizes spawn_agents by count", () => {
+    expect(toolActivityLabel("spawn_agents", { count: 1 })).toBe(
+      "Spawned 1 agent",
     );
-    expect(toolActivityLabel("create_panes", { count: 3 })).toBe(
-      "Started 3 sessions",
+    expect(toolActivityLabel("spawn_agents", { count: 3 })).toBe(
+      "Spawned 3 agents",
     );
-    expect(toolActivityLabel("create_panes")).toBe("Started sessions");
+    expect(toolActivityLabel("spawn_agents")).toBe("Spawned agents");
+  });
+
+  it("labels the Phase-4 arsenal", () => {
+    expect(toolActivityLabel("interrupt_agent", { names: ["Maya"] })).toBe(
+      "Stopped «Maya»",
+    );
+    expect(toolActivityLabel("close_agent", { names: ["Maya"] })).toBe(
+      "Closed «Maya»",
+    );
+    expect(toolActivityLabel("set_agent_config", { names: ["Maya"] })).toBe(
+      "Retuned «Maya»",
+    );
+    expect(toolActivityLabel("review_agent", { names: ["Maya"] })).toBe(
+      "Reviewed «Maya»",
+    );
+    expect(toolActivityLabel("review_agent")).toBe("Ran a code review");
+    expect(toolActivityLabel("decide_approval", { names: ["Maya"] })).toBe(
+      "Decided an approval for «Maya»",
+    );
+    expect(toolActivityLabel("create_worktree")).toBe("Created a worktree");
+    expect(toolActivityLabel("assign_worktree", { names: ["Maya"] })).toBe(
+      "Moved «Maya» to a worktree",
+    );
+    expect(toolActivityLabel("worktree_status")).toBe("Checked worktrees");
+    expect(toolActivityLabel("cleanup_worktree")).toBe("Cleaned up a worktree");
+    expect(toolActivityLabel("set_timer")).toBe("Set a timer");
+    expect(toolActivityLabel("list_timers")).toBe("Checked timers");
+    expect(toolActivityLabel("cancel_timer")).toBe("Cancelled a timer");
+    expect(toolActivityLabel("write_plan")).toBe("Wrote a plan");
+    expect(toolActivityLabel("list_plans")).toBe("Checked plans");
+    expect(toolActivityLabel("read_plan")).toBe("Read a plan");
   });
 
   it("falls back for unknown tools", () => {

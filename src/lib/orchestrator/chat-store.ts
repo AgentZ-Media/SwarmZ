@@ -152,7 +152,7 @@ export interface OrchestratorState {
   ) => void;
 
   // status pings
-  /** remember that this chat prompted a session (prompt_pane / create_panes) */
+  /** remember that this chat prompted a session (prompt_agent / spawn_agents) */
   recordTouchedPane: (chatId: string, paneId: string, name: string) => void;
   /** record an undelivered ping (cap MAX_PENDING_PINGS, oldest dropped) */
   addPendingPing: (

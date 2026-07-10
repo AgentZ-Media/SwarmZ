@@ -2,6 +2,7 @@ mod codex;
 mod codex_usage;
 mod git;
 mod orchestrator;
+mod plans;
 mod projects;
 mod storefile;
 mod transcript;
@@ -116,15 +117,20 @@ async fn worktree_status(path: String, bin: Option<String>) -> Result<worktree::
         .map_err(|e| e.to_string())
 }
 
+/// `force: false` is the gated path — the removal re-checks dirty/ahead
+/// inside worktree::remove and runs `git worktree remove` WITHOUT --force
+/// (git refuses late-appearing work). Omitted/`true` = the user-confirmed
+/// force path.
 #[tauri::command]
 async fn worktree_remove(
     root: String,
     path: String,
     branch: String,
+    force: Option<bool>,
     bin: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        worktree::remove(&root, &path, &branch, bin.as_deref())
+        worktree::remove(&root, &path, &branch, force.unwrap_or(true), bin.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -457,14 +463,24 @@ async fn vibe_session_interrupt(session_id: String) -> Result<(), String> {
 }
 
 /// Answer a pending approval — `decision` ∈ accept | acceptForSession |
-/// decline | cancel.
+/// decline | cancel. `require_routine: true` is the STRICT Conductor path:
+/// Rust refuses (atomically, server-side) unless the request was classified
+/// "routine" — destructive approvals stay with the human no matter what the
+/// caller claims. The human UI omits it / passes false.
 #[tauri::command]
 async fn vibe_session_respond_approval(
     session_id: String,
     approval_id: String,
     decision: String,
+    require_routine: Option<bool>,
 ) -> Result<(), String> {
-    codex::sessions::session_respond_approval(&session_id, &approval_id, &decision).await
+    codex::sessions::session_respond_approval(
+        &session_id,
+        &approval_id,
+        &decision,
+        require_routine.unwrap_or(false),
+    )
+    .await
 }
 
 /// Change the session's access mode (takes effect on the next turn).
@@ -488,6 +504,67 @@ async fn vibe_session_set_model_effort(
 #[tauri::command]
 async fn vibe_session_close(session_id: String) -> Result<(), String> {
     codex::sessions::session_close(&session_id).await
+}
+
+/// Steer the session's RUNNING turn (turn/steer, race-safe via
+/// expectedTurnId). Errors when no turn runs — callers send normally then.
+#[tauri::command]
+async fn vibe_session_steer(
+    session_id: String,
+    text: String,
+) -> Result<serde_json::Value, String> {
+    codex::sessions::session_steer(&session_id, &text).await
+}
+
+/// Move a session to a new working directory (worktree assignment) — the
+/// live thread is retuned via thread/settings/update, the profile for good.
+#[tauri::command]
+async fn vibe_session_set_cwd(session_id: String, cwd: String) -> Result<(), String> {
+    codex::sessions::session_set_cwd(&session_id, &cwd).await
+}
+
+/// Run a detached codex review over the session's work; blocks until the
+/// review turn completes and returns `{status, review, review_thread_id}`.
+#[tauri::command]
+async fn vibe_session_review(
+    session_id: String,
+    target: String,
+) -> Result<serde_json::Value, String> {
+    codex::sessions::session_review(&session_id, &target).await
+}
+
+// ---- Conductor plan documents — see plans.rs ----
+//
+// The ONE sanctioned write surface of the orchestrator: Markdown documents
+// under `<project>/.swarmz/plans/` (slug-confined — a title or slug can never
+// escape the folder). The project dir comes from the trusted chat context.
+
+#[tauri::command]
+async fn conductor_plan_write(
+    project_dir: String,
+    title: String,
+    markdown: String,
+) -> Result<plans::PlanInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || plans::write(&project_dir, &title, &markdown))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn conductor_plan_list(project_dir: String) -> Result<Vec<plans::PlanInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || plans::list(&project_dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn conductor_plan_read(
+    project_dir: String,
+    slug: String,
+) -> Result<plans::PlanDocument, String> {
+    tauri::async_runtime::spawn_blocking(move || plans::read(&project_dir, &slug))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -544,6 +621,12 @@ pub fn run() {
             vibe_session_set_access,
             vibe_session_set_model_effort,
             vibe_session_close,
+            vibe_session_steer,
+            vibe_session_set_cwd,
+            vibe_session_review,
+            conductor_plan_write,
+            conductor_plan_list,
+            conductor_plan_read,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

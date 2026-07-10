@@ -22,7 +22,7 @@ export function normalizeDirKey(dir: string): string {
  * Is `child` the same dir as `parent` or inside it? Segment-boundary-aware
  * (`/a/bc` is NOT within `/a/b`), on normalized keys — callers canonicalize
  * (symlinks, `/private` aliasing) BEFORE comparing when they can. Used by the
- * orchestrator's create_panes to keep sessions spawned into a subfolder of
+ * orchestrator's agent spawning to keep sessions spawned into a subfolder of
  * the Conductor's project attached to that project.
  */
 export function isDirWithin(parent: string, child: string): boolean {

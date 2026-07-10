@@ -17,7 +17,15 @@ import { useUpdates } from "./lib/updates";
 import { useLimits } from "./lib/limits";
 import { startQuitGuard } from "./lib/quit";
 import { startOrchestratorBus } from "./lib/orchestrator/bus";
-import { startVibeSessionActivityWatcher } from "./lib/orchestrator/controller";
+import {
+  deliverTimerTurn,
+  notifyTimerNotice,
+  startVibeSessionActivityWatcher,
+} from "./lib/orchestrator/controller";
+import {
+  registerTimerDelivery,
+  registerTimerNotice,
+} from "./lib/orchestrator/timers";
 import { vibeTriageEntries } from "./lib/vibe/triage";
 import { activateProjectByIndex, focusSession } from "./lib/vibe/controller";
 import { ensureNotifyPermission, notify } from "./lib/transport";
@@ -37,6 +45,11 @@ export default function App() {
 
   // init
   useEffect(() => {
+    // conductor timers deliver autonomous turns through the controller —
+    // registered BEFORE hydrate so missed timers can fire right away; the
+    // notice sink makes expired/claim-dropped timers visible in the chat
+    registerTimerDelivery(deliverTimerTurn);
+    registerTimerNotice(notifyTimerNotice);
     void hydrate();
     void ensureNotifyPermission().then((g) => (notifyGranted.current = g));
     const updates = useUpdates.getState();

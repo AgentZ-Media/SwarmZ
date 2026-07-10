@@ -2,7 +2,7 @@
 // `vibe_session_*` Tauri commands + the `vibe://session-event` stream,
 // codex/sessions.rs) and the session store, OUTSIDE React (the
 // orchestrator/controller.ts pattern). No UI here. Responsibilities:
-//   · typed `invoke` wrappers for the eight session commands (native-only,
+//   · typed `invoke` wrappers for the eleven session commands (native-only,
 //     direct invoke like lib/worktree.ts) + the one event listener
 //   · map streamed session events into normalized store items, batching the
 //     word-level `delta` events (~80 ms flushes) — only the streaming
@@ -121,11 +121,13 @@ function invokeRespondApproval(
   sessionId: string,
   approvalId: string,
   decision: VibeApprovalDecision,
+  requireRoutine: boolean,
 ): Promise<void> {
   return invoke("vibe_session_respond_approval", {
     sessionId,
     approvalId,
     decision,
+    requireRoutine,
   });
 }
 
@@ -147,6 +149,28 @@ function invokeSetModelEffort(
 
 function invokeClose(sessionId: string): Promise<void> {
   return invoke("vibe_session_close", { sessionId });
+}
+
+function invokeSteer(
+  sessionId: string,
+  text: string,
+): Promise<{ turn_id: string | null; steered: boolean }> {
+  return invoke("vibe_session_steer", { sessionId, text });
+}
+
+function invokeSetCwd(sessionId: string, cwd: string): Promise<void> {
+  return invoke("vibe_session_set_cwd", { sessionId, cwd });
+}
+
+function invokeReview(
+  sessionId: string,
+  target: string,
+): Promise<{
+  status: string;
+  review: string | null;
+  review_thread_id: string;
+}> {
+  return invoke("vibe_session_review", { sessionId, target });
 }
 
 // ---- streaming state ----
@@ -396,12 +420,16 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
       const approvalId = str(data.approval_id);
       if (!approvalId) break;
       const kind = data.kind === "fileChange" ? "fileChange" : "command";
+      // Conductor routing class (classified in Rust, conservative) —
+      // anything unexpected degrades to "destructive" (human-only)
+      const escalation = data.escalation === "routine" ? "routine" : "destructive";
       store.upsertItem(sessionId, {
         id: approvalId,
         at: Date.now(),
         kind: "approval",
         approvalKind: kind,
         status: "pending",
+        escalation,
         payload:
           data.request && typeof data.request === "object"
             ? (data.request as Record<string, unknown>)
@@ -658,8 +686,8 @@ export async function resumeSession(sessionId: string): Promise<void> {
  * events; busy is cleared by the turn's completion event, not here.
  *
  * STRICT: every failure (unknown/busy session, resume/start/send errors)
- * REJECTS — this is the orchestrator's delivery contract (`prompt_pane` /
- * `create_panes` prompts must never report `delivered:true` for a turn that
+ * REJECTS — this is the orchestrator's delivery contract (`prompt_agent` /
+ * `spawn_agents` tasks must never report `delivered:true` for a turn that
  * never started). Backend failures still surface as a warning item in the
  * transcript before rejecting, so the human sees them too.
  */
@@ -681,6 +709,17 @@ export async function sendMessageStrict(
     kind: "user",
     text: trimmed,
   });
+  await deliverTurn(sessionId, trimmed);
+}
+
+/**
+ * The turn-delivery core shared by sendMessageStrict and the steer-race
+ * fallback (which already appended its user item): claim busy, ensure the
+ * backend, fire the turn. Rejects on every failure, after surfacing it as a
+ * warning item.
+ */
+async function deliverTurn(sessionId: string, trimmed: string): Promise<void> {
+  const store = useVibe.getState();
   store.setBusy(sessionId, true);
   resetStream(sessionId);
   try {
@@ -693,6 +732,141 @@ export async function sendMessageStrict(
     warn(sessionId, `Send failed: ${errorText(err)}`);
     throw err instanceof Error ? err : new Error(errorText(err));
   }
+}
+
+/** How long the steer-race fallback waits for the busy flag to clear. */
+const STEER_RACE_IDLE_TIMEOUT_MS = 2_000;
+
+/**
+ * Wait until the session's busy flag clears — a real handshake on the store
+ * instead of a fixed sleep. Resolves false when the deadline passes with the
+ * session still busy. Used by the steer-race fallback (the turn-completion
+ * event is already in flight when a steer loses its race) and by
+ * spawn_agents' shared-lane serialization (one writer per worktree).
+ */
+export function waitForSessionIdle(
+  sessionId: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (!useVibe.getState().busy[sessionId]) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let unsub: () => void = () => {};
+    const timer = setTimeout(() => {
+      unsub();
+      resolve(!useVibe.getState().busy[sessionId]);
+    }, timeoutMs);
+    unsub = useVibe.subscribe((s) => {
+      if (!s.busy[sessionId]) {
+        clearTimeout(timer);
+        unsub();
+        resolve(true);
+      }
+    });
+  });
+}
+
+/**
+ * The orchestrator's prompt path for a BUSY session: STEER the running turn
+ * (turn/steer — the instruction is absorbed mid-flight; live-verified on
+ * codex 0.144.1). Race-safe: when the turn ended between the busy check and
+ * the steer, Rust tags the failure "steer-race:" (BOTH the wire-level
+ * mismatch and the early "no turn" case — Rust clears its turn id before the
+ * frontend busy flag clears) and the text falls back to a normal next-turn
+ * send. The user item is appended only AFTER a confirmed delivery — a lost
+ * race never leaves a phantom "delivered-looking" item in the transcript.
+ * Returns how the text was delivered. STRICT like sendMessageStrict.
+ */
+export async function steerMessageStrict(
+  sessionId: string,
+  text: string,
+): Promise<"steered" | "queued"> {
+  const trimmed = text.trim();
+  if (!trimmed) return "queued";
+  const store = useVibe.getState();
+  if (!store.sessions[sessionId])
+    throw new Error(`unknown vibe session "${sessionId}"`);
+  if (!store.busy[sessionId]) {
+    await sendMessageStrict(sessionId, trimmed);
+    return "queued";
+  }
+  ensureEvents();
+  try {
+    await invokeSteer(sessionId, trimmed);
+    // steered into the running turn — NOW mirror the text (confirmed)
+    useVibe.getState().upsertItem(sessionId, {
+      id: `user-${nanoid(8)}`,
+      at: Date.now(),
+      kind: "user",
+      text: trimmed,
+    });
+    return "steered";
+  } catch (err) {
+    const msg = errorText(err);
+    if (msg.includes("steer-race:")) {
+      // the turn ended mid-steer — hand the text to the NEXT turn once the
+      // completion event has cleared the busy flag
+      const idle = await waitForSessionIdle(sessionId, STEER_RACE_IDLE_TIMEOUT_MS);
+      if (!idle) {
+        // a new turn claimed the session first — nothing was delivered and
+        // nothing was appended; the caller re-sends deliberately
+        throw new Error(
+          "steer lost the race and the session is busy again — re-send the prompt",
+        );
+      }
+      await sendMessageStrict(sessionId, trimmed);
+      return "queued";
+    }
+    warn(sessionId, `Steer failed: ${msg}`);
+    throw err instanceof Error ? err : new Error(msg);
+  }
+}
+
+/**
+ * Re-home a session into a worktree (Phase 4 `assign_worktree`). Guarded
+ * against split-brain: a BUSY session refuses (the running turn would keep
+ * writing into the OLD cwd while the occupancy metadata already claims the
+ * new one — a cleanup could then force-delete the agent's real cwd), and a
+ * live backend's metadata commits only AFTER the thread/settings/update
+ * roundtrip succeeded — an RPC failure leaves store and backend consistent
+ * on the old worktree. A not-yet-live session updates the store only and
+ * picks the new cwd up on resume.
+ */
+export async function assignWorktreeToSession(
+  sessionId: string,
+  args: { path: string; root: string; branch: string; shared: boolean },
+): Promise<void> {
+  const store = useVibe.getState();
+  if (!store.sessions[sessionId])
+    throw new Error(`unknown vibe session "${sessionId}"`);
+  if (store.busy[sessionId])
+    throw new Error(
+      "the agent is mid-turn — wait for the turn to finish (or interrupt it) before re-homing",
+    );
+  if (liveBackends.has(sessionId)) {
+    // backend FIRST — the store commits only on its ack
+    await invokeSetCwd(sessionId, args.path);
+  }
+  useVibe.getState().assignWorktree(sessionId, {
+    projectDir: args.path,
+    worktree: { root: args.root, branch: args.branch, shared: args.shared },
+  });
+}
+
+/**
+ * Run a detached codex review over a session's work (Phase 4
+ * `review_agent`). Ensures the backend session is live first (the review
+ * needs the Rust registry entry + the thread's rollout), then blocks until
+ * the review turn finishes. STRICT: failures reject.
+ */
+export async function reviewSession(
+  sessionId: string,
+  target: string,
+): Promise<{ status: string; review: string | null; review_thread_id: string }> {
+  const session = useVibe.getState().sessions[sessionId]?.session;
+  if (!session) throw new Error(`unknown vibe session "${sessionId}"`);
+  ensureEvents();
+  await resumeSession(sessionId);
+  return invokeReview(sessionId, target);
 }
 
 /**
@@ -725,7 +899,8 @@ const DECISION_STATUS: Record<VibeApprovalDecision, VibeApprovalStatus> = {
   cancel: "cancelled",
 };
 
-/** Answer a pending approval — optimistically marks the item, then tells Rust. */
+/** The HUMAN's answer to a pending approval — optimistically marks the item,
+ * then tells Rust (the human may decide any class). */
 export async function respondApproval(
   sessionId: string,
   approvalId: string,
@@ -735,10 +910,31 @@ export async function respondApproval(
     .getState()
     .setApprovalStatus(sessionId, approvalId, DECISION_STATUS[decision]);
   try {
-    await invokeRespondApproval(sessionId, approvalId, decision);
+    await invokeRespondApproval(sessionId, approvalId, decision, false);
   } catch (err) {
     warn(sessionId, `Couldn't answer the approval: ${errorText(err)}`);
   }
+}
+
+/**
+ * The CONDUCTOR's answer (decide_approval) — the STRICT server-anchored
+ * path: Rust applies the decision only when the request was classified
+ * "routine" at arrival (checked atomically next to the Responder — the
+ * frontend's own escalation field is a courtesy copy, never the authority).
+ * NOTHING is marked optimistically: the item status commits only after Rust
+ * confirms, so a refusal (destructive class, already-resolved approval,
+ * dead session) leaves the human's card exactly as it was and the error
+ * propagates to the tool result.
+ */
+export async function respondApprovalStrict(
+  sessionId: string,
+  approvalId: string,
+  decision: VibeApprovalDecision,
+): Promise<void> {
+  await invokeRespondApproval(sessionId, approvalId, decision, true);
+  useVibe
+    .getState()
+    .setApprovalStatus(sessionId, approvalId, DECISION_STATUS[decision]);
 }
 
 /** Change the session's access mode (takes effect on the next turn). */

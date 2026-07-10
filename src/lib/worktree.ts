@@ -79,17 +79,25 @@ export function worktreeStatus(
   return invoke<WorktreeStatus>("worktree_status", { path, bin: gitBin });
 }
 
-/** Remove worktree folder + branch. Callers gate this on status/confirmation. */
+/**
+ * Remove worktree folder + branch. `force: false` is the GATED path (silent
+ * cleanups, the Conductor's cleanup_worktree): Rust re-checks dirty/ahead
+ * inside the removal call and `git worktree remove` runs WITHOUT --force, so
+ * work that appeared after the caller's check still refuses. `force: true`
+ * is for explicitly user-confirmed deletions only.
+ */
 export function removeWorktree(args: {
   root: string;
   path: string;
   branch: string;
+  force: boolean;
   gitBin?: string;
 }): Promise<void> {
   return invoke<void>("worktree_remove", {
     root: args.root,
     path: args.path,
     branch: args.branch,
+    force: args.force,
     bin: args.gitBin,
   });
 }

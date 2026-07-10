@@ -6,15 +6,14 @@
 //
 // Args arrive pre-validated by the Rust registry (required props + basic
 // types) — executors still throw clear errors for everything semantic
-// (unknown session ids, non-repo git requests, …). A thrown error becomes
-// the tool call's error message.
+// (unknown agent ids, non-repo git requests, gated cleanups, …). A thrown
+// error becomes the tool call's error message.
 
 import { invoke } from "@tauri-apps/api/core";
 import { useSwarm } from "@/store";
-import type { NoteItem } from "@/types";
+import type { NoteItem, VibeAccess } from "@/types";
 import { fetchGitInfo } from "@/lib/transport";
 import { useProjects } from "@/lib/projects/store";
-import { isDirWithin, normalizeDirKey } from "@/lib/projects/core";
 import { pushFleetEvent } from "@/lib/events";
 import { useVibe, type VibeSessionEntry } from "@/lib/vibe/session-store";
 import {
@@ -22,19 +21,49 @@ import {
   // for a turn that never started (the UI path swallows failures — they are
   // already visible in the transcript as warning items)
   sendMessageStrict as vibeSendMessage,
+  steerMessageStrict as vibeSteerMessage,
   startSession as startVibeSession,
+  closeSession as closeVibeSession,
+  interrupt as interruptVibeSession,
+  // STRICT: the server-anchored Conductor path — Rust refuses anything not
+  // classified "routine", the UI status commits only after Rust's ack
+  respondApprovalStrict as respondVibeApproval,
+  setAccess as setVibeAccess,
+  setModelEffort as setVibeModelEffort,
+  assignWorktreeToSession,
+  reviewSession,
+  waitForSessionIdle,
 } from "@/lib/vibe/controller";
 import { renderSessionTranscript } from "@/lib/vibe/transcript";
+import { pickAgentName, branchSlugForAgent } from "@/lib/vibe/names";
+import {
+  addWorktree,
+  listWorktrees,
+  removeWorktree,
+  worktreeStatus,
+} from "@/lib/worktree";
 import { useOrchestrator } from "./chat-store";
-import { fleetSummaryLine, sessionSnapshot } from "./snapshot";
+import {
+  fleetSummaryLine,
+  sessionSnapshot,
+  worktreeOccupancy,
+} from "./snapshot";
 import { discoverProjects, projectDocs } from "./native";
 import { appendMemory } from "./memory";
+import {
+  cancelTimer,
+  createTimer,
+  listTimers,
+} from "./timers";
+import { describeRemaining, resolveFireAt } from "./timers-core";
 import type {
-  CreatePaneResult,
-  CreatePaneSpec,
-  CreatePanesResult,
+  ConductorPlanDocument,
+  ConductorPlanInfo,
   OrchestratorToolName,
-  PromptPaneResult,
+  PromptAgentResult,
+  SpawnAgentResult,
+  SpawnAgentSpec,
+  SpawnAgentsResult,
   ToolNoteItem,
 } from "./types";
 
@@ -43,8 +72,8 @@ import type {
  * chat id of the orchestrator chat whose turn triggered the call (the bus
  * resolves the backend id) — null for dev-hook calls (`__orch.tool`), which
  * therefore never track touched sessions. `projectId` is the Conductor
- * instance's project (Phase 3) — session resolution and fleet_snapshot are
- * scoped on it; null = unscoped (dev-hook).
+ * instance's project — session resolution, worktrees, timers and plans are
+ * all scoped on it; null = unscoped (dev-hook).
  */
 export interface ToolCallContext {
   chatId: string | null;
@@ -63,26 +92,21 @@ export const DOUBLE_PROMPT_WINDOW_MS = 2_000;
 
 /**
  * Last orchestrator prompt delivery per session id — across ALL chats and
- * including create_panes startup prompts (in-memory; the guard is about
+ * including spawn_agents startup tasks (in-memory; the guard is about
  * accidental duplicates within seconds, not restarts).
  */
 const lastPromptDelivery = new Map<string, number>();
 
 /**
- * The write choke point: the double-prompt guard, plus a busy session is
- * always REFUSED (a native session runs one turn at a time — the backend
- * rejects a second turn too).
+ * The duplicate-delivery guard. Since Phase 4 a BUSY session no longer
+ * refuses — prompt_agent steers the running turn instead — so this guard is
+ * the only precondition left.
  */
-function assertSessionPromptAllowed(sessionId: string, name: string): void {
+function assertNoDoublePrompt(sessionId: string, name: string): void {
   const last = lastPromptDelivery.get(sessionId);
   if (last !== undefined && Date.now() - last < DOUBLE_PROMPT_WINDOW_MS) {
     throw new Error(
-      `session "${name}" (${sessionId}) already received an orchestrator prompt ${Date.now() - last} ms ago — this looks like a duplicate call; wait a moment and re-send only if it was intentional`,
-    );
-  }
-  if (useVibe.getState().busy[sessionId]) {
-    throw new Error(
-      `session "${name}" (${sessionId}) is busy — wait for it to finish, then prompt it (or tell the user it is still working)`,
+      `agent "${name}" (${sessionId}) already received an orchestrator prompt ${Date.now() - last} ms ago — this looks like a duplicate call; wait a moment and re-send only if it was intentional`,
     );
   }
 }
@@ -122,18 +146,18 @@ export function fleetSessions(projectId: string | null = null) {
 }
 
 /**
- * Resolve a pane_id to its session entry WITHIN the call's project scope, or
- * fail listing every valid id. Accepts a raw session id, or a session name /
- * agent name (optionally `@`-prefixed, case-insensitive) that is unique
- * within the scope.
+ * Resolve an `agent` argument to its session entry WITHIN the call's project
+ * scope, or fail listing every valid id. Accepts a raw session id, or a
+ * session name / agent name (optionally `@`-prefixed, case-insensitive)
+ * that is unique within the scope.
  */
-function requireSession(paneId: unknown, ctx: ToolCallContext): VibeSessionEntry {
+function requireSession(agent: unknown, ctx: ToolCallContext): VibeSessionEntry {
   const scoped = orderedSessions(ctx.projectId);
-  if (typeof paneId === "string" && paneId.trim()) {
-    const byId = scoped.find((e) => e.session.id === paneId);
+  if (typeof agent === "string" && agent.trim()) {
+    const byId = scoped.find((e) => e.session.id === agent);
     if (byId) return byId;
     // name resolution: "@Maya" / "maya" — unique within the project scope
-    const needle = paneId.trim().replace(/^@/, "").toLowerCase();
+    const needle = agent.trim().replace(/^@/, "").toLowerCase();
     const byName = scoped.filter(
       (e) =>
         e.session.name.toLowerCase() === needle ||
@@ -142,7 +166,7 @@ function requireSession(paneId: unknown, ctx: ToolCallContext): VibeSessionEntry
     if (byName.length === 1) return byName[0];
     if (byName.length > 1) {
       throw new Error(
-        `ambiguous session name ${JSON.stringify(String(paneId))} — matches: ${byName
+        `ambiguous agent name ${JSON.stringify(String(agent))} — matches: ${byName
           .map((e) => `${e.session.id} ("${e.session.name}")`)
           .join(", ")}; use the id`,
       );
@@ -152,9 +176,9 @@ function requireSession(paneId: unknown, ctx: ToolCallContext): VibeSessionEntry
     .map((e) => `${e.session.id} ("${e.session.name}")`)
     .join(", ");
   throw new Error(
-    `unknown pane_id ${JSON.stringify(String(paneId))} — valid sessions${
+    `unknown agent ${JSON.stringify(String(agent))} — valid agents${
       ctx.projectId ? " in this project" : ""
-    }: ${valid || "(no sessions open)"}`,
+    }: ${valid || "(no agents)"}`,
   );
 }
 
@@ -162,130 +186,309 @@ function stripNotes(items: NoteItem[]): ToolNoteItem[] {
   return items.map((n) => ({ text: n.text, done: n.done }));
 }
 
-/**
- * The Conductor's default working directory: its project's folder. Errors
- * when the call is unscoped (dev-hook) AND the spec omitted `cwd`.
- */
-function defaultCwd(ctx: ToolCallContext): string {
+/** The Conductor's project record — required by project-scoped tools. */
+function requireProject(ctx: ToolCallContext): { id: string; dir: string } {
   const projectId = ctx.projectId ?? "";
   const dir = useProjects.getState().projects[projectId]?.dir?.trim() ?? "";
-  if (!dir)
+  if (!projectId || !dir)
     throw new Error(
-      "cwd omitted and no project folder available — pass an absolute cwd",
+      "this tool needs a project context — no project folder available",
     );
-  return dir;
+  return { id: projectId, dir };
 }
 
-/**
- * Canonical form of a dir (symlinks, `/private` aliasing) via Rust, falling
- * back to the plain normalized key when canonicalization fails (folder gone)
- * — the same tolerant resolution the project store's dedupe uses.
- */
-async function canonicalDirKey(dir: string): Promise<string> {
-  const key = normalizeDirKey(dir);
-  if (!key) return "";
-  try {
-    const canon = await invoke<string>("canonicalize_path", { path: key });
-    return normalizeDirKey(canon) || key;
-  } catch {
-    return key;
+/** Names already used by sessions of the scope (collision set). */
+function takenAgentNames(projectId: string | null): string[] {
+  const taken: string[] = [];
+  for (const e of orderedSessions(projectId)) {
+    taken.push(e.session.agentName, e.session.name);
   }
+  return taken;
+}
+
+function gitBin(): string | undefined {
+  return useSwarm.getState().settings.gitPath?.trim() || undefined;
+}
+
+/** Trailing-slash-insensitive path equality. */
+function samePath(a: string, b: string): boolean {
+  return a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+}
+
+/** Sessions (ALL projects) working in `path` — cleanup/shared bookkeeping. */
+function sessionsInPath(path: string): VibeSessionEntry[] {
+  return orderedSessions(null).filter((e) =>
+    samePath(e.session.projectDir, path),
+  );
+}
+
+/** Resolve symlinks (macOS /tmp → /private/tmp) — falls back to the input. */
+function canonicalizePath(path: string): Promise<string> {
+  return invoke<string>("canonicalize_path", { path }).catch(() => path);
 }
 
 /**
- * Create one native session (marked conductor-spawned). Access defaults to
- * workspace-write for orchestrator-created sessions (the human still
- * decides approvals).
- *
- * Project assignment: an omitted `cwd` defaults to the Conductor's project
- * folder; any cwd INSIDE the project root (canonicalized prefix check — a
- * subfolder of the project is still this project's work) keeps the session
- * attached to the Conductor's project. Only a genuinely FOREIGN cwd resolves
- * its own project (startSession → `openProject`, deduped by canonical path)
- * — NOT the user's currently active tab — and the tool result says so.
- * Rationale: the orchestrator may spawn into any folder, and a session must
- * always live under the tab of the folder it actually works in; an unknown
- * cwd opens its project tab WITHOUT stealing the user's active one
- * (spawnedBy: "conductor" → activate: false). Unnamed sessions get a pool
- * agent name, collision-free per project.
+ * Find one SwarmZ worktree entry by path, scoped to the CALLING Conductor's
+ * project repo ONLY — a Conductor must never assign agents into or clean up
+ * another project's worktrees, so the persisted cross-project registry is
+ * deliberately NOT consulted. The model-supplied path is canonicalized
+ * before matching (git reports canonical paths).
  */
-async function createOneSession(
-  spec: CreatePaneSpec,
+async function findWorktreeEntry(path: string, ctx: ToolCallContext) {
+  const { dir } = requireProject(ctx);
+  const canonical = await canonicalizePath(path);
+  const scan = await listWorktrees([dir], gitBin());
+  return (
+    scan.entries.find(
+      (e) => samePath(e.path, canonical) || samePath(e.path, path),
+    ) ?? null
+  );
+}
+
+/**
+ * Per-worktree async mutex: cleanup, assignment and the shared occupancy /
+ * status re-checks of ONE worktree path run strictly serialized, so a
+ * cleanup can never interleave with a re-homing or a second cleanup between
+ * its final checks and the removal. Keyed by canonical path.
+ */
+const worktreeLocks = new Map<string, Promise<unknown>>();
+
+async function withWorktreeLock<T>(
+  path: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = (await canonicalizePath(path)).replace(/\/+$/, "");
+  const tail = worktreeLocks.get(key) ?? Promise.resolve();
+  const run = tail.then(fn, fn); // previous failures don't poison the queue
+  worktreeLocks.set(
+    key,
+    run.catch(() => {}),
+  );
+  return run;
+}
+
+// ---- spawn_agents ----
+
+const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/;
+
+/**
+ * How long a shared lane's NEXT initial turn waits for the previous agent's
+ * turn to finish (one writer per worktree). Kept under the tool's registry
+ * timeout so an over-busy lane degrades into an honest per-agent warning,
+ * never a bus timeout.
+ */
+const SHARED_LANE_WAIT_MS = 8 * 60 * 1000;
+
+/** Placement of one agent: worktree "new" | "shared:<agent>" | "none". */
+async function resolvePlacement(
+  spec: SpawnAgentSpec,
+  name: string,
   ctx: ToolCallContext,
-): Promise<{ result: CreatePaneResult; prompt?: { id: string; text: string } }> {
-  const explicitCwd = typeof spec.cwd === "string" ? spec.cwd.trim() : "";
-  const cwd = explicitCwd || defaultCwd(ctx);
-  // cwd inside the Conductor's project root (incl. the root itself) → attach
-  // to its project directly; only genuinely foreign cwds resolve their own tab
-  const ownProjectDir =
-    ctx.projectId != null
-      ? (useProjects.getState().projects[ctx.projectId]?.dir?.trim() ?? "")
-      : "";
-  let withinOwnProject = ctx.projectId != null && explicitCwd === "";
-  if (!withinOwnProject && ctx.projectId != null && ownProjectDir) {
-    const [canonRoot, canonCwd] = await Promise.all([
-      canonicalDirKey(ownProjectDir),
-      canonicalDirKey(explicitCwd),
-    ]);
-    withinOwnProject = isDirWithin(canonRoot, canonCwd);
+  projectDir: string,
+): Promise<{
+  cwd: string;
+  worktree: { root: string; branch: string; shared: boolean } | null;
+  sharedHostId?: string;
+}> {
+  const placement = String(spec.worktree ?? "").trim();
+  if (placement === "none") {
+    return { cwd: projectDir, worktree: null };
   }
-  const projectId = withinOwnProject ? (ctx.projectId ?? undefined) : undefined;
+  if (placement === "new") {
+    const base = branchSlugForAgent(name, spec.task);
+    let lastErr = "";
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const branch = attempt === 0 ? base : `${base}-${attempt + 1}`;
+      try {
+        const info = await addWorktree({
+          cwd: projectDir,
+          branch,
+          copyEnv: true,
+          gitBin: gitBin(),
+        });
+        useSwarm.getState().registerWorktreeRepo(info.root);
+        return {
+          cwd: info.path,
+          worktree: { root: info.root, branch: info.branch, shared: false },
+        };
+      } catch (e) {
+        lastErr = e instanceof Error ? e.message : String(e);
+        // branch/folder collisions retry with a suffix; real git errors abort
+        if (!/already exists/i.test(lastErr)) break;
+      }
+    }
+    throw new Error(`could not create a worktree: ${lastErr}`);
+  }
+  if (placement.startsWith("shared:")) {
+    const hostName = placement.slice("shared:".length).trim();
+    if (!hostName) throw new Error('placement "shared:" needs an agent name');
+    const host = requireSession(hostName, ctx);
+    if (!host.session.worktree) {
+      throw new Error(
+        `agent "${host.session.name}" has no worktree to share — place it in one first (worktree "new" or assign_worktree)`,
+      );
+    }
+    return {
+      cwd: host.session.projectDir,
+      worktree: {
+        root: host.session.worktree.root,
+        branch: host.session.worktree.branch,
+        shared: true,
+      },
+      sharedHostId: host.session.id,
+    };
+  }
+  throw new Error(
+    `unknown worktree placement ${JSON.stringify(placement)} — use "new", "shared:<agentName>" or "none"`,
+  );
+}
+
+/**
+ * Create one agent session (marked conductor-spawned) per its spec.
+ * `reservedNames` is the BATCH's case-insensitive name reservation: explicit
+ * names collide loudly (against live sessions AND earlier batch entries —
+ * duplicate names would make `shared:<name>` and every name-based tool
+ * ambiguous), auto-picked names avoid the whole set; the chosen name is
+ * added before any await, so a parallel retry can't re-use it.
+ */
+async function spawnOneAgent(
+  spec: SpawnAgentSpec,
+  ctx: ToolCallContext,
+  projectId: string,
+  projectDir: string,
+  reservedNames: Set<string>,
+): Promise<{ result: SpawnAgentResult; task?: { id: string; text: string } }> {
+  const task = typeof spec.task === "string" ? spec.task.trim() : "";
+  if (!task) throw new Error("task must not be empty");
   const model = typeof spec.model === "string" ? spec.model.trim() : "";
-  if (model && !/^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(model))
+  if (model && !MODEL_RE.test(model))
     throw new Error(`invalid model "${model}" — letters, digits and . _ : / - only`);
-  const effort = typeof spec.reasoning === "string" ? spec.reasoning : undefined;
-  if (effort && !["minimal", "low", "medium", "high", "xhigh"].includes(effort))
-    throw new Error(`invalid reasoning "${effort}"`);
-  const id = await startVibeSession({
-    ...(typeof spec.name === "string" && spec.name.trim()
-      ? { name: spec.name.trim() }
-      : {}),
-    projectDir: cwd,
-    ...(projectId ? { projectId } : {}),
-    spawnedBy: "conductor",
-    ...(model ? { model } : {}),
-    ...(effort ? { effort } : {}),
-    access: "workspace",
-  });
-  const entry = useVibe.getState().sessions[id];
-  const name = entry?.session.name ?? spec.name ?? null;
-  const result: CreatePaneResult = { id, name, cwd };
-  if (!withinOwnProject && ctx.projectId != null) {
-    // honest scoping note: a foreign cwd lives under ITS OWN project tab, so
-    // this Conductor's fleet tools won't see the session
-    const sessProject = entry?.session.projectId
-      ? useProjects.getState().projects[entry.session.projectId]
-      : undefined;
-    result.note = `cwd is outside this project — the session was opened under its own project tab${
-      sessProject ? ` "${sessProject.name}"` : ""
-    } and is NOT part of this Conductor's fleet`;
+  const effort =
+    typeof spec.effort === "string" && spec.effort.trim()
+      ? spec.effort.trim()
+      : "medium"; // swarm default: sub-agents run medium unless chosen otherwise
+  const access: VibeAccess = spec.access === "full" ? "full" : "workspace";
+  const explicit = typeof spec.name === "string" ? spec.name.trim() : "";
+  if (explicit && reservedNames.has(explicit.toLowerCase())) {
+    throw new Error(
+      `agent name "${explicit}" is already in use in this project — pick a different name or omit it`,
+    );
   }
+  const name = explicit || pickAgentName([...reservedNames]);
+  reservedNames.add(name.toLowerCase());
+
+  const placement = await resolvePlacement(spec, name, ctx, projectDir);
+  let id: string;
+  try {
+    id = await startVibeSession({
+      name,
+      agentName: name,
+      projectDir: placement.cwd,
+      projectId,
+      spawnedBy: "conductor",
+      worktree: placement.worktree,
+      ...(model ? { model } : {}),
+      effort,
+      access,
+    });
+  } catch (err) {
+    // a FRESH worktree created for this agent must not orphan when the
+    // session never started — roll it back (it is clean by construction;
+    // the gated non-force removal double-checks that)
+    const msg = err instanceof Error ? err.message : String(err);
+    if (placement.worktree && !placement.worktree.shared) {
+      let rolledBack = false;
+      try {
+        await removeWorktree({
+          root: placement.worktree.root,
+          path: placement.cwd,
+          branch: placement.worktree.branch,
+          force: false,
+          gitBin: gitBin(),
+        });
+        rolledBack = true;
+      } catch {
+        /* rollback failed — name the path below so nothing orphans silently */
+      }
+      throw new Error(
+        rolledBack
+          ? `${msg} (the freshly created worktree was rolled back)`
+          : `${msg} — AND the fresh worktree could not be rolled back; clean it up via cleanup_worktree: ${placement.cwd}`,
+      );
+    }
+    throw err instanceof Error ? err : new Error(msg);
+  }
+  // joining an existing worktree marks the host shared too
+  if (placement.sharedHostId) {
+    useVibe.getState().setWorktreeShared(placement.sharedHostId, true);
+  }
+  const entry = useVibe.getState().sessions[id];
   return {
-    result,
-    prompt:
-      typeof spec.prompt === "string" && spec.prompt.trim()
-        ? { id, text: spec.prompt }
-        : undefined,
+    result: {
+      id,
+      name: entry?.session.name ?? name,
+      cwd: placement.cwd,
+      branch: placement.worktree?.branch ?? null,
+      shared: placement.worktree?.shared ?? false,
+    },
+    task: { id, text: task },
   };
 }
 
 /** Honest, human-readable account of what the batch created. */
-function buildSummary(results: CreatePaneResult[]): string {
+function buildSummary(results: SpawnAgentResult[]): string {
   const created = results.filter((r) => r.id && !r.error).length;
   const failed = results.filter((r) => r.error).length;
-  let summary = `created ${created} session${created === 1 ? "" : "s"}`;
+  let summary = `spawned ${created} agent${created === 1 ? "" : "s"}`;
   if (failed) summary += `; ${failed} failed`;
   return summary;
 }
 
+// ---- plans (thin invoke wrappers — Rust owns the confinement) ----
+
+function planWrite(
+  projectDir: string,
+  title: string,
+  markdown: string,
+): Promise<ConductorPlanInfo> {
+  return invoke<ConductorPlanInfo>("conductor_plan_write", {
+    projectDir,
+    title,
+    markdown,
+  });
+}
+
+function planList(projectDir: string): Promise<ConductorPlanInfo[]> {
+  return invoke<ConductorPlanInfo[]>("conductor_plan_list", { projectDir });
+}
+
+function planRead(
+  projectDir: string,
+  slug: string,
+): Promise<ConductorPlanDocument> {
+  return invoke<ConductorPlanDocument>("conductor_plan_read", {
+    projectDir,
+    slug,
+  });
+}
+
 export const executors: Record<OrchestratorToolName, ToolExecutor> = {
-  // ---- read tools ----
+  // ---- sensing ----
 
   fleet_snapshot: async (_args, ctx) => {
     const sessions = fleetSessions(ctx.projectId);
     const project = ctx.projectId
       ? (useProjects.getState().projects[ctx.projectId] ?? null)
       : null;
+    const now = Date.now();
+    const timers = ctx.projectId
+      ? listTimers(ctx.projectId).map((t) => ({
+          id: t.id,
+          note: t.note,
+          fires_at: new Date(t.at).toISOString(),
+          remaining: describeRemaining(t.at, now),
+        }))
+      : [];
     return {
       // the Conductor's own project heads the snapshot (null = unscoped dev call)
       project: project
@@ -293,38 +496,42 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         : null,
       summary: fleetSummaryLine(sessions),
       sessions,
+      // who works where — sessions without a worktree work in the project dir
+      worktrees: worktreeOccupancy(sessions),
+      timers,
     };
   },
 
-  read_transcript: async (args, ctx) => {
-    const entry = requireSession(args.pane_id, ctx);
+  read_agent: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
     const items = entry.order
       .map((id) => entry.items[id])
       .filter((i): i is NonNullable<typeof i> => !!i);
     const tail =
       typeof args.tail_messages === "number" ? args.tail_messages : undefined;
     return {
-      session: {
+      agent: {
         id: entry.session.id,
         name: entry.session.name,
         cwd: entry.session.projectDir,
         model: entry.session.model ?? null,
         access: entry.session.access,
+        worktree: entry.session.worktree,
       },
       transcript: renderSessionTranscript(items, { tail }),
     };
   },
 
   read_project_docs: async (args, ctx) => {
-    const hasPane = typeof args.pane_id === "string" && args.pane_id.trim();
+    const hasAgent = typeof args.agent === "string" && args.agent.trim();
     const hasPath = typeof args.path === "string" && args.path.trim();
-    if (!!hasPane === !!hasPath)
-      throw new Error('exactly one of "pane_id" or "path" is required');
-    const root = hasPane
-      ? requireSession(args.pane_id, ctx).session.projectDir
+    if (!!hasAgent === !!hasPath)
+      throw new Error('exactly one of "agent" or "path" is required');
+    const root = hasAgent
+      ? requireSession(args.agent, ctx).session.projectDir
       : (args.path as string).trim();
     if (!root)
-      throw new Error("the session has no project directory — pass \"path\" instead");
+      throw new Error("the agent has no working directory — pass \"path\" instead");
     return projectDocs(root);
   },
 
@@ -342,24 +549,23 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
   },
 
   git_status: async (args, ctx) => {
-    const hasPane = typeof args.pane_id === "string" && args.pane_id.trim();
+    const hasAgent = typeof args.agent === "string" && args.agent.trim();
     const hasPath = typeof args.path === "string" && args.path.trim();
-    if (!!hasPane === !!hasPath)
-      throw new Error('exactly one of "pane_id" or "path" is required');
+    if (!!hasAgent === !!hasPath)
+      throw new Error('exactly one of "agent" or "path" is required');
     let cwd: string;
-    let session: { id: string; name: string } | null = null;
-    if (hasPane) {
-      const entry = requireSession(args.pane_id, ctx);
+    let agent: { id: string; name: string } | null = null;
+    if (hasAgent) {
+      const entry = requireSession(args.agent, ctx);
       cwd = entry.session.projectDir;
-      session = { id: entry.session.id, name: entry.session.name };
+      agent = { id: entry.session.id, name: entry.session.name };
     } else {
       cwd = (args.path as string).trim();
     }
-    const gitBin = useSwarm.getState().settings.gitPath?.trim() || undefined;
-    const g = await fetchGitInfo(cwd, gitBin).catch(() => null);
-    if (!g) return { session, cwd, git: null, note: `not a git repository: ${cwd}` };
+    const g = await fetchGitInfo(cwd, gitBin()).catch(() => null);
+    if (!g) return { agent, cwd, git: null, note: `not a git repository: ${cwd}` };
     return {
-      session,
+      agent,
       cwd,
       git: {
         repo: g.repo,
@@ -382,76 +588,438 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     return discoverProjects(scanRoots);
   },
 
-  // ---- write tools ----
+  // ---- agents ----
 
-  prompt_pane: async (args, ctx) => {
-    const entry = requireSession(args.pane_id, ctx);
+  prompt_agent: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
     const text = String(args.text ?? "");
     if (!text) throw new Error("text must not be empty");
     const id = entry.session.id;
     const name = entry.session.name;
-    assertSessionPromptAllowed(id, name);
-    await vibeSendMessage(id, text);
+    assertNoDoublePrompt(id, name);
+    // steerMessageStrict routes by state: busy → turn/steer (mid-flight
+    // injection), idle → a fresh turn. Both STRICT — failures reject.
+    const how = await vibeSteerMessage(id, text);
     notePromptDelivered(id, name, ctx);
-    const result: PromptPaneResult = {
+    const result: PromptAgentResult = {
       delivered: true,
-      session: { id, name },
-      submitted: true,
+      agent: { id, name },
+      mode: how === "steered" ? "steered" : "turn",
     };
     return result;
   },
 
-  create_panes: async (args, ctx) => {
-    const specs = args.panes as CreatePaneSpec[];
+  spawn_agents: async (args, ctx) => {
+    const specs = args.agents as SpawnAgentSpec[];
     if (!Array.isArray(specs) || specs.length < 1 || specs.length > 8)
-      throw new Error("panes must contain 1–8 entries");
+      throw new Error("agents must contain 1–8 entries");
+    const { id: projectId, dir: projectDir } = requireProject(ctx);
 
-    const results: CreatePaneResult[] = new Array(specs.length);
-    const prompts: { index: number; id: string; text: string }[] = [];
-    // sequential on purpose — each start spawns a codex process
+    // case-insensitive name reservation for the whole batch: live sessions
+    // of the project + every name this batch hands out — explicit duplicate
+    // names fail their spec instead of creating ambiguous `shared:<name>` /
+    // name-based-tool targets
+    const reservedNames = new Set(
+      takenAgentNames(projectId).map((n) => n.toLowerCase()),
+    );
+
+    const results: SpawnAgentResult[] = new Array(specs.length);
+    const tasks: { index: number; id: string; text: string }[] = [];
+    // sequential on purpose — each start creates a worktree (git checkout)
+    // and spawns a codex process; "shared:" placements may reference agents
+    // spawned earlier in the SAME batch
     for (let i = 0; i < specs.length; i++) {
       try {
-        const { result, prompt } = await createOneSession(specs[i], ctx);
+        const { result, task } = await spawnOneAgent(
+          specs[i],
+          ctx,
+          projectId,
+          projectDir,
+          reservedNames,
+        );
         results[i] = result;
-        if (prompt) prompts.push({ index: i, ...prompt });
+        if (task) tasks.push({ index: i, ...task });
       } catch (e) {
         results[i] = {
           error: e instanceof Error ? e.message : String(e),
-          cwd: typeof specs[i]?.cwd === "string" ? (specs[i].cwd as string) : null,
           name: typeof specs[i]?.name === "string" ? specs[i].name : null,
         };
       }
     }
 
-    // initial prompts in parallel once all sessions exist — a session's
-    // thread is live right after start, so the turn submits immediately
-    await Promise.all(
-      prompts.map(async ({ index, id, text }) => {
-        try {
-          await vibeSendMessage(id, text);
-          notePromptDelivered(
+    // initial tasks once all agents exist — GROUPED BY WORKTREE: within one
+    // lane the next agent's turn starts only after the previous agent's turn
+    // FINISHED (one writer per worktree — a Promise.all kickoff would have
+    // several agents mutating the same checkout at once); distinct lanes
+    // still kick off in parallel. A lane that stays busy past the deadline
+    // hands the remaining tasks back to the Conductor instead of starting a
+    // second writer.
+    const deliver = async ({ index, id, text }: (typeof tasks)[number]) => {
+      try {
+        await vibeSendMessage(id, text);
+        notePromptDelivered(
+          id,
+          useVibe.getState().sessions[id]?.session.name ??
+            results[index]?.name ??
             id,
-            useVibe.getState().sessions[id]?.session.name ??
-              results[index]?.name ??
-              id,
-            ctx,
-          );
-        } catch (e) {
-          const r = results[index];
-          if (r)
-            r.warning = `prompt not delivered: ${e instanceof Error ? e.message : String(e)}`;
+          ctx,
+        );
+        return true;
+      } catch (e) {
+        const r = results[index];
+        if (r)
+          r.warning = `task not delivered: ${e instanceof Error ? e.message : String(e)}`;
+        return false;
+      }
+    };
+    const lanes = new Map<string, typeof tasks>();
+    for (const t of tasks) {
+      const cwd = results[t.index]?.cwd ?? t.id;
+      const lane = lanes.get(cwd) ?? [];
+      lane.push(t);
+      lanes.set(cwd, lane);
+    }
+    await Promise.all(
+      [...lanes.values()].map(async (lane) => {
+        for (let i = 0; i < lane.length; i++) {
+          if (i > 0) {
+            const prev = lane[i - 1];
+            const prevName =
+              useVibe.getState().sessions[prev.id]?.session.name ?? prev.id;
+            const idle = await waitForSessionIdle(prev.id, SHARED_LANE_WAIT_MS);
+            if (!idle) {
+              for (let j = i; j < lane.length; j++) {
+                const r = results[lane[j].index];
+                if (r && !r.warning)
+                  r.warning = `task not delivered: the shared worktree is still busy with «${prevName}» — prompt this agent once the lane is free (one writer per worktree)`;
+              }
+              break;
+            }
+          }
+          await deliver(lane[i]);
         }
       }),
     );
 
-    const out: CreatePanesResult = {
-      sessions: results,
+    const out: SpawnAgentsResult = {
+      agents: results,
       summary: buildSummary(results),
     };
     return out;
   },
 
-  // ---- memory tool ----
+  interrupt_agent: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const id = entry.session.id;
+    if (!useVibe.getState().busy[id]) {
+      return {
+        interrupted: false,
+        agent: { id, name: entry.session.name },
+        note: "no turn is running — nothing to interrupt",
+      };
+    }
+    interruptVibeSession(id);
+    return { interrupted: true, agent: { id, name: entry.session.name } };
+  },
+
+  close_agent: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const { id, name, worktree, projectDir } = entry.session;
+    await closeVibeSession(id);
+    return {
+      closed: true,
+      agent: { id, name },
+      ...(worktree
+        ? {
+            note: `the agent's worktree stays (${projectDir}) — clean it via cleanup_worktree once the work is merged or discarded`,
+          }
+        : {}),
+    };
+  },
+
+  set_agent_config: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const id = entry.session.id;
+    const touched: string[] = [];
+    if (args.model !== undefined || args.effort !== undefined) {
+      const model =
+        args.model === undefined
+          ? entry.session.model
+          : String(args.model).trim() || undefined;
+      if (model && !MODEL_RE.test(model))
+        throw new Error(`invalid model "${model}"`);
+      const effort =
+        args.effort === undefined
+          ? entry.session.effort
+          : String(args.effort).trim() || undefined;
+      await setVibeModelEffort(id, model, effort);
+      if (args.model !== undefined) touched.push("model");
+      if (args.effort !== undefined) touched.push("effort");
+    }
+    if (args.access !== undefined) {
+      const access = args.access === "full" ? "full" : "workspace";
+      await setVibeAccess(id, access);
+      touched.push("access");
+    }
+    if (touched.length === 0)
+      throw new Error("nothing to change — pass model, effort and/or access");
+    const after = useVibe.getState().sessions[id]?.session;
+    return {
+      agent: { id, name: entry.session.name },
+      changed: touched,
+      config: {
+        model: after?.model ?? null,
+        effort: after?.effort ?? null,
+        access: after?.access ?? entry.session.access,
+      },
+      note: "takes effect from the agent's next turn",
+    };
+  },
+
+  review_agent: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const target = typeof args.target === "string" ? args.target : "uncommitted";
+    const res = await reviewSession(entry.session.id, target);
+    return {
+      agent: { id: entry.session.id, name: entry.session.name },
+      cwd: entry.session.projectDir,
+      target: target || "uncommitted",
+      status: res.status,
+      review: res.review ?? "(the review returned no findings text)",
+    };
+  },
+
+  decide_approval: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const decision = args.decision === "decline" ? "decline" : "accept";
+    const wanted =
+      typeof args.approval_id === "string" && args.approval_id.trim()
+        ? args.approval_id.trim()
+        : null;
+    const pending = entry.order
+      .map((iid) => entry.items[iid])
+      .filter(
+        (i): i is Extract<NonNullable<typeof i>, { kind: "approval" }> =>
+          !!i && i.kind === "approval" && i.status === "pending",
+      );
+    if (pending.length === 0)
+      throw new Error(
+        `agent "${entry.session.name}" has no pending approval to decide`,
+      );
+    const approval = wanted
+      ? pending.find((a) => a.id === wanted)
+      : pending[0];
+    if (!approval)
+      throw new Error(
+        `no pending approval "${wanted}" on agent "${entry.session.name}" — pending: ${pending
+          .map((a) => a.id)
+          .join(", ")}`,
+      );
+    if (approval.escalation !== "routine")
+      throw new Error(
+        "this approval is classified DESTRUCTIVE — only the human may decide it; tell the user it is waiting",
+      );
+    // the STRICT server-anchored path: Rust re-checks the class stored next
+    // to the blocked Responder and refuses anything non-routine — the check
+    // above is a fast courtesy, never the authority. Errors (already
+    // resolved by the human, dead session, destructive) propagate; nothing
+    // is marked optimistically.
+    await respondVibeApproval(entry.session.id, approval.id, decision);
+    return {
+      decided: true,
+      agent: { id: entry.session.id, name: entry.session.name },
+      approval_id: approval.id,
+      decision,
+    };
+  },
+
+  // ---- worktrees ----
+
+  create_worktree: async (args, ctx) => {
+    const { dir } = requireProject(ctx);
+    const branch =
+      (typeof args.branch === "string" && args.branch.trim()) ||
+      `swarm/lane-${1000 + Math.floor(Math.random() * 9000)}`;
+    const info = await addWorktree({
+      cwd: dir,
+      branch,
+      copyEnv: true,
+      gitBin: gitBin(),
+    });
+    useSwarm.getState().registerWorktreeRepo(info.root);
+    return {
+      root: info.root,
+      path: info.path,
+      branch: info.branch,
+      copied_env_files: info.copied,
+    };
+  },
+
+  assign_worktree: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const path = String(args.path ?? "").trim();
+    if (!path) throw new Error("path must not be empty");
+    // same lock as cleanup_worktree: a re-homing can never interleave with a
+    // cleanup's final occupancy check on the same worktree
+    return withWorktreeLock(path, async () => {
+      const wt = await findWorktreeEntry(path, ctx);
+      if (!wt)
+        throw new Error(
+          `no SwarmZ worktree at ${path} in this project — create one first (create_worktree / spawn_agents worktree:"new")`,
+        );
+      if (wt.missing)
+        throw new Error(`the worktree folder is gone: ${path}`);
+      // shared iff another agent already works there
+      const others = sessionsInPath(wt.path).filter(
+        (e) => e.session.id !== entry.session.id,
+      );
+      const shared = others.length > 0;
+      // rejects busy sessions; commits metadata only after the backend ack
+      await assignWorktreeToSession(entry.session.id, {
+        path: wt.path,
+        root: wt.root,
+        branch: wt.branch,
+        shared,
+      });
+      if (shared) {
+        for (const other of others)
+          useVibe.getState().setWorktreeShared(other.session.id, true);
+      }
+      return {
+        agent: { id: entry.session.id, name: entry.session.name },
+        path: wt.path,
+        branch: wt.branch,
+        shared,
+        note: "the agent works there from its next turn on",
+      };
+    });
+  },
+
+  worktree_status: async (_args, ctx) => {
+    const { dir } = requireProject(ctx);
+    const scan = await listWorktrees([dir], gitBin());
+    return {
+      worktrees: scan.entries.map((e) => ({
+        path: e.path,
+        branch: e.branch,
+        dirty: e.dirty,
+        ahead: e.ahead,
+        ...(e.ahead_unknown ? { ahead_unknown: true } : {}),
+        missing: e.missing,
+        agents: sessionsInPath(e.path).map((s) => s.session.name),
+      })),
+    };
+  },
+
+  cleanup_worktree: async (args, ctx) => {
+    const path = String(args.path ?? "").trim();
+    if (!path) throw new Error("path must not be empty");
+    // ONE per-worktree lock around occupancy + status + removal: nothing may
+    // re-home into (assign_worktree takes the same lock) or re-check this
+    // path while the cleanup decides. The removal itself is the GATED
+    // non-force path — Rust re-checks dirty/ahead inside the call and `git
+    // worktree remove` (without --force) refuses even later-appearing work.
+    return withWorktreeLock(path, async () => {
+      const wt = await findWorktreeEntry(path, ctx);
+      if (!wt) throw new Error(`no SwarmZ worktree at ${path} in this project`);
+      const occupants = sessionsInPath(wt.path);
+      if (occupants.length > 0)
+        throw new Error(
+          `refused: agent${occupants.length === 1 ? "" : "s"} ${occupants
+            .map((e) => `"${e.session.name}"`)
+            .join(", ")} still work${occupants.length === 1 ? "s" : ""} in this worktree — close or re-home them first`,
+        );
+      // SAFE GATE: re-check at execution time — on ANY doubt (including an
+      // uncomputable ahead count) the worktree stays
+      const st = await worktreeStatus(wt.path, gitBin());
+      if (st.exists && st.dirty)
+        throw new Error(
+          "refused: the worktree has uncommitted changes — commit, merge or explicitly discard them first (or ask the user)",
+        );
+      if ((st.exists && st.ahead_unknown) || (!st.exists && wt.ahead_unknown))
+        throw new Error(
+          `refused: could not verify whether branch "${wt.branch}" holds unmerged commits — resolve manually (or ask the user)`,
+        );
+      const ahead = st.exists ? st.ahead : wt.ahead;
+      if (ahead > 0)
+        throw new Error(
+          `refused: branch "${wt.branch}" holds ${ahead} commit${ahead === 1 ? "" : "s"} no other branch has — merge or push it first (or ask the user)`,
+        );
+      await removeWorktree({
+        root: wt.root,
+        path: wt.path,
+        branch: wt.branch,
+        force: false,
+        gitBin: gitBin(),
+      });
+      void useSwarm.getState().refreshWorktrees();
+      return { removed: true, path: wt.path, branch: wt.branch };
+    });
+  },
+
+  // ---- timers ----
+
+  set_timer: async (args, ctx) => {
+    const { id: projectId } = requireProject(ctx);
+    const note = typeof args.note === "string" ? args.note.trim() : "";
+    if (!note) throw new Error("note must not be empty");
+    const resolved = resolveFireAt(Date.now(), args.delay_seconds, args.at_iso);
+    if ("error" in resolved) throw new Error(resolved.error);
+    const timer = createTimer(projectId, note, resolved.at);
+    return {
+      timer_id: timer.id,
+      note: timer.note,
+      fires_at: new Date(timer.at).toISOString(),
+      remaining: describeRemaining(timer.at, Date.now()),
+    };
+  },
+
+  list_timers: async (_args, ctx) => {
+    const { id: projectId } = requireProject(ctx);
+    const now = Date.now();
+    return {
+      timers: listTimers(projectId).map((t) => ({
+        timer_id: t.id,
+        note: t.note,
+        fires_at: new Date(t.at).toISOString(),
+        remaining: describeRemaining(t.at, now),
+      })),
+    };
+  },
+
+  cancel_timer: async (args, ctx) => {
+    const { id: projectId } = requireProject(ctx);
+    const timerId = String(args.timer_id ?? "").trim();
+    const timer = cancelTimer(projectId, timerId);
+    return { cancelled: true, timer_id: timer.id, note: timer.note };
+  },
+
+  // ---- plans ----
+
+  write_plan: async (args, ctx) => {
+    const { dir } = requireProject(ctx);
+    const title = String(args.title ?? "");
+    const markdown = String(args.markdown ?? "");
+    const info = await planWrite(dir, title, markdown);
+    return {
+      written: true,
+      slug: info.slug,
+      path: info.path,
+      note: "agents can read this file — reference the path in their briefs",
+    };
+  },
+
+  list_plans: async (_args, ctx) => {
+    const { dir } = requireProject(ctx);
+    return { plans: await planList(dir) };
+  },
+
+  read_plan: async (args, ctx) => {
+    const { dir } = requireProject(ctx);
+    return planRead(dir, String(args.slug ?? ""));
+  },
+
+  // ---- memory ----
 
   remember: async (args, ctx) => {
     const text = typeof args.text === "string" ? args.text.trim() : "";

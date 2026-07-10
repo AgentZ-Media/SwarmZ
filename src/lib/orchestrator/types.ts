@@ -63,16 +63,31 @@ export interface ProjectEntry {
 // (src-tauri/src/orchestrator/registry.rs). The TS side mirrors the NAMES
 // only (executor lookup + typing); schemas are never duplicated here.
 
-/** The tool names — must match the Rust registry exactly. */
+/** The tool names — must match the Rust registry exactly (Phase 4: 24). */
 export const ORCHESTRATOR_TOOL_NAMES = [
   "fleet_snapshot",
-  "read_transcript",
+  "read_agent",
   "read_project_docs",
   "read_notes",
   "git_status",
   "list_projects",
-  "prompt_pane",
-  "create_panes",
+  "spawn_agents",
+  "prompt_agent",
+  "interrupt_agent",
+  "close_agent",
+  "set_agent_config",
+  "review_agent",
+  "decide_approval",
+  "create_worktree",
+  "assign_worktree",
+  "worktree_status",
+  "cleanup_worktree",
+  "set_timer",
+  "list_timers",
+  "cancel_timer",
+  "write_plan",
+  "list_plans",
+  "read_plan",
   "remember",
 ] as const;
 
@@ -132,43 +147,64 @@ export interface ToolNoteItem {
   done: boolean;
 }
 
-/** `prompt_pane` result. */
-export interface PromptPaneResult {
+/** One plan document's info (`conductor_plan_write` / `_list`). */
+export interface ConductorPlanInfo {
+  slug: string;
+  title: string;
+  /** absolute file path — hand this to agents */
+  path: string;
+  modified_ms: number;
+  size: number;
+}
+
+/** One plan document's content (`conductor_plan_read`). */
+export interface ConductorPlanDocument {
+  slug: string;
+  path: string;
+  content: string;
+}
+
+/** `prompt_agent` result. */
+export interface PromptAgentResult {
   delivered: true;
-  session: { id: string; name: string };
-  submitted: boolean;
+  agent: { id: string; name: string };
+  /** how the text reached the agent: a fresh turn, or steered mid-turn */
+  mode: "turn" | "steered";
 }
 
-/** One session request inside `create_panes`. */
-export interface CreatePaneSpec {
-  /** absolute working directory; omit = the Conductor's project folder */
-  cwd?: string;
-  /** codex model id; omit = the user's default configuration */
+/** One agent request inside `spawn_agents`. */
+export interface SpawnAgentSpec {
+  /** the agent's first order — self-contained */
+  task: string;
+  /** "new" | "shared:<agentName>" | "none" */
+  worktree: string;
+  /** codex model id; omit = the default */
   model?: string;
-  /** model_reasoning_effort */
-  reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  /** reasoning effort (open string — catalog-driven); omit = medium */
+  effort?: string;
+  access?: "workspace" | "full";
   name?: string;
-  /** initial prompt, submitted as the session's first turn */
-  prompt?: string;
 }
 
-/** Per-session outcome of `create_panes` — errors never abort the batch. */
-export interface CreatePaneResult {
+/** Per-agent outcome of `spawn_agents` — errors never abort the batch. */
+export interface SpawnAgentResult {
   /** set on success */
   id?: string;
   name?: string | null;
+  /** the agent's working directory (worktree path or project folder) */
   cwd?: string | null;
-  /** scoping note — set when a foreign cwd opened its own project tab (the
-   * session is then outside this Conductor's fleet) */
-  note?: string;
-  /** prompt delivery note */
+  /** worktree branch (null = works directly in the project folder) */
+  branch?: string | null;
+  /** true when the agent shares its worktree with another agent */
+  shared?: boolean;
+  /** task delivery note */
   warning?: string;
-  /** set when this session failed to start */
+  /** set when this agent failed to start */
   error?: string;
 }
 
-export interface CreatePanesResult {
-  sessions: CreatePaneResult[];
+export interface SpawnAgentsResult {
+  agents: SpawnAgentResult[];
   /** honest, human-readable account of what was created */
   summary?: string;
 }
