@@ -707,12 +707,19 @@ async fn vibe_session_set_cwd(session_id: String, cwd: String) -> Result<(), Str
 
 /// Run a detached codex review over the session's work; blocks until the
 /// review turn completes and returns `{status, review, review_thread_id}`.
+/// `require_workspace: true` is the STRICT Conductor path (audit C3): the
+/// review runs on the parent session's access profile, so a human-granted
+/// FULL-access session refuses — an autonomous review must never reuse that
+/// authority (danger-full-access + approvalPolicy "never" would execute
+/// without any approval to cancel). Every current caller IS a Conductor
+/// path, so an omitted flag defaults to the strict gate (fail closed).
 #[tauri::command]
 async fn vibe_session_review(
     session_id: String,
     target: String,
+    require_workspace: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    codex::sessions::session_review(&session_id, &target).await
+    codex::sessions::session_review(&session_id, &target, require_workspace.unwrap_or(true)).await
 }
 
 // ---- Conductor plan documents — see plans.rs ----

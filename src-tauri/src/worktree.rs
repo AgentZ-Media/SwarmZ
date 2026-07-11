@@ -10,7 +10,6 @@ use crate::git::{git_bin, output_with_timeout};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 /// Folder of every SwarmZ-managed worktree, directly under the repo root.
@@ -93,9 +92,13 @@ pub struct WorktreeEntry {
 
 fn run(bin: &str, cwd: &Path, args: &[&str]) -> Result<String, String> {
     // generous deadline: `worktree add` checks out a whole tree, but even
-    // that must not hang forever on a dead network volume
+    // that must not hang forever on a dead network volume. Every invocation
+    // goes through `git_command` (audit C1): hooks/fsmonitor/pager are
+    // suppressed — `git worktree add` must never run a repo-controlled
+    // `post-checkout`, `git update-ref` never a `reference-transaction`
+    // hook, in the unsandboxed backend.
     let out = output_with_timeout(
-        Command::new(bin).arg("-C").arg(cwd).args(args),
+        crate::git::git_command(bin, cwd).args(args),
         Duration::from_secs(120),
     )
     .map_err(|e| format!("failed to run git: {e}"))?;
@@ -214,41 +217,77 @@ fn slug(branch: &str) -> String {
     if s.is_empty() { "worktree".into() } else { s }
 }
 
+/// Open the chain of directory components below `start`, each hop no-follow
+/// (`create` additionally mkdirs missing hops). A symlinked or vanished
+/// component refuses — the caller skips that file (fail closed per entry).
+fn walk_chain(
+    start: &crate::fsx::DirHandle,
+    dirs: &[&str],
+    create: bool,
+) -> Result<crate::fsx::DirHandle, String> {
+    let mut cur = start.try_clone()?;
+    for d in dirs {
+        cur = if create { cur.ensure_dir(d)? } else { cur.open_dir(d)? };
+    }
+    Ok(cur)
+}
+
 /// Copy every untracked file of the main repo into the worktree — `.env`s,
 /// local configs, keys — skipping the heavyweight cache/build dirs. This is
 /// what makes a fresh worktree "just work" like the main checkout.
-fn copy_environment(bin: &str, root: &Path, dest: &Path) -> u64 {
+///
+/// Audit C7: the copy is fd-ANCHORED on both sides. Every path component is
+/// opened NO-FOLLOW relative to the repo-root handle (sources) and the
+/// verified worktree handle (destinations, `fsx::DirHandle`); regular files
+/// are re-checked on the open fd, symlink entries are recreated via
+/// readlinkat/symlinkat (their target string copied verbatim, never
+/// followed), and nothing is ever overwritten (`create_new`). A concurrent
+/// rename/symlink swap anywhere on either chain — including of `.worktrees`
+/// itself — makes that entry refuse instead of redirecting a secret to (or
+/// reading one from) a foreign host path. Best-effort per file, like before:
+/// one unreadable file must not fail the spawn.
+fn copy_environment(bin: &str, root: &Path, dest: &crate::fsx::DirHandle) -> u64 {
+    use crate::fsx::{DirHandle, EntryKind};
     // --others without --exclude-standard = ALL untracked files, including
     // gitignored ones (which is the point: .env etc. are usually ignored)
     let list = match run(bin, root, &["ls-files", "--others", "-z"]) {
         Ok(l) => l,
         Err(_) => return 0,
     };
+    let Ok(src_root) = DirHandle::open_root(root) else {
+        return 0;
+    };
     let mut copied = 0u64;
     for rel in list.split('\0').filter(|r| !r.is_empty()) {
-        let skip = Path::new(rel)
-            .components()
-            .any(|c| SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()));
-        if skip {
-            continue;
-        }
-        let src = root.join(rel);
-        let dst = dest.join(rel);
-        let Ok(meta) = src.symlink_metadata() else {
+        let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+        let Some((leaf, dirs)) = comps.split_last() else {
             continue;
         };
-        if let Some(parent) = dst.parent() {
-            if fs::create_dir_all(parent).is_err() {
-                continue;
-            }
+        if comps
+            .iter()
+            .any(|c| *c == ".." || SKIP_DIRS.contains(c))
+        {
+            continue;
         }
-        // best-effort per file — one unreadable file must not fail the spawn
-        let ok = if meta.file_type().is_symlink() {
-            fs::read_link(&src)
-                .and_then(|t| std::os::unix::fs::symlink(t, &dst))
-                .is_ok()
-        } else {
-            fs::copy(&src, &dst).is_ok()
+        let Ok(src_dir) = walk_chain(&src_root, dirs, false) else {
+            continue;
+        };
+        let Ok(dst_dir) = walk_chain(dest, dirs, true) else {
+            continue;
+        };
+        let ok = match src_dir.kind(leaf) {
+            Ok(Some(EntryKind::Symlink)) => match src_dir.read_link(leaf) {
+                Ok(Some(target)) => dst_dir.symlink(&target, leaf).is_ok(),
+                _ => false,
+            },
+            Ok(Some(EntryKind::File)) => match src_dir.open_file(leaf) {
+                Ok(Some(mut f)) => match dst_dir.create_new(leaf) {
+                    Ok(mut out) => std::io::copy(&mut f, &mut out).is_ok(),
+                    Err(_) => false,
+                },
+                _ => false,
+            },
+            _ => false, // missing / dir / fifo / device → skip
         };
         if ok {
             copied += 1;
@@ -300,6 +339,21 @@ pub fn add(
     }
     ensure_excluded(&root)?;
 
+    // C5: the failed-add rollback deletes the fresh branch TRANSACTIONALLY —
+    // `-b` creates it at the current HEAD, so that OID (captured BEFORE the
+    // add) is the only tip the rollback may delete. A tip that moved in the
+    // race window (a commit landing on the fresh branch) survives.
+    let expected_branch_oid = run(bin, &root, &["rev-parse", "--verify", "HEAD"])
+        .ok()
+        .filter(|s| !s.is_empty());
+    let rollback = |path_str: &str| {
+        let _ = run(bin, &root, &["worktree", "remove", "--force", path_str]);
+        let _ = run(bin, &root, &["worktree", "prune"]);
+        if let Some(oid) = &expected_branch_oid {
+            let _ = delete_branch_transactional(bin, &root, branch, oid);
+        }
+    };
+
     let path_str = path.to_string_lossy().into_owned();
     run(bin, &root, &["worktree", "add", "-b", branch, &path_str])?;
 
@@ -307,19 +361,50 @@ pub fn add(
     // must exist as a real directory under the container fd opened above —
     // not under whatever `.worktrees` resolves to NOW. Failure = the
     // container was swapped mid-add; roll the checkout back (fresh branch,
-    // no commits yet) and refuse.
-    if container_handle.open_dir(&slug_name).is_err() {
-        let _ = run(bin, &root, &["worktree", "remove", "--force", &path_str]);
-        let _ = run(bin, &root, &["worktree", "prune"]);
-        let _ = run(bin, &root, &["branch", "-D", branch]);
-        return Err(format!(
-            "refusing: {} was redirected while the worktree was created (symlink swap?)",
-            container.display()
-        ));
+    // no commits yet — and the rollback delete is OID-guarded) and refuse.
+    let slug_handle = match container_handle.open_dir(&slug_name) {
+        Ok(h) => h,
+        Err(_) => {
+            rollback(&path_str);
+            return Err(format!(
+                "refusing: {} was redirected while the worktree was created (symlink swap?)",
+                container.display()
+            ));
+        }
+    };
+    // C7: the path-resolved worktree and the anchored handle must be the SAME
+    // directory (dev+inode) — a `.worktrees` swap between the git add and now
+    // would leave the pathname pointing elsewhere; refuse before any env file
+    // (.env, keys) could be copied through it.
+    match slug_handle.identity() {
+        Ok(anchored) => {
+            let by_path = fs::metadata(&path)
+                .map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    (m.dev(), m.ino())
+                })
+                .ok();
+            if by_path != Some(anchored) {
+                rollback(&path_str);
+                return Err(format!(
+                    "refusing: {} was redirected after the worktree was created (symlink swap?)",
+                    container.display()
+                ));
+            }
+        }
+        Err(e) => {
+            rollback(&path_str);
+            return Err(format!("refusing: could not verify the created worktree: {e}"));
+        }
     }
 
     let copied = if copy_env {
-        copy_environment(bin, &root, &path)
+        // C7: the env copy is fd-ANCHORED on both sides — sources are read
+        // through a no-follow handle chain rooted at the repo, destinations
+        // written through the verified slug handle. A concurrent rename/
+        // symlink of `.worktrees` (or of a subfolder on either side) can no
+        // longer redirect a copied secret to or from a foreign host path.
+        copy_environment(bin, &root, &slug_handle)
     } else {
         0
     };
@@ -902,6 +987,47 @@ mod tests {
         fs::remove_dir_all(&repo).ok();
     }
 
+    /// Audit C7 (frozen): the env copy is fd-anchored — an escaping symlink
+    /// planted among the untracked files is recreated as a SYMLINK (its
+    /// target string copied verbatim), never followed to copy foreign
+    /// content INTO the worktree, and the destination write goes through the
+    /// verified worktree handle. A regular untracked file copies normally.
+    #[test]
+    #[cfg(unix)]
+    fn env_copy_is_anchored_and_never_follows_symlinks() {
+        let repo = temp_repo();
+        let cwd = repo.to_string_lossy().into_owned();
+        // an out-of-tree secret and an in-tree UNTRACKED symlink to it
+        let outside = std::env::temp_dir().join(format!("swarmz-c7-out-{}", std::process::id()));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret"), "s3cr3t").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), repo.join("link-to-secret")).unwrap();
+        // a normal untracked (gitignored) env file — must copy
+        fs::write(repo.join(".env.local"), "TOKEN=xyz").unwrap();
+
+        let info = add(&cwd, "test/c7-anchored", true, None).unwrap();
+        let dest = Path::new(&info.path);
+        // the symlink was recreated AS a symlink — not resolved into a copy
+        let copied_link = dest.join("link-to-secret");
+        let meta = fs::symlink_metadata(&copied_link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "an untracked symlink must be recreated as a symlink, never followed"
+        );
+        assert_eq!(
+            fs::read_link(&copied_link).unwrap(),
+            outside.join("secret"),
+            "the target string is copied verbatim"
+        );
+        // the regular untracked file copied through
+        assert_eq!(
+            fs::read_to_string(dest.join(".env.local")).unwrap(),
+            "TOKEN=xyz"
+        );
+        fs::remove_dir_all(&repo).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
     /// Audit R4 (frozen): a symlinked `.worktrees` container refuses the add
     /// — the checkout and env copy must never be redirected to a host folder.
     #[test]
@@ -915,6 +1041,89 @@ mod tests {
         assert!(err.contains("symlink"), "{err}");
         fs::remove_dir_all(&repo).ok();
         fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Audits C5+C7 (frozen): the concurrent-attacker simulation. A git
+    /// wrapper swaps `.worktrees` for a symlink to a foreign folder right
+    /// AFTER `git worktree add` succeeded — and lands a racing commit on the
+    /// fresh branch. The add must refuse (the post-add identity
+    /// re-verification against the ANCHORED container handle catches the
+    /// swap — the pathname now resolves into the evil target), NO env file
+    /// may have crossed the swapped path, and the rollback's branch deletion
+    /// is transactional — the racing commit survives (C5).
+    #[test]
+    #[cfg(unix)]
+    fn add_refuses_swap_after_checkout_and_rollback_is_transactional() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = temp_repo();
+        let cwd = repo.to_string_lossy().into_owned();
+        let root = repo.to_string_lossy().into_owned();
+        let scratch = std::env::temp_dir().join(format!(
+            "swarmz-c7-swap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&scratch).unwrap();
+        let evil = scratch.join("evil-target");
+        fs::create_dir_all(&evil).unwrap();
+        // a would-be exfil sink inside evil — if any env copy crossed the
+        // swapped path it would land here
+        let marker = scratch.join("swapped");
+        let real = git_bin(None);
+        let branch = "test/swapped";
+        let evil_s = evil.to_string_lossy().into_owned();
+        let marker_s = marker.to_string_lossy().into_owned();
+        // an untracked env file the copy WOULD move if the add didn't refuse
+        fs::write(repo.join(".env.local"), "TOKEN=xyz").unwrap();
+        let wrapper = scratch.join("git-wrapper.sh");
+        // the wrapper passes everything through to real git; on the FIRST
+        // `worktree add` it runs it, then swaps `.worktrees` for a symlink to
+        // `evil` and lands a racing commit on the new branch (moving its tip)
+        let script = format!(
+            "#!/bin/sh\n\
+             REAL='{real}'\n\
+             for a in \"$@\"; do\n\
+             \x20 if [ \"$a\" = add ]; then IS_ADD=1; fi\n\
+             done\n\
+             \"$REAL\" \"$@\"\n\
+             RC=$?\n\
+             if [ \"$IS_ADD\" = 1 ] && [ ! -f '{marker_s}' ]; then\n\
+             \x20 : > '{marker_s}'\n\
+             \x20 mv '{root}/.worktrees' '{root}/.wt-moved'\n\
+             \x20 ln -s '{evil_s}' '{root}/.worktrees'\n\
+             \x20 WT='{root}/.wt-moved/swapped'\n\
+             \x20 echo racing > \"$WT/a.txt\"\n\
+             \x20 \"$REAL\" -C \"$WT\" commit -qam racing\n\
+             fi\n\
+             exit $RC\n"
+        );
+        fs::write(&wrapper, script).unwrap();
+        let mut perm = fs::metadata(&wrapper).unwrap().permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&wrapper, perm).unwrap();
+
+        let err = add(&cwd, branch, true, Some(&wrapper.to_string_lossy())).unwrap_err();
+        assert!(err.contains("redirected"), "{err}");
+        // C7: no env file crossed into the evil target
+        assert!(
+            !evil.join("swapped/.env.local").exists() && !evil.join(".env.local").exists(),
+            "an env file was copied through the swapped path"
+        );
+        // C5: the racing commit survives — the transactional rollback delete
+        // (expected-OID = HEAD before the add) refused because the branch tip
+        // moved. The branch still exists and holds the racing commit.
+        let tip = branch_oid(real, &repo, branch);
+        assert!(
+            tip.is_some(),
+            "the rollback must not delete a branch whose tip moved (racing commit lost)"
+        );
+        // restore a sane .worktrees for cleanup, then drop everything
+        let _ = fs::remove_file(repo.join(".worktrees"));
+        fs::remove_dir_all(&repo).ok();
+        fs::remove_dir_all(&scratch).ok();
     }
 
     /// Final hardening F3 (frozen): the branch deletion is transactional —
@@ -995,6 +1204,83 @@ mod tests {
         let big_with_entry = format!("/.worktrees/\n{}\n", "x".repeat(1024 * 1024));
         fs::write(repo.join(".git/info/exclude"), &big_with_entry).unwrap();
         add(&cwd, "test/big-but-present", false, None).unwrap();
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Audit C1 (frozen): the backend's own git NEVER executes repository-
+    /// controlled code. The chain this closes: a repo sets `core.hooksPath`
+    /// at a TRACKED folder (husky style), a workspace agent edits the hook
+    /// body (a plain sandbox-permitted file edit), and an autonomous
+    /// `create_worktree` would then run `post-checkout` UNSANDBOXED in the
+    /// Tauri backend; `git status` would run a configured `core.fsmonitor`
+    /// hook; the branch cleanup would run `reference-transaction`. With the
+    /// `git_command` suppressions none of them ever fires.
+    #[test]
+    #[cfg(unix)]
+    fn backend_git_never_fires_repo_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = temp_repo();
+        let cwd = repo.to_string_lossy().into_owned();
+        let marker = repo.join("HOOK_FIRED");
+        let hook_body = format!("#!/bin/sh\n: > \"{}\"\n", marker.display());
+        // hooks in BOTH the default dir and a husky-style tracked hooksPath
+        let tracked_hooks = repo.join("hooks");
+        for dir in [repo.join(".git/hooks"), tracked_hooks.clone()] {
+            fs::create_dir_all(&dir).unwrap();
+            for name in [
+                "post-checkout",
+                "post-commit",
+                "pre-push",
+                "reference-transaction",
+                "post-index-change",
+            ] {
+                let p = dir.join(name);
+                fs::write(&p, &hook_body).unwrap();
+                let mut perm = fs::metadata(&p).unwrap().permissions();
+                perm.set_mode(0o755);
+                fs::set_permissions(&p, perm).unwrap();
+            }
+        }
+        let git_raw = |args: &[&str]| {
+            // RAW git, deliberately WITHOUT the suppressions — the positive
+            // control and the config setup
+            let out = std::process::Command::new(git_bin(None))
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "raw git {args:?} failed");
+        };
+        git_raw(&["config", "core.hooksPath", "hooks"]);
+        // positive control: without suppression the fixture DOES fire —
+        // otherwise this test would prove nothing
+        git_raw(&["commit", "--allow-empty", "-qm", "control"]);
+        assert!(
+            marker.exists(),
+            "fixture broken: the raw-git positive control did not fire the hook"
+        );
+        fs::remove_file(&marker).unwrap();
+        // a repo-config fsmonitor "hook" (the `git status` execution vector)
+        git_raw(&[
+            "config",
+            "core.fsmonitor",
+            &tracked_hooks.join("post-checkout").to_string_lossy(),
+        ]);
+
+        // the suppressed surface: worktree add (post-checkout), status
+        // (fsmonitor), gated remove incl. transactional branch delete
+        // (reference-transaction) — none may fire a hook. copy_env=false so
+        // the untracked `hooks/` fixture doesn't dirty the worktree; the
+        // status query still exercises the fsmonitor vector.
+        let info = add(&cwd, "test/hooks-suppressed", false, None).unwrap();
+        let st = status(&info.path, None);
+        assert!(st.exists && st.ahead == 0, "{st:?}");
+        remove(&cwd, &info.path, &info.branch, false, None).unwrap();
+        assert!(
+            !marker.exists(),
+            "a repository-controlled hook ran inside the unsandboxed backend"
+        );
         fs::remove_dir_all(&repo).ok();
     }
 

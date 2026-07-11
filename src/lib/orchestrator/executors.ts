@@ -302,6 +302,23 @@ function guardOutwardGithub(ctx: ToolCallContext, action: string): void {
 const GH_WRITE_COMMAND_RE =
   /\bgit\s+push\b|\bgh\s+(?:pr\s+(?:create|comment|review|merge|close|edit|ready|reopen)|release\s+(?:create|edit|delete|upload)|issue\s+(?:create|comment|close|edit|reopen)|api)\b/i;
 
+/**
+ * Strip shell quotes so the write detection sees the same tokens the Rust
+ * tokenizer does: `gh 'pr' 'comment'` / `gh "pr" comment` must reduce to the
+ * bare `gh pr comment` the regex matches — otherwise a quoted form Rust
+ * accepts would slip past this defense-in-depth twin. Removes every `'`/`"`
+ * (quotes never appear inside a real gh subcommand token) and collapses
+ * whitespace. Over-flagging a read command only costs a human click; missing a
+ * quoted write is the failure we must avoid.
+ */
+function stripShellQuotes(text: string): string {
+  return text
+    .replace(/['"]/g, "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .join(" ");
+}
+
 export function approvalLooksLikeGithubWrite(approval: {
   approvalKind: "command" | "fileChange";
   payload: Record<string, unknown>;
@@ -313,7 +330,12 @@ export function approvalLooksLikeGithubWrite(approval: {
     : typeof cmd === "string"
       ? cmd
       : "";
-  return GH_WRITE_COMMAND_RE.test(text);
+  // test both the raw text and a quote-stripped, whitespace-normalized form so
+  // quoted subcommands (`gh 'pr' 'comment'`, `gh "pr" comment`) match too
+  return (
+    GH_WRITE_COMMAND_RE.test(text) ||
+    GH_WRITE_COMMAND_RE.test(stripShellQuotes(text))
+  );
 }
 
 /**
@@ -1017,7 +1039,12 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
   review_agent: async (args, ctx) => {
     const entry = requireSession(args.agent, ctx);
     const target = typeof args.target === "string" ? args.target : "uncommitted";
-    const res = await reviewSession(entry.session.id, target);
+    // C3: the Conductor must not launder a HUMAN-granted full-access session
+    // through a detached review — pass the strict flag (Rust's
+    // `conductor_access_gate` is authoritative).
+    const res = await reviewSession(entry.session.id, target, {
+      requireWorkspace: true,
+    });
     return {
       agent: { id: entry.session.id, name: entry.session.name },
       cwd: entry.session.projectDir,
@@ -1492,7 +1519,10 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         `agent "${entry.session.name}" is not on the PR's head branch "${detail.head_ref}" — the review must run in a checkout of that branch`,
       );
     const base = detail.base_ref || "main";
-    const res = await reviewSession(entry.session.id, `branch:${base}`);
+    // C3: strict Conductor review path — no full-access reuse (Rust gate authoritative)
+    const res = await reviewSession(entry.session.id, `branch:${base}`, {
+      requireWorkspace: true,
+    });
     const reviewText = res.review ?? "(the review returned no findings text)";
     const post = args.post === true;
     // POSTING the review to GitHub is outward-facing — gate it in autonomous

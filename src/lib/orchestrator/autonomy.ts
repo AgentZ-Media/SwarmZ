@@ -247,8 +247,16 @@ export function noteHumanTurn(projectId: string): void {
   if (changed) markDirty();
 }
 
-/** Is the project's breaker currently latched? (UI/state introspection) */
+/**
+ * Is autonomy currently latched off for this project? The Deck's orch dot and
+ * the breaker notice read this. It reflects BOTH the per-project circuit
+ * breaker AND the global fail-closed `autonomyUnavailable` latch (a corrupt/
+ * unreadable persisted budget, or a persist WRITE failure): otherwise a
+ * corruption-triggered pause would stop autonomy SILENTLY, with the breaker
+ * indicator still dark. Either state means "autonomy is not running here".
+ */
 export function autonomyTripped(projectId: string): boolean {
+  if (budgetsUnavailable) return true;
   return budgets.get(projectId)?.tripped ?? false;
 }
 
@@ -302,18 +310,24 @@ function parseBudgetEntry(
     r.consecutive < 0
   )
     return INVALID_BUDGET;
-  // `firedAt` MUST be an array; individual junk timestamps are still filtered
-  // (element-level noise can't hide a trip — the `tripped` flag carries that).
+  // `firedAt` MUST be an array. A MALFORMED individual element (non-number /
+  // NaN / Infinity) is ENTRY corruption, NOT droppable noise: silently
+  // dropping one element can turn a full 20/20 rolling window into 19 and mint
+  // a fresh allowance (exactly the un-latch risk the `tripped` flag can't
+  // cover — the count itself is the guard). Fail closed on any malformed
+  // element. Only two element transforms are legitimate and stay silent:
+  //   · a genuinely EXPIRED timestamp (≤ now − window) is pruned — the rolling
+  //     window is about volume, and an expired entry no longer counts;
+  //   · a far-FUTURE finite timestamp is CLAMPED to `now` (kept, restrictive)
+  //     rather than dropped — a clamp never lowers the count.
   if (!Array.isArray(r.firedAt)) return INVALID_BUDGET;
-  const firedAt = r.firedAt
-    .filter(
-      (t): t is number =>
-        typeof t === "number" &&
-        Number.isFinite(t) &&
-        t > now - AUTONOMY_WINDOW_MS &&
-        t <= now + 60_000, // clock-skew grace; far-future junk drops
-    )
-    .slice(0, 100);
+  const firedAt: number[] = [];
+  for (const t of r.firedAt) {
+    if (typeof t !== "number" || !Number.isFinite(t)) return INVALID_BUDGET;
+    if (t <= now - AUTONOMY_WINDOW_MS) continue; // genuinely expired — legit prune
+    firedAt.push(t > now + 60_000 ? now : t); // clock-skew grace; clamp, never drop
+  }
+  firedAt.splice(100); // hard cap (already far above the window cap — stays restrictive)
   const consecutive = Math.min(Math.floor(r.consecutive), 1000);
   const tripped = r.tripped;
   if (!tripped && consecutive === 0 && firedAt.length === 0) return null;

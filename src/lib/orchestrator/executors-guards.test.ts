@@ -80,6 +80,27 @@ describe("approvalLooksLikeGithubWrite (TF5)", () => {
     ).toBe(true);
   });
 
+  it("detects QUOTED forms the Rust tokenizer accepts (T2)", () => {
+    // single-quoted subcommand tokens (string form)
+    expect(approvalLooksLikeGithubWrite(cmd("gh 'pr' 'comment' 12 -b hi"))).toBe(
+      true,
+    );
+    // double-quoted subcommand (mixed)
+    expect(approvalLooksLikeGithubWrite(cmd('gh "pr" comment 12'))).toBe(true);
+    expect(approvalLooksLikeGithubWrite(cmd("gh 'release' 'create' v1"))).toBe(
+      true,
+    );
+    expect(approvalLooksLikeGithubWrite(cmd('gh "api" -X POST x'))).toBe(true);
+    // quoted argv form (codex passes commands as arrays)
+    expect(
+      approvalLooksLikeGithubWrite(cmd(["gh", "'pr'", "'merge'", "12"])),
+    ).toBe(true);
+    // irregular whitespace between quoted tokens still normalizes
+    expect(approvalLooksLikeGithubWrite(cmd("gh   'pr'   comment  12"))).toBe(
+      true,
+    );
+  });
+
   it("does NOT flag reads, unrelated commands, or file-change approvals", () => {
     expect(approvalLooksLikeGithubWrite(cmd("gh pr view 12"))).toBe(false);
     expect(approvalLooksLikeGithubWrite(cmd("gh pr list"))).toBe(false);

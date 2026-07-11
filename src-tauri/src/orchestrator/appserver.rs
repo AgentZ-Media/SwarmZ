@@ -91,8 +91,15 @@ struct TurnOutcome {
 struct ChatState {
     thread_id: String,
     /// ProcessHost generation at start/resume — a mismatch after a respawn
-    /// triggers a transparent thread/resume before the next turn.
+    /// triggers a transparent thread/resume before the next turn. Commits
+    /// only AFTER a successful resume (a failed resume must retry).
     generation: u64,
+    /// The EVENT fence (audit C4, mirroring the session-side F11 split):
+    /// advanced to the target generation BEFORE the awaited resume —
+    /// a delayed straggler from the dead generation (Exited, turn/completed)
+    /// must never touch an operation that is already moving to the new
+    /// process. Guards compare against THIS, never against `generation`.
+    fence_generation: u64,
     /// Persona captured at start/resume — reused for the developerInstructions
     /// when chat_send has to transparently thread/resume after a respawn.
     persona: PersonaSpec,
@@ -101,6 +108,18 @@ struct ChatState {
     current_turn_id: Option<String>,
     last_agent_message: Option<String>,
     done_tx: Option<oneshot::Sender<TurnOutcome>>,
+    /// Operation token: incremented whenever a `done_tx` is installed. Every
+    /// later step of that operation (marking the turn started, clearing on
+    /// its error paths) verifies the token — a stale operation can neither
+    /// clobber nor resurrect a successor's slot (audit C4).
+    done_op: u64,
+    /// The process generation the CURRENT operation's turn was started on —
+    /// `None` while the operation is still setting up (ensure/resume).
+    /// `handle_exit` fails ONLY operations whose turn verifiably ran on the
+    /// dead generation; `turn/completed` consumes `done_tx` ONLY once a turn
+    /// was actually started (a stale completion from a previous, timed-out
+    /// turn can no longer steal a fresh operation's sender) — audit C4.
+    done_gen: Option<u64>,
 }
 
 #[derive(Default)]
@@ -414,9 +433,130 @@ fn spawn_gen_dispatcher(
     });
 }
 
-/// The generation a chat currently runs on (None = unknown chat).
-fn chat_generation(chat_id: &str) -> Option<u64> {
-    SHARED.lock().chats.get(chat_id).map(|c| c.generation)
+/// The chat's EVENT FENCE generation (None = unknown chat) — the guard value
+/// for straggler drops. NOT `generation` (resume bookkeeping): the fence
+/// moves to the target generation BEFORE the awaited resume (audit C4).
+fn chat_fence(chat_id: &str) -> Option<u64> {
+    SHARED.lock().chats.get(chat_id).map(|c| c.fence_generation)
+}
+
+// ---------------------------------------------------------------------------
+// Operation-slot state machine (audit C4 — pure state transitions on SHARED,
+// unit-tested; the async command flows below compose exactly these)
+// ---------------------------------------------------------------------------
+
+/// Claim the chat's turn slot ATOMICALLY (check-and-set in one lock section)
+/// and bind the fresh `done_tx` to a new operation token. Two parallel sends
+/// can never both pass the busy check; every later step of the operation
+/// verifies the returned token.
+fn claim_turn_slot(
+    chat_id: &str,
+    done_tx: oneshot::Sender<TurnOutcome>,
+    busy_msg: &str,
+) -> Result<(u64, String, PersonaSpec, ProjectContext), String> {
+    let mut shared = SHARED.lock();
+    let chat = shared
+        .chats
+        .get_mut(chat_id)
+        .ok_or_else(|| format!("unknown chat_id \"{chat_id}\" — start a chat first"))?;
+    if chat.done_tx.is_some() {
+        return Err(busy_msg.into());
+    }
+    chat.done_op += 1;
+    chat.done_tx = Some(done_tx);
+    chat.done_gen = None;
+    chat.last_agent_message = None;
+    Ok((
+        chat.done_op,
+        chat.thread_id.clone(),
+        chat.persona.clone(),
+        chat.project.clone(),
+    ))
+}
+
+/// Advance the chat's EVENT fence to `generation` — called BEFORE the awaited
+/// thread/resume (C4): from this point a straggler from any older process
+/// generation is fenced out, even though the resume (and the `generation`
+/// bookkeeping commit) is still pending. Never moves backwards.
+fn advance_fence(chat_id: &str, generation: u64) {
+    if let Some(chat) = SHARED.lock().chats.get_mut(chat_id) {
+        if generation > chat.fence_generation {
+            chat.fence_generation = generation;
+        }
+    }
+}
+
+/// The LAST gate before `turn/start` (C4): mark operation `token`'s turn as
+/// started on `generation`. Returns false when the operation no longer owns
+/// the slot (its `done_tx` was consumed — e.g. a process exit failed it
+/// mid-setup) — the caller must NOT start a turn then: the webview would be
+/// told "failed" while a real turn runs on, silently shedding the
+/// autonomous marker.
+fn try_mark_turn_started(chat_id: &str, token: u64, generation: u64) -> bool {
+    let mut shared = SHARED.lock();
+    let Some(chat) = shared.chats.get_mut(chat_id) else {
+        return false;
+    };
+    if chat.done_op != token || chat.done_tx.is_none() {
+        return false;
+    }
+    chat.done_gen = Some(generation);
+    true
+}
+
+/// Clear operation `token`'s slot on its error paths — token-checked, so a
+/// stale operation can never free a successor's claim.
+fn clear_op(chat_id: &str, token: u64) {
+    if let Some(chat) = SHARED.lock().chats.get_mut(chat_id) {
+        if chat.done_op == token {
+            chat.done_tx = None;
+            chat.done_gen = None;
+        }
+    }
+}
+
+/// Consume the chat's sender for a terminal `turn/completed` — but ONLY when
+/// the current operation actually STARTED a turn (`done_gen` set): a stale
+/// completion (a previous timed-out turn ending late) can no longer steal a
+/// fresh operation's sender while it is still setting up (C4).
+fn take_completion(chat_id: &str) -> (Option<oneshot::Sender<TurnOutcome>>, Option<String>) {
+    let mut shared = SHARED.lock();
+    match shared.chats.get_mut(chat_id) {
+        Some(chat) => {
+            chat.current_turn_id = None;
+            if chat.done_gen.is_some() {
+                chat.done_gen = None;
+                (chat.done_tx.take(), chat.last_agent_message.take())
+            } else {
+                (None, None)
+            }
+        }
+        None => (None, None),
+    }
+}
+
+/// One process generation died: take (to fail) every operation of that
+/// project whose turn VERIFIABLY ran on that (or an older) generation.
+/// Operations still setting up toward a newer process (`done_gen` None) are
+/// untouched — their own error paths handle a dead connection, and failing
+/// them here while their turn later starts is exactly the C4 race.
+fn take_exit_failures(
+    project_id: &str,
+    event_gen: u64,
+) -> Vec<(String, Option<oneshot::Sender<TurnOutcome>>)> {
+    let mut shared = SHARED.lock();
+    shared
+        .chats
+        .iter_mut()
+        .filter(|(_, chat)| {
+            chat.project.id == project_id && chat.done_gen.is_some_and(|g| g <= event_gen)
+        })
+        .map(|(cid, chat)| {
+            chat.current_turn_id = None;
+            chat.done_gen = None;
+            (cid.clone(), chat.done_tx.take())
+        })
+        .collect()
 }
 
 fn handle_server_request(
@@ -432,9 +572,11 @@ fn handle_server_request(
         .map(str::to_string);
     let chat_id = chat_for_thread(thread_id.as_deref());
     // a straggler from an older process generation: the chat has moved on —
-    // answer the (dead) responder and drop the request
+    // answer the (dead) responder and drop the request. The FENCE generation
+    // guards (C4): it advances before the awaited resume, so mid-respawn
+    // stragglers are fenced too.
     if let Some(cid) = &chat_id {
-        if chat_generation(cid).is_some_and(|g| g > event_gen) {
+        if chat_fence(cid).is_some_and(|g| g > event_gen) {
             responder.error(-32601, "stale process generation");
             return;
         }
@@ -527,8 +669,10 @@ fn handle_notification(app: &AppHandle, event_gen: u64, method: &str, params: &V
     };
     // a straggler from an older process generation must never mutate a chat
     // that already resumed onto a newer one (its done_tx/turn state belong to
-    // the NEW process; the old turn was failed by that generation's Exited)
-    if chat_generation(&chat_id).is_some_and(|g| g > event_gen) {
+    // the NEW process; the old turn was failed by that generation's Exited).
+    // The FENCE generation guards (C4): it advances BEFORE the awaited
+    // resume, closing the mid-respawn straggler window.
+    if chat_fence(&chat_id).is_some_and(|g| g > event_gen) {
         return;
     }
     match method {
@@ -579,16 +723,10 @@ fn handle_notification(app: &AppHandle, event_gen: u64, method: &str, params: &V
                 .pointer("/turn/error/message")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let (done_tx, message) = {
-                let mut shared = SHARED.lock();
-                match shared.chats.get_mut(&chat_id) {
-                    Some(chat) => {
-                        chat.current_turn_id = None;
-                        (chat.done_tx.take(), chat.last_agent_message.take())
-                    }
-                    None => (None, None),
-                }
-            };
+            // C4: `take_completion` consumes the sender ONLY when the current
+            // operation actually started a turn — a stale completion never
+            // steals a fresh operation's slot mid-setup
+            let (done_tx, message) = take_completion(&chat_id);
             if status == "failed" {
                 emit_chat_event(
                     app,
@@ -651,26 +789,16 @@ fn handle_notification(app: &AppHandle, event_gen: u64, method: &str, params: &V
 }
 
 /// One process generation of one project died: fail every running turn of
-/// THAT project's chats that still run on that (or an older) generation and
-/// tell them. Chats that already resumed onto a NEWER process are untouched
-/// (`chat.generation > event_gen`), and other projects' Conductors never
-/// were (that is the point of per-project slots). An idle reap takes this
-/// same path — no turns are running then, so nothing is failed.
+/// THAT project's chats whose turn VERIFIABLY ran on that (or an older)
+/// generation and tell them. Chats that already resumed onto a NEWER process
+/// are untouched, operations still SETTING UP toward a new process are
+/// untouched too (audit C4 — failing them while their turn later starts
+/// would strip the webview's autonomous marker off a live turn), and other
+/// projects' Conductors never were (that is the point of per-project slots).
+/// An idle reap takes this same path — no turns are running then, so nothing
+/// is failed.
 fn handle_exit(app: &AppHandle, project_id: &str, event_gen: u64) {
-    let pending: Vec<(String, Option<oneshot::Sender<TurnOutcome>>)> = {
-        let mut shared = SHARED.lock();
-        shared
-            .chats
-            .iter_mut()
-            .filter(|(_, chat)| {
-                chat.project.id == project_id && chat.generation <= event_gen
-            })
-            .map(|(cid, chat)| {
-                chat.current_turn_id = None;
-                (cid.clone(), chat.done_tx.take())
-            })
-            .collect()
-    };
+    let pending = take_exit_failures(project_id, event_gen);
     for (chat_id, done_tx) in pending {
         if let Some(tx) = done_tx {
             let _ = tx.send(TurnOutcome {
@@ -713,6 +841,9 @@ fn register_chat(
         let cid = existing.clone();
         if let Some(chat) = shared.chats.get_mut(&cid) {
             chat.generation = generation;
+            if generation > chat.fence_generation {
+                chat.fence_generation = generation;
+            }
         }
         return cid;
     }
@@ -725,6 +856,7 @@ fn register_chat(
         ChatState {
             thread_id: thread_id.to_string(),
             generation,
+            fence_generation: generation,
             ..Default::default()
         },
     );
@@ -814,36 +946,20 @@ pub async fn chat_send(
 ) -> Result<Value, String> {
     // claim the chat's turn slot ATOMICALLY (check-and-set in one lock
     // section) — two parallel sends can no longer both pass the busy check
-    // and overwrite each other's done_tx. Every error path below MUST
-    // clear_done.
+    // and overwrite each other's done_tx. The claim binds this operation to
+    // a TOKEN (C4); every error path below MUST clear_op, and the turn only
+    // ever starts through `try_mark_turn_started`.
     let (done_tx, done_rx) = oneshot::channel();
-    let (thread_id, persona, project) = {
-        let mut shared = SHARED.lock();
-        let chat = shared
-            .chats
-            .get_mut(chat_id)
-            .ok_or_else(|| format!("unknown chat_id \"{chat_id}\" — start a chat first"))?;
-        if chat.done_tx.is_some() {
-            return Err("a turn is already running in this chat — interrupt it or wait".into());
-        }
-        chat.done_tx = Some(done_tx);
-        chat.last_agent_message = None;
-        (
-            chat.thread_id.clone(),
-            chat.persona.clone(),
-            chat.project.clone(),
-        )
-    };
-    let clear_done = || {
-        if let Some(chat) = SHARED.lock().chats.get_mut(chat_id) {
-            chat.done_tx = None;
-        }
-    };
+    let (op_token, thread_id, persona, project) = claim_turn_slot(
+        chat_id,
+        done_tx,
+        "a turn is already running in this chat — interrupt it or wait",
+    )?;
 
     let (conn, generation, sink) = match ensure_conn(app, &project.id).await {
         Ok(v) => v,
         Err(e) => {
-            clear_done();
+            clear_op(chat_id, op_token);
             return Err(e);
         }
     };
@@ -860,6 +976,10 @@ pub async fn chat_send(
     // turn → resume its thread (and re-register its route — routes die with
     // the process)
     if needs_resume {
+        // C4: move the EVENT fence to the new generation BEFORE awaiting the
+        // resume — a delayed old-generation straggler (Exited,
+        // turn/completed) must not touch this operation mid-respawn
+        advance_fence(chat_id, generation);
         let memory = load_memory(app, &project.id).await;
         if let Err(e) = host::resume_thread(
             &conn,
@@ -870,13 +990,15 @@ pub async fn chat_send(
             // ThreadNotFound included: the orchestrator has no fresh-start
             // fallback here by design — the frontend controller handles a
             // failed resume by starting a new thread
-            clear_done();
+            clear_op(chat_id, op_token);
             return Err(format!(
                 "thread/resume after app-server restart failed: {}",
                 e.message()
             ));
         }
         conn.register_thread(&thread_id, sink.clone());
+        // the RESUME bookkeeping commits only now, after a genuine success
+        // (the fence moved earlier — see above)
         if let Some(chat) = SHARED.lock().chats.get_mut(chat_id) {
             chat.generation = generation;
         }
@@ -913,19 +1035,35 @@ pub async fn chat_send(
         turn_params["effort"] = json!(e);
     }
 
+    // C4: NEVER start a turn for an operation that was already failed — if
+    // the sender was consumed while we were setting up (a process exit
+    // straggler), report that failure instead of launching a turn the
+    // webview would account as human-triggered.
+    if !try_mark_turn_started(chat_id, op_token, generation) {
+        return match done_rx.await {
+            Ok(outcome) => Err(outcome
+                .error
+                .unwrap_or_else(|| "turn aborted before it started".into())),
+            Err(_) => Err("turn aborted before it started".into()),
+        };
+    }
+
     match conn
         .request("turn/start", turn_params, RPC_TIMEOUT_MS)
         .await
     {
         Ok(res) => {
             if let Some(turn_id) = res.pointer("/turn/id").and_then(|v| v.as_str()) {
-                if let Some(chat) = SHARED.lock().chats.get_mut(chat_id) {
-                    chat.current_turn_id = Some(turn_id.to_string());
+                let mut shared = SHARED.lock();
+                if let Some(chat) = shared.chats.get_mut(chat_id) {
+                    if chat.done_op == op_token {
+                        chat.current_turn_id = Some(turn_id.to_string());
+                    }
                 }
             }
         }
         Err(e) => {
-            clear_done();
+            clear_op(chat_id, op_token);
             return Err(format!("turn/start failed: {e}"));
         }
     }
@@ -943,7 +1081,7 @@ pub async fn chat_send(
         }
         Ok(Err(_)) => Err("turn aborted: chat state was dropped".into()),
         Err(_) => {
-            clear_done();
+            clear_op(chat_id, op_token);
             Err(format!(
                 "turn timed out after {} minutes",
                 TURN_TIMEOUT_MS / 60_000
@@ -998,28 +1136,18 @@ const COMPACT_TIMEOUT_MS: u64 = 300_000;
 /// Transparently resumes after a process respawn, like `chat_send`.
 pub async fn chat_compact(app: &AppHandle, chat_id: &str) -> Result<Value, String> {
     let (done_tx, done_rx) = oneshot::channel();
-    let (thread_id, persona, project) = {
-        let mut shared = SHARED.lock();
-        let chat = shared
-            .chats
-            .get_mut(chat_id)
-            .ok_or_else(|| format!("unknown chat_id \"{chat_id}\""))?;
-        if chat.done_tx.is_some() {
-            return Err("a turn is already running in this chat — interrupt it or wait before compacting".into());
-        }
-        chat.done_tx = Some(done_tx);
-        chat.last_agent_message = None;
-        (chat.thread_id.clone(), chat.persona.clone(), chat.project.clone())
-    };
-    let clear_done = || {
-        if let Some(chat) = SHARED.lock().chats.get_mut(chat_id) {
-            chat.done_tx = None;
-        }
-    };
+    // same C4 discipline as chat_send: token-bound claim, fence advance
+    // before the awaited resume, and no compaction turn for an operation
+    // that was already failed
+    let (op_token, thread_id, persona, project) = claim_turn_slot(
+        chat_id,
+        done_tx,
+        "a turn is already running in this chat — interrupt it or wait before compacting",
+    )?;
     let (conn, generation, sink) = match ensure_conn(app, &project.id).await {
         Ok(v) => v,
         Err(e) => {
-            clear_done();
+            clear_op(chat_id, op_token);
             return Err(e);
         }
     };
@@ -1030,6 +1158,7 @@ pub async fn chat_compact(app: &AppHandle, chat_id: &str) -> Result<Value, Strin
         .map(|c| c.generation != generation)
         .unwrap_or(false);
     if needs_resume {
+        advance_fence(chat_id, generation);
         let memory = load_memory(app, &project.id).await;
         if let Err(e) = host::resume_thread(
             &conn,
@@ -1037,13 +1166,21 @@ pub async fn chat_compact(app: &AppHandle, chat_id: &str) -> Result<Value, Strin
         )
         .await
         {
-            clear_done();
+            clear_op(chat_id, op_token);
             return Err(format!("thread/resume before compaction failed: {}", e.message()));
         }
         conn.register_thread(&thread_id, sink.clone());
         if let Some(chat) = SHARED.lock().chats.get_mut(chat_id) {
             chat.generation = generation;
         }
+    }
+    if !try_mark_turn_started(chat_id, op_token, generation) {
+        return match done_rx.await {
+            Ok(outcome) => Err(outcome
+                .error
+                .unwrap_or_else(|| "compaction aborted before it started".into())),
+            Err(_) => Err("compaction aborted before it started".into()),
+        };
     }
     if let Err(e) = conn
         .request(
@@ -1053,7 +1190,7 @@ pub async fn chat_compact(app: &AppHandle, chat_id: &str) -> Result<Value, Strin
         )
         .await
     {
-        clear_done();
+        clear_op(chat_id, op_token);
         return Err(format!("thread/compact/start failed: {e}"));
     }
     match tokio::time::timeout(Duration::from_millis(COMPACT_TIMEOUT_MS), done_rx).await {
@@ -1281,6 +1418,151 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Conductor of THIS project"));
+    }
+
+    /// Insert a bare test chat into SHARED (unique ids per test — SHARED is
+    /// process-global).
+    fn insert_test_chat(chat_id: &str, project_id: &str, generation: u64) {
+        let mut shared = SHARED.lock();
+        shared
+            .thread_to_chat
+            .insert(format!("thread-{chat_id}"), chat_id.to_string());
+        shared.chats.insert(
+            chat_id.to_string(),
+            ChatState {
+                thread_id: format!("thread-{chat_id}"),
+                generation,
+                fence_generation: generation,
+                project: ProjectContext {
+                    id: project_id.into(),
+                    dir: String::new(),
+                    name: String::new(),
+                },
+                ..Default::default()
+            },
+        );
+    }
+
+    fn remove_test_chat(chat_id: &str) {
+        let mut shared = SHARED.lock();
+        if let Some(chat) = shared.chats.remove(chat_id) {
+            shared.thread_to_chat.remove(&chat.thread_id);
+        }
+    }
+
+    /// Audit C4 (frozen): the Conductor respawn race. `chat_send` installs
+    /// its `done_tx` while the chat still carries the OLD generation; a
+    /// delayed old-generation `Exited` must NOT take and fail that sender —
+    /// the send would then start the real turn anyway, the webview would
+    /// clear busy + the autonomous marker, and the still-running autonomous
+    /// turn's tool calls would count as human-triggered. The operation
+    /// binding (`done_gen`) plus the pre-`turn/start` gate close both halves.
+    #[test]
+    fn respawn_race_never_fails_a_mid_setup_operation() {
+        let cid = format!("c4-race-{}", std::process::id());
+        let pid = format!("c4-project-{}", std::process::id());
+        insert_test_chat(&cid, &pid, 1);
+
+        // the operation claims the slot (still on generation 1)
+        let (tx, mut rx) = oneshot::channel();
+        let (token, ..) = claim_turn_slot(&cid, tx, "busy").expect("claim");
+
+        // the delayed gen-1 Exited straggler arrives MID-SETUP: it must not
+        // touch the operation (its turn never ran on gen 1)
+        assert!(
+            take_exit_failures(&pid, 1).is_empty(),
+            "an exit must never fail an operation that has not started a turn"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the fresh done_tx must survive the stale exit"
+        );
+
+        // chat_send advances the FENCE before awaiting the resume — from now
+        // on gen-1 stragglers are dropped by the event guards
+        advance_fence(&cid, 2);
+        assert_eq!(chat_fence(&cid), Some(2));
+        // (and the fence never moves backwards)
+        advance_fence(&cid, 1);
+        assert_eq!(chat_fence(&cid), Some(2));
+
+        // the turn starts on generation 2
+        assert!(try_mark_turn_started(&cid, token, 2), "the live op must start");
+        // another late gen-1 exit: the turn runs on gen 2 → untouched
+        assert!(take_exit_failures(&pid, 1).is_empty());
+        // a GENUINE gen-2 exit fails exactly this operation
+        let failed = take_exit_failures(&pid, 2);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, cid);
+        assert!(failed[0].1.is_some(), "the sender is taken for failing");
+        remove_test_chat(&cid);
+    }
+
+    /// C4 companion: once an operation's sender was consumed, the operation
+    /// must NEVER start its turn (`try_mark_turn_started` refuses) — and a
+    /// stale token can neither free nor hijack a successor's slot.
+    #[test]
+    fn failed_operations_cannot_start_turns_and_stale_tokens_are_inert() {
+        let cid = format!("c4-token-{}", std::process::id());
+        let pid = format!("c4-token-project-{}", std::process::id());
+        insert_test_chat(&cid, &pid, 1);
+
+        let (tx1, _rx1) = oneshot::channel();
+        let (token1, ..) = claim_turn_slot(&cid, tx1, "busy").expect("claim 1");
+        // simulate the operation being failed (its sender consumed)
+        SHARED
+            .lock()
+            .chats
+            .get_mut(&cid)
+            .unwrap()
+            .done_tx
+            .take()
+            .unwrap()
+            .send(TurnOutcome {
+                status: "failed".into(),
+                error: Some("codex app-server exited".into()),
+                message: None,
+            })
+            .ok();
+        assert!(
+            !try_mark_turn_started(&cid, token1, 2),
+            "a failed operation must never start a turn"
+        );
+
+        // a successor claims the slot — the stale token is inert against it
+        let (tx2, mut rx2) = oneshot::channel();
+        let (token2, ..) = claim_turn_slot(&cid, tx2, "busy").expect("claim 2");
+        assert_ne!(token1, token2);
+        clear_op(&cid, token1); // stale clear → no effect
+        assert!(try_mark_turn_started(&cid, token2, 2));
+        assert!(rx2.try_recv().is_err(), "successor's sender untouched");
+        // the successor's own clear works
+        clear_op(&cid, token2);
+        assert!(SHARED.lock().chats.get(&cid).unwrap().done_tx.is_none());
+        remove_test_chat(&cid);
+    }
+
+    /// C4 companion: a STALE `turn/completed` (a previous timed-out turn
+    /// ending late) must not steal a fresh operation's sender while that
+    /// operation is still setting up — `take_completion` only consumes once
+    /// a turn was genuinely started.
+    #[test]
+    fn stale_completion_never_steals_a_fresh_slot() {
+        let cid = format!("c4-completion-{}", std::process::id());
+        let pid = format!("c4-completion-project-{}", std::process::id());
+        insert_test_chat(&cid, &pid, 1);
+
+        let (tx, mut rx) = oneshot::channel();
+        let (token, ..) = claim_turn_slot(&cid, tx, "busy").expect("claim");
+        // stale completion arrives before the op started its turn → not taken
+        let (taken, _) = take_completion(&cid);
+        assert!(taken.is_none(), "mid-setup sender must not be consumed");
+        assert!(rx.try_recv().is_err());
+        // once the turn started, a completion IS taken
+        assert!(try_mark_turn_started(&cid, token, 1));
+        let (taken, _) = take_completion(&cid);
+        assert!(taken.is_some(), "a started turn's completion resolves");
+        remove_test_chat(&cid);
     }
 
     #[test]

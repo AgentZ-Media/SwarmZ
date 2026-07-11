@@ -338,7 +338,100 @@ mod anchored {
             }
             Ok(())
         }
+
+        /// Duplicate the handle (dup the fd) — lets callers walk component
+        /// chains starting from a borrowed handle.
+        pub fn try_clone(&self) -> Result<DirHandle, String> {
+            self.fd
+                .try_clone()
+                .map(|fd| DirHandle { fd })
+                .map_err(|e| format!("could not duplicate directory handle: {e}"))
+        }
+
+        /// The handle's own filesystem identity `(device, inode)` — the
+        /// anchored truth a PATH-resolved view can be verified against
+        /// (audit C7: same identity = the pathname still names this very
+        /// directory).
+        pub fn identity(&self) -> Result<(u64, u64), String> {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstat(self.fd.as_raw_fd(), &mut st) };
+            if rc < 0 {
+                return Err(format!(
+                    "could not stat directory handle: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            #[allow(clippy::unnecessary_cast)]
+            Ok((st.st_dev as u64, st.st_ino as u64))
+        }
+
+        /// What is the child entry (lstat semantics — a symlink reports as
+        /// Symlink, never followed)? None = missing.
+        pub fn kind(&self, name: &str) -> Result<Option<super::EntryKind>, String> {
+            Ok(self.stat(name)?.map(|st| match st.st_mode & libc::S_IFMT {
+                libc::S_IFREG => super::EntryKind::File,
+                libc::S_IFDIR => super::EntryKind::Dir,
+                libc::S_IFLNK => super::EntryKind::Symlink,
+                _ => super::EntryKind::Other,
+            }))
+        }
+
+        /// Read one child SYMLINK's target string (readlinkat — nothing is
+        /// followed). None = missing.
+        pub fn read_link(&self, name: &str) -> Result<Option<std::path::PathBuf>, String> {
+            assert_component(name)?;
+            let c = cstr(name)?;
+            let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+            let n = unsafe {
+                libc::readlinkat(
+                    self.fd.as_raw_fd(),
+                    c.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                return if err.raw_os_error() == Some(libc::ENOENT) {
+                    Ok(None)
+                } else {
+                    Err(format!("could not readlink {name:?}: {err}"))
+                };
+            }
+            buf.truncate(n as usize);
+            use std::os::unix::ffi::OsStringExt;
+            Ok(Some(std::path::PathBuf::from(
+                std::ffi::OsString::from_vec(buf),
+            )))
+        }
+
+        /// Create one child as a SYMLINK to `target` (symlinkat; fails when
+        /// the name already exists — never overwrites).
+        pub fn symlink(&self, target: &Path, name: &str) -> Result<(), String> {
+            use std::os::unix::ffi::OsStrExt;
+            assert_component(name)?;
+            let c = cstr(name)?;
+            let t = CString::new(target.as_os_str().as_bytes())
+                .map_err(|_| format!("symlink target contains NUL: {}", target.display()))?;
+            let rc = unsafe { libc::symlinkat(t.as_ptr(), self.fd.as_raw_fd(), c.as_ptr()) };
+            if rc < 0 {
+                return Err(format!(
+                    "could not create symlink {name:?}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
     }
+}
+
+/// What a directory child is (lstat semantics — see `DirHandle::kind`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+    Other,
 }
 
 #[cfg(unix)]
@@ -439,6 +532,43 @@ mod anchored_fallback {
         pub fn unlink(&self, name: &str) -> Result<(), String> {
             assert_component(name)?;
             fs::remove_file(self.path.join(name)).map_err(|e| e.to_string())
+        }
+
+        pub fn try_clone(&self) -> Result<DirHandle, String> {
+            Ok(DirHandle { path: self.path.clone() })
+        }
+
+        pub fn identity(&self) -> Result<(u64, u64), String> {
+            Err("directory identity is not supported on this platform".into())
+        }
+
+        pub fn kind(&self, name: &str) -> Result<Option<super::EntryKind>, String> {
+            assert_component(name)?;
+            match self.path.join(name).symlink_metadata() {
+                Err(_) => Ok(None),
+                Ok(m) => Ok(Some(if m.file_type().is_symlink() {
+                    super::EntryKind::Symlink
+                } else if m.is_file() {
+                    super::EntryKind::File
+                } else if m.is_dir() {
+                    super::EntryKind::Dir
+                } else {
+                    super::EntryKind::Other
+                })),
+            }
+        }
+
+        pub fn read_link(&self, name: &str) -> Result<Option<PathBuf>, String> {
+            assert_component(name)?;
+            match fs::read_link(self.path.join(name)) {
+                Ok(t) => Ok(Some(t)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+
+        pub fn symlink(&self, _target: &Path, _name: &str) -> Result<(), String> {
+            Err("symlink creation is not supported on this platform".into())
         }
     }
 }

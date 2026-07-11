@@ -598,7 +598,13 @@ function maybeEnqueueFinishTrigger(sessionId: string, projectId: string): void {
       const diffLine = diffLineFromStats(diffStats(fresh.diff));
       if (!diffLine) return;
       try {
-        const res = await reviewSession(sessionId, "uncommitted");
+        // C3: the autonomous auto-review is a Conductor-driven detached review —
+        // a full-access lane must not be driven through it (Rust's
+        // `conductor_access_gate` refuses; a refused full-access lane simply
+        // isn't auto-reviewed, recorded as a failed review below).
+        const res = await reviewSession(sessionId, "uncommitted", {
+          requireWorkspace: true,
+        });
         review = {
           status: res.status,
           text: res.review ?? "(the review returned no findings text)",

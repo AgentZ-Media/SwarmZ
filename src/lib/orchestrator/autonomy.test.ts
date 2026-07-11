@@ -337,6 +337,57 @@ describe("present-but-invalid persisted budgets fail closed (TF6)", () => {
     expect(autonomyUnavailable()).toBe(true); // the whole load is untrusted
   });
 
+  it("a MALFORMED firedAt element latches instead of silently dropping (T3a)", () => {
+    // the exact un-latch risk: dropping one junk element from a full 20/20
+    // window turns it into 19 and mints a fresh allowance — fail closed
+    hydrateAutonomyBudgets({
+      version: 1,
+      projects: {
+        p: { firedAt: [T0 - 1000, "junk", T0 - 2000], consecutive: 0, tripped: false },
+      },
+    });
+    expect(autonomyUnavailable()).toBe(true);
+    resetAutonomyBudgets();
+    hydrateAutonomyBudgets({
+      version: 1,
+      projects: { p: { firedAt: [T0, NaN], consecutive: 0, tripped: false } },
+    });
+    expect(autonomyUnavailable()).toBe(true);
+  });
+
+  it("legitimately EXPIRED firedAt elements prune without latching; far-future clamps", () => {
+    // an expired timestamp (outside the rolling hour) is a legit prune, not
+    // corruption — no latch; a far-future finite value clamps (kept, restrictive)
+    hydrateAutonomyBudgets(
+      {
+        version: 1,
+        projects: {
+          p: {
+            firedAt: [T0 - AUTONOMY_WINDOW_MS - 5000, T0 - 1000, T0 + 10 * 60_000],
+            consecutive: 0,
+            tripped: false,
+          },
+        },
+      },
+      T0,
+    );
+    expect(autonomyUnavailable()).toBe(false);
+    // the expired one dropped, the in-window + clamped ones remain (2 entries)
+    const snap = serializeAutonomyBudgets(T0);
+    expect(snap.projects.p.firedAt.length).toBe(2);
+  });
+
+  it("autonomyTripped reflects the global fail-closed latch (T3b)", () => {
+    // a corrupt budget pauses autonomy globally — the Deck dot / breaker notice
+    // read autonomyTripped, which must surface the pause (never dark & silent)
+    expect(autonomyTripped("p")).toBe(false);
+    latchAutonomyUnavailable();
+    expect(autonomyTripped("p")).toBe(true);
+    expect(autonomyTripped("any-other")).toBe(true);
+    noteHumanTurn("p"); // a human clears the global latch
+    expect(autonomyTripped("p")).toBe(false);
+  });
+
   it("a well-formed empty envelope hydrates cleanly (no false latch)", () => {
     hydrateAutonomyBudgets({ version: 1, projects: {} });
     expect(autonomyUnavailable()).toBe(false);

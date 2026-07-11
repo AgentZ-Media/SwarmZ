@@ -34,6 +34,68 @@ pub(crate) fn git_bin(overridden: Option<&str>) -> &str {
     }
 }
 
+/// `-c` overrides suppressing REPOSITORY-CONTROLLED execution — prepended to
+/// every backend git invocation (audit R6/C1). The backend's own git
+/// subprocesses run UNSANDBOXED while hook bodies / fsmonitor configs are
+/// workspace-agent-editable content (a husky-style tracked `hooksPath` makes
+/// the hook BODY a plain tracked file): without these, `git worktree add`
+/// runs `post-checkout`, `git status` runs a configured `core.fsmonitor`
+/// hook, `git update-ref` runs `reference-transaction` — project-controlled
+/// code with host authority. Command-line `-c` wins over EVERY config scope
+/// (system/global/repo), so:
+///   - `core.hooksPath=/dev/null` — no hook is ever found or run (git probes
+///     `<hooksPath>/<hook>`, which cannot exist under `/dev/null`),
+///   - `core.fsmonitor=false` — no fsmonitor hook/daemon on status queries,
+///   - `core.pager=cat` — belt and braces; stdout is piped, but a pager must
+///     never be a code path.
+///
+/// External diff/textconv drivers are additionally disabled per-call where a
+/// diff is produced (`--no-ext-diff --no-textconv` in `git_info`).
+const GIT_SUPPRESSIONS: &[&str] = &[
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.pager=cat",
+];
+
+/// Build a git `Command` for the backend's LOCAL-ONLY operations (status,
+/// worktree management, ref queries): repository-controlled execution is
+/// suppressed (see `GIT_SUPPRESSIONS`), interactive prompts are off, and —
+/// since none of these operations has any business on the network — EVERY
+/// transport is refused outright (`protocol.allow=never`; a repo-configured
+/// `ext::…` remote URL executes arbitrary commands when a transport touches
+/// it). All backend git calls MUST go through this builder or
+/// `git_command_net`; never `Command::new(git)` directly.
+pub(crate) fn git_command(bin: &str, cwd: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.arg("-C").arg(cwd);
+    cmd.args(GIT_SUPPRESSIONS);
+    cmd.args(["-c", "protocol.allow=never"]);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
+/// Like `git_command`, for the backend's ONE network operation (`git push`
+/// in github.rs): transports stay usable, but the EXECUTABLE ones are closed
+/// — `ext::` remotes refuse, and ssh is pinned to the stock binary (a
+/// repo-local `core.sshCommand` would otherwise run arbitrary project code
+/// under the unsandboxed backend on every push). Residual (documented):
+/// `credential.helper` from config still runs — suppressing it would break
+/// all https auth (keychain); planting one requires writing `.git/config`,
+/// which the approval classifier refuses autonomously (fileChanges touching
+/// a `.git` component are destructive, and no allowlisted command writes
+/// config).
+pub(crate) fn git_command_net(bin: &str, cwd: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.arg("-C").arg(cwd);
+    cmd.args(GIT_SUPPRESSIONS);
+    cmd.args(["-c", "protocol.ext.allow=never", "-c", "core.sshCommand=ssh"]);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
 /// Hard cap per drained pipe (audit R12): a pathological child spewing
 /// gigabytes must not grow an unbounded buffer — the excess is read and
 /// discarded (the pipe keeps draining so the child never blocks on it).
@@ -146,7 +208,7 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn git(bin: &str, cwd: &str, args: &[&str]) -> Option<String> {
     let out = output_with_timeout(
-        Command::new(bin).arg("-C").arg(cwd).args(args),
+        git_command(bin, Path::new(cwd)).args(args),
         GIT_TIMEOUT,
     )
     .ok()?;
@@ -202,9 +264,15 @@ pub fn git_info(cwd: &str, bin_override: Option<&str>) -> Option<GitInfo> {
             .unwrap_or_else(|| "(no commits)".to_string()),
     };
 
-    // staged + unstaged line counts vs HEAD; fails on a repo without commits → 0/0
+    // staged + unstaged line counts vs HEAD; fails on a repo without commits
+    // → 0/0. `--no-ext-diff --no-textconv` (C1): a repo-configured external
+    // diff/textconv driver must never execute during the backend's poll.
     let (mut insertions, mut deletions) = (0u64, 0u64);
-    if let Some(numstat) = git(bin, cwd, &["diff", "--numstat", "HEAD"]) {
+    if let Some(numstat) = git(
+        bin,
+        cwd,
+        &["diff", "--no-ext-diff", "--no-textconv", "--numstat", "HEAD"],
+    ) {
         for line in numstat.lines() {
             let mut cols = line.split('\t');
             // binary files report "-" in both columns → count as 0

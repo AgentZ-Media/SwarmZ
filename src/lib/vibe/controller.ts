@@ -193,12 +193,23 @@ function invokeSetCwd(sessionId: string, cwd: string): Promise<void> {
 function invokeReview(
   sessionId: string,
   target: string,
+  requireWorkspace?: boolean,
 ): Promise<{
   status: string;
   review: string | null;
   review_thread_id: string;
 }> {
-  return invoke("vibe_session_review", { sessionId, target });
+  return invoke("vibe_session_review", {
+    sessionId,
+    target,
+    // C3: the detached review must not reuse a HUMAN-granted full-access
+    // profile under the Conductor (danger-full-access + approvalPolicy "never"
+    // = no approval to cancel). Every review caller is a Conductor path, so we
+    // pass the strict flag; the AUTHORITATIVE gate is Rust's
+    // `conductor_access_gate` on `session_review` (a full-access session
+    // refuses). Harmless if the backend confines review unconditionally.
+    requireWorkspace: requireWorkspace ?? false,
+  });
 }
 
 // ---- streaming state ----
@@ -1126,6 +1137,7 @@ export async function assignWorktreeToSession(
 export async function reviewSession(
   sessionId: string,
   target: string,
+  opts: { requireWorkspace?: boolean } = {},
 ): Promise<{ status: string; review: string | null; review_thread_id: string }> {
   const session = useVibe.getState().sessions[sessionId]?.session;
   if (!session) throw new Error(`unknown vibe session "${sessionId}"`);
@@ -1135,7 +1147,7 @@ export async function reviewSession(
   const endInflight = beginInflight("review");
   try {
     await resumeSession(sessionId);
-    return await invokeReview(sessionId, target);
+    return await invokeReview(sessionId, target, opts.requireWorkspace);
   } finally {
     endInflight();
   }

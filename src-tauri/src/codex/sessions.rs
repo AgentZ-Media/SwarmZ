@@ -243,9 +243,50 @@ fn rg_args_safe(args: &[String]) -> bool {
     })
 }
 
+/// Short options of the routine read heads whose VALUE names a FILE the
+/// command reads — and which may be ATTACHED to the flag itself in one token
+/// (`grep -fpatterns`, `-f<value>`). The attached value is extracted and
+/// confined exactly like a bare operand (audit C6): before this, an
+/// attached value without `/`, `~` or `..` slipped through uncanonicalized,
+/// so an in-cwd symlink `patterns -> /outside/secret` stayed routine.
+fn short_path_opts(head: &str) -> &'static [char] {
+    match head {
+        // grep/rg `-f <file>`: read patterns FROM a file
+        "grep" | "rg" => &['f'],
+        _ => &[],
+    }
+}
+
+/// One operand value's confinement (the R3/F4 rules — see
+/// `operands_confined`): `~`/`..` refuse, absolute paths must canonicalize
+/// into the cwd, relative spellings are cwd-joined and canonicalized
+/// (symlink-resolving) and must land back inside.
+fn operand_value_confined(val: &str, cwd: &str) -> bool {
+    if val.starts_with('~') {
+        return false;
+    }
+    if std::path::Path::new(val)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if val.starts_with('/') {
+        return path_within(cwd, val);
+    }
+    // F4: relative operands resolve against the session cwd — join,
+    // canonicalize (symlink-resolving via path_within) and require
+    // containment. Non-path tokens (grep patterns, plain words) fold to
+    // a missing in-tree leaf and pass; an in-tree symlink pointing out
+    // resolves outside and refuses.
+    let joined = std::path::Path::new(cwd).join(val);
+    path_within(cwd, &joined.to_string_lossy())
+}
+
 /// R3 path-operand confinement (fail closed): every operand of an otherwise
 /// routine command that CAN address a filesystem path must stay inside the
-/// session's cwd. Concretely, for each token (flags' `=`-values included):
+/// session's cwd (`head` selects the per-command path-bearing short
+/// options). Concretely, for each token (flags' `=`-values included):
 ///   - `~…` (home expansion in the real shell) → human,
 ///   - any `..` path component → human (traversal is never resolved),
 ///   - an ABSOLUTE path must canonicalize into the session cwd → else human,
@@ -257,8 +298,9 @@ fn rg_args_safe(args: &[String]) -> bool {
 ///
 /// Flag tokens themselves (`-la`, `--stat`) pass untouched; a flag's
 /// separate value token is checked like any operand, so `grep -f /etc/x`
-/// classifies destructive.
-fn operands_confined(args: &[String], cwd: &str) -> bool {
+/// classifies destructive — and an ATTACHED short-option value
+/// (`grep -fpatterns`) is extracted and confined the same way (audit C6).
+fn operands_confined(head: &str, args: &[String], cwd: &str) -> bool {
     args.iter().all(|tok| {
         // for `--flag=value`, gate the VALUE; bare flags pass
         let val: &str = if let Some(rest) = tok.strip_prefix("--") {
@@ -266,33 +308,26 @@ fn operands_confined(args: &[String], cwd: &str) -> bool {
                 Some((_, v)) => v,
                 None => return true,
             }
-        } else if tok.starts_with('-') {
-            // short flags pass — UNLESS they smuggle an attached path value
-            // (`grep -f/etc/patterns` is one token): any '/', '~' or '..'
-            // inside a short-flag token → human
+        } else if let Some(body) = tok.strip_prefix('-') {
+            // short flags: a path-bearing option char may carry its value
+            // ATTACHED in the same token (`-fpatterns`, also inside a
+            // cluster: `-if/etc/x`) — extract the remainder and confine it
+            // like a bare operand (C6)
+            for (i, c) in body.char_indices() {
+                if short_path_opts(head).contains(&c) {
+                    let attached = &body[i + c.len_utf8()..];
+                    if attached.is_empty() {
+                        break; // `-f` alone — the next token is checked as an operand
+                    }
+                    return operand_value_confined(attached, cwd);
+                }
+            }
+            // any other short token smuggling path syntax still refuses
             return !tok.contains('/') && !tok.contains('~') && !tok.contains("..");
         } else {
             tok
         };
-        if val.starts_with('~') {
-            return false;
-        }
-        if std::path::Path::new(val)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return false;
-        }
-        if val.starts_with('/') {
-            return path_within(cwd, val);
-        }
-        // F4: relative operands resolve against the session cwd — join,
-        // canonicalize (symlink-resolving via path_within) and require
-        // containment. Non-path tokens (grep patterns, plain words) fold to
-        // a missing in-tree leaf and pass; an in-tree symlink pointing out
-        // resolves outside and refuses.
-        let joined = std::path::Path::new(cwd).join(val);
-        path_within(cwd, &joined.to_string_lossy())
+        operand_value_confined(val, cwd)
     })
 }
 
@@ -309,6 +344,52 @@ const SENSITIVE_PATTERNS: &[&str] = &[
     ".env", "id_rsa", "id_ed25519", ".ssh", ".aws", ".npmrc", ".netrc",
     "credentials", "secret", "keychain", "password", "token", "/etc/",
 ];
+
+/// Path COMPONENTS that route a fileChange straight to the human (audit C2):
+/// VCS control directories — a write into `.git/hooks/…` or `.git/config`
+/// arms repository-controlled code execution (git config, hooks, filters,
+/// fsmonitor; the backend's own git suppresses the TRIGGER half via
+/// `git_command`, this refuses the WRITE half) — plus the Conductor's own
+/// `.swarmz` control area (plans are written ONLY through the sanctioned
+/// `write_plan` surface). Matched as whole path components, case-insensitive
+/// (macOS filesystems are) — `agitator.txt`/`.github` never false-trip.
+const PROTECTED_DIR_COMPONENTS: &[&str] = &[".git", ".hg", ".svn", ".swarmz"];
+
+/// Does any component of `p` name a protected control directory?
+fn has_protected_component(p: &std::path::Path) -> bool {
+    p.components().any(|c| match c {
+        std::path::Component::Normal(n) => {
+            let s = n.to_string_lossy();
+            PROTECTED_DIR_COMPONENTS
+                .iter()
+                .any(|d| s.eq_ignore_ascii_case(d))
+        }
+        _ => false,
+    })
+}
+
+/// C2, both spellings: the RAW path must not touch a protected component,
+/// and neither may its SYMLINK-RESOLVED form relative to the session cwd —
+/// `hooks/pre-commit` with `hooks -> .git/hooks` lands in `.git` only after
+/// canonicalization. Any resolution doubt → protected (fail closed; the
+/// containment check would refuse such a path anyway).
+fn touches_protected_dir(cwd: &str, raw_path: &str) -> bool {
+    if has_protected_component(std::path::Path::new(raw_path)) {
+        return true;
+    }
+    let (Some(c_cwd), Some(c_target)) = (
+        crate::fsx::canonicalize_lenient(std::path::Path::new(cwd)),
+        crate::fsx::canonicalize_lenient(std::path::Path::new(raw_path)),
+    ) else {
+        return true;
+    };
+    match c_target.strip_prefix(&c_cwd) {
+        Ok(rel) => has_protected_component(rel),
+        // outside the cwd — path_within refuses it independently; treat as
+        // protected here so this gate never opens anything on its own
+        Err(_) => true,
+    }
+}
 
 /// Strict quote-aware tokenizer. Returns None (→ destructive) when the
 /// command contains ANY shell metasyntax outside single quotes:
@@ -498,7 +579,7 @@ fn classify_command_str(raw: &str, cwd: &str, depth: u8, gh_writes: bool) -> boo
     // read-only head (`cat /Users/x/Documents/…` is exfiltration). gh has
     // its own strict parser (numeric selectors only, no path flags), and its
     // free-text `--body` values must not false-trip on a path-shaped word.
-    if head != "gh" && !operands_confined(args, cwd) {
+    if head != "gh" && !operands_confined(head, args, cwd) {
         return false;
     }
     if ROUTINE_READ_HEADS.contains(&head) {
@@ -760,7 +841,10 @@ use crate::fsx::path_within;
 /// Are all of a fileChange approval's changes routine? Routine requires EVERY
 /// change to be (a) a pure create (`add` of a not-yet-existing path) or an
 /// in-place edit (`update` without a rename/move), AND (b) strictly inside
-/// the session's canonicalized cwd, AND (c) free of sensitive path parts.
+/// the session's canonicalized cwd, AND (c) free of sensitive path parts,
+/// AND (d) free of protected control-dir components (`.git`/`.hg`/`.svn`/
+/// `.swarmz` — audit C2: a create of `.git/hooks/pre-commit` or an edit of
+/// `.git/config` arms repo-controlled execution and is never autonomous).
 /// Deletes, renames, overwriting adds, unknown kinds, traversal, symlinks
 /// out of the tree → human.
 fn file_changes_within(params: &Value, cwd: &str) -> bool {
@@ -793,7 +877,10 @@ fn file_changes_within(params: &Value, cwd: &str) -> bool {
         };
         let lower = path.to_lowercase();
         let sensitive = SENSITIVE_PATTERNS.iter().any(|s| lower.contains(s));
-        kind_ok && !sensitive && path_within(cwd, path)
+        kind_ok
+            && !sensitive
+            && !touches_protected_dir(cwd, path)
+            && path_within(cwd, path)
     })
 }
 
@@ -1499,7 +1586,7 @@ pub async fn session_resume(
 fn conductor_access_gate(access: Access, require_workspace: bool) -> Result<(), String> {
     if require_workspace && access == Access::Full {
         return Err(
-            "refused: this session runs with FULL access (no sandbox) — the Conductor may not prompt or steer full-access sessions; the human drives it, or downgrades it to workspace access first"
+            "refused: this session runs with FULL access (no sandbox) — the Conductor may not prompt, steer or review full-access sessions; the human drives it, or downgrades it to workspace access first"
                 .into(),
         );
     }
@@ -1937,13 +2024,27 @@ fn review_target(target: &str) -> Result<Value, String> {
 /// `exitedReviewMode.review`; needs the parent thread's rollout on disk —
 /// sessions are non-ephemeral, so it is). The session itself is untouched
 /// (its own turn keeps running). Blocks until the review turn completes.
-pub async fn session_review(session_id: &str, target: &str) -> Result<Value, String> {
+///
+/// `require_workspace` (audit C3) is the STRICT Conductor path, like
+/// send/steer: the review thread inherits the parent session's access
+/// profile, and a HUMAN-granted full-access profile (danger-full-access +
+/// approvalPolicy "never" — commands run WITHOUT any approval this handler
+/// could cancel) must never be reused by an autonomous review. A
+/// full-access session refuses via `conductor_access_gate`, checked against
+/// the live profile BEFORE anything runs.
+pub async fn session_review(
+    session_id: &str,
+    target: &str,
+    require_workspace: bool,
+) -> Result<Value, String> {
     let target = review_target(target)?;
     let (host, thread_id, generation, profile) = {
         let sessions = SESSIONS.lock();
         let st = sessions
             .get(session_id)
             .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
+        // C3: gate FIRST — a refused full-access session stays untouched
+        conductor_access_gate(st.profile.access, require_workspace)?;
         let thread_id = st.thread_id.clone().ok_or("this session has no thread yet")?;
         (
             st.host.clone(),
@@ -2829,6 +2930,54 @@ mod tests {
         std::fs::remove_dir_all(&escape).ok();
     }
 
+    /// Audit C6 (frozen): ATTACHED short-option path values are confined
+    /// like operands. `grep -fpatterns file` with an in-cwd symlink
+    /// `patterns -> /outside/secret` used to slip through — the token has no
+    /// `/`, `~` or `..`, and its value was never canonicalized.
+    #[test]
+    fn attached_short_option_path_values_are_confined() {
+        let root = std::env::temp_dir().join(format!(
+            "swarmz-c6-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let cwd = root.to_string_lossy().into_owned();
+        std::fs::write(root.join("src/a.rs"), "x").unwrap();
+        std::fs::write(root.join("pat.txt"), "needle").unwrap();
+        let classify = |c: &str| classify_no_gh("command", &json!({ "command": c }), &cwd);
+
+        // the escaping symlink, spelled WITHOUT any path syntax in the token
+        let escape = std::env::temp_dir().join(format!("swarmz-c6-out-{}", std::process::id()));
+        std::fs::create_dir_all(&escape).unwrap();
+        std::fs::write(escape.join("secret.txt"), "s3cr3t").unwrap();
+        std::os::unix::fs::symlink(escape.join("secret.txt"), root.join("patterns")).unwrap();
+        for c in [
+            "grep -fpatterns src/a.rs",
+            "grep -ifpatterns src/a.rs", // inside a cluster
+            "rg -fpatterns src",
+            "grep -f patterns src/a.rs", // the separate spelling (F4 path)
+        ] {
+            assert_eq!(classify(c), "destructive", "{c}");
+        }
+        // attached values with explicit path syntax keep refusing too
+        assert_eq!(classify("grep -f/etc/passwd src/a.rs"), "destructive");
+        assert_eq!(classify("grep -f~/x src/a.rs"), "destructive");
+        assert_eq!(classify("grep -f../pat src/a.rs"), "destructive");
+        // an honest IN-TREE pattern file stays routine, attached or separate
+        assert_eq!(classify("grep -fpat.txt src/a.rs"), "routine");
+        assert_eq!(classify("grep -f pat.txt src/a.rs"), "routine");
+        assert_eq!(classify("rg -if pat.txt src"), "routine");
+        // unrelated short clusters are untouched by the extraction
+        assert_eq!(classify("grep -in needle src/a.rs"), "routine");
+        assert_eq!(classify("head -n5 src/a.rs"), "routine");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&escape).ok();
+    }
+
     // ---- Phase-7 security review: gh CLI classification (frozen) ----
 
     fn classify_gh(c: &str, gh_writes: bool) -> &'static str {
@@ -3190,6 +3339,92 @@ mod tests {
         std::fs::remove_dir_all(&escape_dir).ok();
     }
 
+    /// Audit C2 (frozen): a fileChange touching a VCS/control directory is
+    /// NEVER routine — creating `.git/hooks/pre-commit` or rewriting
+    /// `.git/config` arms repository-controlled code execution (the trigger
+    /// half is suppressed in the backend's own git, this refuses the write
+    /// half); `.swarmz` is the Conductor's own control area. Component
+    /// match, case-insensitive, symlink-resolving — no `agitator.txt`
+    /// false positives.
+    #[test]
+    fn file_changes_into_vcs_control_dirs_are_destructive() {
+        let root = std::env::temp_dir().join(format!(
+            "swarmz-fc-vcs-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(root.join("sub/.git")).unwrap();
+        std::fs::create_dir_all(root.join(".swarmz/plans")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let cwd = root.to_string_lossy().into_owned();
+        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+
+        let change = |path: &str, kind: Value| {
+            json!({ "changes": [{ "path": path, "kind": kind, "diff": "d" }] })
+        };
+        let p = |rel: &str| root.join(rel).to_string_lossy().into_owned();
+
+        // creates/edits under protected components — all human, every VCS
+        for rel in [
+            ".git/hooks/pre-commit",
+            ".git/hooks/x",
+            "sub/.git/config-new",
+            ".hg/hgrc",
+            ".svn/hooks/post-commit",
+            ".swarmz/plans/evil.md",
+            ".swarmz/x",
+        ] {
+            assert_eq!(
+                classify_no_gh("fileChange", &change(&p(rel), json!({"type":"add"})), &cwd),
+                "destructive",
+                "create {rel} must be human"
+            );
+        }
+        // an in-place EDIT of .git/config is the classic vector → human
+        assert_eq!(
+            classify_no_gh(
+                "fileChange",
+                &change(&p(".git/config"), json!({"type":"update"})),
+                &cwd
+            ),
+            "destructive"
+        );
+        // case-insensitive (macOS filesystems are): .GIT == .git
+        assert_eq!(
+            classify_no_gh(
+                "fileChange",
+                &change(&p(".GIT/hooks/pre-commit"), json!({"type":"add"})),
+                &cwd
+            ),
+            "destructive"
+        );
+        // the symlink-resolved spelling: `hooks -> .git/hooks`, create
+        // `hooks/pre-commit` — lands in .git only after canonicalization
+        std::os::unix::fs::symlink(root.join(".git/hooks"), root.join("hooks")).unwrap();
+        assert_eq!(
+            classify_no_gh(
+                "fileChange",
+                &change(&p("hooks/pre-commit"), json!({"type":"add"})),
+                &cwd
+            ),
+            "destructive"
+        );
+        // NO false positives: names that merely CONTAIN the substrings stay
+        // routine when everything else is fine
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        for rel in ["agitator.txt", "digit.rs", ".gitignore", ".github/workflows/ci.yml"] {
+            assert_eq!(
+                classify_no_gh("fileChange", &change(&p(rel), json!({"type":"add"})), &cwd),
+                "routine",
+                "create {rel} must stay routine"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn path_within_resolves_and_fails_closed() {
         // non-existing paths compare lexically after `..`-rejection
@@ -3281,6 +3516,47 @@ mod tests {
         // human path: both pass
         assert!(conductor_access_gate(Access::Workspace, false).is_ok());
         assert!(conductor_access_gate(Access::Full, false).is_ok());
+    }
+
+    /// Audit C3 (frozen): the DETACHED REVIEW runs the same Conductor access
+    /// gate as send/steer — a human-granted FULL-access session refuses
+    /// BEFORE the resume/review touches the process at all. This closes the
+    /// full-access-reuse hole: under danger-full-access + approvalPolicy
+    /// "never" a review turn executes commands WITHOUT any approval the
+    /// review handler could cancel.
+    #[tokio::test]
+    async fn session_review_refuses_full_access_on_the_conductor_path() {
+        let sid = format!("c3-review-gate-test-{}", std::process::id());
+        let (tx, _rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
+        SESSIONS.lock().insert(
+            sid.clone(),
+            SessionState {
+                host: Arc::new(ProcessHost::new()),
+                thread_id: Some("t".into()),
+                generation: 1,
+                route_generation: 1,
+                profile: SessionProfile {
+                    cwd: "/repo".into(),
+                    model: None,
+                    effort: None,
+                    access: Access::Full,
+                },
+                current_turn_id: None,
+                busy: false,
+                access_override_pending: false,
+                pending_approvals: HashMap::new(),
+                compact_done: None,
+                sink: tx,
+                approval_counter: 0,
+            },
+        );
+        let err = session_review(&sid, "uncommitted", true).await.unwrap_err();
+        assert!(err.contains("FULL access"), "{err}");
+        assert!(err.contains("refused"), "{err}");
+        assert!(err.contains("review"), "{err}");
+        // the refused session is untouched
+        assert!(SESSIONS.lock().get(&sid).is_some());
+        SESSIONS.lock().remove(&sid);
     }
 
     /// Final hardening F11 (frozen): `adopt_generation` moves the event

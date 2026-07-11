@@ -86,17 +86,36 @@ let persistAutonomyTimer: ReturnType<typeof setTimeout> | null = null;
  * freshest state. Never rejects. */
 let autonomyWriteChain: Promise<void> = Promise.resolve();
 
+/** Immediate retries for a contended/transient budget write before failing
+ * closed — a truly persistent failure must not be treated as success. */
+const AUTONOMY_WRITE_RETRIES = 3;
+
 function writeAutonomyBudgetsNow(): Promise<void> {
-  autonomyWriteChain = autonomyWriteChain
-    .then(() => saveAutonomyBudgets(serializeAutonomyBudgets()))
-    .catch((e) => {
-      // never block quitting or invert overlapping writes on a failed write —
-      // but SURFACE it rather than treating a lost write as success: a
-      // swallowed autonomy-budget write means a tripped breaker / consumed
-      // budget may not have reached disk, so a relaunch could resume with a
-      // stale allowance. Visible in the console, at least.
-      console.error("[autonomy] failed to persist budget state:", e);
-    });
+  autonomyWriteChain = autonomyWriteChain.then(async () => {
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt <= AUTONOMY_WRITE_RETRIES; attempt++) {
+      try {
+        await saveAutonomyBudgets(serializeAutonomyBudgets());
+        return; // persisted — the durable copy now tracks the in-memory one
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    // Every attempt failed. A lost autonomy-budget write means a tripped
+    // breaker / consumed budget may NOT have reached disk, so a relaunch could
+    // resume with a silently stale (more permissive) allowance. Do NOT treat
+    // this as success: fail closed IN MEMORY (`latchAutonomyUnavailable`) so
+    // this run stops dispatching autonomous turns — no further un-persisted
+    // budget accrues, the breaker indicator lights (autonomyTripped now
+    // reflects the global latch), and the human message that clears it is the
+    // same authority that re-arms a breaker AND its write will persist. Never
+    // blocks quitting or inverts overlapping writes.
+    console.error(
+      "[autonomy] failed to persist budget state — pausing autonomy fail-closed:",
+      lastErr,
+    );
+    latchAutonomyUnavailable();
+  });
   return autonomyWriteChain;
 }
 

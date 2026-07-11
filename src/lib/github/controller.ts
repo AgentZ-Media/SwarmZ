@@ -246,22 +246,96 @@ async function syncGithubIntegration(): Promise<void> {
   }
 }
 
+/** Retry budget for the autonomous-writes FALLING edge (disable reaching Rust). */
+const AUTO_GH_DISARM_RETRIES = 5;
+const AUTO_GH_DISARM_RETRY_MS = 1_000;
+let autoGhDisarmRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function autonomousGithubOn(): boolean {
+  return useSwarm.getState().settings.autonomousGithubWrites === true;
+}
+
+/**
+ * The FALLING edge of the "Autonomous GitHub actions" toggle: disabling it
+ * MUST reach Rust, or the server-side gh-write classification keeps treating
+ * autonomous turns as allowed to write. Awaited + retried with backoff and,
+ * on PERSISTENT failure, fail-closed: the backend gate is the conjunction
+ * `integration_enabled && autonomous_gh_writes` (github.rs), so turning the
+ * master integration gate OFF also closes autonomous writes — that is our
+ * hard fallback, routed through the already-fail-closed master falling-edge
+ * (`disarmIntegrationNow`, triggered by the settings subscriber). A failed
+ * disable therefore NEVER leaves the autonomous gh-write permission armed.
+ */
+async function disarmAutonomousGithubNow(attempt = 0): Promise<void> {
+  if (!IS_TAURI || autonomousGithubOn()) return; // re-enabled meanwhile
+  try {
+    await setAutonomousGithubWrites(false);
+  } catch (e) {
+    if (autonomousGithubOn()) return; // re-enabled while we failed
+    if (attempt < AUTO_GH_DISARM_RETRIES) {
+      autoGhDisarmRetryTimer = setTimeout(
+        () => void disarmAutonomousGithubNow(attempt + 1),
+        AUTO_GH_DISARM_RETRY_MS,
+      );
+      return;
+    }
+    const msg = e instanceof Error ? e.message : String(e);
+    if (integrationOn()) {
+      // fail closed via the conjunction: drop the master integration gate. The
+      // settings subscriber's falling edge disarms it (awaited, retried), and
+      // integration-off makes the backend gate deny autonomous writes even if
+      // Rust never heard the autonomous-flag flip.
+      console.error(
+        "[github] failed to disarm autonomous gh writes — failing closed by disabling the integration gate:",
+        msg,
+      );
+      useSwarm.getState().updateSettings({ githubIntegration: false });
+      pushFleetEvent({
+        kind: "pr",
+        sessionId: "",
+        sessionName: "GitHub",
+        label: `Could not disable autonomous GitHub actions (${msg}) — GitHub integration was turned off to keep autonomous writes disabled`,
+      });
+    } else {
+      // integration already off → the conjunction ALREADY denies autonomous
+      // writes; nothing stays armed, just surface the failed mirror
+      console.error(
+        "[github] failed to disarm autonomous gh writes; integration is off so the backend gate already denies them:",
+        msg,
+      );
+      pushFleetEvent({
+        kind: "pr",
+        sessionId: "",
+        sessionName: "GitHub",
+        label: `Could not confirm autonomous GitHub actions were disabled in the backend (${msg}) — GitHub integration is off, so autonomous writes are blocked anyway`,
+      });
+    }
+  }
+}
+
 /**
  * Mirror the "Autonomous GitHub actions" toggle into Rust — independent of
  * the master integration gate: the server-side gh-write approval
  * classification consults it, so Rust must always know the current state.
- * Best-effort and TOLERANT: on a backend without the command yet (parallel
- * rollout) the invoke rejects and we only log — the TS-side
- * `guardOutwardGithub` still gates autonomous writes; this is the Rust twin.
+ * The two edges are asymmetric:
+ *   · ENABLING is best-effort/TOLERANT — a failed enable just leaves Rust
+ *     denying autonomous writes (the safe direction; on a backend without the
+ *     command yet the TS-side `guardOutwardGithub` still gates them);
+ *   · DISABLING is fail-closed (`disarmAutonomousGithubNow`): awaited, retried,
+ *     and finally the master-integration-gate fallback — a failed disable must
+ *     never leave the permission armed.
  */
 async function syncAutonomousGithubWrites(): Promise<void> {
   if (!IS_TAURI) return;
-  const enabled = !!useSwarm.getState().settings.autonomousGithubWrites;
+  if (!autonomousGithubOn()) {
+    await disarmAutonomousGithubNow();
+    return;
+  }
   try {
-    await setAutonomousGithubWrites(enabled);
+    await setAutonomousGithubWrites(true);
   } catch (e) {
     console.error(
-      "[github] autonomous-writes sync failed (non-fatal — backend may lack the command):",
+      "[github] autonomous-writes enable sync failed (non-fatal — writes stay denied in Rust):",
       e,
     );
   }
@@ -414,6 +488,10 @@ export function startGithubController(): () => void {
     if (disarmRetryTimer) {
       clearTimeout(disarmRetryTimer);
       disarmRetryTimer = null;
+    }
+    if (autoGhDisarmRetryTimer) {
+      clearTimeout(autoGhDisarmRetryTimer);
+      autoGhDisarmRetryTimer = null;
     }
   };
 }

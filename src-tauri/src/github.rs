@@ -955,12 +955,10 @@ pub fn pr_create(
     let bin = gh_bin(bin_override);
     let git = git_bin(git_override);
 
-    // the branch actually checked out in the given folder
+    // the branch actually checked out in the given folder (C1: through the
+    // suppression builder — local read, no transports, no hooks)
     let branch_out = output_with_timeout(
-        Command::new(git)
-            .arg("-C")
-            .arg(dir)
-            .args(["symbolic-ref", "--short", "-q", "HEAD"]),
+        crate::git::git_command(git, Path::new(dir)).args(["symbolic-ref", "--short", "-q", "HEAD"]),
         Duration::from_secs(10),
     )
     .map_err(|e| format!("git did not run: {e}"))?;
@@ -976,11 +974,12 @@ pub fn pr_create(
     };
     ensure_lane_branch(&branch, &default_branch)?;
 
-    // push the branch (plain push, NEVER --force)
+    // push the branch (plain push, NEVER --force). C1: the NET builder —
+    // hooks (pre-push!) suppressed, `ext::` remotes refused, ssh pinned to
+    // the stock binary; a repo config must not gain code execution through
+    // the backend's one network operation.
     let push = output_with_timeout(
-        Command::new(git_bin(git_override))
-            .arg("-C")
-            .arg(dir)
+        crate::git::git_command_net(git_bin(git_override), Path::new(dir))
             .args(["push", "-u", "origin", &branch]),
         GH_WRITE_TIMEOUT,
     )
