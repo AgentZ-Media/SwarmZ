@@ -78,6 +78,33 @@ pub fn integration_enabled() -> bool {
     INTEGRATION_ENABLED.load(Ordering::SeqCst)
 }
 
+/// The AUTONOMOUS-writes opt-in, mirrored from Settings
+/// (`github_set_autonomous_writes`) — final hardening F2. FAIL-CLOSED
+/// default: even with the integration master toggle ON, agent-run gh WRITE
+/// approvals (`gh pr comment`/`gh pr review`) classify destructive and the
+/// Conductor's strict `decide_approval` path refuses them until the user
+/// explicitly opts in to autonomous GitHub writes. A prompt-injected agent
+/// can therefore never get a PR approved/commented autonomously while the
+/// opt-in is off — the human decides.
+static AUTONOMOUS_GH_WRITES: AtomicBool = AtomicBool::new(false);
+
+/// Sync the autonomous-writes opt-in (plain atomic — the strict approval
+/// path re-reads it LIVE at respond time, so a flip applies immediately).
+pub fn set_autonomous_writes(enabled: bool) {
+    AUTONOMOUS_GH_WRITES.store(enabled, Ordering::SeqCst);
+}
+
+pub fn autonomous_gh_writes() -> bool {
+    AUTONOMOUS_GH_WRITES.load(Ordering::SeqCst)
+}
+
+/// The Rust-side gate for AGENT-run gh writes (classification + the strict
+/// Conductor respond path): master toggle AND autonomous opt-in — both must
+/// be on for a gh write approval to be routine-decidable by the Conductor.
+pub fn agent_gh_writes_allowed() -> bool {
+    integration_enabled() && autonomous_gh_writes()
+}
+
 /// In-flight gh/git WRITE ops (pr_create/comment/review) — a `git push` or a
 /// PR mutation mid-flight. The quit guard reads this so quitting mid-write
 /// warns instead of killing a push (`gh_writes` in the QuitConfirm dialog).
@@ -1571,6 +1598,34 @@ mod tests {
         assert!(pr_comment("/nonexistent", 1, "   ", None).is_err());
         assert!(pr_review("/nonexistent", 1, "merge", None, None).is_err());
         assert!(pr_review("/nonexistent", 1, "comment", None, None).is_err(), "comment review needs a body");
+        set_integration(false);
+    }
+
+    /// Final hardening F2 (frozen): agent-run gh writes are gated on the
+    /// CONJUNCTION of the integration master toggle and the
+    /// autonomous-writes opt-in — either flag off means the Conductor's
+    /// strict approval path refuses (a prompt-injected agent can never get
+    /// a PR approved/commented autonomously without the explicit opt-in).
+    #[test]
+    fn agent_gh_writes_require_integration_and_autonomous_opt_in() {
+        let _serial = GATE_TEST_LOCK.lock();
+        // fail-closed defaults: both flags start (and end) off
+        set_integration(false);
+        set_autonomous_writes(false);
+        assert!(!agent_gh_writes_allowed());
+        // integration alone is NOT enough — the opt-in is required
+        set_integration(true);
+        assert!(!agent_gh_writes_allowed());
+        // the opt-in alone is not enough either
+        set_integration(false);
+        set_autonomous_writes(true);
+        assert!(!agent_gh_writes_allowed());
+        // only BOTH open the agent-side gate
+        set_integration(true);
+        assert!(agent_gh_writes_allowed());
+        // and it closes again the moment either flag drops
+        set_autonomous_writes(false);
+        assert!(!agent_gh_writes_allowed());
         set_integration(false);
     }
 

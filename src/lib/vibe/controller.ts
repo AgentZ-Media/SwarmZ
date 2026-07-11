@@ -118,11 +118,15 @@ function invokeSend(
   sessionId: string,
   text: string,
   outputSchema?: Record<string, unknown>,
+  requireWorkspace?: boolean,
 ): Promise<{ turn_id: string | null }> {
   return invoke("vibe_session_send", {
     sessionId,
     text,
     outputSchema: outputSchema ?? null,
+    // the Conductor path passes true → Rust refuses a full-access session
+    // (capability-reuse guard), authoritative at the backend boundary
+    requireWorkspace: requireWorkspace ?? false,
   });
 }
 
@@ -173,8 +177,13 @@ function invokeClose(sessionId: string): Promise<void> {
 function invokeSteer(
   sessionId: string,
   text: string,
+  requireWorkspace?: boolean,
 ): Promise<{ turn_id: string | null; steered: boolean }> {
-  return invoke("vibe_session_steer", { sessionId, text });
+  return invoke("vibe_session_steer", {
+    sessionId,
+    text,
+    requireWorkspace: requireWorkspace ?? false,
+  });
 }
 
 function invokeSetCwd(sessionId: string, cwd: string): Promise<void> {
@@ -914,6 +923,13 @@ export interface SendTurnOpts {
    * executors pass this — the human composer never does.
    */
   via?: "conductor";
+  /**
+   * Conductor path only: asks Rust to REFUSE the turn if the target session
+   * runs at `full` access (the capability-reuse guard — the Conductor may not
+   * autonomously drive a human-granted full-access agent). The human composer
+   * never sets this.
+   */
+  requireWorkspace?: boolean;
 }
 
 /**
@@ -938,7 +954,12 @@ async function deliverTurn(
   if (opts?.outputSchema) schemaTurns.set(sessionId, { turnId: null });
   try {
     await resumeSession(sessionId);
-    const res = await invokeSend(sessionId, trimmed, opts?.outputSchema);
+    const res = await invokeSend(
+      sessionId,
+      trimmed,
+      opts?.outputSchema,
+      opts?.requireWorkspace,
+    );
     // send returns after the turn/start ack — busy stays true until the turn
     // completion event clears it
     if (opts?.outputSchema) {
@@ -1034,7 +1055,7 @@ export async function steerMessageStrict(
   }
   ensureEvents();
   try {
-    const res = await invokeSteer(sessionId, trimmed);
+    const res = await invokeSteer(sessionId, trimmed, opts?.requireWorkspace);
     // steered into the running turn — NOW mirror the text (confirmed)
     useVibe.getState().upsertItem(sessionId, {
       id: `user-${nanoid(8)}`,

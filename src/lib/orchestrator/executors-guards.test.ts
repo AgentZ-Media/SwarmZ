@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  approvalLooksLikeGithubWrite,
   redactRemoteUrl,
   resolveAgentAccess,
   sanitizeAgentName,
@@ -54,5 +55,42 @@ describe("redactRemoteUrl (T7)", () => {
     expect(redactRemoteUrl("git@github.com:o/r.git")).toBe(
       "git@github.com:o/r.git",
     );
+  });
+});
+
+describe("approvalLooksLikeGithubWrite (TF5)", () => {
+  const cmd = (command: unknown) => ({
+    approvalKind: "command" as const,
+    payload: { command },
+  });
+
+  it("detects outward gh/git writes (string or argv command)", () => {
+    expect(approvalLooksLikeGithubWrite(cmd("git push origin HEAD"))).toBe(true);
+    expect(approvalLooksLikeGithubWrite(cmd("gh pr create --fill"))).toBe(true);
+    expect(approvalLooksLikeGithubWrite(cmd("gh pr comment 12 -b hi"))).toBe(true);
+    expect(approvalLooksLikeGithubWrite(cmd("gh pr merge 12"))).toBe(true);
+    expect(approvalLooksLikeGithubWrite(cmd("gh release create v1"))).toBe(true);
+    expect(approvalLooksLikeGithubWrite(cmd("gh issue create -t x"))).toBe(true);
+    expect(approvalLooksLikeGithubWrite(cmd("gh api -X POST repos/o/r/issues"))).toBe(
+      true,
+    );
+    // argv form (codex passes commands as arrays)
+    expect(
+      approvalLooksLikeGithubWrite(cmd(["gh", "pr", "review", "12", "--approve"])),
+    ).toBe(true);
+  });
+
+  it("does NOT flag reads, unrelated commands, or file-change approvals", () => {
+    expect(approvalLooksLikeGithubWrite(cmd("gh pr view 12"))).toBe(false);
+    expect(approvalLooksLikeGithubWrite(cmd("gh pr list"))).toBe(false);
+    expect(approvalLooksLikeGithubWrite(cmd("git status"))).toBe(false);
+    expect(approvalLooksLikeGithubWrite(cmd("ls -la"))).toBe(false);
+    expect(approvalLooksLikeGithubWrite(cmd(undefined))).toBe(false);
+    expect(
+      approvalLooksLikeGithubWrite({
+        approvalKind: "fileChange",
+        payload: { command: "git push" }, // wrong kind — not a command approval
+      }),
+    ).toBe(false);
   });
 });

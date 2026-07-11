@@ -89,8 +89,13 @@ let autonomyWriteChain: Promise<void> = Promise.resolve();
 function writeAutonomyBudgetsNow(): Promise<void> {
   autonomyWriteChain = autonomyWriteChain
     .then(() => saveAutonomyBudgets(serializeAutonomyBudgets()))
-    .catch(() => {
-      /* never block quitting on a failed write */
+    .catch((e) => {
+      // never block quitting or invert overlapping writes on a failed write —
+      // but SURFACE it rather than treating a lost write as success: a
+      // swallowed autonomy-budget write means a tripped breaker / consumed
+      // budget may not have reached disk, so a relaunch could resume with a
+      // stale allowance. Visible in the console, at least.
+      console.error("[autonomy] failed to persist budget state:", e);
     });
   return autonomyWriteChain;
 }

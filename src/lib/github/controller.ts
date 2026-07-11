@@ -26,6 +26,7 @@ import {
   fetchGhAuthStatus,
   fetchGhPrList,
   fetchGhRepoInfo,
+  setAutonomousGithubWrites,
   setGithubIntegration,
 } from "./api";
 import { describeGhUnavailable, prEventLabel } from "./core";
@@ -245,6 +246,27 @@ async function syncGithubIntegration(): Promise<void> {
   }
 }
 
+/**
+ * Mirror the "Autonomous GitHub actions" toggle into Rust — independent of
+ * the master integration gate: the server-side gh-write approval
+ * classification consults it, so Rust must always know the current state.
+ * Best-effort and TOLERANT: on a backend without the command yet (parallel
+ * rollout) the invoke rejects and we only log — the TS-side
+ * `guardOutwardGithub` still gates autonomous writes; this is the Rust twin.
+ */
+async function syncAutonomousGithubWrites(): Promise<void> {
+  if (!IS_TAURI) return;
+  const enabled = !!useSwarm.getState().settings.autonomousGithubWrites;
+  try {
+    await setAutonomousGithubWrites(enabled);
+  } catch (e) {
+    console.error(
+      "[github] autonomous-writes sync failed (non-fatal — backend may lack the command):",
+      e,
+    );
+  }
+}
+
 // ---- watch_pr (Conductor tool surface) ----
 
 /** Watch a PR: its watcher changes wake the Conductor. This-app-run only. */
@@ -360,6 +382,10 @@ export function startGithubController(): () => void {
     ) {
       scheduleSync();
     }
+    // the autonomous-writes gate mirrors independently of the master toggle
+    if (a.autonomousGithubWrites !== b.autonomousGithubWrites) {
+      void syncAutonomousGithubWrites();
+    }
   });
 
   // projects: opening/closing tabs changes what the watcher polls; a newly
@@ -373,6 +399,7 @@ export function startGithubController(): () => void {
   });
 
   scheduleSync();
+  void syncAutonomousGithubWrites(); // mirror the current state to Rust on start
   void refreshGithubAuth();
 
   return () => {

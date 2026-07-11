@@ -2,8 +2,9 @@
 //! `<repo>/.worktrees/<slug>`, copy the untracked environment over, report
 //! whether closing one would lose work, and remove it again. Unlike `git.rs`
 //! (strictly read-only) this module deliberately writes: `git worktree
-//! add/remove`, `git branch -D` and the repo-local `.git/info/exclude` entry
-//! (never the tracked `.gitignore`).
+//! add/remove`, the transactional branch deletion (`git update-ref -d` with
+//! the expected old OID) and the repo-local `.git/info/exclude` entry (never
+//! the tracked `.gitignore`).
 
 use crate::git::{git_bin, output_with_timeout};
 use serde::Serialize;
@@ -143,16 +144,20 @@ fn ensure_excluded(root: &Path) -> Result<(), String> {
     let info = git
         .ensure_dir("info")
         .map_err(|e| format!("refusing the .git/info component (symlink?): {e}"))?;
-    let current = match info.open_file("exclude") {
+    // bounded read — an exclude file is small; one BEYOND the cap refuses
+    // the rewrite entirely (final hardening F9: rewriting a truncated prefix
+    // would silently drop later exclude rules). An already-present entry
+    // needs no rewrite, so it passes either way.
+    const EXCLUDE_CAP: u64 = 1024 * 1024;
+    let (current, oversized) = match info.open_file("exclude") {
         Ok(Some(file)) => {
             let mut s = String::new();
-            // bounded — an exclude file is small; 1 MiB of it is plenty
-            std::io::Read::take(file, 1024 * 1024)
+            let read = std::io::Read::take(file, EXCLUDE_CAP + 1)
                 .read_to_string(&mut s)
                 .map_err(|e| e.to_string())?;
-            s
+            (s, read as u64 > EXCLUDE_CAP)
         }
-        Ok(None) => String::new(),
+        Ok(None) => (String::new(), false),
         Err(e) => return Err(format!("refusing the exclude file (symlink?): {e}")),
     };
     let has_entry = current.lines().any(|l| {
@@ -160,6 +165,11 @@ fn ensure_excluded(root: &Path) -> Result<(), String> {
     });
     if has_entry {
         return Ok(());
+    }
+    if oversized {
+        return Err(format!(
+            ".git/info/exclude is larger than {EXCLUDE_CAP} bytes — refusing to rewrite it (add the /.worktrees/ entry manually)"
+        ));
     }
     let mut next = current;
     if !next.is_empty() && !next.ends_with('\n') {
@@ -263,20 +273,25 @@ pub fn add(
     run(bin, &root, &["check-ref-format", "--branch", branch])
         .map_err(|_| format!("\"{branch}\" is not a valid branch name"))?;
 
-    // audit R4: a symlinked `.worktrees` would redirect the whole checkout
-    // (and the env copy — .env files included) to an arbitrary host folder
+    // audit R4 + final hardening F8: a symlinked `.worktrees` would redirect
+    // the whole checkout (and the env copy — .env files included) to an
+    // arbitrary host folder. The container is created/opened through an
+    // ANCHORED no-follow handle (`fsx::DirHandle`) — a pre-planted symlink
+    // refuses — and kept open across the git call: after `git worktree add`,
+    // the slug is re-verified THROUGH the anchored fd. A concurrent swap of
+    // `.worktrees` between the open and the (path-based) git checkout lands
+    // the worktree somewhere else — the anchored re-check then finds no slug
+    // under the REAL container, the add rolls back and refuses BEFORE any
+    // env file (.env, keys) is copied.
     let container = root.join(WORKTREES_DIR);
-    if container
-        .symlink_metadata()
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return Err(format!(
-            "refusing: {} is a symlink — worktrees must live in a real folder",
-            container.display()
-        ));
-    }
-    let path = container.join(slug(branch));
+    let container_handle = {
+        let root_handle = crate::fsx::DirHandle::open_root(&root)?;
+        root_handle.ensure_dir(WORKTREES_DIR).map_err(|e| {
+            format!("refusing {}: {e}", container.display())
+        })?
+    };
+    let slug_name = slug(branch);
+    let path = container.join(&slug_name);
     if path.exists() {
         return Err(format!(
             "worktree folder already exists: {}",
@@ -287,6 +302,21 @@ pub fn add(
 
     let path_str = path.to_string_lossy().into_owned();
     run(bin, &root, &["worktree", "add", "-b", branch, &path_str])?;
+
+    // F8 post-add verification through the ANCHORED handle: the checkout
+    // must exist as a real directory under the container fd opened above —
+    // not under whatever `.worktrees` resolves to NOW. Failure = the
+    // container was swapped mid-add; roll the checkout back (fresh branch,
+    // no commits yet) and refuse.
+    if container_handle.open_dir(&slug_name).is_err() {
+        let _ = run(bin, &root, &["worktree", "remove", "--force", &path_str]);
+        let _ = run(bin, &root, &["worktree", "prune"]);
+        let _ = run(bin, &root, &["branch", "-D", branch]);
+        return Err(format!(
+            "refusing: {} was redirected while the worktree was created (symlink swap?)",
+            container.display()
+        ));
+    }
 
     let copied = if copy_env {
         copy_environment(bin, &root, &path)
@@ -300,6 +330,65 @@ pub fn add(
         branch: branch.to_string(),
         copied,
     })
+}
+
+/// Current tip OID of a local branch (None = branch missing/unreadable).
+fn branch_oid(bin: &str, root: &Path, branch: &str) -> Option<String> {
+    run(
+        bin,
+        root,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    )
+    .ok()
+    .filter(|s| !s.is_empty())
+}
+
+/// Is `branch` currently checked out in ANY worktree (incl. the main
+/// checkout)? Unreadable state counts as checked out (fail closed) — a
+/// branch we can't verify is never deleted.
+fn branch_checked_out_somewhere(bin: &str, root: &Path, branch: &str) -> bool {
+    match run(bin, root, &["worktree", "list", "--porcelain"]) {
+        Ok(p) => {
+            let needle = format!("branch refs/heads/{branch}");
+            p.lines().any(|l| l.trim() == needle)
+        }
+        Err(_) => true,
+    }
+}
+
+/// TRANSACTIONAL branch deletion (final hardening F3): delete
+/// `refs/heads/<branch>` ONLY if its tip still equals `expected_oid` — via
+/// `git update-ref -d <ref> <expected-old-oid>`, which fails atomically when
+/// the OID moved. This closes the check/delete race `git branch -D` had:
+/// after the ahead/dirty re-check, another process could land a fresh commit
+/// (making the worktree clean enough for `git worktree remove` to accept),
+/// and an unconditional `branch -D` would then delete the branch WITH that
+/// new commit. With the expected-OID delete, a moved tip survives — losing a
+/// branch pointer is recoverable annoyance, losing a commit is data loss.
+/// Also refuses while the branch is checked out anywhere (`update-ref -d`
+/// does not protect checkouts the way `branch -D` does).
+fn delete_branch_transactional(
+    bin: &str,
+    root: &Path,
+    branch: &str,
+    expected_oid: &str,
+) -> Result<(), String> {
+    if branch_checked_out_somewhere(bin, root, branch) {
+        return Err(format!(
+            "branch \"{branch}\" is checked out in a worktree — not deleting it"
+        ));
+    }
+    run(
+        bin,
+        root,
+        &[
+            "update-ref",
+            "-d",
+            &format!("refs/heads/{branch}"),
+            expected_oid,
+        ],
+    )
+    .map(|_| ())
 }
 
 /// Commits reachable only from `branch` — not from any other local branch
@@ -416,7 +505,13 @@ fn find_registered_worktree(
 ///     removal — dirty, local-only commits or an UNCOMPUTABLE ahead count
 ///     refuse — and the `git worktree remove` runs WITHOUT `--force`, so git
 ///     itself refuses work that appeared between the check and the removal
-///     (the TOCTOU net; copied gitignored env files don't block it).
+///     (the TOCTOU net; copied gitignored env files don't block it),
+///   - the branch deletion is TRANSACTIONAL (final hardening F3): the tip
+///     OID is captured BEFORE the removal and the delete runs as
+///     `git update-ref -d <ref> <expected-oid>` — a commit that lands in the
+///     race window moves the tip, the delete fails and the branch (with the
+///     new commit) survives. A branch still checked out anywhere is never
+///     deleted either.
 pub fn remove(
     root: &str,
     path: &str,
@@ -453,6 +548,12 @@ pub fn remove(
             ));
         }
     }
+    // F3: capture the branch tip BEFORE any check/removal — the branch
+    // deletion at the end is transactional against exactly this OID, so a
+    // commit landing anywhere in the race window keeps the branch alive.
+    let expected_oid = derived_branch
+        .as_ref()
+        .and_then(|b| branch_oid(bin, &root_p, b));
 
     if Path::new(&registered_path).exists() {
         if force {
@@ -505,10 +606,13 @@ pub fn remove(
             }
         }
     }
-    // best-effort, DERIVED branch only: it may be checked out elsewhere or
-    // already gone; a caller-named branch is never deleted on its own
-    if let Some(derived) = &derived_branch {
-        let _ = run(bin, &root_p, &["branch", "-D", derived]);
+    // best-effort, DERIVED branch only, TRANSACTIONAL (F3): deleted via
+    // `update-ref -d` against the tip captured BEFORE the removal — a tip
+    // that moved in between (fresh commit from another process) survives,
+    // as does a branch still checked out somewhere. A caller-named branch
+    // is never deleted on its own.
+    if let (Some(derived), Some(oid)) = (&derived_branch, &expected_oid) {
+        let _ = delete_branch_transactional(bin, &root_p, derived, oid);
     }
     Ok(())
 }
@@ -811,6 +915,87 @@ mod tests {
         assert!(err.contains("symlink"), "{err}");
         fs::remove_dir_all(&repo).ok();
         fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Final hardening F3 (frozen): the branch deletion is transactional —
+    /// a tip that MOVED after the OID capture (the race: another process
+    /// lands a commit between the ahead re-check and the delete) survives;
+    /// only the expected OID deletes.
+    #[test]
+    fn branch_delete_is_transactional_against_oid_movement() {
+        let repo = temp_repo();
+        let bin = git_bin(None);
+        let g = |args: &[&str]| run(bin, &repo, args).unwrap();
+        g(&["branch", "swarm/txn"]);
+        let oid_a = branch_oid(bin, &repo, "swarm/txn").expect("branch tip");
+        // the race: a fresh commit moves the branch tip after the capture
+        fs::write(repo.join("a.txt"), "moved").unwrap();
+        g(&["add", "a.txt"]);
+        g(&["commit", "-qm", "race commit"]);
+        g(&["branch", "-f", "swarm/txn", "HEAD"]);
+        let oid_b = branch_oid(bin, &repo, "swarm/txn").expect("moved tip");
+        assert_ne!(oid_a, oid_b, "the tip must have moved");
+        // deleting against the STALE oid fails — the branch (and the new
+        // commit) survive
+        assert!(
+            delete_branch_transactional(bin, &repo, "swarm/txn", &oid_a).is_err(),
+            "a moved tip must refuse the delete"
+        );
+        assert_eq!(
+            branch_oid(bin, &repo, "swarm/txn").as_deref(),
+            Some(oid_b.as_str()),
+            "the branch with the racing commit must survive"
+        );
+        // against the CURRENT oid the delete goes through
+        delete_branch_transactional(bin, &repo, "swarm/txn", &oid_b).unwrap();
+        assert!(branch_oid(bin, &repo, "swarm/txn").is_none());
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// F3 companion: a branch checked out ANYWHERE (worktree or the main
+    /// checkout) is never deleted — `update-ref -d` would not protect that
+    /// the way `branch -D` did, so the transactional path re-checks it.
+    #[test]
+    fn branch_delete_refuses_checked_out_branches() {
+        let repo = temp_repo();
+        let bin = git_bin(None);
+        let cwd = repo.to_string_lossy().into_owned();
+        let info = add(&cwd, "test/checkedout", false, None).unwrap();
+        let oid = branch_oid(bin, &repo, &info.branch).expect("worktree branch tip");
+        let err = delete_branch_transactional(bin, &repo, &info.branch, &oid).unwrap_err();
+        assert!(err.contains("checked out"), "{err}");
+        assert!(branch_oid(bin, &repo, &info.branch).is_some(), "branch survives");
+        // the main checkout's branch refuses too
+        let main_oid = branch_oid(bin, &repo, "main").expect("main tip");
+        assert!(delete_branch_transactional(bin, &repo, "main", &main_oid).is_err());
+        assert!(branch_oid(bin, &repo, "main").is_some());
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Final hardening F9 (frozen): an exclude file beyond the bounded-read
+    /// cap refuses the rewrite — a truncated-prefix rewrite would silently
+    /// drop later exclude rules (potentially exposing ignored secrets).
+    #[test]
+    fn oversized_exclude_refuses_rewrite() {
+        let repo = temp_repo();
+        let cwd = repo.to_string_lossy().into_owned();
+        // an entry-less exclude just beyond 1 MiB
+        let big = format!("# padding\n{}\n", "x".repeat(1024 * 1024));
+        fs::write(repo.join(".git/info/exclude"), &big).unwrap();
+        let err = add(&cwd, "test/too-big", false, None).unwrap_err();
+        assert!(err.contains("refusing to rewrite"), "{err}");
+        // the exclude file was NOT truncated
+        assert_eq!(
+            fs::metadata(repo.join(".git/info/exclude")).unwrap().len(),
+            big.len() as u64,
+            "the oversized exclude must stay untouched"
+        );
+        // an oversized exclude that ALREADY has the entry needs no rewrite —
+        // the add passes
+        let big_with_entry = format!("/.worktrees/\n{}\n", "x".repeat(1024 * 1024));
+        fs::write(repo.join(".git/info/exclude"), &big_with_entry).unwrap();
+        add(&cwd, "test/big-but-present", false, None).unwrap();
+        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]

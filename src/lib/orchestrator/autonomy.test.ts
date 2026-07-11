@@ -158,11 +158,10 @@ describe("autonomy budget", () => {
     ).toBe(true);
   });
 
-  it("hydrate is hardened against junk and never clobbers live state", () => {
-    hydrateAutonomyBudgets(null);
-    hydrateAutonomyBudgets("garbage");
-    hydrateAutonomyBudgets({ projects: { p: { firedAt: "no", consecutive: "x", tripped: "yes" } } });
-    expect(autonomyTripped("p")).toBe(false);
+  it("a missing key (null/undefined) is tolerated; live state wins over a persisted copy", () => {
+    hydrateAutonomyBudgets(null); // genuinely absent — fresh install, no latch
+    hydrateAutonomyBudgets(undefined);
+    expect(autonomyUnavailable()).toBe(false);
     // live state wins over a persisted copy of the same project
     noteAutonomousTurn("q", T0);
     hydrateAutonomyBudgets(
@@ -267,5 +266,96 @@ describe("fail-closed load-failure latch (T3)", () => {
     resetAutonomyBudgets();
     expect(autonomyUnavailable()).toBe(false);
     expect(checkAutonomyBudget("p", T0).ok).toBe(true);
+  });
+});
+
+describe("present-but-invalid persisted budgets fail closed (TF6)", () => {
+  it("a corrupt ENVELOPE latches instead of minting fresh state", () => {
+    hydrateAutonomyBudgets("garbage");
+    expect(autonomyUnavailable()).toBe(true);
+  });
+
+  it("a missing or unknown schema version latches", () => {
+    hydrateAutonomyBudgets({
+      projects: { p: { firedAt: [], consecutive: 0, tripped: false } },
+    });
+    expect(autonomyUnavailable()).toBe(true);
+    resetAutonomyBudgets();
+    hydrateAutonomyBudgets({ version: 2, projects: {} });
+    expect(autonomyUnavailable()).toBe(true);
+  });
+
+  it("a non-object projects field (array/null) latches", () => {
+    hydrateAutonomyBudgets({ version: 1, projects: [] });
+    expect(autonomyUnavailable()).toBe(true);
+    resetAutonomyBudgets();
+    hydrateAutonomyBudgets({ version: 1, projects: null });
+    expect(autonomyUnavailable()).toBe(true);
+  });
+
+  it("a corrupt entry that could HIDE a trip latches (tripped not a boolean)", () => {
+    // the exact un-latch risk: `tripped: "yes"` would coerce to false and
+    // silently open a latched breaker — fail closed instead
+    hydrateAutonomyBudgets({
+      version: 1,
+      projects: { p: { firedAt: [], consecutive: 0, tripped: "yes" } },
+    });
+    expect(autonomyUnavailable()).toBe(true);
+  });
+
+  it("negative/non-numeric consecutive or a non-array firedAt latches", () => {
+    hydrateAutonomyBudgets({
+      version: 1,
+      projects: { p: { firedAt: [], consecutive: -3, tripped: false } },
+    });
+    expect(autonomyUnavailable()).toBe(true);
+    resetAutonomyBudgets();
+    hydrateAutonomyBudgets({
+      version: 1,
+      projects: { p: { firedAt: "no", consecutive: 0, tripped: false } },
+    });
+    expect(autonomyUnavailable()).toBe(true);
+    resetAutonomyBudgets();
+    hydrateAutonomyBudgets({
+      version: 1,
+      projects: { p: { firedAt: [], consecutive: "x", tripped: false } },
+    });
+    expect(autonomyUnavailable()).toBe(true);
+  });
+
+  it("a corrupt entry fails closed even after an earlier VALID entry applied", () => {
+    hydrateAutonomyBudgets(
+      {
+        version: 1,
+        projects: {
+          a: { firedAt: [], consecutive: 2, tripped: false },
+          b: { firedAt: [], consecutive: 0, tripped: 3 },
+        },
+      },
+      T0,
+    );
+    expect(autonomyUnavailable()).toBe(true); // the whole load is untrusted
+  });
+
+  it("a well-formed empty envelope hydrates cleanly (no false latch)", () => {
+    hydrateAutonomyBudgets({ version: 1, projects: {} });
+    expect(autonomyUnavailable()).toBe(false);
+  });
+
+  it("valid entries (incl. a tripped one, a huge clamped consecutive) restore without latching", () => {
+    hydrateAutonomyBudgets(
+      {
+        version: 1,
+        projects: {
+          p: { firedAt: [], consecutive: 0, tripped: true },
+          q: { firedAt: [], consecutive: 9_999_999, tripped: false },
+        },
+      },
+      T0,
+    );
+    expect(autonomyUnavailable()).toBe(false);
+    expect(autonomyTripped("p")).toBe(true);
+    // a huge-but-positive consecutive is clamped (still restrictive), not junk
+    expect(checkAutonomyBudget("q", T0 + 1).ok).toBe(false);
   });
 });

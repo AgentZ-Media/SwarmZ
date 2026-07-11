@@ -255,7 +255,7 @@ async fn leased_conn(
         match &*cache {
             Some((g, s)) if *g == generation => s.clone(),
             _ => {
-                let (tx, rx) = mpsc::unbounded_channel();
+                let (tx, rx) = mpsc::channel(crate::codex::host::ROUTE_CHANNEL_CAPACITY);
                 spawn_gen_dispatcher(
                     app.clone(),
                     project_id.to_string(),
@@ -390,7 +390,7 @@ fn spawn_gen_dispatcher(
     project_id: String,
     instance: Arc<Instance>,
     generation: u64,
-    mut rx: mpsc::UnboundedReceiver<ThreadEvent>,
+    mut rx: mpsc::Receiver<ThreadEvent>,
 ) {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
@@ -1426,7 +1426,7 @@ mod tests {
         host: ProcessHost,
         conn: Arc<Connection>,
         generation: u64,
-        sink_rx: mpsc::UnboundedReceiver<ThreadEvent>,
+        sink_rx: mpsc::Receiver<ThreadEvent>,
         thread_id: String,
     }
 
@@ -1453,7 +1453,7 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("thread id")
             .to_string();
-        let (sink_tx, sink_rx) = mpsc::unbounded_channel();
+        let (sink_tx, sink_rx) = mpsc::channel(crate::codex::host::ROUTE_CHANNEL_CAPACITY);
         conn.register_thread(&thread_id, sink_tx);
         println!("[{label}] thread started: {thread_id} (cwd {})", project.dir);
         SpikeConductor {
@@ -1613,7 +1613,7 @@ mod tests {
         )
         .await
         .expect("thread/resume after respawn");
-        let (sink_tx, sink_rx) = mpsc::unbounded_channel();
+        let (sink_tx, sink_rx) = mpsc::channel(crate::codex::host::ROUTE_CHANNEL_CAPACITY);
         conn2.register_thread(&a.thread_id, sink_tx);
         a.conn = conn2;
         a.generation = gen2;
@@ -1697,7 +1697,7 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap()
             .to_string();
-        let (atx, mut arx) = mpsc::unbounded_channel();
+        let (atx, mut arx) = mpsc::channel(crate::codex::host::ROUTE_CHANNEL_CAPACITY);
         agent_conn.register_thread(&agent_tid, atx);
         agent_conn
             .request(
@@ -1772,7 +1772,7 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap()
             .to_string();
-        let (ctx, mut crx) = mpsc::unbounded_channel();
+        let (ctx, mut crx) = mpsc::channel(crate::codex::host::ROUTE_CHANNEL_CAPACITY);
         cond_conn.register_thread(&cond_tid, ctx);
         // the EXACT wire shape the trigger router builds (triggers-core.ts)
         let wire = format!(
@@ -1958,7 +1958,7 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap()
             .to_string();
-        let (ctx, mut crx) = mpsc::unbounded_channel();
+        let (ctx, mut crx) = mpsc::channel(crate::codex::host::ROUTE_CHANNEL_CAPACITY);
         cond_conn.register_thread(&cond_tid, ctx);
         cond_conn
             .request(
@@ -2093,7 +2093,7 @@ mod tests {
                 .await
                 .expect("agent thread/start");
             let tid = started.pointer("/thread/id").and_then(|v| v.as_str()).unwrap().to_string();
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::channel(crate::codex::host::ROUTE_CHANNEL_CAPACITY);
             conn.register_thread(&tid, tx);
             let mut turn = json!({
                 "threadId": tid,
@@ -2248,13 +2248,13 @@ mod tests {
             .await
             .expect("thread/start");
         let tid = started.pointer("/thread/id").and_then(|v| v.as_str()).unwrap().to_string();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(crate::codex::host::ROUTE_CHANNEL_CAPACITY);
         conn.register_thread(&tid, tx);
 
         // drive one turn/method and collect (final_message, saw_compaction)
         async fn drive(
             conn: &Arc<Connection>,
-            rx: &mut mpsc::UnboundedReceiver<ThreadEvent>,
+            rx: &mut mpsc::Receiver<ThreadEvent>,
             method: &str,
             params: Value,
         ) -> (String, bool) {

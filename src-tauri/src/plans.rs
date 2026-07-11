@@ -185,16 +185,23 @@ fn ensure_excluded(project_dir: &str) {
     let Ok(info) = git.ensure_dir("info") else {
         return;
     };
-    let current = match info.open_file("exclude") {
+    // bounded: an exclude file is small; one BEYOND the cap skips the
+    // rewrite entirely (final hardening F9 — a truncated-prefix rewrite
+    // would silently drop later exclude rules). An already-present entry
+    // needs no rewrite, so it passes either way.
+    const EXCLUDE_CAP: u64 = 1024 * 1024;
+    let (current, oversized) = match info.open_file("exclude") {
         Ok(Some(file)) => {
             let mut s = String::new();
-            // bounded: an exclude file is small; 1 MiB of it is plenty
-            if file.take(1024 * 1024).read_to_string(&mut s).is_err() {
-                return;
+            match file.take(EXCLUDE_CAP + 1).read_to_string(&mut s) {
+                Ok(read) => {
+                    let over = read as u64 > EXCLUDE_CAP;
+                    (s, over)
+                }
+                Err(_) => return,
             }
-            s
         }
-        Ok(None) => String::new(),
+        Ok(None) => (String::new(), false),
         Err(_) => return, // symlinked/non-regular exclude — leave it alone
     };
     let has_entry = current.lines().any(|l| {
@@ -202,6 +209,9 @@ fn ensure_excluded(project_dir: &str) {
     });
     if has_entry {
         return;
+    }
+    if oversized {
+        return; // F9: never rewrite a truncated prefix (best-effort skip)
     }
     let mut next = current;
     if !next.is_empty() && !next.ends_with('\n') {
@@ -496,6 +506,25 @@ mod tests {
         for t in ["Hello World", "ÄÖÜ", "a__b", "9 lives", "--"] {
             assert!(is_valid_slug(&slugify(t)), "slugify({t:?}) invalid");
         }
+    }
+
+    /// Final hardening F9 (frozen): an exclude file beyond the bounded-read
+    /// cap is never rewritten from a truncated prefix — the best-effort
+    /// exclusion silently skips, the plan write itself still succeeds and
+    /// the oversized exclude stays byte-identical.
+    #[test]
+    fn oversized_exclude_is_never_truncate_rewritten() {
+        let project = temp_project();
+        let dir = project.to_string_lossy().into_owned();
+        // a real .git/info with an entry-less exclude just beyond 1 MiB
+        fs::create_dir_all(project.join(".git/info")).unwrap();
+        let big = format!("# padding\n{}\n", "y".repeat(1024 * 1024));
+        fs::write(project.join(".git/info/exclude"), &big).unwrap();
+        write(&dir, "Big Exclude", "still writes\n").unwrap();
+        let after = fs::read(project.join(".git/info/exclude")).unwrap();
+        assert_eq!(after.len(), big.len(), "the oversized exclude must stay untouched");
+        assert!(!String::from_utf8_lossy(&after).contains(".swarmz"));
+        fs::remove_dir_all(&project).ok();
     }
 
     #[test]

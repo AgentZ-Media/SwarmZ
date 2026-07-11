@@ -277,48 +277,96 @@ export function serializeAutonomyBudgets(
 }
 
 /**
+ * Parse one persisted budget entry. Returns the ProjectBudget, `null` when the
+ * entry is structurally VALID but empty (nothing to remember — skip it), or
+ * the `INVALID` sentinel when the entry is CORRUPT in a way that could HIDE a
+ * tripped breaker (wrong-typed `tripped`, a negative/non-numeric `consecutive`,
+ * a non-array `firedAt`, or not an object at all). A corrupt entry must
+ * fail-closed, never silently coerce a latched breaker to open.
+ */
+const INVALID_BUDGET = Symbol("invalid-budget");
+function parseBudgetEntry(
+  raw: unknown,
+  now: number,
+): ProjectBudget | null | typeof INVALID_BUDGET {
+  if (!raw || typeof raw !== "object") return INVALID_BUDGET;
+  const r = raw as Record<string, unknown>;
+  // `tripped` MUST be a real boolean — a corrupt/truthy-but-not-true value
+  // could mask a latched breaker; fail closed rather than read it as `false`.
+  if (typeof r.tripped !== "boolean") return INVALID_BUDGET;
+  // `consecutive` MUST be a finite, non-negative number (absurd/negative → fail
+  // closed); a huge-but-positive value is clamped, still restrictive.
+  if (
+    typeof r.consecutive !== "number" ||
+    !Number.isFinite(r.consecutive) ||
+    r.consecutive < 0
+  )
+    return INVALID_BUDGET;
+  // `firedAt` MUST be an array; individual junk timestamps are still filtered
+  // (element-level noise can't hide a trip — the `tripped` flag carries that).
+  if (!Array.isArray(r.firedAt)) return INVALID_BUDGET;
+  const firedAt = r.firedAt
+    .filter(
+      (t): t is number =>
+        typeof t === "number" &&
+        Number.isFinite(t) &&
+        t > now - AUTONOMY_WINDOW_MS &&
+        t <= now + 60_000, // clock-skew grace; far-future junk drops
+    )
+    .slice(0, 100);
+  const consecutive = Math.min(Math.floor(r.consecutive), 1000);
+  const tripped = r.tripped;
+  if (!tripped && consecutive === 0 && firedAt.length === 0) return null;
+  return { firedAt, consecutive, tripped };
+}
+
+/**
  * Hydrate the persisted budgets (store.ts, FIRST in hydrate() — before the
  * project hydration that gates every autonomous delivery path). Hardened
  * field by field; window entries outside the rolling hour are dropped.
  * Projects already touched in memory keep their live state (they can only
  * be MORE restrictive than a fresh boot). A tripped project stays tripped —
  * only a real human message re-arms it.
+ *
+ * `null`/`undefined` = a genuinely MISSING store key (fresh install) → no
+ * restriction. But a PRESENT-BUT-INVALID value (wrong shape / version, or a
+ * structurally corrupt entry) is treated exactly like a store READ ERROR:
+ * FAIL CLOSED (`latchAutonomyUnavailable`) — a corrupt persisted copy must
+ * never silently un-latch a tripped breaker or mint a fresh allowance. Only a
+ * human message clears it. (store.ts already latches when the LOAD itself
+ * throws; this covers a load that resolves to junk.)
  */
 export function hydrateAutonomyBudgets(
   data: unknown,
   now: number = Date.now(),
 ): void {
-  if (!data || typeof data !== "object") return;
-  const projects = (data as { projects?: unknown }).projects;
-  if (!projects || typeof projects !== "object") return;
+  // genuinely absent — fresh install, no restriction
+  if (data === null || data === undefined) return;
+  // present but not the expected envelope → fail closed
+  if (
+    typeof data !== "object" ||
+    (data as { version?: unknown }).version !== 1 ||
+    typeof (data as { projects?: unknown }).projects !== "object" ||
+    !(data as { projects?: unknown }).projects ||
+    Array.isArray((data as { projects?: unknown }).projects)
+  ) {
+    latchAutonomyUnavailable();
+    return;
+  }
+  const projects = (data as { projects: Record<string, unknown> }).projects;
   let anyTripped = false;
-  for (const [projectId, raw] of Object.entries(
-    projects as Record<string, unknown>,
-  )) {
-    if (!projectId || !raw || typeof raw !== "object") continue;
+  for (const [projectId, raw] of Object.entries(projects)) {
+    if (!projectId) continue; // an empty id addresses no project — skip
     if (budgets.has(projectId)) continue; // live state wins
-    const r = raw as Record<string, unknown>;
-    const firedAt = Array.isArray(r.firedAt)
-      ? r.firedAt
-          .filter(
-            (t): t is number =>
-              typeof t === "number" &&
-              Number.isFinite(t) &&
-              t > now - AUTONOMY_WINDOW_MS &&
-              t <= now + 60_000, // clock-skew grace; far-future junk drops
-          )
-          .slice(0, 100)
-      : [];
-    const consecutive =
-      typeof r.consecutive === "number" &&
-      Number.isFinite(r.consecutive) &&
-      r.consecutive > 0
-        ? Math.min(Math.floor(r.consecutive), 1000)
-        : 0;
-    const tripped = r.tripped === true;
-    if (!tripped && consecutive === 0 && firedAt.length === 0) continue;
-    budgets.set(projectId, { firedAt, consecutive, tripped });
-    if (tripped) anyTripped = true;
+    const parsed = parseBudgetEntry(raw, now);
+    if (parsed === INVALID_BUDGET) {
+      // a corrupt entry could hide a latched breaker → fail closed globally
+      latchAutonomyUnavailable();
+      return;
+    }
+    if (!parsed) continue; // structurally valid but empty — nothing to keep
+    budgets.set(projectId, parsed);
+    if (parsed.tripped) anyTripped = true;
   }
   // the Deck's orch dot may already be subscribed — surface restored trips
   if (anyTripped) notifyAutonomyChange();

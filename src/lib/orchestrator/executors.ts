@@ -291,6 +291,32 @@ function guardOutwardGithub(ctx: ToolCallContext, action: string): void {
 }
 
 /**
+ * Does an approval's command perform an OUTWARD GitHub write (push / PR /
+ * release / issue mutation / `gh api`)? Used by `decide_approval` as the
+ * TF5 defense-in-depth twin: in an autonomous turn with `autonomousGithubWrites`
+ * off, the Conductor must not ACCEPT such an approval even if it somehow
+ * reached it classified "routine" (the Rust classifier already marks these
+ * destructive — this is belt and braces). Pure + exported for unit tests.
+ * File-change approvals are never outward writes.
+ */
+const GH_WRITE_COMMAND_RE =
+  /\bgit\s+push\b|\bgh\s+(?:pr\s+(?:create|comment|review|merge|close|edit|ready|reopen)|release\s+(?:create|edit|delete|upload)|issue\s+(?:create|comment|close|edit|reopen)|api)\b/i;
+
+export function approvalLooksLikeGithubWrite(approval: {
+  approvalKind: "command" | "fileChange";
+  payload: Record<string, unknown>;
+}): boolean {
+  if (approval.approvalKind !== "command") return false;
+  const cmd = approval.payload?.command;
+  const text = Array.isArray(cmd)
+    ? cmd.map((c) => (typeof c === "string" ? c : "")).join(" ")
+    : typeof cmd === "string"
+      ? cmd
+      : "";
+  return GH_WRITE_COMMAND_RE.test(text);
+}
+
+/**
  * Strip any userinfo (`user:token@`) from a remote URL before it reaches the
  * model — a PAT embedded in an `origin` URL must never leak into a tool
  * result. Idempotent with the Rust-side redaction (git.rs); belt and braces.
@@ -728,6 +754,17 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
 
   prompt_agent: async (args, ctx) => {
     const entry = requireSession(args.agent, ctx);
+    // capability-reuse guard (TF5): a FULL-access session (danger-full-access,
+    // approvalPolicy "never" — the sandbox bypassed) must never be driven by
+    // the Conductor. The Conductor can only ever CREATE "workspace" agents
+    // (resolveAgentAccess), so a full-access lane was elevated by a HUMAN for
+    // direct use — reusing it via the Conductor (especially in an autonomous
+    // turn) would launder full access through the swarm. The human's composer
+    // / @session path is separate (vibe controller) and stays unaffected.
+    if (entry.session.access === "full")
+      throw new Error(
+        `agent "${entry.session.name}" runs with FULL access (danger-full-access) — the Conductor cannot drive it. Ask the user to prompt it directly via the composer.`,
+      );
     const text = String(args.text ?? "");
     if (!text) throw new Error("text must not be empty");
     const id = entry.session.id;
@@ -754,11 +791,14 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         expectReport
           ? {
               via: "conductor",
+              // Conductor path: Rust refuses a full-access session (the
+              // capability-reuse guard, authoritative at the backend)
+              requireWorkspace: true,
               outputSchema:
                 AGENT_REPORT_SCHEMA as unknown as Record<string, unknown>,
               freshTurnText: text + REPORT_PROMPT_SUFFIX,
             }
-          : { via: "conductor" },
+          : { via: "conductor", requireWorkspace: true },
       );
     } catch (err) {
       if (expectReport) clearReportExpectation(id);
@@ -846,10 +886,11 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
           expectReport
             ? {
                 via: "conductor",
+                requireWorkspace: true,
                 outputSchema:
                   AGENT_REPORT_SCHEMA as unknown as Record<string, unknown>,
               }
-            : { via: "conductor" },
+            : { via: "conductor", requireWorkspace: true },
         );
         if (expectReport) bindReportExpectation(id, sent.turnId);
         notePromptDelivered(
@@ -1015,6 +1056,21 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     if (approval.escalation !== "routine")
       throw new Error(
         "this approval is classified DESTRUCTIVE — only the human may decide it; tell the user it is waiting",
+      );
+    // TF5 defense-in-depth: even a "routine"-classified approval that performs
+    // an OUTWARD GitHub write (push / PR / release) must NOT be accepted in an
+    // AUTONOMOUS turn while the user has not opted into autonomous GitHub
+    // actions — mirrors guardOutwardGithub for the direct-approval path (the
+    // Rust classifier already marks such commands destructive; this is the
+    // belt-and-braces twin). A human-triggered turn stays allowed.
+    if (
+      decision === "accept" &&
+      isAutonomousTurnInFlight(ctx.chatId) &&
+      useSwarm.getState().settings.autonomousGithubWrites !== true &&
+      approvalLooksLikeGithubWrite(approval)
+    )
+      throw new Error(
+        'refused: this approval performs an outward GitHub write (push / PR / release) and this is an AUTONOMOUS turn. Such writes stay with the user unless they enable Settings → "Autonomous GitHub actions". Leave it for the human to decide.',
       );
     // the STRICT server-anchored path: Rust re-checks the class stored next
     // to the blocked Responder and refuses anything non-routine — the check

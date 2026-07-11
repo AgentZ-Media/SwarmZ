@@ -228,10 +228,18 @@ mod anchored {
                 .map(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG))
         }
 
-        /// Open one child for reading, NO-FOLLOW, and require a regular file
-        /// (a FIFO/device would hang the open or the read). None = missing.
+        /// Open one child for reading, NO-FOLLOW, and require a regular file.
+        /// The open itself is `O_NONBLOCK` (final hardening F7): a race-swap
+        /// to a FIFO between the pre-check and the open must not park the
+        /// thread in a blocking `openat` — the FIFO opens instantly instead
+        /// and the authoritative post-open `fstat` refuses it. For the
+        /// regular file that passes, `O_NONBLOCK` is cleared again before
+        /// the handle is returned (it has no read semantics on regular
+        /// files, but callers get a plain blocking File either way).
+        /// None = missing.
         pub fn open_file(&self, name: &str) -> Result<Option<File>, String> {
             assert_component(name)?;
+            // pre-check for friendly errors/missing semantics — NOT the gate
             match self.is_regular_file(name)? {
                 None => return Ok(None),
                 Some(false) => {
@@ -244,7 +252,7 @@ mod anchored {
                 libc::openat(
                     self.fd.as_raw_fd(),
                     c.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
                 )
             };
             if fd < 0 {
@@ -260,6 +268,13 @@ mod anchored {
             let meta = file.metadata().map_err(|e| e.to_string())?;
             if !meta.is_file() {
                 return Err(format!("not a regular file: {name:?}"));
+            }
+            // drop O_NONBLOCK for the returned handle
+            unsafe {
+                let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+                if flags >= 0 {
+                    let _ = libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+                }
             }
             Ok(Some(file))
         }

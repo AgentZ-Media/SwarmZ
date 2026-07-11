@@ -101,6 +101,16 @@ export function setGithubIntegration(enabled: boolean): Promise<void> {
   return invoke<void>("github_set_integration", { enabled });
 }
 
+/**
+ * Mirror the Settings "Autonomous GitHub actions" toggle into Rust so the
+ * server-side gh-write approval classification can consult it (defense in
+ * depth with the TS-side `guardOutwardGithub`). Best-effort: the command may
+ * not exist on an older backend — callers swallow a missing-command error.
+ */
+export function setAutonomousGithubWrites(enabled: boolean): Promise<void> {
+  return invoke<void>("github_set_autonomous_writes", { enabled });
+}
+
 /** Declaratively (re)configure the Rust PR watcher; [] stops polling. */
 export function configureGithubWatch(
   repos: { project_id: string; dir: string }[],

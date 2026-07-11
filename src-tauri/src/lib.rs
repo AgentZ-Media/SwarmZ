@@ -239,6 +239,17 @@ async fn github_set_integration(enabled: bool) -> Result<(), String> {
         .map_err(|e| format!("github_set_integration failed: {e}"))
 }
 
+/// Mirror the Settings "autonomous GitHub writes" opt-in into Rust (final
+/// hardening F2). It gates the AGENT-side gh writes server-side: an agent-run
+/// `gh pr comment`/`gh pr review` approval is routine-decidable by the
+/// Conductor ONLY while integration AND this opt-in are both on — the strict
+/// respond path re-reads the live flags, so a flip applies to already-pending
+/// approvals too. Fail-closed default: off.
+#[tauri::command]
+fn github_set_autonomous_writes(enabled: bool) {
+    github::set_autonomous_writes(enabled);
+}
+
 /// Number of gh/git WRITE ops currently in flight (a `git push` or PR
 /// mutation) — the quit guard reads this so quitting mid-write warns.
 #[tauri::command]
@@ -590,14 +601,26 @@ async fn vibe_session_resume(
 /// turn/start ack. The transcript + completion arrive as events.
 /// `output_schema` (optional) constrains this ONE turn's final assistant
 /// message to a JSON Schema (the structured agent→Conductor status reports).
+/// `require_workspace: true` is the STRICT Conductor path (final hardening
+/// F5): Rust refuses when the session runs with FULL access — the Conductor
+/// may not repurpose human-granted full authority. The human composer omits
+/// it / passes false.
 #[tauri::command]
 async fn vibe_session_send(
     app: AppHandle,
     session_id: String,
     text: String,
     output_schema: Option<serde_json::Value>,
+    require_workspace: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    codex::sessions::session_send(&app, &session_id, &text, output_schema).await
+    codex::sessions::session_send(
+        &app,
+        &session_id,
+        &text,
+        output_schema,
+        require_workspace.unwrap_or(false),
+    )
+    .await
 }
 
 /// Interrupt the session's running turn (turn/interrupt).
@@ -664,12 +687,15 @@ async fn vibe_session_close(session_id: String) -> Result<(), String> {
 
 /// Steer the session's RUNNING turn (turn/steer, race-safe via
 /// expectedTurnId). Errors when no turn runs — callers send normally then.
+/// `require_workspace: true` is the STRICT Conductor path (final hardening
+/// F5): a FULL-access session refuses.
 #[tauri::command]
 async fn vibe_session_steer(
     session_id: String,
     text: String,
+    require_workspace: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    codex::sessions::session_steer(&session_id, &text).await
+    codex::sessions::session_steer(&session_id, &text, require_workspace.unwrap_or(false)).await
 }
 
 /// Move a session to a new working directory (worktree assignment) — the
@@ -759,6 +785,7 @@ pub fn run() {
             gh_pr_comment,
             gh_pr_review,
             github_set_integration,
+            github_set_autonomous_writes,
             github_writes_in_flight,
             github_watch_configure,
             transcript_read,

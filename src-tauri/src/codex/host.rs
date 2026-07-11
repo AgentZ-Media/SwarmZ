@@ -128,8 +128,9 @@ const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STDERR_LINE_BYTES: usize = 8 * 1024;
 /// Server-event queue between the reader task and the router (audit R8):
 /// bounded so a flood backpressures the child's stdout pipe instead of
-/// growing an unbounded queue. The router forwards to per-thread sinks
-/// without blocking, so the queue drains fast in steady state.
+/// growing an unbounded queue. The router forwards to per-thread route
+/// queues that are bounded too (F10, `ROUTE_CHANNEL_CAPACITY`) — a stalled
+/// consumer backpressures end to end instead of ballooning memory.
 const EVENTS_CHANNEL_CAPACITY: usize = 4_096;
 /// Outgoing-line queue to the writer task (audit R8): RPCs and approval
 /// responses are small and rare; a full queue means the child stopped
@@ -652,9 +653,19 @@ fn mcp_disable_args() -> Result<Vec<String>, String> {
 // Thread registry + Connection — per-threadId event routing
 // ---------------------------------------------------------------------------
 
+/// Per-thread route queue capacity (final hardening F10): the raw event
+/// queue is bounded, so the routes it drains into must be bounded too or
+/// the end-to-end backpressure collapses into an unbounded consumer queue.
+/// A full route makes the router `.await` — which backpressures the raw
+/// queue and ultimately the child's stdout pipe. Consumers (the session and
+/// orchestrator dispatchers) drain fast and never await back into the
+/// router, so a full queue means a genuine flood, not a deadlock.
+pub const ROUTE_CHANNEL_CAPACITY: usize = 1_024;
+
 /// Where a registered thread's server events land. Multiple threads may
 /// share one sink (the orchestrator does — one dispatcher for all chats).
-pub type EventSink = mpsc::UnboundedSender<ThreadEvent>;
+/// BOUNDED (F10) — create with `mpsc::channel(ROUTE_CHANNEL_CAPACITY)`.
+pub type EventSink = mpsc::Sender<ThreadEvent>;
 
 /// Answer handle for a routed server request — carries the request id and
 /// the owning client, so the consumer never has to track which process
@@ -828,11 +839,16 @@ fn spawn_router(
                     };
                     match sink {
                         Some(s) => {
-                            if let Err(failed) = s.send(ThreadEvent::Request {
-                                method,
-                                params,
-                                responder,
-                            }) {
+                            // bounded send (F10): a full route AWAITS —
+                            // backpressure instead of unbounded growth
+                            if let Err(failed) = s
+                                .send(ThreadEvent::Request {
+                                    method,
+                                    params,
+                                    responder,
+                                })
+                                .await
+                            {
                                 // consumer gone (sink dropped) — the request
                                 // must still be answered or the server hangs
                                 if let ThreadEvent::Request { responder, .. } = failed.0 {
@@ -849,13 +865,13 @@ fn spawn_router(
                         .and_then(|v| v.as_str())
                         .and_then(|tid| routes.get(tid))
                     {
-                        let _ = sink.send(ThreadEvent::Notification { method, params });
+                        let _ = sink.send(ThreadEvent::Notification { method, params }).await;
                     }
                     // no sink: account-level or foreign-thread notification — ignore
                 }
                 ServerEvent::Exited => {
                     for sink in routes.drain_distinct() {
-                        let _ = sink.send(ThreadEvent::Exited);
+                        let _ = sink.send(ThreadEvent::Exited).await;
                     }
                     break;
                 }
@@ -1171,8 +1187,8 @@ enabled = false
     #[tokio::test]
     async fn route_table_routes_and_broadcasts_exit_once_per_sink() {
         let routes = RouteTable::default();
-        let (shared_tx, mut shared_rx) = mpsc::unbounded_channel();
-        let (solo_tx, mut solo_rx) = mpsc::unbounded_channel();
+        let (shared_tx, mut shared_rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
+        let (solo_tx, mut solo_rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
         // two threads share one sink (orchestrator pattern), one has its own
         routes.insert("t-1", shared_tx.clone());
         routes.insert("t-2", shared_tx.clone());
@@ -1186,7 +1202,7 @@ enabled = false
 
         // process death: each distinct sink hears Exited exactly once
         for sink in routes.drain_distinct() {
-            let _ = sink.send(ThreadEvent::Exited);
+            let _ = sink.send(ThreadEvent::Exited).await;
         }
         assert!(matches!(shared_rx.recv().await, Some(ThreadEvent::Exited)));
         assert!(matches!(solo_rx.recv().await, Some(ThreadEvent::Exited)));
@@ -1260,7 +1276,7 @@ enabled = false
             .to_string();
         push(&log, format!("thread started: {thread_id}"));
 
-        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+        let (sink_tx, mut sink_rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
         conn.register_thread(&thread_id, sink_tx);
 
         // apply_patch under "untrusted" triggers a fileChange approval;
@@ -1550,7 +1566,7 @@ enabled = false
             .and_then(|v| v.as_str())
             .expect("thread id")
             .to_string();
-        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+        let (sink_tx, mut sink_rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
         conn.register_thread(&thread_id, sink_tx);
 
         // the FIRST turn asks for the tool immediately — without the fix this

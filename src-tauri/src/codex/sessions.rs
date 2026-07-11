@@ -120,9 +120,19 @@ struct SessionState {
     host: Arc<ProcessHost>,
     /// current app-server thread; may be replaced on a lost-rollout fallback
     thread_id: Option<String>,
-    /// spawn generation this session's route was registered under — a mismatch
-    /// after a respawn triggers a transparent thread/resume before the turn
+    /// the process generation this session's EVENT FENCE lives on — events
+    /// from any other generation are dropped. Moved FORWARD as soon as an
+    /// operation learns of a respawn (final hardening F11: BEFORE the
+    /// awaited thread/resume), so a delayed straggler from the dead
+    /// generation can never clear the new operation's busy flag.
     generation: u64,
+    /// spawn generation the thread's ROUTE + thread/resume were last
+    /// established under — a mismatch with the live process generation
+    /// triggers the transparent thread/resume before the next turn. Split
+    /// from `generation` (F11): the fence moves early, the route only after
+    /// the resume actually succeeded (a failed resume retries on the next
+    /// send while the fence stays ahead).
+    route_generation: u64,
     profile: SessionProfile,
     /// running turn id (for interrupt); None between turns
     current_turn_id: Option<String>,
@@ -148,10 +158,10 @@ struct SessionState {
 /// One blocked approval request: the Responder that answers the server's RPC
 /// plus the routing class it was classified with (source of truth for the
 /// strict Conductor response path — the frontend can never upgrade it).
-/// `gh_write_gated` marks a "routine" that exists ONLY because the GitHub
-/// integration was enabled at arrival — the strict path re-checks the LIVE
-/// flag, so a pending gh write can't outlive a later disable (see
-/// `routine_gate`).
+/// `gh_write_gated` marks a "routine" that exists ONLY because the gh-write
+/// gate (integration master toggle AND autonomous-writes opt-in) was on at
+/// arrival — the strict path re-checks the LIVE gate, so a pending gh write
+/// can't outlive a later disable of either flag (see `routine_gate`).
 struct PendingApproval {
     responder: Responder,
     escalation: &'static str,
@@ -238,13 +248,16 @@ fn rg_args_safe(args: &[String]) -> bool {
 /// session's cwd. Concretely, for each token (flags' `=`-values included):
 ///   - `~…` (home expansion in the real shell) → human,
 ///   - any `..` path component → human (traversal is never resolved),
-///   - an ABSOLUTE path must canonicalize into the session cwd → else human.
+///   - an ABSOLUTE path must canonicalize into the session cwd → else human,
+///   - a RELATIVE operand is joined to the session cwd and canonicalized
+///     (symlink-resolving) — it must land back inside the cwd (final
+///     hardening F4: `cat src/link` with `src/link -> /outside` used to
+///     slip through as "relative = safe"; the relative SPELLING of an
+///     escaping symlink is exfiltration too).
 ///
-/// Relative operands are safe by construction: they resolve against the
-/// request cwd, which `classify_approval` already confines to the session
-/// cwd. Flag tokens themselves (`-la`, `--stat`) pass untouched; a flag's
+/// Flag tokens themselves (`-la`, `--stat`) pass untouched; a flag's
 /// separate value token is checked like any operand, so `grep -f /etc/x`
-/// or `cargo test --manifest-path /other/Cargo.toml` classify destructive.
+/// classifies destructive.
 fn operands_confined(args: &[String], cwd: &str) -> bool {
     args.iter().all(|tok| {
         // for `--flag=value`, gate the VALUE; bare flags pass
@@ -273,7 +286,13 @@ fn operands_confined(args: &[String], cwd: &str) -> bool {
         if val.starts_with('/') {
             return path_within(cwd, val);
         }
-        true
+        // F4: relative operands resolve against the session cwd — join,
+        // canonicalize (symlink-resolving via path_within) and require
+        // containment. Non-path tokens (grep patterns, plain words) fold to
+        // a missing in-tree leaf and pass; an in-tree symlink pointing out
+        // resolves outside and refuses.
+        let joined = std::path::Path::new(cwd).join(val);
+        path_within(cwd, &joined.to_string_lossy())
     })
 }
 
@@ -442,8 +461,9 @@ fn git_is_routine(args: &[String]) -> bool {
 /// Is this full command line routine? Pure, fail-closed, recursion-bounded.
 /// `cwd` is the session's TRUSTED working directory — every path-bearing
 /// operand of a routine candidate must stay inside it (audit R3).
-/// `gh_writes` = the GitHub integration master toggle (Phase 7): with it ON,
-/// the two sanctioned gh WRITE forms (`gh pr comment`, `gh pr review`) may be
+/// `gh_writes` = the Rust-side gh-write gate (Phase 7 master toggle AND the
+/// Phase-8/final-hardening autonomous-writes opt-in): with it ON, the two
+/// sanctioned gh WRITE forms (`gh pr comment`, `gh pr review`) may be
 /// routine; with it OFF every gh write is destructive. Read-only gh commands
 /// are routine either way.
 fn command_is_routine(raw: &str, cwd: &str, gh_writes: bool) -> bool {
@@ -489,25 +509,67 @@ fn classify_command_str(raw: &str, cwd: &str, depth: u8, gh_writes: bool) -> boo
         "git" => git_is_routine(args),
         // GitHub CLI (Phase 7) — tiny read allowlist + the two gated writes
         "gh" => gh_is_routine(args, gh_writes),
-        // Build/test commands stay routine WITH the two gates above:
-        // they run under codex' workspace-write sandbox (network off,
-        // writes confined to the tree), full access is human-only since
-        // audit R1, and R3 keeps their path args (--manifest-path,
-        // --outDir, …) in-tree — so the accepted agent threat model is
-        // "runs the project's own build in its own tree", nothing more.
-        "cargo" => matches!(
-            args.first().map(|s| s.as_str()),
-            Some("test") | Some("check") | Some("clippy") | Some("build")
-        ),
-        "pnpm" => match args.first().map(|s| s.as_str()) {
-            Some("test") => true,
-            Some("run") => args.get(1).map(|s| s.as_str()) == Some("test"),
-            _ => false,
-        },
-        "tsc" => true,
+        // Build/test/script runners (`cargo`, `pnpm`, `npm`, `yarn`, `tsc`,
+        // `node`, `make`, …) are NEVER routine (final hardening F1). The old
+        // rationale ("they run under codex' workspace-write sandbox") was
+        // FALSE: under workspace-write + on-request a command approval only
+        // exists for a SANDBOX-ESCALATING run (live-verified — see the
+        // sessions_spike (b) comment and docs/codex-protocol/inventory.md
+        // §5: in-workspace commands run WITHOUT approval). An approved
+        // build/test therefore executes UNSANDBOXED — network on, no write
+        // confinement — and runs project-controlled code (build.rs, test
+        // scripts, compiler plugins). That is arbitrary code execution with
+        // host authority and stays a human decision. Only genuinely inert
+        // version probes of SYSTEM binaries remain routine.
         "node" => args.len() == 1 && matches!(args[0].as_str(), "--version" | "-v"),
         _ => false,
     }
+}
+
+/// Final-hardening F1 defense-in-depth: does the approval request carry a
+/// proposed execpolicy amendment? On 0.144.1 that field rides on approvals
+/// that ask to ESCALATE past the sandbox (see docs/codex-protocol/
+/// inventory.md §5) — an allowlisted read-only head has no business asking
+/// for one, so its presence forces the request to the human REGARDLESS of
+/// how harmless the command text looks. The gh flows are exempt: gh always
+/// needs the network escalation, and they are separately double-opt-in
+/// gated (integration master toggle + autonomous-writes opt-in) and
+/// strictly parsed.
+fn amendment_forces_human(params: &Value, cwd: &str) -> bool {
+    let has_amendment = match params.get("proposedExecpolicyAmendment") {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(_) => true, // unknown shape → treat as present (fail closed)
+    };
+    if !has_amendment {
+        return false;
+    }
+    // exempt ONLY a command whose (unwrapped) head is gh
+    let is_gh = params
+        .get("command")
+        .and_then(|c| c.as_str())
+        .map(|raw| command_head_is_gh(raw, cwd))
+        .unwrap_or(false);
+    !is_gh
+}
+
+/// Does the command line's effective head (after the strict shell unwrap)
+/// normalize to `gh`? Pure helper for the amendment exemption above.
+fn command_head_is_gh(raw: &str, _cwd: &str) -> bool {
+    fn head_of(raw: &str, depth: u8) -> Option<String> {
+        if depth > 2 {
+            return None;
+        }
+        let tokens = tokenize_strict(raw)?;
+        if tokens.is_empty() {
+            return None;
+        }
+        if let Some(inner) = unwrap_shell_strict(&tokens) {
+            return head_of(inner, depth + 1);
+        }
+        normalized_head(&tokens[0]).map(str::to_string)
+    }
+    head_of(raw, 0).as_deref() == Some("gh")
 }
 
 /// Parse gh tokens after a subcommand against a flag spec `(flag,
@@ -738,11 +800,18 @@ fn file_changes_within(params: &Value, cwd: &str) -> bool {
 /// Classify one approval request for Conductor routing. `kind` is the
 /// approval flavor from `approval_kind`, `params` the raw request params,
 /// `cwd` the session's working directory (the trusted profile value, not
-/// anything model-supplied). `gh_writes` = the GitHub-integration master
-/// toggle (Phase 7) — with it OFF, gh write commands are always destructive.
+/// anything model-supplied). `gh_writes` = the Rust-side gh-write gate
+/// (integration master toggle AND autonomous-writes opt-in) — with it OFF,
+/// gh write commands are always destructive.
 pub fn classify_approval(kind: &str, params: &Value, cwd: &str, gh_writes: bool) -> &'static str {
     let routine = match kind {
         "command" => {
+            // F1 defense-in-depth: a proposed execpolicy amendment marks a
+            // sandbox-escalation request — human-only for every non-gh head,
+            // whatever the command text claims to be
+            if amendment_forces_human(params, cwd) {
+                return "destructive";
+            }
             let cmd_ok = params
                 .get("command")
                 .and_then(|c| c.as_str())
@@ -930,7 +999,7 @@ fn spawn_session_dispatcher(
     app: AppHandle,
     session_id: String,
     generation: u64,
-    mut rx: mpsc::UnboundedReceiver<ThreadEvent>,
+    mut rx: mpsc::Receiver<ThreadEvent>,
 ) {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
@@ -995,10 +1064,11 @@ fn handle_server_request(
             // the Conductor may decide it, "destructive" = hard human-only.
             // Stored NEXT to the Responder — the strict response path
             // enforces it server-side, whatever the frontend claims. The
-            // Phase-7 gh-write gate reads the Rust-side integration flag,
-            // never anything frontend-claimed per request.
+            // gh-write gate reads the Rust-side flags (integration master
+            // toggle AND the autonomous-writes opt-in — final hardening
+            // F2), never anything frontend-claimed per request.
             let escalation =
-                classify_approval(kind, &params, &cwd, crate::github::integration_enabled());
+                classify_approval(kind, &params, &cwd, crate::github::agent_gh_writes_allowed());
             // Phase-7 stale-toggle guard: is this routine ONLY because the
             // integration is on right now? (classified again with the flag
             // off — a difference marks it for the live re-check on respond)
@@ -1245,7 +1315,7 @@ fn register_session(
     thread_id: &str,
     profile: SessionProfile,
 ) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
     spawn_session_dispatcher(app.clone(), session_id.to_string(), generation, rx);
     // state BEFORE route (audit R6 ordering): once an event can arrive, the
     // generation fence must already know this session
@@ -1255,6 +1325,7 @@ fn register_session(
             host,
             thread_id: Some(thread_id.to_string()),
             generation,
+            route_generation: generation,
             profile,
             current_turn_id: None,
             busy: false,
@@ -1266,6 +1337,25 @@ fn register_session(
         },
     );
     conn.register_thread(thread_id, tx);
+}
+
+/// Final hardening F11 — adopt a NEW process generation ATOMICALLY, before
+/// the (awaited) thread/resume runs: the event fence moves forward first,
+/// so a DELAYED `Exited`/`turn/completed` straggler from the dead
+/// generation can no longer clear the busy flag the in-flight send/compact
+/// operation holds (pre-fix, that cleared busy while the resume awaited and
+/// a second send could race in). The dead generation's leftovers are taken
+/// over here: the stale turn id clears and its blocked approval responders
+/// are returned so the caller can cancel them (they belong to the dead
+/// process — same cleanup `exit_bookkeeping` would have done).
+fn adopt_generation(session_id: &str, generation: u64) -> Vec<PendingApproval> {
+    let mut sessions = SESSIONS.lock();
+    let Some(st) = sessions.get_mut(session_id) else {
+        return Vec::new();
+    };
+    st.generation = generation;
+    st.current_turn_id = None;
+    st.pending_approvals.drain().map(|(_, p)| p).collect()
 }
 
 /// Start a fresh Vibe session: a dedicated app-server process + thread/start
@@ -1399,17 +1489,37 @@ pub async fn session_resume(
     Ok(json!({ "thread_id": effective_thread_id, "resumed": resumed }))
 }
 
+/// The Conductor-path access gate (final hardening F5, pure + unit-tested):
+/// a session running with FULL access (no sandbox, no approvals) must never
+/// be driven by the Conductor's tool bus — a human may have granted that
+/// authority for their OWN prompts, but an autonomous Conductor repurposing
+/// it is capability reuse past every approval guardrail. Fail-closed
+/// refusal (the clearer variant; re-confining silently would surprise the
+/// human who set the access). The human composer path passes `false`.
+fn conductor_access_gate(access: Access, require_workspace: bool) -> Result<(), String> {
+    if require_workspace && access == Access::Full {
+        return Err(
+            "refused: this session runs with FULL access (no sandbox) — the Conductor may not prompt or steer full-access sessions; the human drives it, or downgrades it to workspace access first"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Send one user message — NON-blocking: returns the turn id after the
 /// `turn/start` ack; the transcript + completion stream as events. One turn
 /// per session at a time (a busy session rejects). Transparently resumes after
 /// a private-process respawn. `output_schema` (optional, Phase 5) constrains
 /// this ONE turn's final assistant message to a JSON Schema — the structured
-/// agent→Conductor status reports ride on it.
+/// agent→Conductor status reports ride on it. `require_workspace` (final
+/// hardening F5) is the STRICT Conductor path: a FULL-access session refuses
+/// before anything is claimed — see `conductor_access_gate`.
 pub async fn session_send(
     app: &AppHandle,
     session_id: &str,
     text: &str,
     output_schema: Option<Value>,
+    require_workspace: bool,
 ) -> Result<Value, String> {
     // atomically claim the turn slot + snapshot what we need for the roundtrip
     let (host, mut thread_id, gen_stored, override_pending, profile) = {
@@ -1417,6 +1527,9 @@ pub async fn session_send(
         let st = sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
+        // F5: checked INSIDE the lock, against the live profile — before the
+        // busy claim, so a refusal leaves the session untouched
+        conductor_access_gate(st.profile.access, require_workspace)?;
         if st.busy {
             return Err("a turn is already running in this session — interrupt it or wait".into());
         }
@@ -1428,7 +1541,7 @@ pub async fn session_send(
         (
             st.host.clone(),
             thread_id,
-            st.generation,
+            st.route_generation,
             st.access_override_pending,
             st.profile.clone(),
         )
@@ -1451,6 +1564,13 @@ pub async fn session_send(
     // resume the thread (routes die with the process, re-register below with
     // a FRESH generation-tagged dispatcher — audit R6)
     if gen_stored != generation {
+        // F11: move the event fence to the new generation BEFORE awaiting the
+        // resume — a delayed straggler from the dead generation must not
+        // clear THIS operation's busy flag mid-respawn. The dead process'
+        // blocked approvals are answered (cancel) as part of the takeover.
+        for pending in adopt_generation(session_id, generation) {
+            pending.responder.ok(&json!({ "decision": "cancel" }));
+        }
         match host::resume_thread(&conn, thread_resume_params(&thread_id, &profile)).await {
             Ok(_) => {}
             Err(host::ResumeError::ThreadNotFound(_)) => {
@@ -1492,13 +1612,14 @@ pub async fn session_send(
             }
         }
         // fresh generation-tagged dispatcher — the old one only ever serves
-        // (and drops) the dead process' stragglers. The state's generation
-        // updates BEFORE the route registers: no event can arrive before the
-        // route exists, and once one does the fence already matches.
-        let (tx, rx) = mpsc::unbounded_channel();
+        // (and drops) the dead process' stragglers. The state's fence moved
+        // in `adopt_generation` already (F11); the ROUTE generation commits
+        // only now, after the resume genuinely succeeded.
+        let (tx, rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
         spawn_session_dispatcher(app.clone(), session_id.to_string(), generation, rx);
         if let Some(st) = SESSIONS.lock().get_mut(session_id) {
             st.generation = generation;
+            st.route_generation = generation;
             st.sink = tx.clone();
         }
         conn.register_thread(&thread_id, tx);
@@ -1597,7 +1718,7 @@ pub async fn session_compact(app: &AppHandle, session_id: &str) -> Result<Value,
         (
             st.host.clone(),
             thread_id,
-            st.generation,
+            st.route_generation,
             st.profile.clone(),
         )
     };
@@ -1618,17 +1739,22 @@ pub async fn session_compact(app: &AppHandle, session_id: &str) -> Result<Value,
     // resume the thread so compaction operates on the right context (fresh
     // generation-tagged dispatcher, audit R6 — same as `send`)
     if gen_stored != generation {
+        // F11: fence forward BEFORE the awaited resume — same as `send`
+        for pending in adopt_generation(session_id, generation) {
+            pending.responder.ok(&json!({ "decision": "cancel" }));
+        }
         if let Err(e) =
             host::resume_thread(&conn, thread_resume_params(&thread_id, &profile)).await
         {
             release(session_id);
             return Err(format!("resuming the session before compaction failed: {}", e.message()));
         }
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
         spawn_session_dispatcher(app.clone(), session_id.to_string(), generation, rx);
         // generation BEFORE route — see the identical ordering note in `send`
         if let Some(st) = SESSIONS.lock().get_mut(session_id) {
             st.generation = generation;
+            st.route_generation = generation;
             st.sink = tx.clone();
         }
         conn.register_thread(&thread_id, tx);
@@ -1683,12 +1809,20 @@ pub async fn session_compact(app: &AppHandle, session_id: &str) -> Result<Value,
 /// "expected active turn id …" / "no active turn to steer"). Errors when no
 /// turn is running — callers fall back to a normal send then. The steered
 /// text is mirrored into the transcript by the frontend controller.
-pub async fn session_steer(session_id: &str, text: &str) -> Result<Value, String> {
+/// `require_workspace` (final hardening F5) is the STRICT Conductor path:
+/// a FULL-access session refuses — see `conductor_access_gate`.
+pub async fn session_steer(
+    session_id: &str,
+    text: &str,
+    require_workspace: bool,
+) -> Result<Value, String> {
     let (host, thread_id, turn_id) = {
         let sessions = SESSIONS.lock();
         let st = sessions
             .get(session_id)
             .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
+        // F5: against the live profile, before any turn state is read
+        conductor_access_gate(st.profile.access, require_workspace)?;
         // the "steer-race:" tag matters: Rust clears current_turn_id on
         // turn/completed BEFORE the frontend busy flag clears, so an early
         // no-turn here is the SAME lost race as the wire-level mismatch —
@@ -1811,7 +1945,12 @@ pub async fn session_review(session_id: &str, target: &str) -> Result<Value, Str
             .get(session_id)
             .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
         let thread_id = st.thread_id.clone().ok_or("this session has no thread yet")?;
-        (st.host.clone(), thread_id, st.generation, st.profile.clone())
+        (
+            st.host.clone(),
+            thread_id,
+            st.route_generation,
+            st.profile.clone(),
+        )
     };
     let (conn, current_gen) = host.ensure().await?;
     // respawned since the session's route was set → the parent thread must be
@@ -1839,7 +1978,7 @@ pub async fn session_review(session_id: &str, target: &str) -> Result<Value, Str
         .to_string();
 
     // collect the review thread's outcome on a temporary route
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
     conn.register_thread(&review_tid, tx);
     let mut review_text: Option<String> = None;
     let mut last_message: Option<String> = None;
@@ -1910,24 +2049,26 @@ pub async fn session_review(session_id: &str, target: &str) -> Result<Value, Str
 }
 
 /// The strict Conductor response gate (pure, unit-tested): only "routine"
-/// passes, AND a routine class that exists solely because the GitHub
-/// integration was ON at classification time (`gh_write_gated`) is re-checked
-/// against the LIVE flag — the user disabling the integration while the
-/// approval sat pending downgrades it back to human-only. Frontend state can
-/// never upgrade an approval through this gate.
+/// passes, AND a routine class that exists solely because the gh-write gate
+/// was ON at classification time (`gh_write_gated`) is re-checked against
+/// the LIVE gate — `gh_writes_allowed_now` is the CONJUNCTION of the
+/// integration master toggle and the autonomous-writes opt-in (final
+/// hardening F2): the user disabling EITHER while the approval sat pending
+/// downgrades it back to human-only. Frontend state can never upgrade an
+/// approval through this gate.
 fn routine_gate(
     escalation: &str,
     gh_write_gated: bool,
-    integration_on_now: bool,
+    gh_writes_allowed_now: bool,
 ) -> Result<(), String> {
     if escalation != "routine" {
         return Err(
             "this approval is classified DESTRUCTIVE — only the human may decide it".into(),
         );
     }
-    if gh_write_gated && !integration_on_now {
+    if gh_write_gated && !gh_writes_allowed_now {
         return Err(
-            "this approval is a GitHub write and the GitHub integration has been disabled since it arrived — only the human may decide it now".into(),
+            "this approval is a GitHub write and autonomous GitHub writes are not (or no longer) enabled — only the human may decide it now".into(),
         );
     }
     Ok(())
@@ -1968,7 +2109,7 @@ pub async fn session_respond_approval(
             routine_gate(
                 pending.escalation,
                 pending.gh_write_gated,
-                crate::github::integration_enabled(),
+                crate::github::agent_gh_writes_allowed(),
             )?;
         }
         st.pending_approvals
@@ -2263,8 +2404,11 @@ mod tests {
 
     #[test]
     fn routine_is_only_genuinely_read_only() {
-        // the WHOLE routine surface — single read-only/test commands,
-        // bare or in codex' genuine zsh wrapper
+        // the WHOLE routine surface — single read-only commands, bare or in
+        // codex' genuine zsh wrapper. Build/test commands are GONE from this
+        // list (final hardening F1): an approval under workspace-write +
+        // on-request means a sandbox ESCALATION, and an escalated build/test
+        // runs project-controlled code unsandboxed.
         for c in [
             "ls -la",
             "ls",
@@ -2290,21 +2434,145 @@ mod tests {
             "git branch -vv",
             "git remote -v",
             "git remote show origin",
-            "cargo test",
-            "cargo check",
-            "cargo clippy",
-            "cargo build",
-            "pnpm test",
-            "pnpm run test",
-            "tsc --noEmit",
             "node --version",
             "/bin/zsh -lc 'ls -la'",
-            "/bin/zsh -lc 'cargo test'",
             "/bin/bash -c 'git status'",
             "sh -c 'pwd'",
         ] {
             assert_eq!(classify_cmd(c), "routine", "{c}");
         }
+    }
+
+    /// Final hardening F1 (frozen): build/test/script-running commands are
+    /// NEVER routine — under workspace-write + on-request a command approval
+    /// only exists for a sandbox-ESCALATING run (live-verified, see
+    /// docs/codex-protocol/inventory.md §5), so an approved build/test would
+    /// execute project-controlled code (build.rs, test scripts, plugins)
+    /// UNSANDBOXED: network on, no write confinement. Human-only, always.
+    #[test]
+    fn build_and_test_commands_are_destructive() {
+        for c in [
+            "cargo test",
+            "cargo check",
+            "cargo clippy",
+            "cargo build",
+            "cargo test --workspace",
+            "pnpm test",
+            "pnpm run test",
+            "pnpm run build",
+            "pnpm build",
+            "pnpm install",
+            "npm test",
+            "npm run test",
+            "npm run build",
+            "yarn test",
+            "yarn run build",
+            "tsc",
+            "tsc --noEmit",
+            "tsc -b --clean", // deletes generated files
+            "tsc --version",  // tsc is typically a project-local binary — in doubt human
+            "tsc --outDir dist",
+            "make",
+            "make test",
+            "make -j8 all",
+            "node script.js",
+            "node -e 'x'",
+            // wrapped forms classify identically
+            "/bin/zsh -lc 'cargo test'",
+            "/bin/zsh -lc 'pnpm test'",
+            "bash -c 'tsc --noEmit'",
+            "sh -c 'make'",
+        ] {
+            assert_eq!(classify_cmd(c), "destructive", "{c}");
+        }
+        // the one inert survivor: a version probe of the SYSTEM node binary
+        assert_eq!(classify_cmd("node --version"), "routine");
+        assert_eq!(classify_cmd("node -v"), "routine");
+    }
+
+    /// Final hardening F1 defense-in-depth (frozen): an approval request
+    /// carrying a `proposedExecpolicyAmendment` asks to ESCALATE past the
+    /// sandbox — destructive for every non-gh head, however read-only the
+    /// command text looks. gh stays classifiable (it always needs the
+    /// network escalation and is double-opt-in gated separately).
+    #[test]
+    fn execpolicy_amendment_forces_human_for_non_gh_heads() {
+        let with_amendment = |cmd: &str| {
+            json!({
+                "command": cmd,
+                "proposedExecpolicyAmendment": ["some", "amendment"],
+            })
+        };
+        for cmd in ["ls -la", "cat src/x.rs", "git status", "/bin/zsh -lc 'ls'"] {
+            assert_eq!(
+                classify_approval("command", &with_amendment(cmd), "/repo/wt", true),
+                "destructive",
+                "{cmd} with amendment"
+            );
+            // the SAME command without the amendment stays routine
+            assert_eq!(
+                classify_approval("command", &json!({ "command": cmd }), "/repo/wt", true),
+                "routine",
+                "{cmd} without amendment"
+            );
+        }
+        // gh is exempt: the network escalation is expected and separately gated
+        assert_eq!(
+            classify_approval(
+                "command",
+                &with_amendment("gh pr comment 12 --body 'done'"),
+                "/repo/wt",
+                true,
+            ),
+            "routine"
+        );
+        assert_eq!(
+            classify_approval(
+                "command",
+                &with_amendment("gh pr list"),
+                "/repo/wt",
+                false,
+            ),
+            "routine"
+        );
+        // …but a NON-gh command can't ride the exemption, and a gh write
+        // with the gate off stays destructive amendment or not
+        assert_eq!(
+            classify_approval(
+                "command",
+                &with_amendment("gh pr merge 12"),
+                "/repo/wt",
+                true,
+            ),
+            "destructive"
+        );
+        assert_eq!(
+            classify_approval(
+                "command",
+                &with_amendment("gh pr comment 12 --body x"),
+                "/repo/wt",
+                false,
+            ),
+            "destructive"
+        );
+        // null / absent / empty-array amendments don't trip the gate
+        for benign in [
+            json!({ "command": "ls", "proposedExecpolicyAmendment": null }),
+            json!({ "command": "ls", "proposedExecpolicyAmendment": [] }),
+            json!({ "command": "ls" }),
+        ] {
+            assert_eq!(classify_approval("command", &benign, "/repo/wt", false), "routine");
+        }
+        // unknown amendment shapes fail closed
+        assert_eq!(
+            classify_approval(
+                "command",
+                &json!({ "command": "ls", "proposedExecpolicyAmendment": "weird" }),
+                "/repo/wt",
+                false,
+            ),
+            "destructive"
+        );
     }
 
     #[test]
@@ -2500,7 +2768,8 @@ mod tests {
         ] {
             assert_eq!(classify(c), "destructive", "{c}");
         }
-        // in-tree and relative operands stay routine
+        // in-tree and relative operands stay routine (build/test heads are
+        // destructive since F1 — see build_and_test_commands_are_destructive)
         for c in [
             "cat src/a.rs",
             "head -n 50 src/a.rs",
@@ -2509,10 +2778,6 @@ mod tests {
             "wc -l src/a.rs",
             "ls -la",
             "ls src",
-            "tsc --noEmit",
-            "tsc --outDir dist",
-            "cargo test",
-            "pnpm test",
         ] {
             assert_eq!(classify(c), "routine", "{c}");
         }
@@ -2534,6 +2799,32 @@ mod tests {
             "destructive",
             "escaping symlink operand"
         );
+        // final hardening F4 (frozen): the RELATIVE spelling of that same
+        // escaping symlink is destructive too — relative operands are joined
+        // to the cwd and canonicalized, they no longer pass as "safe by
+        // construction"
+        assert_eq!(
+            classify("cat src/link.txt"),
+            "destructive",
+            "escaping symlink via its relative spelling"
+        );
+        assert_eq!(
+            classify("head -n 5 src/link.txt"),
+            "destructive",
+            "relative symlink operand under another read head"
+        );
+        // …and a symlinked DIRECTORY escapes the same way
+        let dirlink = root.join("outdir");
+        std::os::unix::fs::symlink(&escape, &dirlink).unwrap();
+        assert_eq!(
+            classify("cat outdir/target.txt"),
+            "destructive",
+            "relative path THROUGH an escaping dir symlink"
+        );
+        // a relative operand that stays in-tree (or names nothing on disk)
+        // still classifies routine after the F4 resolution
+        assert_eq!(classify("grep needle src/a.rs"), "routine");
+        assert_eq!(classify("rg TODO no-such-dir"), "routine");
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&escape).ok();
     }
@@ -2926,13 +3217,14 @@ mod tests {
     #[test]
     fn stale_generation_events_never_mutate_the_live_session() {
         let sid = format!("r6-fence-test-{}", std::process::id());
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
         SESSIONS.lock().insert(
             sid.clone(),
             SessionState {
                 host: Arc::new(ProcessHost::new()),
                 thread_id: Some("t".into()),
                 generation: 2, // the session lives on gen 2 now
+                route_generation: 2,
                 profile: SessionProfile {
                     cwd: "/repo".into(),
                     model: None,
@@ -2973,6 +3265,88 @@ mod tests {
         // unknown sessions and stale exits are no-ops too
         assert!(exit_bookkeeping("never-registered", 1).is_none());
         SESSIONS.lock().remove(&sid);
+    }
+
+    /// Final hardening F5 (frozen): the Conductor bus path
+    /// (`require_workspace: true`) must never drive a FULL-access session —
+    /// human-granted full authority is not reusable by the autonomous loop.
+    /// The human path (`false`) is untouched.
+    #[test]
+    fn conductor_access_gate_refuses_full_access_reuse() {
+        // conductor path: workspace ok, full refuses
+        assert!(conductor_access_gate(Access::Workspace, true).is_ok());
+        let err = conductor_access_gate(Access::Full, true).unwrap_err();
+        assert!(err.contains("FULL access"), "{err}");
+        assert!(err.contains("refused"), "{err}");
+        // human path: both pass
+        assert!(conductor_access_gate(Access::Workspace, false).is_ok());
+        assert!(conductor_access_gate(Access::Full, false).is_ok());
+    }
+
+    /// Final hardening F11 (frozen): `adopt_generation` moves the event
+    /// fence forward BEFORE the awaited resume — a delayed straggler from
+    /// the dead generation can no longer clear the busy flag the in-flight
+    /// operation holds, and the dead process' approvals are handed back for
+    /// cancelling.
+    #[test]
+    fn adopt_generation_fences_out_delayed_exits_mid_respawn() {
+        let sid = format!("f11-adopt-test-{}", std::process::id());
+        let (tx, _rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
+        SESSIONS.lock().insert(
+            sid.clone(),
+            SessionState {
+                host: Arc::new(ProcessHost::new()),
+                thread_id: Some("t".into()),
+                generation: 1, // the state still sits on the DEAD gen 1…
+                route_generation: 1,
+                profile: SessionProfile {
+                    cwd: "/repo".into(),
+                    model: None,
+                    effort: None,
+                    access: Access::Workspace,
+                },
+                current_turn_id: Some("stale-turn-gen1".into()),
+                // …while a NEW send already claimed busy and is respawning
+                busy: true,
+                access_override_pending: false,
+                pending_approvals: HashMap::new(),
+                compact_done: None,
+                sink: tx,
+                approval_counter: 0,
+            },
+        );
+
+        // the operation learns of generation 2 and adopts it BEFORE resuming
+        let orphaned = adopt_generation(&sid, 2);
+        assert!(orphaned.is_empty(), "no gen-1 approvals were pending");
+        {
+            let sessions = SESSIONS.lock();
+            let st = sessions.get(&sid).unwrap();
+            assert_eq!(st.generation, 2, "the fence moved forward");
+            assert_eq!(st.route_generation, 1, "the route commits only after the resume");
+            assert!(st.current_turn_id.is_none(), "the dead turn id cleared");
+            assert!(st.busy, "the in-flight operation keeps its busy claim");
+        }
+
+        // THE RACE: the delayed gen-1 Exited arrives now — pre-fix it
+        // cleared busy (state was still on gen 1); post-fix the fence
+        // rejects it and the operation's busy claim survives
+        assert!(exit_bookkeeping(&sid, 1).is_none(), "stale exit must not apply");
+        assert!(turn_completed_bookkeeping(&sid, 1).is_none());
+        {
+            let sessions = SESSIONS.lock();
+            let st = sessions.get(&sid).unwrap();
+            assert!(st.busy, "the delayed gen-1 exit must not clear the new operation's busy flag");
+        }
+
+        // gen-2 events apply normally once the turn actually runs
+        assert!(generation_current(&sid, 2));
+        assert!(turn_completed_bookkeeping(&sid, 2).is_some());
+        assert!(!SESSIONS.lock().get(&sid).unwrap().busy);
+        SESSIONS.lock().remove(&sid);
+
+        // unknown session: adopt is a no-op that returns nothing
+        assert!(adopt_generation("never-registered", 7).is_empty());
     }
 
     #[test]
@@ -3086,7 +3460,7 @@ mod tests {
                 .await
                 .expect("thread/start");
             let thread_id = started.pointer("/thread/id").and_then(|v| v.as_str()).unwrap().to_string();
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
             conn.register_thread(&thread_id, tx);
             conn.request(
                 "turn/start",
@@ -3154,7 +3528,7 @@ mod tests {
                 .await
                 .expect("thread/start");
             let thread_id = started.pointer("/thread/id").and_then(|v| v.as_str()).unwrap().to_string();
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
             conn.register_thread(&thread_id, tx);
             let prompt = format!(
                 "Run the shell command `touch {}` — it writes OUTSIDE this workspace, in the home directory — and report the result.",
@@ -3220,7 +3594,7 @@ mod tests {
                 .await
                 .expect("thread/start");
             let thread_id = started.pointer("/thread/id").and_then(|v| v.as_str()).unwrap().to_string();
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
             conn.register_thread(&thread_id, tx);
             conn.request(
                 "turn/start",
@@ -3335,7 +3709,7 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap()
                 .to_string();
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
             conn.register_thread(&tid, tx);
             conn.request(
                 "turn/start",
@@ -3472,7 +3846,7 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap()
             .to_string();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
         conn.register_thread(&thread_id, tx);
         conn.request(
             "turn/start",
@@ -3572,13 +3946,13 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap()
             .to_string();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
         conn.register_thread(&tid, tx);
 
         // wait for THIS turn's terminal event — the same signal the fixed
         // `session_compact` blocks on (turn/completed resolves compact_done)
         async fn wait_turn_completed(
-            rx: &mut mpsc::UnboundedReceiver<ThreadEvent>,
+            rx: &mut mpsc::Receiver<ThreadEvent>,
         ) -> (String, String) {
             let mut final_message = String::new();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
