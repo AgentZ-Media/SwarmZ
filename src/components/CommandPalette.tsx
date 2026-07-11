@@ -63,7 +63,7 @@ export function CommandPalette({
               <Command.Input
                 value={search}
                 onValueChange={setSearch}
-                placeholder="Jump to a session or action…"
+                placeholder="Jump to an agent or action…"
                 className="h-11 w-full bg-transparent text-14 text-txt outline-none placeholder:text-fnt"
               />
               <kbd className="rounded-xs border border-line2 px-1 font-mono text-10 text-fnt">
@@ -118,7 +118,7 @@ export function CommandPalette({
                 </PaletteItem>
               </PaletteGroup>
 
-              <PaletteGroup heading="Sessions">
+              <PaletteGroup heading="Agents">
                 {order.map((id) => {
                   const entry = sessions[id];
                   if (!entry) return null;
@@ -126,7 +126,7 @@ export function CommandPalette({
                   return (
                     <PaletteItem
                       key={id}
-                      value={`session ${s.name} ${s.projectDir} ${id}`}
+                      value={`agent session ${s.name} ${s.projectDir} ${id}`}
                       onSelect={() => run(() => focusSession(id))}
                     >
                       <SessionDot entry={entry} />
@@ -147,7 +147,7 @@ export function CommandPalette({
                   }
                 >
                   <ActionDot />
-                  <span className="truncate text-txt">New session</span>
+                  <span className="truncate text-txt">New agent</span>
                   <Shortcut>⌘T</Shortcut>
                 </PaletteItem>
                 <PaletteItem
@@ -161,6 +161,18 @@ export function CommandPalette({
                   <Shortcut>⌘⇧O</Shortcut>
                 </PaletteItem>
                 <PaletteItem
+                  value="toggle conductor sidebar show hide"
+                  onSelect={() =>
+                    run(() => useVibeUi.getState().toggleConductor())
+                  }
+                >
+                  <ActionDot />
+                  <span className="truncate text-txt">
+                    Toggle Conductor sidebar
+                  </span>
+                  <Shortcut>⌘B</Shortcut>
+                </PaletteItem>
+                <PaletteItem
                   value="next attention waiting session jump approval"
                   onSelect={() =>
                     run(() => {
@@ -171,7 +183,7 @@ export function CommandPalette({
                 >
                   <ActionDot />
                   <span className="truncate text-txt">
-                    Jump to session waiting for input
+                    Jump to agent waiting for input
                   </span>
                   {waiting > 0 && (
                     <span className="ml-1.5 rounded-xs bg-acc/15 px-1 font-mono text-10 tabular-nums text-acc">
@@ -271,7 +283,8 @@ function ActionDot() {
 }
 
 /** Status dot matching the signal triad, condensed: amber dot + ⚑ for
- * needs-you (pending approval), quiet muted dot for working, faint for idle. */
+ * needs-you (pending approval), accent dot for working (DESIGN.md: working =
+ * accent), faint for idle. */
 function SessionDot({ entry }: { entry: VibeSessionEntry }) {
   const busy = useVibe((s) => !!s.busy[entry.session.id]);
   const needsYou = hasPendingApproval(entry);
@@ -280,7 +293,7 @@ function SessionDot({ entry }: { entry: VibeSessionEntry }) {
       <span
         className={cn(
           "h-1.5 w-1.5 shrink-0 rounded-full",
-          needsYou ? "bg-attn" : busy ? "bg-mut" : "bg-fnt",
+          needsYou ? "bg-attn" : busy ? "bg-acc" : "bg-fnt",
         )}
       />
       {needsYou && (

@@ -29,6 +29,7 @@ import {
   autonomyTripped,
   subscribeAutonomy,
 } from "@/lib/orchestrator/autonomy";
+import { useConductorTimers } from "@/lib/orchestrator/timers";
 import { useProjects } from "@/lib/projects/store";
 import { useVibe } from "@/lib/vibe/session-store";
 import { sendMessage as vibeSend } from "@/lib/vibe/controller";
@@ -45,6 +46,7 @@ import {
 import { useSwarm } from "@/store";
 import { effectivePersona } from "@/lib/orchestrator/persona";
 import { useVibeUi } from "@/lib/vibe/ui-store";
+import { ConductorPlansButton } from "./ConductorPlans";
 import { cn } from "@/lib/utils";
 
 const MAX_ROWS_PX = 168; // ~6 lines
@@ -113,6 +115,7 @@ export function ConductorSidebar() {
         ) : (
           <NoProjectNotice hasProject={!!projectId} />
         )}
+        <TimersNotice projectId={projectId} />
         <BreakerNotice projectId={projectId} />
         <ConductorComposer chatId={activeChatId} projectId={projectId} />
       </div>
@@ -155,6 +158,53 @@ function BreakerNotice({ projectId }: { projectId: string | null }) {
   );
 }
 
+/**
+ * Conductor follow-up timers pending for THIS project — a quiet visibility
+ * line so the human knows the Conductor scheduled itself to wake up (they
+ * only fire while the app runs; missed ones fire on the next launch). Both
+ * selectors return primitives (count + soonest epoch) — never a fresh array
+ * (the useSyncExternalStore rule). The clock time is absolute, so no tick.
+ */
+function TimersNotice({ projectId }: { projectId: string | null }) {
+  const count = useConductorTimers((s) =>
+    projectId ? s.timers.filter((t) => t.projectId === projectId).length : 0,
+  );
+  const nextAt = useConductorTimers((s) => {
+    if (!projectId) return 0;
+    let soonest = Infinity;
+    for (const t of s.timers)
+      if (t.projectId === projectId && t.at < soonest) soonest = t.at;
+    return soonest === Infinity ? 0 : soonest;
+  });
+  if (count === 0 || !nextAt) return null;
+  return (
+    <div className="mx-4 mb-2 flex items-center gap-2 rounded-lg border border-line bg-card px-3 py-1.5 font-mono text-11 text-mut">
+      <span aria-hidden className="shrink-0 text-fnt">
+        ⏲
+      </span>
+      <span className="min-w-0 truncate">
+        {count} timer{count === 1 ? "" : "s"} pending
+      </span>
+      <span className="ml-auto shrink-0 text-fnt">
+        next {formatTimerAt(nextAt)}
+      </span>
+    </div>
+  );
+}
+
+/** Absolute clock time for a timer; prepends a short date when not today. */
+function formatTimerAt(at: number): string {
+  const d = new Date(at);
+  const hm = d.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const sameDay = new Date().toDateString() === d.toDateString();
+  if (sameDay) return hm;
+  const md = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return `${md} ${hm}`;
+}
+
 function ConductorHeader({
   chatId,
   projectId,
@@ -185,6 +235,7 @@ function ConductorHeader({
         </span>
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1">
+        <ConductorPlansButton projectId={projectId} />
         <ChatSwitcher projectId={projectId} />
         <button
           onClick={() => projectId && createChat(projectId)}

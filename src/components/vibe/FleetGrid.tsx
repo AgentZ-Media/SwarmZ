@@ -228,6 +228,9 @@ const AgentCard = memo(function AgentCard({
 }) {
   const name = useVibe((s) => s.sessions[id]?.session.name ?? "");
   const projectDir = useVibe((s) => s.sessions[id]?.session.projectDir ?? "");
+  const fromConductor = useVibe(
+    (s) => s.sessions[id]?.session.spawnedBy === "conductor",
+  );
   const branch = useVibe(
     (s) => s.sessions[id]?.session.worktree?.branch ?? "",
   );
@@ -283,6 +286,18 @@ const AgentCard = memo(function AgentCard({
         <span className="min-w-0 truncate text-13 font-semibold text-txt">
           {name}
         </span>
+        {fromConductor && (
+          // dezent — marks a lane the Conductor staffed vs. a self-spawned one.
+          // `//` is the Conductor's mark throughout the app (sidebar header),
+          // so it reads as attribution without stealing the name's width.
+          <span
+            aria-label="Spawned by the Conductor"
+            title="Spawned by the Conductor"
+            className="shrink-0 rounded-sm border border-acc/35 bg-acc/10 px-1 font-mono text-10 font-semibold leading-none text-acc/90"
+          >
+            //
+          </span>
+        )}
         <span className="min-w-0 truncate font-mono text-10 text-fnt">
           {where}
         </span>
@@ -424,12 +439,21 @@ interface MiniLineSpec {
 function miniLine(item: VibeItem): MiniLineSpec | null {
   switch (item.kind) {
     case "user":
-      return {
-        glyph: "›",
-        glyphCls: "text-fnt",
-        text: item.text,
-        textCls: "text-mut",
-      };
+      // a Conductor-injected prompt is marked with the Conductor's `//` glyph
+      return item.via === "conductor"
+        ? {
+            glyph: "//",
+            glyphCls: "text-acc/80",
+            text: item.text,
+            textCls: "text-mut",
+            mono: true,
+          }
+        : {
+            glyph: "›",
+            glyphCls: "text-fnt",
+            text: item.text,
+            textCls: "text-mut",
+          };
     case "assistant": {
       // an expect_report turn's final message: a readable status line
       // instead of clamped raw JSON (same gate as the ItemFeed report card)

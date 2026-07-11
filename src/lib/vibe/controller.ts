@@ -884,6 +884,7 @@ export async function sendMessageStrict(
       at: Date.now(),
       kind: "user",
       text: trimmed,
+      ...(opts?.via ? { via: opts.via } : {}),
     });
     return await deliverTurn(sessionId, trimmed, opts);
   } finally {
@@ -907,6 +908,12 @@ export interface SendTurnOpts {
    * agent→Conductor status reports).
    */
   outputSchema?: Record<string, unknown>;
+  /**
+   * Marks the mirrored user item as Conductor-authored (prompt_agent /
+   * spawn_agents) so the feed can attribute it. Only the orchestrator
+   * executors pass this — the human composer never does.
+   */
+  via?: "conductor";
 }
 
 /**
@@ -1034,6 +1041,7 @@ export async function steerMessageStrict(
       at: Date.now(),
       kind: "user",
       text: trimmed,
+      ...(opts?.via ? { via: opts.via } : {}),
     });
     return { mode: "steered", turnId: res.turn_id ?? null };
   } catch (err) {
@@ -1257,7 +1265,7 @@ export async function respondApproval(
 ): Promise<void> {
   useVibe
     .getState()
-    .setApprovalStatus(sessionId, approvalId, DECISION_STATUS[decision]);
+    .setApprovalStatus(sessionId, approvalId, DECISION_STATUS[decision], "human");
   try {
     await invokeRespondApproval(sessionId, approvalId, decision, false);
   } catch (err) {
@@ -1283,7 +1291,12 @@ export async function respondApprovalStrict(
   await invokeRespondApproval(sessionId, approvalId, decision, true);
   useVibe
     .getState()
-    .setApprovalStatus(sessionId, approvalId, DECISION_STATUS[decision]);
+    .setApprovalStatus(
+      sessionId,
+      approvalId,
+      DECISION_STATUS[decision],
+      "conductor",
+    );
 }
 
 /** Change the session's access mode (takes effect on the next turn). */

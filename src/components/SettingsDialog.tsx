@@ -474,6 +474,12 @@ function GithubSection() {
             checked={!!settings.githubSuggestPrOnFinish}
             onChange={(v) => updateSettings({ githubSuggestPrOnFinish: v })}
           />
+          <ToggleCard
+            title="Autonomous GitHub writes"
+            sub="Lets the Conductor open PRs, comment and post reviews DURING an autonomous turn (a fleet event drove it, not your message). Off = it must propose these to you instead; turns you trigger directly always allow them. Merging and closing a PR always stay with you. A safety cap against a prompt-injected autonomous cascade posting on your repo — leave off unless you want hands-off GitHub."
+            checked={!!settings.autonomousGithubWrites}
+            onChange={(v) => updateSettings({ autonomousGithubWrites: v })}
+          />
           <Row
             label="Watch interval"
             help="How often open PRs are polled for check/review changes."

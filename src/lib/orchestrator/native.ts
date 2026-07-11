@@ -6,6 +6,8 @@ import { useSwarm, type SwarmState } from "@/store";
 import { useVibe } from "@/lib/vibe/session-store";
 import { useProjects } from "@/lib/projects/store";
 import type {
+  ConductorPlanDocument,
+  ConductorPlanInfo,
   KnownFolder,
   ProjectDocs,
   ProjectEntry,
@@ -41,6 +43,26 @@ export function readTranscript(args: {
  */
 export function projectDocs(root: string): Promise<ProjectDocs> {
   return invoke<ProjectDocs>("project_docs", { root });
+}
+
+/**
+ * List the plan documents the Conductor wrote under `<projectDir>/.swarmz/plans/`
+ * (read-only; same slug-confined area as the `list_plans` tool). Newest first
+ * is up to the caller — the Rust command returns them as found.
+ */
+export function listPlans(projectDir: string): Promise<ConductorPlanInfo[]> {
+  return invoke<ConductorPlanInfo[]>("conductor_plan_list", { projectDir });
+}
+
+/** Read one plan document's Markdown content (read-only; `read_plan` tool). */
+export function readPlan(
+  projectDir: string,
+  slug: string,
+): Promise<ConductorPlanDocument> {
+  return invoke<ConductorPlanDocument>("conductor_plan_read", {
+    projectDir,
+    slug,
+  });
 }
 
 /**

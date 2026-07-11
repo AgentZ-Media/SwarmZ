@@ -202,11 +202,12 @@ export interface VibeState {
   patchItem: (id: string, itemId: string, patch: Partial<VibeItem>) => void;
   /** append text to a command item's output (capped) */
   appendCommandOutput: (id: string, itemId: string, delta: string) => void;
-  /** set an approval item's status */
+  /** set an approval item's status (+ who decided it, for attribution) */
   setApprovalStatus: (
     id: string,
     approvalId: string,
     status: VibeApprovalStatus,
+    decidedBy?: "conductor" | "human",
   ) => void;
 }
 
@@ -541,13 +542,20 @@ export const useVibe = create<VibeState>((set, get) => ({
     schedulePersist();
   },
 
-  setApprovalStatus: (id, approvalId, status) => {
+  setApprovalStatus: (id, approvalId, status, decidedBy) => {
     const next = withEntry(get(), id, (e) => {
       const item = e.items[approvalId];
       if (!item || item.kind !== "approval") return e;
       return {
         ...e,
-        items: { ...e.items, [approvalId]: { ...item, status } },
+        items: {
+          ...e.items,
+          [approvalId]: {
+            ...item,
+            status,
+            ...(decidedBy ? { decidedBy } : {}),
+          },
+        },
       };
     });
     if (!next) return;
@@ -636,6 +644,14 @@ function sanitizeItem(raw: unknown): VibeItem | null {
   const text = typeof m.text === "string" ? m.text : "";
   switch (m.kind) {
     case "user":
+      // Conductor-authorship survives restarts (the "via Conductor" mark)
+      return {
+        id,
+        at,
+        kind: "user",
+        text,
+        ...(m.via === "conductor" ? { via: "conductor" as const } : {}),
+      };
     case "warning":
     case "notice": // compaction dividers survive restarts
       return { id, at, kind: m.kind, text };
@@ -709,6 +725,10 @@ function sanitizeItem(raw: unknown): VibeItem | null {
         // routing class survives hydration; anything else = destructive
         ...(m.escalation === "routine" || m.escalation === "destructive"
           ? { escalation: m.escalation }
+          : {}),
+        // attribution survives hydration (who decided a resolved approval)
+        ...(m.decidedBy === "conductor" || m.decidedBy === "human"
+          ? { decidedBy: m.decidedBy }
           : {}),
         payload:
           m.payload && typeof m.payload === "object"

@@ -2,7 +2,6 @@ import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { VList, type VListHandle } from "virtua";
 import { useVibe } from "@/lib/vibe/session-store";
-import { respondApproval } from "@/lib/vibe/controller";
 import { reportForItem } from "@/lib/vibe/report-item";
 import { approvalCommand, commandExit } from "@/lib/vibe/ui";
 import { cn } from "@/lib/utils";
@@ -92,21 +91,15 @@ const ItemRow = memo(function ItemRow({
   if (!item) return null;
   return (
     <div className="mx-auto w-full max-w-[46rem] pb-4">
-      <RenderItem sessionId={sessionId} item={item} />
+      <RenderItem item={item} />
     </div>
   );
 });
 
-function RenderItem({
-  sessionId,
-  item,
-}: {
-  sessionId: string;
-  item: VibeItem;
-}) {
+function RenderItem({ item }: { item: VibeItem }) {
   switch (item.kind) {
     case "user":
-      return <UserRow text={item.text} />;
+      return <UserRow text={item.text} via={item.via} />;
     case "assistant": {
       // an expect_report turn's final message renders as a report card, not
       // as raw JSON (the gate is strict: stamped `report: true` AND parses)
@@ -119,7 +112,7 @@ function RenderItem({
     case "fileChange":
       return <FileChangeCard changes={item.changes} status={item.status} />;
     case "approval":
-      return <ApprovalRow sessionId={sessionId} item={item} />;
+      return <ApprovalRow item={item} />;
     case "warning":
       return <WarningRow text={item.text} />;
     case "notice":
@@ -133,11 +126,25 @@ function RenderItem({
   }
 }
 
-/** User bubble — pop surface, 12/12/4/12 radius (reference). */
-function UserRow({ text }: { text: string }) {
+/** User bubble — pop surface, 12/12/4/12 radius (reference). A prompt the
+ * Conductor injected (prompt_agent / spawn_agents) carries a small "via
+ * Conductor" label so it's distinguishable from a message the human typed. */
+function UserRow({ text, via }: { text: string; via?: "conductor" }) {
   return (
-    <div className="flex justify-end">
-      <div className="max-w-[82%] select-text whitespace-pre-wrap rounded-xl rounded-br-[4px] border border-line2 bg-pop px-3.5 py-2.5 text-13 leading-relaxed text-txt">
+    <div className="flex flex-col items-end gap-1">
+      {via === "conductor" && (
+        <span className="flex items-center gap-1 pr-1 font-mono text-10 text-acc/80">
+          <span aria-hidden>//</span> via Conductor
+        </span>
+      )}
+      <div
+        className={cn(
+          "max-w-[82%] select-text whitespace-pre-wrap rounded-xl rounded-br-[4px] border px-3.5 py-2.5 text-13 leading-relaxed text-txt",
+          via === "conductor"
+            ? "border-acc/30 bg-acc/[0.06]"
+            : "border-line2 bg-pop",
+        )}
+      >
         {text}
       </div>
     </div>
@@ -319,10 +326,8 @@ function CommandRow({ item }: { item: Extract<VibeItem, { kind: "command" }> }) 
 }
 
 function ApprovalRow({
-  sessionId,
   item,
 }: {
-  sessionId: string;
   item: Extract<VibeItem, { kind: "approval" }>;
 }) {
   const pending = item.status === "pending";
@@ -372,30 +377,35 @@ function ApprovalRow({
         <p className="px-3 pb-1.5 text-12 leading-normal text-mut">{reason}</p>
       )}
       {pending ? (
-        <div className="flex gap-2 border-t border-line px-3 py-2">
-          <button
-            onClick={() => respondApproval(sessionId, item.id, "accept")}
-            className="focus-ring rounded-md bg-txt px-3 py-1 font-mono text-11 font-bold text-bg hover:brightness-90"
-          >
-            Allow
-          </button>
-          <button
-            onClick={() => respondApproval(sessionId, item.id, "decline")}
-            className="focus-ring rounded-md border border-line2 px-3 py-1 font-mono text-11 text-mut hover:border-err/45 hover:text-err"
-          >
-            Decline
-          </button>
+        // The interactive decision lives in the composer takeover (the single
+        // "Allow" surface for the focused session — U6). The inline card stays
+        // read-only so a screen never shows two competing Allow buttons.
+        <div className="flex items-center gap-1.5 border-t border-attn/25 bg-attn/10 px-3 py-1.5 font-mono text-11 text-attn">
+          <span aria-hidden className="animate-zattn shrink-0">
+            ↓
+          </span>
+          <span>awaiting your decision below</span>
         </div>
       ) : (
         <div
           className={cn(
-            "border-t border-line px-3 py-1.5 font-mono text-11",
+            "flex items-center gap-1.5 border-t border-line px-3 py-1.5 font-mono text-11",
             item.status === "accepted" || item.status === "acceptedForSession"
               ? "text-ok"
               : "text-fnt",
           )}
         >
-          {resolvedLabel(item.status)}
+          <span>{resolvedLabel(item.status)}</span>
+          {item.decidedBy === "conductor" && (
+            // attribution — the human must see, at a glance, the approvals they
+            // did NOT give themselves (the Conductor decided this routine one)
+            <span
+              className="ml-auto shrink-0 rounded-sm border border-acc/40 bg-acc/10 px-1.5 py-px text-10 text-acc"
+              title="Decided autonomously by the Conductor (a routine, read-only/test approval). Destructive approvals always wait for you."
+            >
+              ⟐ Conductor{item.escalation === "routine" ? " · routine" : ""}
+            </span>
+          )}
         </div>
       )}
     </div>

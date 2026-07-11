@@ -753,11 +753,12 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         text,
         expectReport
           ? {
+              via: "conductor",
               outputSchema:
                 AGENT_REPORT_SCHEMA as unknown as Record<string, unknown>,
               freshTurnText: text + REPORT_PROMPT_SUFFIX,
             }
-          : undefined,
+          : { via: "conductor" },
       );
     } catch (err) {
       if (expectReport) clearReportExpectation(id);
@@ -844,10 +845,11 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
           expectReport ? text + REPORT_PROMPT_SUFFIX : text,
           expectReport
             ? {
+                via: "conductor",
                 outputSchema:
                   AGENT_REPORT_SCHEMA as unknown as Record<string, unknown>,
               }
-            : undefined,
+            : { via: "conductor" },
         );
         if (expectReport) bindReportExpectation(id, sent.turnId);
         notePromptDelivered(

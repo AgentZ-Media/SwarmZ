@@ -32,7 +32,11 @@ import {
 import { registerAutonomousRunner } from "./lib/orchestrator/triggers";
 import { startGithubController } from "./lib/github/controller";
 import { vibeTriageEntries } from "./lib/vibe/triage";
-import { activateProjectByIndex, focusSession } from "./lib/vibe/controller";
+import {
+  activateProjectByIndex,
+  closeSession,
+  focusSession,
+} from "./lib/vibe/controller";
 import { ensureNotifyPermission, notify } from "./lib/transport";
 
 // dev-only orchestrator smoke-test hook (`window.__orch`) — the DEV guard
@@ -170,7 +174,7 @@ export default function App() {
         e.preventDefault();
         s.setPaletteOpen(!s.paletteOpen);
       } else if (k === "t") {
-        // new native Codex session
+        // new native Codex agent
         e.preventDefault();
         useVibeUi.getState().setNewSessionOpen(true);
       } else if (k === "b") {
@@ -195,9 +199,22 @@ export default function App() {
         e.preventDefault();
         activateProjectByIndex(Number(k) - 1);
       } else if (k === "w") {
-        // always claim ⌘W: unhandled it falls through to the native menu's
-        // Close Window item and closes the whole app
+        // ⌘W — close the FOCUSED agent (browser-tab muscle memory). Always
+        // preventDefault first: unhandled it falls through to the native menu's
+        // Close Window item and quits the whole app (the invariant). With no
+        // agent focused it stays a safe no-op — ⌘W never closes a project tab
+        // (that stays an explicit gesture, and closing a tab keeps its agents).
         e.preventDefault();
+        const ui = useVibeUi.getState();
+        if (ui.stageMode === "session") {
+          const v = useVibe.getState();
+          const id = v.activeId;
+          if (id && v.sessions[id]) {
+            // busy → the same confirm dialog the card's close button raises
+            if (v.busy[id]) ui.setCloseConfirmId(id);
+            else void closeSession(id);
+          }
+        }
       }
     };
     window.addEventListener("keydown", onKey);

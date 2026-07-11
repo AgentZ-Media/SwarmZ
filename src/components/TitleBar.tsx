@@ -134,12 +134,14 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
           </button>
         </Tip>
 
-        <button
-          onClick={() => useVibeUi.getState().setNewSessionOpen(true)}
-          className="no-drag focus-ring ml-1 flex h-8 items-center gap-1.5 rounded-md bg-acc px-3 text-12 font-semibold text-white hover:brightness-110"
-        >
-          <Plus size={13} strokeWidth={2.8} /> New agent
-        </button>
+        <Tip label="New agent (⌘T)">
+          <button
+            onClick={() => useVibeUi.getState().setNewSessionOpen(true)}
+            className="no-drag focus-ring ml-1 flex h-8 items-center gap-1.5 rounded-md bg-acc px-3 text-12 font-semibold text-white hover:brightness-110"
+          >
+            <Plus size={13} strokeWidth={2.8} /> New agent
+          </button>
+        </Tip>
       </div>
     </header>
   );

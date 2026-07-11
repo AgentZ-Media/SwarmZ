@@ -548,7 +548,19 @@ export interface VibePlanStep {
  * raw request (itemId links a fileChange approval to its fileChange item).
  */
 export type VibeItem =
-  | { id: string; at: number; kind: "user"; text: string }
+  | {
+      id: string;
+      at: number;
+      kind: "user";
+      text: string;
+      /**
+       * The Conductor injected this prompt (prompt_agent / spawn_agents),
+       * rather than the human typing it. Lets the feed mark it "via Conductor"
+       * so autonomously-issued orders are distinguishable from your own.
+       * Undefined = a human message (or a pre-existing item).
+       */
+      via?: "conductor";
+    }
   | {
       id: string;
       at: number;
@@ -605,6 +617,14 @@ export type VibeItem =
        * treated as destructive.
        */
       escalation?: "routine" | "destructive";
+      /**
+       * Who decided a resolved approval — the Conductor (via the strict
+       * `decide_approval` path) or the human (the takeover / inline card).
+       * Undefined = still pending, or a pre-existing item resolved before this
+       * field existed. Drives the "approved by Conductor" attribution so the
+       * user can see, at a glance, which approvals they did NOT give themselves.
+       */
+      decidedBy?: "conductor" | "human";
       /** the raw request params (itemId, reason, command, cwd, …) */
       payload: Record<string, unknown>;
     }
