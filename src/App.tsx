@@ -10,6 +10,7 @@ import { CloseWorktreeDialog } from "./components/CloseWorktreeDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { QuickNotesPanel } from "./components/QuickNotesPanel";
 import { UsageDashboard } from "./components/UsageDashboard";
+import { GitHubPanel } from "./components/GitHubPanel";
 import { useSwarm } from "./store";
 import { useVibe } from "./lib/vibe/session-store";
 import { hasPendingApproval } from "./lib/vibe/ui";
@@ -29,6 +30,7 @@ import {
   registerTimerNotice,
 } from "./lib/orchestrator/timers";
 import { registerAutonomousRunner } from "./lib/orchestrator/triggers";
+import { startGithubController } from "./lib/github/controller";
 import { vibeTriageEntries } from "./lib/vibe/triage";
 import { activateProjectByIndex, focusSession } from "./lib/vibe/controller";
 import { ensureNotifyPermission, notify } from "./lib/transport";
@@ -69,12 +71,16 @@ export default function App() {
     // orchestrator status pings: busy → idle / pending-approval transitions
     // of sessions an orchestrator chat prompted become system pings there
     const stopVibePings = startVibeSessionActivityWatcher();
+    // GitHub integration (Phase 7): repo/PR detection, the Rust write-gate
+    // sync, the PR watcher and its pr-changed → ticker/autonomy routing
+    const stopGithub = startGithubController();
     return () => {
       updates.stopBackgroundPolling();
       stopLimits();
       stopQuitGuard();
       stopOrchestratorBus();
       stopVibePings();
+      stopGithub();
     };
   }, [hydrate]);
 
@@ -218,6 +224,7 @@ export default function App() {
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       <UsageDashboard />
       <QuickNotesPanel />
+      <GitHubPanel />
     </TooltipProvider>
   );
 }

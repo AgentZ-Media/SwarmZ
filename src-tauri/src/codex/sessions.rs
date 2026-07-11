@@ -144,9 +144,14 @@ struct SessionState {
 /// One blocked approval request: the Responder that answers the server's RPC
 /// plus the routing class it was classified with (source of truth for the
 /// strict Conductor response path — the frontend can never upgrade it).
+/// `gh_write_gated` marks a "routine" that exists ONLY because the GitHub
+/// integration was enabled at arrival — the strict path re-checks the LIVE
+/// flag, so a pending gh write can't outlive a later disable (see
+/// `routine_gate`).
 struct PendingApproval {
     responder: Responder,
     escalation: &'static str,
+    gh_write_gated: bool,
 }
 
 static SESSIONS: Lazy<Mutex<HashMap<String, SessionState>>> = Lazy::new(Mutex::default);
@@ -361,16 +366,20 @@ fn git_is_routine(args: &[String]) -> bool {
 }
 
 /// Is this full command line routine? Pure, fail-closed, recursion-bounded.
-fn command_is_routine(raw: &str) -> bool {
+/// `gh_writes` = the GitHub integration master toggle (Phase 7): with it ON,
+/// the two sanctioned gh WRITE forms (`gh pr comment`, `gh pr review`) may be
+/// routine; with it OFF every gh write is destructive. Read-only gh commands
+/// are routine either way.
+fn command_is_routine(raw: &str, gh_writes: bool) -> bool {
     // secrets/system-config are never the Conductor's call, wrapped or not
     let lower = raw.to_lowercase();
     if SENSITIVE_PATTERNS.iter().any(|p| lower.contains(p)) {
         return false;
     }
-    classify_command_str(raw, 0)
+    classify_command_str(raw, 0, gh_writes)
 }
 
-fn classify_command_str(raw: &str, depth: u8) -> bool {
+fn classify_command_str(raw: &str, depth: u8, gh_writes: bool) -> bool {
     if depth > 2 {
         return false; // nested wrappers beyond sh -c 'sh -c …' → human
     }
@@ -382,7 +391,7 @@ fn classify_command_str(raw: &str, depth: u8) -> bool {
     }
     // a genuine shell wrapper is unwrapped and its SCRIPT is classified
     if let Some(inner) = unwrap_shell_strict(&tokens) {
-        return classify_command_str(inner, depth + 1);
+        return classify_command_str(inner, depth + 1, gh_writes);
     }
     let Some(head) = normalized_head(&tokens[0]) else {
         return false;
@@ -393,6 +402,8 @@ fn classify_command_str(raw: &str, depth: u8) -> bool {
     }
     match head {
         "git" => git_is_routine(args),
+        // GitHub CLI (Phase 7) — tiny read allowlist + the two gated writes
+        "gh" => gh_is_routine(args, gh_writes),
         // read-only build/test commands
         "cargo" => matches!(
             args.first().map(|s| s.as_str()),
@@ -405,6 +416,189 @@ fn classify_command_str(raw: &str, depth: u8) -> bool {
         },
         "tsc" => true,
         "node" => args.len() == 1 && matches!(args[0].as_str(), "--version" | "-v"),
+        _ => false,
+    }
+}
+
+/// Parse gh tokens after a subcommand against a flag spec `(flag,
+/// takes_value)`. Returns `(positionals, seen_flags)` — the positional tokens
+/// plus the canonical names of the flags that appeared — or None when ANY
+/// dash token is off the allowlist (fail closed). A value-taking flag in its
+/// `--flag value` spelling CONSUMES the next token, so flag values are never
+/// mistaken for positionals (and a value can never smuggle an action flag).
+fn gh_parse_args<'a>(
+    rest: &'a [String],
+    allowed: &[(&'static str, bool)],
+) -> Option<(Vec<&'a str>, Vec<&'static str>)> {
+    let mut positionals = Vec::new();
+    let mut seen = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = rest[i].as_str();
+        if tok.starts_with('-') {
+            let spec = allowed
+                .iter()
+                .find(|(f, _)| tok == *f || tok.starts_with(&format!("{f}=")));
+            let Some((flag, takes_value)) = spec else {
+                return None;
+            };
+            seen.push(*flag);
+            if *takes_value && tok == *flag {
+                i += 1; // `--flag value` spelling: skip the value token
+            }
+        } else {
+            positionals.push(tok);
+        }
+        i += 1;
+    }
+    Some((positionals, seen))
+}
+
+/// A gh selector positional the classification accepts: NOTHING (gh targets
+/// the current branch's PR — inside the session repo) or ONE bare NUMBER.
+/// gh also accepts URLs and branch names as selectors — a URL RETARGETS the
+/// command at an arbitrary foreign repo (`gh pr comment <url>` would post,
+/// `gh pr review <url> --approve` would approve, anywhere on the host), so
+/// URLs, branches and extra positionals all classify destructive.
+fn gh_selector_ok(positionals: &[&str]) -> bool {
+    match positionals {
+        [] => true,
+        [n] => !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+/// Read-only formatting/filter flags of the gh read subcommands. NO `--web`
+/// (opens a browser), NO `-R/--repo` (retargets to arbitrary repos), NO
+/// `--body-file`-style file readers. `true` = the flag takes a value.
+const GH_READ_FLAGS: &[(&str, bool)] = &[
+    ("--json", true),
+    ("--jq", true),
+    ("--limit", true),
+    ("--state", true),
+    ("--comments", false),
+];
+
+/// Do the args parse against the read-flag allowlist WITHOUT any positional?
+/// (list-style reads take no selector; `gh repo view <owner/repo>` would
+/// retarget, so repo view is positional-free too.)
+fn gh_read_no_positional(rest: &[String]) -> bool {
+    matches!(gh_parse_args(rest, GH_READ_FLAGS), Some((p, _)) if p.is_empty())
+}
+
+/// Read-flag allowlist plus at most one bare-number selector.
+fn gh_read_numeric_selector(rest: &[String]) -> bool {
+    matches!(gh_parse_args(rest, GH_READ_FLAGS), Some((p, _)) if gh_selector_ok(&p))
+}
+
+/// Conservative gh classification (Phase 7, fail-closed like everything here):
+/// - read-only queries of the CURRENT repo are routine unconditionally
+///   (`gh pr list|view|diff|checks|status`, `gh repo view`, `gh auth status`,
+///   `gh issue list|view`, `gh run list|view`)
+/// - `gh pr comment --body …` and `gh pr review --approve|--request-changes|
+///   --comment [--body …]` are routine ONLY while the GitHub integration is
+///   enabled (`gh_writes`)
+/// - EVERYTHING else is destructive: merge, close, create, ready, edit,
+///   `gh api` (any method), repo/release/secret/workflow/alias mutations,
+///   unknown subcommands, unknown flags, `--body-file` (file exfiltration),
+///   and ANY non-numeric selector positional — gh accepts `<number>|<url>|
+///   <branch>`, and a URL retargets the command at an arbitrary FOREIGN repo
+///   (comment/review/read anywhere), so only bare numbers (or absence) pass.
+fn gh_is_routine(args: &[String], gh_writes: bool) -> bool {
+    let Some(group) = args.first() else {
+        return false; // bare `gh` → human
+    };
+    if group.starts_with('-') {
+        return false;
+    }
+    let rest = &args[1..];
+    match group.as_str() {
+        "auth" => {
+            rest.first().map(|s| s.as_str()) == Some("status")
+                && matches!(
+                    gh_parse_args(
+                        &rest[1..],
+                        &[("--json", true), ("--jq", true), ("--active", false), ("-a", false)],
+                    ),
+                    Some((p, _)) if p.is_empty()
+                )
+        }
+        "pr" => {
+            let Some(sub) = rest.first() else {
+                return false;
+            };
+            if sub.starts_with('-') {
+                return false;
+            }
+            let flags = &rest[1..];
+            match sub.as_str() {
+                // list-style reads take no selector at all
+                "list" | "status" => gh_read_no_positional(flags),
+                // selector reads: at most one BARE NUMBER (a URL/branch
+                // selector reads a foreign repo → human)
+                "view" | "diff" | "checks" => gh_read_numeric_selector(flags),
+                // gated writes: only with the integration enabled, only the
+                // exact sanctioned flag shapes, only a numeric selector —
+                // `gh pr comment <url> --body …` would post into ANY repo
+                "comment" => {
+                    gh_writes
+                        && matches!(
+                            gh_parse_args(flags, &[("--body", true), ("-b", true)]),
+                            Some((p, _)) if gh_selector_ok(&p)
+                        )
+                }
+                "review" => {
+                    if !gh_writes {
+                        return false;
+                    }
+                    let Some((positionals, seen)) = gh_parse_args(
+                        flags,
+                        &[
+                            ("--approve", false),
+                            ("-a", false),
+                            ("--request-changes", false),
+                            ("-r", false),
+                            ("--comment", false),
+                            ("-c", false),
+                            ("--body", true),
+                            ("-b", true),
+                        ],
+                    ) else {
+                        return false;
+                    };
+                    let actions = seen
+                        .iter()
+                        .filter(|f| {
+                            matches!(
+                                **f,
+                                "--approve" | "-a" | "--request-changes" | "-r" | "--comment" | "-c"
+                            )
+                        })
+                        .count();
+                    actions == 1 && gh_selector_ok(&positionals)
+                }
+                // merge / close / create / ready / edit / checkout / lock / … → human
+                _ => false,
+            }
+        }
+        // `gh repo view <owner/repo>` retargets — positionals are forbidden,
+        // only the session repo's own view is routine
+        "repo" => {
+            rest.first().map(|s| s.as_str()) == Some("view")
+                && gh_read_no_positional(&rest[1..])
+        }
+        "issue" => match rest.first().map(|s| s.as_str()) {
+            Some("list") => gh_read_no_positional(&rest[1..]),
+            Some("view") => gh_read_numeric_selector(&rest[1..]),
+            _ => false,
+        },
+        "run" => match rest.first().map(|s| s.as_str()) {
+            Some("list") => gh_read_no_positional(&rest[1..]),
+            Some("view") => gh_read_numeric_selector(&rest[1..]),
+            _ => false,
+        },
+        // `gh api` (any method — even GET can hit mutating GraphQL), release,
+        // gist, secret, workflow, alias, extension, … → human
         _ => false,
     }
 }
@@ -523,14 +717,15 @@ fn file_changes_within(params: &Value, cwd: &str) -> bool {
 /// Classify one approval request for Conductor routing. `kind` is the
 /// approval flavor from `approval_kind`, `params` the raw request params,
 /// `cwd` the session's working directory (the trusted profile value, not
-/// anything model-supplied).
-pub fn classify_approval(kind: &str, params: &Value, cwd: &str) -> &'static str {
+/// anything model-supplied). `gh_writes` = the GitHub-integration master
+/// toggle (Phase 7) — with it OFF, gh write commands are always destructive.
+pub fn classify_approval(kind: &str, params: &Value, cwd: &str, gh_writes: bool) -> &'static str {
     let routine = match kind {
         "command" => {
             let cmd_ok = params
                 .get("command")
                 .and_then(|c| c.as_str())
-                .map(command_is_routine)
+                .map(|c| command_is_routine(c, gh_writes))
                 .unwrap_or(false);
             // the REQUEST's cwd (when present) must sit inside the session's
             // assigned directory — a foreign cwd retargets even a read-only
@@ -736,8 +931,16 @@ fn handle_server_request(
             // Conductor routing class (Phase 4, fail closed): "routine" =
             // the Conductor may decide it, "destructive" = hard human-only.
             // Stored NEXT to the Responder — the strict response path
-            // enforces it server-side, whatever the frontend claims.
-            let escalation = classify_approval(kind, &params, &cwd);
+            // enforces it server-side, whatever the frontend claims. The
+            // Phase-7 gh-write gate reads the Rust-side integration flag,
+            // never anything frontend-claimed per request.
+            let escalation =
+                classify_approval(kind, &params, &cwd, crate::github::integration_enabled());
+            // Phase-7 stale-toggle guard: is this routine ONLY because the
+            // integration is on right now? (classified again with the flag
+            // off — a difference marks it for the live re-check on respond)
+            let gh_write_gated = escalation == "routine"
+                && classify_approval(kind, &params, &cwd, false) == "destructive";
             let approval_id = {
                 let mut sessions = SESSIONS.lock();
                 let Some(st) = sessions.get_mut(session_id) else {
@@ -750,8 +953,10 @@ fn handle_server_request(
                     st.approval_counter,
                     APPROVAL_SEQ.fetch_add(1, Ordering::Relaxed)
                 );
-                st.pending_approvals
-                    .insert(approval_id.clone(), PendingApproval { responder, escalation });
+                st.pending_approvals.insert(
+                    approval_id.clone(),
+                    PendingApproval { responder, escalation, gh_write_gated },
+                );
                 approval_id
             };
             emit_session_event(
@@ -1410,6 +1615,30 @@ pub async fn session_review(session_id: &str, target: &str) -> Result<Value, Str
     }))
 }
 
+/// The strict Conductor response gate (pure, unit-tested): only "routine"
+/// passes, AND a routine class that exists solely because the GitHub
+/// integration was ON at classification time (`gh_write_gated`) is re-checked
+/// against the LIVE flag — the user disabling the integration while the
+/// approval sat pending downgrades it back to human-only. Frontend state can
+/// never upgrade an approval through this gate.
+fn routine_gate(
+    escalation: &str,
+    gh_write_gated: bool,
+    integration_on_now: bool,
+) -> Result<(), String> {
+    if escalation != "routine" {
+        return Err(
+            "this approval is classified DESTRUCTIVE — only the human may decide it".into(),
+        );
+    }
+    if gh_write_gated && !integration_on_now {
+        return Err(
+            "this approval is a GitHub write and the GitHub integration has been disabled since it arrived — only the human may decide it now".into(),
+        );
+    }
+    Ok(())
+}
+
 /// Answer a pending approval — `decision` ∈ accept | acceptForSession |
 /// decline | cancel — resolving the blocked server request.
 ///
@@ -1438,11 +1667,15 @@ pub async fn session_respond_approval(
             .pending_approvals
             .get(approval_id)
             .ok_or_else(|| format!("no pending approval \"{approval_id}\" in this session"))?;
-        if require_routine && pending.escalation != "routine" {
-            // the responder STAYS pending — the human's card remains live
-            return Err(
-                "this approval is classified DESTRUCTIVE — only the human may decide it".into(),
-            );
+        if require_routine {
+            // the responder STAYS pending on refusal — the human's card
+            // remains live (destructive class, or a gh write whose routine
+            // class went stale because the integration was disabled)
+            routine_gate(
+                pending.escalation,
+                pending.gh_write_gated,
+                crate::github::integration_enabled(),
+            )?;
         }
         st.pending_approvals
             .remove(approval_id)
@@ -1705,8 +1938,14 @@ mod tests {
 
     // ---- Phase-4 security review: the fail-closed classifier ----
 
+    /// 3-arg shorthand for the suite: gh writes OFF (the fail-closed default
+    /// posture) — the Phase-7 gh tests pass the flag explicitly.
+    fn classify_no_gh(kind: &str, params: &Value, cwd: &str) -> &'static str {
+        classify_approval(kind, params, cwd, false)
+    }
+
     fn classify_cmd(c: &str) -> &'static str {
-        classify_approval("command", &json!({ "command": c }), "/repo/wt")
+        classify_no_gh("command", &json!({ "command": c }), "/repo/wt")
     }
 
     #[test]
@@ -1859,19 +2098,181 @@ mod tests {
             assert_eq!(classify_cmd(c), "destructive", "{c}");
         }
         // missing command field / non-string → human
-        assert_eq!(classify_approval("command", &json!({}), "/repo/wt"), "destructive");
+        assert_eq!(classify_no_gh("command", &json!({}), "/repo/wt"), "destructive");
         assert_eq!(
-            classify_approval("command", &json!({ "command": 42 }), "/repo/wt"),
+            classify_no_gh("command", &json!({ "command": 42 }), "/repo/wt"),
             "destructive"
         );
         // unknown approval kinds → human
-        assert_eq!(classify_approval("elicitation", &json!({}), "/repo/wt"), "destructive");
+        assert_eq!(classify_no_gh("elicitation", &json!({}), "/repo/wt"), "destructive");
+    }
+
+    // ---- Phase-7 security review: gh CLI classification (frozen) ----
+
+    fn classify_gh(c: &str, gh_writes: bool) -> &'static str {
+        classify_approval("command", &json!({ "command": c }), "/repo/wt", gh_writes)
+    }
+
+    #[test]
+    fn gh_read_only_commands_are_routine_regardless_of_integration() {
+        for c in [
+            "gh pr list",
+            "gh pr list --state open --limit 20",
+            "gh pr list --json number,title",
+            "gh pr view 12",
+            "gh pr view 12 --json title,body --jq .title",
+            "gh pr view 12 --comments",
+            "gh pr diff 12",
+            "gh pr checks 12",
+            "gh pr checks 12 --json name,bucket",
+            "gh pr status",
+            "gh repo view",
+            "gh repo view --json name,owner",
+            "gh auth status",
+            "gh issue list",
+            "gh issue view 4",
+            "gh run list --limit 5",
+            "gh run view 123",
+            "/bin/zsh -lc 'gh pr list'",
+        ] {
+            assert_eq!(classify_gh(c, false), "routine", "{c} (integration off)");
+            assert_eq!(classify_gh(c, true), "routine", "{c} (integration on)");
+        }
+    }
+
+    #[test]
+    fn gh_sanctioned_writes_are_routine_only_with_the_integration_enabled() {
+        for c in [
+            "gh pr comment 12 --body 'looks good, merging can wait'",
+            "gh pr comment 12 -b thanks",
+            "gh pr review 12 --approve",
+            "gh pr review 12 --request-changes --body 'fix the race in store.ts'",
+            "gh pr review 12 --comment --body 'left notes inline'",
+            // no selector = the current branch's PR (inside the session repo)
+            "gh pr comment --body 'status update'",
+            "gh pr review --approve",
+        ] {
+            assert_eq!(classify_gh(c, true), "routine", "{c} (integration on)");
+            // master toggle OFF → every gh write is hard human-only
+            assert_eq!(classify_gh(c, false), "destructive", "{c} (integration off)");
+        }
+    }
+
+    /// Double-review HIGH 2 (frozen): a pending approval's routine class must
+    /// not outlive the integration toggle — the strict Conductor gate
+    /// re-checks the LIVE flag for gh-write-gated routines.
+    #[test]
+    fn routine_gate_rechecks_the_live_integration_flag() {
+        // plain routine (not gh-gated) passes regardless of the flag
+        assert!(routine_gate("routine", false, true).is_ok());
+        assert!(routine_gate("routine", false, false).is_ok());
+        // a gh-write routine passes only while the integration is STILL on
+        assert!(routine_gate("routine", true, true).is_ok());
+        let err = routine_gate("routine", true, false).unwrap_err();
+        assert!(err.contains("GitHub"), "{err}");
+        // destructive never passes, whatever the flags say
+        assert!(routine_gate("destructive", false, true).is_err());
+        assert!(routine_gate("destructive", true, true).is_err());
+        // and the marker derivation: a sanctioned gh write flips its class
+        // with the toggle — exactly the double-classification the handler
+        // stores as `gh_write_gated`
+        let params = json!({ "command": "gh pr comment 12 --body 'done'" });
+        let on = classify_approval("command", &params, "/repo/wt", true);
+        let off = classify_approval("command", &params, "/repo/wt", false);
+        assert_eq!((on, off), ("routine", "destructive"));
+        // a plain read never becomes gh-write-gated
+        let read = json!({ "command": "gh pr view 12" });
+        assert_eq!(classify_approval("command", &read, "/repo/wt", true), "routine");
+        assert_eq!(classify_approval("command", &read, "/repo/wt", false), "routine");
+    }
+
+    #[test]
+    fn gh_adversarial_payloads_are_all_destructive() {
+        // frozen: merge/close/create/api and every escape hatch stay
+        // human-only EVEN with the integration enabled
+        for c in [
+            // irreversible / outward PR mutations
+            "gh pr merge 12",
+            "gh pr merge 12 --squash --delete-branch",
+            "gh pr merge --admin",
+            "gh pr close 12",
+            "gh pr close 12 --delete-branch",
+            "gh pr create --title x --body y",
+            "gh pr create --fill",
+            "gh pr ready 12",
+            "gh pr edit 12 --title hijack",
+            "gh pr checkout 12",
+            "gh pr lock 12",
+            "gh pr reopen 12",
+            // repo / account level destruction
+            "gh repo delete AgentZ-Media/SwarmZ --yes",
+            "gh repo edit --visibility public",
+            "gh repo clone other/repo",
+            "gh release create v1.0.0",
+            "gh release delete v1.0.0",
+            "gh workflow run deploy.yml",
+            "gh alias set co 'pr checkout'",
+            "gh extension install evil/ext",
+            "gh auth logout",
+            "gh auth refresh -s admin:org",
+            // gh api = arbitrary REST/GraphQL, any method → human
+            "gh api repos/x/y",
+            "gh api -X DELETE /repos/x/y",
+            "gh api graphql -f query='mutation {}'",
+            // flag tricks
+            "gh pr comment 12 --body-file /repo/wt/notes.md", // file exfiltration into a public comment
+            "gh pr view 12 --web",                            // not on the flag allowlist
+            "gh pr list -R other/repo",                       // repo retargeting
+            "gh pr review 12",                                // no action flag
+            "gh pr review 12 --approve --request-changes",    // ambiguous double action
+            "gh pr comment 12 --edit-last --body x",
+            // positional-URL retargeting (double-review HIGH 1, frozen): gh
+            // accepts <number>|<url>|<branch> as selector — a URL retargets
+            // the command at an arbitrary FOREIGN repo; only bare numbers pass
+            "gh pr comment https://github.com/victim/other-repo/pull/1 --body 'leaked content'",
+            "gh pr review https://github.com/anyone/repo/pull/1 --approve",
+            "gh pr view https://github.com/other/repo/pull/1",
+            "gh pr diff https://github.com/other/repo/pull/1",
+            "gh pr checks https://github.com/other/repo/pull/1",
+            "gh issue view https://github.com/other/repo/issues/1",
+            "gh run view https://github.com/other/repo/actions/runs/1",
+            // branch selectors and extra positionals → human too
+            "gh pr view some-branch",
+            "gh pr comment feature/x --body hi",
+            "gh pr view 12 extra",
+            "gh pr comment 12 13 --body x",
+            "gh pr list extra",
+            "gh pr status 12",
+            // repo view with ANY positional retargets (owner/repo selector)
+            "gh repo view owner/repo",
+            "gh repo view https://github.com/other/repo",
+            "gh issue list 5",
+            "gh run list 5",
+            "gh auth status extra",
+            // a value-flag can't smuggle the selector past the gate
+            "gh pr review --body x https://github.com/other/repo/pull/1 --approve",
+            // structural
+            "gh",
+            "gh --version && rm -rf .",
+            "gh pr comment 12 --body \"$(cat /repo/wt/notes.md)\"",
+        ] {
+            assert_eq!(classify_gh(c, true), "destructive", "{c} (integration on)");
+            assert_eq!(classify_gh(c, false), "destructive", "{c} (integration off)");
+        }
+        // sensitive substrings force human even under a read-only gh head
+        assert_eq!(
+            classify_gh("gh pr view 12 --json body --jq .token", true),
+            "destructive"
+        );
+        // `gh secret set` carries the sensitive "secret" substring AND an
+        // unknown subcommand — destructive twice over
+        assert_eq!(classify_gh("gh secret set DEPLOY_KEY", true), "destructive");
     }
 
     #[test]
     fn request_cwd_outside_the_session_dir_is_destructive() {
         let classify = |cmd: &str, req_cwd: Value, session_cwd: &str| {
-            classify_approval(
+            classify_no_gh(
                 "command",
                 &json!({ "command": cmd, "cwd": req_cwd }),
                 session_cwd,
@@ -1949,17 +2350,17 @@ mod tests {
 
         // pure create inside the tree → routine
         assert_eq!(
-            classify_approval("fileChange", &change(&p("src/new.rs"), json!({"type":"add"})), &cwd),
+            classify_no_gh("fileChange", &change(&p("src/new.rs"), json!({"type":"add"})), &cwd),
             "routine"
         );
         // in-place edit inside the tree → routine
         assert_eq!(
-            classify_approval("fileChange", &change(&p("src/existing.rs"), json!({"type":"update"})), &cwd),
+            classify_no_gh("fileChange", &change(&p("src/existing.rs"), json!({"type":"update"})), &cwd),
             "routine"
         );
         // update with move_path (either spelling) = rename → human
         assert_eq!(
-            classify_approval(
+            classify_no_gh(
                 "fileChange",
                 &change(&p("src/existing.rs"), json!({"type":"update","move_path": p("src/renamed.rs")})),
                 &cwd
@@ -1967,7 +2368,7 @@ mod tests {
             "destructive"
         );
         assert_eq!(
-            classify_approval(
+            classify_no_gh(
                 "fileChange",
                 &change(&p("src/existing.rs"), json!({"type":"update","movePath": p("src/renamed.rs")})),
                 &cwd
@@ -1976,26 +2377,26 @@ mod tests {
         );
         // delete → human, always
         assert_eq!(
-            classify_approval("fileChange", &change(&p("src/existing.rs"), json!({"type":"delete"})), &cwd),
+            classify_no_gh("fileChange", &change(&p("src/existing.rs"), json!({"type":"delete"})), &cwd),
             "destructive"
         );
         // add OVER an existing file is an overwrite → human
         assert_eq!(
-            classify_approval("fileChange", &change(&p("src/existing.rs"), json!({"type":"add"})), &cwd),
+            classify_no_gh("fileChange", &change(&p("src/existing.rs"), json!({"type":"add"})), &cwd),
             "destructive"
         );
         // missing/unknown kind → human (fail closed)
         assert_eq!(
-            classify_approval("fileChange", &json!({ "changes": [{ "path": p("src/x.rs") }] }), &cwd),
+            classify_no_gh("fileChange", &json!({ "changes": [{ "path": p("src/x.rs") }] }), &cwd),
             "destructive"
         );
         assert_eq!(
-            classify_approval("fileChange", &change(&p("src/x.rs"), json!({"type":"weird"})), &cwd),
+            classify_no_gh("fileChange", &change(&p("src/x.rs"), json!({"type":"weird"})), &cwd),
             "destructive"
         );
         // `..` traversal is rejected lexically, before any fs lookup
         assert_eq!(
-            classify_approval(
+            classify_no_gh(
                 "fileChange",
                 &change(&format!("{cwd}/../../etc/passwd"), json!({"type":"add"})),
                 &cwd
@@ -2010,7 +2411,7 @@ mod tests {
         std::fs::remove_file(&link).ok();
         std::os::unix::fs::symlink(escape_dir.join("target.rs"), &link).unwrap();
         assert_eq!(
-            classify_approval(
+            classify_no_gh(
                 "fileChange",
                 &change(&link.to_string_lossy(), json!({"type":"update"})),
                 &cwd
@@ -2021,7 +2422,7 @@ mod tests {
         let dirlink = root.join("out");
         std::os::unix::fs::symlink(&escape_dir, &dirlink).unwrap();
         assert_eq!(
-            classify_approval(
+            classify_no_gh(
                 "fileChange",
                 &change(&dirlink.join("new.rs").to_string_lossy(), json!({"type":"add"})),
                 &cwd
@@ -2032,7 +2433,7 @@ mod tests {
         let broken = root.join("src/broken.rs");
         std::os::unix::fs::symlink(root.join("does-not-exist"), &broken).unwrap();
         assert_eq!(
-            classify_approval(
+            classify_no_gh(
                 "fileChange",
                 &change(&broken.to_string_lossy(), json!({"type":"update"})),
                 &cwd
@@ -2041,12 +2442,12 @@ mod tests {
         );
         // sensitive names stay human even inside the tree
         assert_eq!(
-            classify_approval("fileChange", &change(&p(".env"), json!({"type":"add"})), &cwd),
+            classify_no_gh("fileChange", &change(&p(".env"), json!({"type":"add"})), &cwd),
             "destructive"
         );
         // one bad change poisons the batch
         assert_eq!(
-            classify_approval(
+            classify_no_gh(
                 "fileChange",
                 &json!({ "changes": [
                     { "path": p("src/new2.rs"), "kind": {"type":"add"}, "diff": "d" },
@@ -2057,9 +2458,9 @@ mod tests {
             "destructive"
         );
         // no paths to judge → human
-        assert_eq!(classify_approval("fileChange", &json!({}), &cwd), "destructive");
+        assert_eq!(classify_no_gh("fileChange", &json!({}), &cwd), "destructive");
         assert_eq!(
-            classify_approval("fileChange", &json!({ "changes": [] }), &cwd),
+            classify_no_gh("fileChange", &json!({ "changes": [] }), &cwd),
             "destructive"
         );
 

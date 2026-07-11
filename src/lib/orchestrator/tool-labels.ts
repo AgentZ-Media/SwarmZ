@@ -69,6 +69,22 @@ export function toolActivityLabel(
       return "Read a plan";
     case "remember":
       return "Noted to memory";
+    // GitHub (Phase 7): the outward-facing actions especially must be
+    // legible in the audit trail — never a generic "Used a tool"
+    case "github_status":
+      return "Checked GitHub";
+    case "list_prs":
+      return "Checked pull requests";
+    case "read_pr":
+      return "Read a pull request";
+    case "create_pr":
+      return "Opened a pull request";
+    case "review_pr":
+      return "Reviewed a pull request";
+    case "comment_pr":
+      return "Commented on a pull request";
+    case "watch_pr":
+      return "Updated a PR watch";
     default:
       return "Used a tool";
   }

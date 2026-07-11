@@ -13,17 +13,22 @@ export type FleetEventKind =
   | "waiting" // a session raised a pending approval (needs-you)
   | "orch_prompt" // the orchestrator delivered a prompt into a session
   | "created" // a session was created
-  | "exited"; // a session's turn failed / the session was closed
+  | "exited" // a session's turn failed / the session was closed
+  | "pr"; // a GitHub PR changed (watcher; ticker-only, no toast)
 
 export interface FleetEvent {
   id: string;
   /** epoch ms */
   at: number;
   kind: FleetEventKind;
-  /** vibe session id */
+  /** vibe session id ("" for non-session events like "pr") */
   sessionId: string;
   /** session name captured at event time (the session may be gone later) */
   sessionName: string;
+  /** pre-built ticker label (kind "pr") — session kinds derive theirs */
+  label?: string;
+  /** external link the ticker chip opens (kind "pr": the PR URL) */
+  url?: string;
 }
 
 /** Feed cap — oldest events fall off first. */

@@ -162,6 +162,8 @@ export interface SwarmState {
   notesOpen: boolean;
   /** usage dashboard drawer */
   dashboardOpen: boolean;
+  /** GitHub panel drawer (title bar / Deck PR indicator) */
+  githubOpen: boolean;
   /** command palette (⌘K) */
   paletteOpen: boolean;
   /** pending app-quit while these sessions are still working (see lib/quit.ts) */
@@ -227,6 +229,7 @@ export interface SwarmState {
 
   // ui
   setDashboardOpen: (open: boolean) => void;
+  setGithubOpen: (open: boolean) => void;
   setPaletteOpen: (open: boolean) => void;
 }
 
@@ -236,6 +239,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   quickNotes: { global: [], folders: {} },
   notesOpen: false,
   dashboardOpen: false,
+  githubOpen: false,
   paletteOpen: false,
   quitConfirm: null,
   worktrees: [],
@@ -591,5 +595,6 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   },
 
   setDashboardOpen: (open) => set({ dashboardOpen: open }),
+  setGithubOpen: (open) => set({ githubOpen: open }),
   setPaletteOpen: (open) => set({ paletteOpen: open }),
 }));

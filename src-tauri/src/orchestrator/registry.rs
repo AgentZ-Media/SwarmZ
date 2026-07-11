@@ -30,6 +30,16 @@ const WORKTREE_TIMEOUT_MS: u64 = 150_000;
 const REVIEW_TIMEOUT_MS: u64 = 600_000;
 /// `prompt_agent` may steer a running turn (an extra app-server roundtrip).
 const PROMPT_TIMEOUT_MS: u64 = 30_000;
+/// GitHub reads go over the network (`gh` → GitHub API). Must OUTLAST the
+/// executor's worst case (`github_status` chains auth + repo + PR list ≈
+/// 3 × the 30 s gh subprocess deadline; `read_pr` runs view + diff) — the bus
+/// timeout can't cancel the webview executor, only orphan it.
+const GITHUB_TIMEOUT_MS: u64 = 90_000;
+/// `create_pr` pushes the branch first (a possibly large upload): worktree
+/// resolve + repo info (30 s) + push (120 s) + gh pr create (120 s) headroom.
+const CREATE_PR_TIMEOUT_MS: u64 = 300_000;
+/// `review_pr` runs a whole detached codex review before (optionally) posting.
+const REVIEW_PR_TIMEOUT_MS: u64 = 600_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolDefinition {
@@ -332,6 +342,91 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
+        // ---- github (Phase 7 — usable only while the user's GitHub
+        //      integration toggle is ON; executors refuse otherwise) ----
+        ToolDefinition {
+            name: "github_status",
+            description: "GitHub situation of this project: whether the user's GitHub integration is enabled, gh auth state (account), the project's GitHub repo (owner/name, default branch) and the open-PR count. Always answers — when the integration is disabled it says so; every other github tool refuses then. Call this first before any GitHub work.",
+            parameters: empty_params(),
+            timeout_ms: GITHUB_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "list_prs",
+            description: "Open pull requests of this project's GitHub repo: number, title, author, head/base branch, draft state, mergeable, review decision and a CI checks summary (passing/failing/pending). Requires the GitHub integration to be enabled.",
+            parameters: empty_params(),
+            timeout_ms: GITHUB_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "read_pr",
+            description: "One pull request in detail: description, reviews, changed files, CI checks, and (by default) the unified diff — capped for large PRs. Requires the GitHub integration to be enabled.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "number": { "type": "integer", "description": "PR number (from list_prs)" },
+                    "include_diff": { "type": "boolean", "description": "include the unified diff (default true) — pass false for a cheap metadata-only read" }
+                },
+                "required": ["number"]
+            }),
+            timeout_ms: GITHUB_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "create_pr",
+            description: "OUTWARD-FACING: push an agent's worktree branch to origin (plain push, never force, never the default branch) and open a pull request from it. Use it ONLY on the user's explicit order or their standing instruction for this goal. Pass exactly one of agent (the branch of that agent's worktree) or branch (a worktree branch of this project). Requires the GitHub integration to be enabled.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "agent": agent_param(),
+                    "branch": { "type": "string", "description": "a worktree branch of this project (alternative to agent)" },
+                    "title": { "type": "string", "description": "PR title" },
+                    "body": { "type": "string", "description": "PR description (Markdown) — say what changed and why" },
+                    "base": { "type": "string", "description": "base branch — omit for the repo default" },
+                    "draft": { "type": "boolean", "description": "open as a draft PR (default false)" }
+                },
+                "required": ["title", "body"]
+            }),
+            timeout_ms: CREATE_PR_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "review_pr",
+            description: "Run the native codex review machinery over a pull request's changes: the PR's head branch must be checked out in one of this project's worktrees (pass that agent, or it is found by branch); the detached review diffs it against the PR's base and returns prioritized findings. Set post:true to also submit the findings to GitHub as a PR review (outward-facing — only on the user's order or standing instruction). Requires the GitHub integration to be enabled.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "number": { "type": "integer", "description": "PR number (from list_prs)" },
+                    "agent": agent_param(),
+                    "post": { "type": "boolean", "description": "also submit the review to GitHub (default false — findings only reach you)" },
+                    "action": { "type": "string", "enum": ["comment", "approve", "request_changes"], "description": "review verdict when posting (default comment)" }
+                },
+                "required": ["number"]
+            }),
+            timeout_ms: REVIEW_PR_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "comment_pr",
+            description: "OUTWARD-FACING: post a comment on a pull request (visible to everyone on GitHub). Use it only on the user's explicit order or their standing instruction. Requires the GitHub integration to be enabled.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "number": { "type": "integer", "description": "PR number (from list_prs)" },
+                    "body": { "type": "string", "description": "the comment (Markdown)" }
+                },
+                "required": ["number", "body"]
+            }),
+            timeout_ms: GITHUB_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "watch_pr",
+            description: "Watch a pull request: while the app runs, every real change (checks turning green/red, review decisions, ready/draft flips, close/merge) wakes you with an autonomous [pr update] turn. action \"unwatch\" stops it. Watches last for the current app run — set a timer for follow-ups that must survive a restart. Requires the GitHub integration to be enabled.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "number": { "type": "integer", "description": "PR number (from list_prs)" },
+                    "action": { "type": "string", "enum": ["watch", "unwatch"], "description": "omit for \"watch\"" }
+                },
+                "required": ["number"]
+            }),
+            timeout_ms: GITHUB_TIMEOUT_MS,
+        },
         // ---- memory ----
         ToolDefinition {
             name: "remember",
@@ -441,8 +536,9 @@ pub fn validate_args(def: &ToolDefinition, args: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// The frozen Phase-4 catalog — a missing or extra tool fails loudly.
-    pub const EXPECTED_TOOLS: [&str; 23] = [
+    /// The frozen Phase-4 catalog + the Phase-7 GitHub tools — a missing or
+    /// extra tool fails loudly.
+    pub const EXPECTED_TOOLS: [&str; 30] = [
         "fleet_snapshot",
         "read_agent",
         "read_project_docs",
@@ -466,6 +562,13 @@ mod tests {
         "write_plan",
         "list_plans",
         "read_plan",
+        "github_status",
+        "list_prs",
+        "read_pr",
+        "create_pr",
+        "review_pr",
+        "comment_pr",
+        "watch_pr",
     ];
 
     #[test]
@@ -600,5 +703,57 @@ mod tests {
         assert_eq!(find_tool("cleanup_worktree").unwrap().timeout_ms, WORKTREE_TIMEOUT_MS);
         assert_eq!(find_tool("prompt_agent").unwrap().timeout_ms, PROMPT_TIMEOUT_MS);
         assert_eq!(find_tool("fleet_snapshot").unwrap().timeout_ms, DEFAULT_TIMEOUT_MS);
+        // GitHub: network reads, a push-heavy create, a full review turn
+        assert_eq!(find_tool("github_status").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+        assert_eq!(find_tool("list_prs").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+        assert_eq!(find_tool("read_pr").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+        assert_eq!(find_tool("create_pr").unwrap().timeout_ms, CREATE_PR_TIMEOUT_MS);
+        assert_eq!(find_tool("review_pr").unwrap().timeout_ms, REVIEW_PR_TIMEOUT_MS);
+        assert_eq!(find_tool("comment_pr").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+        assert_eq!(find_tool("watch_pr").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn github_tool_args_are_validated() {
+        let def = find_tool("read_pr").unwrap();
+        let err = validate_args(&def, &json!({})).unwrap_err();
+        assert!(err.contains("number"), "unexpected error: {err}");
+        assert!(validate_args(&def, &json!({ "number": 12 })).is_ok());
+        assert!(validate_args(&def, &json!({ "number": 12, "include_diff": false })).is_ok());
+        let err = validate_args(&def, &json!({ "number": "12" })).unwrap_err();
+        assert!(err.contains("expected integer"), "unexpected error: {err}");
+
+        let def = find_tool("create_pr").unwrap();
+        let err = validate_args(&def, &json!({ "title": "x" })).unwrap_err();
+        assert!(err.contains("body"), "unexpected error: {err}");
+        assert!(validate_args(
+            &def,
+            &json!({ "agent": "Maya", "title": "Fix checkout", "body": "…", "draft": true })
+        )
+        .is_ok());
+
+        let def = find_tool("review_pr").unwrap();
+        assert!(validate_args(&def, &json!({ "number": 3, "post": true, "action": "approve" })).is_ok());
+        let err =
+            validate_args(&def, &json!({ "number": 3, "action": "merge" })).unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+
+        let def = find_tool("comment_pr").unwrap();
+        let err = validate_args(&def, &json!({ "number": 3 })).unwrap_err();
+        assert!(err.contains("body"), "unexpected error: {err}");
+
+        let def = find_tool("watch_pr").unwrap();
+        assert!(validate_args(&def, &json!({ "number": 3 })).is_ok());
+        let err = validate_args(&def, &json!({ "number": 3, "action": "mute" })).unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+    }
+
+    /// There is deliberately NO merge/close tool — merging PRs stays a human
+    /// action (see the approval classification: `gh pr merge` is destructive).
+    #[test]
+    fn no_pr_merge_or_close_tool_exists() {
+        for forbidden in ["merge_pr", "close_pr", "pr_merge", "pr_close"] {
+            assert!(find_tool(forbidden).is_none(), "{forbidden} must not exist");
+        }
     }
 }

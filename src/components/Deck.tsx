@@ -18,6 +18,10 @@ import {
   subscribeAutonomy,
 } from "@/lib/orchestrator/autonomy";
 import { useProjects } from "@/lib/projects/store";
+import { useSwarm } from "@/store";
+import { useGithub } from "@/lib/github/store";
+import { deckPrSignature } from "@/lib/github/core";
+import { openUrl } from "@/lib/transport";
 import { decayedSignal, hasPendingApproval } from "@/lib/vibe/ui";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { Tip } from "./ui/tooltip";
@@ -39,6 +43,7 @@ export function Deck() {
       <EventTicker />
       <Equalizer />
       <OrchestratorDot />
+      <PrIndicator />
       <Meters />
       <Clock />
     </div>
@@ -314,6 +319,7 @@ const EVENT_STYLE: Record<
   orch_prompt: { glyph: "▸", cls: "text-mut" },
   created: { glyph: "+", cls: "text-fnt" },
   exited: { glyph: "×", cls: "text-fnt" },
+  pr: { glyph: "⇅", cls: "text-mut" },
 };
 
 function eventLabel(e: FleetEvent): string {
@@ -328,20 +334,31 @@ function eventLabel(e: FleetEvent): string {
       return `${e.sessionName} created`;
     case "exited":
       return `${e.sessionName} turn failed`;
+    case "pr":
+      return e.label ?? e.sessionName;
   }
 }
 
 function EventChip({ event }: { event: FleetEvent }) {
   const live = useVibe((s) => !!s.sessions[event.sessionId]);
+  // PR events carry no session — the chip opens the PR on GitHub instead
+  const isPr = event.kind === "pr";
+  const clickable = isPr ? !!event.url : live;
   const style = EVENT_STYLE[event.kind];
   return (
     <button
-      onClick={() => focusSession(event.sessionId)}
-      disabled={!live}
-      title={live ? "Open agent" : "Closed"}
+      onClick={() => {
+        if (isPr) {
+          if (event.url) void openUrl(event.url);
+        } else {
+          focusSession(event.sessionId);
+        }
+      }}
+      disabled={!clickable}
+      title={isPr ? "Open PR on GitHub" : live ? "Open agent" : "Closed"}
       className={cn(
         "focus-ring flex min-w-0 shrink items-center gap-1 rounded-xs px-1 py-0.5",
-        live ? "hover:bg-card" : "cursor-default",
+        clickable ? "hover:bg-card" : "cursor-default",
       )}
     >
       <span className="shrink-0 text-fnt">{hhmm(event.at)}</span>
@@ -588,7 +605,49 @@ function OrchestratorDot() {
   );
 }
 
-// ---- 7. Clock ----
+// ---- 7. PR indicator (Phase 7 — only with the GitHub integration ON) ----
+
+/**
+ * Quiet per-ACTIVE-project PR chip: `⇅ N` open PRs, err-tinted with a
+ * failing-check count while any PR's checks are red. Hidden when the
+ * integration is off or the project has no open PRs. Click opens the GitHub
+ * panel. Selector contract: only PRIMITIVES leave the selectors (the PR list
+ * collapses into `deckPrSignature`'s string).
+ */
+function PrIndicator() {
+  const enabled = useSwarm((s) => !!s.settings.githubIntegration);
+  const activeProjectId = useProjects((s) => s.activeProjectId);
+  const sig = useGithub((s) =>
+    activeProjectId ? deckPrSignature(s.byProject[activeProjectId]?.prs) : "",
+  );
+  const setGithubOpen = useSwarm((s) => s.setGithubOpen);
+  if (!enabled || !sig) return null;
+  const [open, failing] = sig.split(":").map(Number);
+  const red = failing > 0;
+  return (
+    <Tip
+      label={
+        red
+          ? `${open} open PR${open === 1 ? "" : "s"} — ${failing} with failing checks`
+          : `${open} open PR${open === 1 ? "" : "s"}`
+      }
+    >
+      <button
+        onClick={() => setGithubOpen(true)}
+        className={cn(
+          "focus-ring flex h-5 shrink-0 items-center gap-1 rounded-xs px-1 tabular-nums hover:bg-card",
+          red ? "text-err" : "text-fnt",
+        )}
+      >
+        <span aria-hidden>⇅</span>
+        {open}
+        {red && <span className="font-semibold">×{failing}</span>}
+      </button>
+    </Tip>
+  );
+}
+
+// ---- 8. Clock ----
 
 function Clock() {
   const [now, setNow] = useState(() => Date.now());

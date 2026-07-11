@@ -69,7 +69,10 @@ import {
   idleMarker,
   idleWire,
   shouldNudgeReflect,
+  suggestPrLine,
 } from "./triggers-core";
+import { hasOpenPrForBranch } from "@/lib/github/core";
+import { useGithub } from "@/lib/github/store";
 
 /** Trailing-edge delta flush — word-level deltas never write per event. */
 const DELTA_FLUSH_MS = 80;
@@ -561,19 +564,38 @@ function maybeEnqueueFinishTrigger(sessionId: string, projectId: string): void {
         };
       }
       const diffLine = diffLineFromStats(diffStats(fresh.diff));
+      let wire = agentFinishedWire({
+        name,
+        id: sessionId,
+        report,
+        lastMessage,
+        diffLine,
+        review,
+        failure,
+        reflectNudge: nudge,
+      });
+      // Phase 7 (Settings, both toggles ON): a COMPLETED lane on a worktree
+      // branch without an open PR gets the suggest-a-PR line — a suggestion
+      // only; create_pr stays bound to the user's order (operative core)
+      const { githubIntegration, githubSuggestPrOnFinish } =
+        useSwarm.getState().settings;
+      const branch = fresh.session.worktree?.branch;
+      if (
+        !failure &&
+        githubIntegration &&
+        githubSuggestPrOnFinish &&
+        branch &&
+        !hasOpenPrForBranch(
+          useGithub.getState().byProject[projectId]?.prs,
+          branch,
+        )
+      ) {
+        wire = `${wire}\n\n${suggestPrLine(branch)}`;
+      }
       return {
         kind: "agent-finished" as const,
         marker: agentFinishedMarker(name),
-        wire: agentFinishedWire({
-          name,
-          id: sessionId,
-          report,
-          lastMessage,
-          diffLine,
-          review,
-          failure,
-          reflectNudge: nudge,
-        }),
+        wire,
       };
     },
     onSettled: (outcome) => {

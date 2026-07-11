@@ -3,6 +3,7 @@ import {
   BarChart3,
   Download,
   FolderOpen,
+  GitPullRequest,
   PanelLeft,
   Plus,
   Search,
@@ -125,6 +126,8 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
         {/* appears only once at least one git worktree exists */}
         <WorktreesButton />
 
+        <GitHubButton />
+
         <Tip label="Settings (⌘,)">
           <button onClick={onOpenSettings} className={BAR_BTN}>
             <Settings size={15} />
@@ -139,6 +142,23 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
         </button>
       </div>
     </header>
+  );
+}
+
+/** The GitHub panel button (Phase 7) — the drawer itself is read-only and
+ * works without the integration toggle; automation lives behind Settings. */
+function GitHubButton() {
+  const githubOpen = useSwarm((s) => s.githubOpen);
+  const setGithubOpen = useSwarm((s) => s.setGithubOpen);
+  return (
+    <Tip label="GitHub — repo & pull requests">
+      <button
+        onClick={() => setGithubOpen(!githubOpen)}
+        className={cn(BAR_BTN, githubOpen && "bg-card text-txt")}
+      >
+        <GitPullRequest size={15} />
+      </button>
+    </Tip>
   );
 }
 

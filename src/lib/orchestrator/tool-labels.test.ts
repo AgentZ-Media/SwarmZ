@@ -71,6 +71,16 @@ describe("toolActivityLabel", () => {
     expect(toolActivityLabel("read_plan")).toBe("Read a plan");
   });
 
+  it("labels every GitHub tool — outward actions must be legible in the audit trail", () => {
+    expect(toolActivityLabel("github_status")).toBe("Checked GitHub");
+    expect(toolActivityLabel("list_prs")).toBe("Checked pull requests");
+    expect(toolActivityLabel("read_pr")).toBe("Read a pull request");
+    expect(toolActivityLabel("create_pr")).toBe("Opened a pull request");
+    expect(toolActivityLabel("review_pr")).toBe("Reviewed a pull request");
+    expect(toolActivityLabel("comment_pr")).toBe("Commented on a pull request");
+    expect(toolActivityLabel("watch_pr")).toBe("Updated a PR watch");
+  });
+
   it("falls back for unknown tools", () => {
     expect(toolActivityLabel("some_new_tool")).toBe("Used a tool");
   });

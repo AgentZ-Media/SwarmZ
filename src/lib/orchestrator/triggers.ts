@@ -46,6 +46,9 @@ const OPEN_TAB_ONLY: ReadonlySet<AutonomousTriggerKind> = new Set([
   "agent-finished",
   "agent-blocked",
   "idle",
+  // PR updates are ambient signals like finishes — a closed tab mutes them
+  // (the PR cache still updates; timers remain the durable follow-up path)
+  "pr-changed",
 ]);
 
 function eligibility(projectId: string, kind: AutonomousTriggerKind) {

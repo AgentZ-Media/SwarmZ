@@ -1,6 +1,7 @@
 mod codex;
 mod codex_usage;
 mod git;
+mod github;
 mod orchestrator;
 mod plans;
 mod projects;
@@ -144,6 +145,142 @@ async fn worktree_list(
     tauri::async_runtime::spawn_blocking(move || worktree::list(&roots, bin.as_deref()))
         .await
         .map_err(|e| e.to_string())
+}
+
+// ---- GitHub integration — see github.rs (local `gh` CLI, no OAuth) ----
+//
+// All async + spawn_blocking (gh is a network subprocess). Read commands work
+// unconditionally and degrade typed (`GhOutcome`); write commands are
+// additionally Rust-gated on the integration flag (`github_set_integration`,
+// mirrored from the Settings master toggle) — they error while it is off.
+
+/// Is gh installed + logged in, and as whom? Never errors.
+#[tauri::command]
+async fn gh_auth_status(bin: Option<String>) -> github::GhAuthStatus {
+    tauri::async_runtime::spawn_blocking(move || github::auth_status(bin.as_deref()))
+        .await
+        .unwrap_or_default()
+}
+
+/// GitHub remote of a project folder (owner/repo, default branch, …).
+#[tauri::command]
+async fn gh_repo_info(
+    dir: String,
+    bin: Option<String>,
+) -> Result<github::GhOutcome<github::GhRepoInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || github::repo_info(&dir, bin.as_deref()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Open PRs of the repo behind `dir`, with derived check summaries.
+#[tauri::command]
+async fn gh_pr_list(
+    dir: String,
+    bin: Option<String>,
+) -> Result<github::GhOutcome<Vec<github::GhPr>>, String> {
+    tauri::async_runtime::spawn_blocking(move || github::pr_list(&dir, bin.as_deref()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// One PR in detail (checks, reviews, files, capped unified diff).
+#[tauri::command]
+async fn gh_pr_view(
+    dir: String,
+    number: u64,
+    include_diff: Option<bool>,
+    bin: Option<String>,
+) -> Result<github::GhOutcome<github::GhPrDetail>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github::pr_view(&dir, number, include_diff.unwrap_or(true), bin.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// GATED write: push the branch checked out in `dir` (never force, never the
+/// default branch) and open a PR from it.
+#[tauri::command]
+async fn gh_pr_create(
+    dir: String,
+    title: String,
+    body: String,
+    base: Option<String>,
+    draft: Option<bool>,
+    bin: Option<String>,
+    git_bin: Option<String>,
+) -> Result<github::GhOutcome<github::GhPrCreated>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github::pr_create(
+            &dir,
+            &title,
+            &body,
+            base.as_deref(),
+            draft.unwrap_or(false),
+            bin.as_deref(),
+            git_bin.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// GATED write: comment on a PR.
+#[tauri::command]
+async fn gh_pr_comment(
+    dir: String,
+    number: u64,
+    body: String,
+    bin: Option<String>,
+) -> Result<github::GhOutcome<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github::pr_comment(&dir, number, &body, bin.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// GATED write: submit a PR review (approve | request_changes | comment).
+#[tauri::command]
+async fn gh_pr_review(
+    dir: String,
+    number: u64,
+    action: String,
+    body: Option<String>,
+    bin: Option<String>,
+) -> Result<github::GhOutcome<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github::pr_review(&dir, number, &action, body.as_deref(), bin.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Mirror the Settings "GitHub integration" master toggle into Rust — the
+/// server-side gate for the gh write commands AND for `classify_approval`'s
+/// gh-write routing (agent-run `gh pr comment` is routine only while ON).
+/// Async + spawn_blocking because DISABLING drains in-flight writes (it may
+/// wait behind a running `git push`) — the ack means "no write is running
+/// and none can start".
+#[tauri::command]
+async fn github_set_integration(enabled: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || github::set_integration(enabled))
+        .await
+        .map_err(|e| format!("github_set_integration failed: {e}"))
+}
+
+/// Declaratively (re)configure the PR watcher: poll the given repos every
+/// `interval_secs`, emit `github://pr-changed` on real changes. An empty
+/// list stops polling.
+#[tauri::command]
+fn github_watch_configure(
+    app: AppHandle,
+    repos: Vec<github::WatchRepo>,
+    interval_secs: u64,
+    bin: Option<String>,
+) {
+    github::watch_configure(&app, repos, interval_secs, bin);
 }
 
 // ---- Orchestrator sensing — read-only, see transcript.rs / projects.rs ----
@@ -601,6 +738,15 @@ pub fn run() {
             worktree_status,
             worktree_remove,
             worktree_list,
+            gh_auth_status,
+            gh_repo_info,
+            gh_pr_list,
+            gh_pr_view,
+            gh_pr_create,
+            gh_pr_comment,
+            gh_pr_review,
+            github_set_integration,
+            github_watch_configure,
             transcript_read,
             project_docs,
             discover_projects,

@@ -63,6 +63,7 @@ export function SettingsDialog({
           <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 py-5">
             <ConductorSection />
             <AutonomySection />
+            <GithubSection />
             <AppearanceSection />
             <MemorySection />
             <PathsSection />
@@ -416,6 +417,83 @@ function AutonomySection() {
   );
 }
 
+// ---- GitHub (Phase 7) ----
+
+/** Watch-interval choices (seconds). */
+const WATCH_INTERVALS: { label: string; sec: number }[] = [
+  { label: "1m", sec: 60 },
+  { label: "2m", sec: 120 },
+  { label: "5m", sec: 300 },
+  { label: "10m", sec: 600 },
+];
+
+/**
+ * The GitHub integration — everything runs over the LOCAL `gh` CLI, no OAuth,
+ * no tokens in SwarmZ. The master toggle gates the Conductor's github tools,
+ * the PR watcher, the Deck indicator AND the routine-classification of the
+ * two sanctioned agent-run gh writes (comment/review — mirrored into Rust).
+ * The read-only GitHub panel works regardless.
+ */
+function GithubSection() {
+  const settings = useSwarm((s) => s.settings);
+  const updateSettings = useSwarm((s) => s.updateSettings);
+  if (!IS_TAURI) return null;
+
+  const enabled = !!settings.githubIntegration;
+  const intervalSec = settings.githubWatchIntervalSec ?? 120;
+
+  return (
+    <Section
+      label="GitHub"
+      sub="Uses your locally installed, logged-in gh CLI — SwarmZ never handles tokens or its own login. The panel (title bar) is always read-only available; this switch adds the automation."
+    >
+      <div className="flex flex-col gap-2">
+        <ToggleCard
+          title="GitHub integration"
+          sub="Gives the Conductor its GitHub tools (PRs listen/read/create/review/comment/watch), starts the PR watcher and the Deck indicator, and lets it decide routine agent approvals for gh comment/review. Merging and closing PRs always stay with you."
+          checked={enabled}
+          onChange={(v) => updateSettings({ githubIntegration: v })}
+        />
+        <div className={enabled ? "flex flex-col gap-2" : "pointer-events-none flex flex-col gap-2 opacity-40"}>
+          <ToggleCard
+            title="Auto-review new PRs"
+            sub="A newly opened PR wakes the Conductor with an autonomous review turn (budget-capped like every autonomous turn)."
+            checked={!!settings.githubAutoReviewPrs}
+            onChange={(v) => updateSettings({ githubAutoReviewPrs: v })}
+          />
+          <ToggleCard
+            title="Suggest a PR when a lane finishes"
+            sub="When a Conductor-tasked agent finishes work on a branch without an open PR, the Conductor's report suggests opening one. Creating it still needs your order."
+            checked={!!settings.githubSuggestPrOnFinish}
+            onChange={(v) => updateSettings({ githubSuggestPrOnFinish: v })}
+          />
+          <Row
+            label="Watch interval"
+            help="How often open PRs are polled for check/review changes."
+          >
+            <div className="flex items-center gap-1">
+              {WATCH_INTERVALS.map((w) => (
+                <button
+                  key={w.sec}
+                  onClick={() => updateSettings({ githubWatchIntervalSec: w.sec })}
+                  className={cn(
+                    "focus-ring rounded-md border px-2 py-0.5 font-mono text-10 transition-colors",
+                    intervalSec === w.sec
+                      ? "border-acc/60 text-txt"
+                      : "border-line text-mut hover:text-txt",
+                  )}
+                >
+                  {w.label}
+                </button>
+              ))}
+            </div>
+          </Row>
+        </div>
+      </div>
+    </Section>
+  );
+}
+
 // ---- Appearance ----
 
 function AppearanceSection() {
@@ -691,6 +769,19 @@ function PathsSection() {
           />
           <p className="mt-1.5 text-11 leading-relaxed text-fnt">
             Used for the read-only git status and the worktree management.
+          </p>
+        </div>
+
+        <div>
+          <Label>GitHub CLI binary</Label>
+          <BinaryPathInput
+            value={settings.ghPath ?? ""}
+            placeholder="gh — auto-resolved (homebrew paths probed)"
+            onCommit={(v) => updateSettings({ ghPath: v })}
+          />
+          <p className="mt-1.5 text-11 leading-relaxed text-fnt">
+            Absolute path to <code className="font-mono text-mut">gh</code> for
+            the GitHub integration and panel.
           </p>
         </div>
 

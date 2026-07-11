@@ -63,7 +63,8 @@ export interface ProjectEntry {
 // (src-tauri/src/orchestrator/registry.rs). The TS side mirrors the NAMES
 // only (executor lookup + typing); schemas are never duplicated here.
 
-/** The tool names — must match the Rust registry exactly (Phase 4: 24). */
+/** The tool names — must match the Rust registry exactly (Phase 4: 24,
+ * Phase 7 adds the 7 GitHub tools → 31). */
 export const ORCHESTRATOR_TOOL_NAMES = [
   "fleet_snapshot",
   "read_agent",
@@ -88,6 +89,13 @@ export const ORCHESTRATOR_TOOL_NAMES = [
   "write_plan",
   "list_plans",
   "read_plan",
+  "github_status",
+  "list_prs",
+  "read_pr",
+  "create_pr",
+  "review_pr",
+  "comment_pr",
+  "watch_pr",
   "remember",
 ] as const;
 

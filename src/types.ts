@@ -229,6 +229,29 @@ export interface AppSettings {
    * carets, entrances). Off by default — motion on.
    */
   reduceMotion?: boolean;
+  /** absolute path to the `gh` binary (GitHub CLI) — empty = auto-resolve */
+  ghPath?: string;
+  /**
+   * Phase 7 — the GitHub integration MASTER toggle (default OFF). ON enables:
+   * the Conductor's github tools, the PR watcher, the Deck PR indicator and
+   * the routine-classification of the two sanctioned agent-run gh writes
+   * (`gh pr comment` / `gh pr review` — mirrored into Rust). The read-only
+   * GitHub panel works regardless (local gh state only, no OAuth ever).
+   */
+  githubIntegration?: boolean;
+  /**
+   * When ON (and the integration is on), a NEWLY OPENED PR detected by the
+   * watcher wakes the Conductor with an autonomous review turn. Default off.
+   */
+  githubAutoReviewPrs?: boolean;
+  /**
+   * When ON (and the integration is on), the Conductor's agent-finished turn
+   * for a lane on a branch WITHOUT an open PR carries a "propose a PR"
+   * suggestion line. Default off.
+   */
+  githubSuggestPrOnFinish?: boolean;
+  /** PR watcher poll interval in seconds (default 120, floor 30). */
+  githubWatchIntervalSec?: number;
 }
 
 /**
@@ -282,7 +305,8 @@ export type AutonomousTriggerKind =
   | "agent-blocked"
   | "approval"
   | "timer"
-  | "idle";
+  | "idle"
+  | "pr-changed";
 
 /** A session referenced by an orchestrator tool call — rendered as a jump chip. */
 export interface OrchestratorPaneRef {
