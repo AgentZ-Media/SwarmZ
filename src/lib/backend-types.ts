@@ -1,71 +1,19 @@
 import type {
   AppSettings,
   CodexAccountLimits,
-  CustomCommandsData,
-  DetectedCommand,
-  FolderCommands,
   GitInfo,
-  PersistedGrid,
+  PersistedAutonomyBudgets,
+  PersistedConductorTimers,
   PersistedOrchestratorChats,
+  PersistedProjects,
   PersistedVibeSessions,
-  PersistedWorkspaces,
-  Profile,
   QuickNotesData,
-  SessionUsage,
-  SubscriptionLimits,
   UsageHistoryEntry,
-  UsageTotals,
-  WorkspacePreset,
 } from "@/types";
-
-export interface PtyDataEvent {
-  id: string;
-  data: string; // base64
-}
-export interface PtyExitEvent {
-  id: string;
-}
 
 export type Unlisten = () => void;
 
 export interface Backend {
-  ptySpawn(args: {
-    id: string;
-    cwd?: string;
-    startup?: string;
-    cols: number;
-    rows: number;
-  }): Promise<void>;
-  ptyWrite(id: string, data: string): Promise<void> | void;
-  ptyResize(id: string, cols: number, rows: number): Promise<void> | void;
-  ptyKill(id: string): Promise<void> | void;
-  /**
-   * True when the shell in this PTY has a foreground child process (dev
-   * server, build, …) — used to warn before killing a floating terminal.
-   * Unknown sessions and check failures resolve false.
-   */
-  ptyHasChildren(id: string): Promise<boolean>;
-
-  /** Subscribe to output / exit of ONE agent's PTY (events are addressed per agent). */
-  onPtyData(id: string, cb: (e: PtyDataEvent) => void): Promise<Unlisten>;
-  onPtyExit(id: string, cb: (e: PtyExitEvent) => void): Promise<Unlisten>;
-
-  fetchUsageForDir(cwd: string, runtime?: string): Promise<SessionUsage | null>;
-  fetchUsageForSession(
-    cwd: string,
-    sinceMs: number,
-    sessionId?: string,
-    /** session ids already claimed by other agents — never match these */
-    excludeSessionIds?: string[],
-    runtime?: string,
-  ): Promise<SessionUsage | null>;
-  fetchUsageTotals(): Promise<UsageTotals>;
-  /**
-   * Fires when session files changed. `changedDirs` holds the affected
-   * project-dir names (encoded cwds); empty/undefined = unknown → refresh all.
-   */
-  onUsageChanged(cb: (changedDirs?: string[]) => void): Promise<Unlisten>;
-
   pickDirectory(): Promise<string | undefined>;
   getHome(): Promise<string>;
 
@@ -80,31 +28,35 @@ export interface Backend {
   ensureNotifyPermission(): Promise<boolean>;
   notify(title: string, body: string): Promise<void>;
 
-  /** Runnable commands found in a folder's project files (scripts, targets, …). */
-  detectProjectCommands(cwd: string): Promise<DetectedCommand[]>;
-
-  loadProfiles(): Promise<Profile[] | null>;
-  saveProfiles(profiles: Profile[]): Promise<void>;
-
-  /** Quick-command customizations (presets + hidden), keyed by project folder (cwd). */
-  loadCommandPresets(): Promise<Record<string, FolderCommands> | null>;
-  saveCommandPresets(presets: Record<string, FolderCommands>): Promise<void>;
-
-  /** Custom prompt snippets for the insert picker — global + per folder (cwd). */
-  loadCustomCommands(): Promise<CustomCommandsData | null>;
-  saveCustomCommands(data: CustomCommandsData): Promise<void>;
-
   /** Quick notes (checklists) — global + per project folder (repo root). */
   loadQuickNotes(): Promise<QuickNotesData | null>;
   saveQuickNotes(data: QuickNotesData): Promise<void>;
 
-  /** Orchestrator chat sidebar — chats + active id + panel open/width. */
+  /** Orchestrator chats — chats + active id + panel open/width. */
   loadOrchestratorChats(): Promise<PersistedOrchestratorChats | null>;
   saveOrchestratorChats(data: PersistedOrchestratorChats): Promise<void>;
 
-  /** Vibe-Mode native Codex sessions — session meta + normalized transcript. */
+  /** Native Codex sessions — session meta + normalized transcript. */
   loadVibeSessions(): Promise<PersistedVibeSessions | null>;
   saveVibeSessions(data: PersistedVibeSessions): Promise<void>;
+
+  /** Project tabs — projects (open + closed) and the active tab. */
+  loadProjects(): Promise<PersistedProjects | null>;
+  saveProjects(data: PersistedProjects): Promise<void>;
+
+  /** Conductor follow-up timers — project-scoped, survive restarts. */
+  loadConductorTimers(): Promise<PersistedConductorTimers | null>;
+  saveConductorTimers(data: PersistedConductorTimers): Promise<void>;
+
+  /** Autonomy budgets / circuit breakers — a relaunch must not reset them. */
+  loadAutonomyBudgets(): Promise<PersistedAutonomyBudgets | null>;
+  saveAutonomyBudgets(data: PersistedAutonomyBudgets): Promise<void>;
+
+  /**
+   * Delete top-level swarmz.json keys (missing keys are a no-op) — the
+   * one-time schema-v2 cleanup of the dead pane-era keys runs through this.
+   */
+  deleteStoreKeys(keys: string[]): Promise<void>;
 
   loadUsageHistory(): Promise<UsageHistoryEntry[] | null>;
   saveUsageHistory(entries: UsageHistoryEntry[]): Promise<void>;
@@ -112,23 +64,12 @@ export interface Backend {
   loadSettings(): Promise<AppSettings | null>;
   saveSettings(settings: AppSettings): Promise<void>;
 
-  /** Workspace tabs (name/order/defaultCwd) — agents inside are in-memory. */
-  loadWorkspaces(): Promise<PersistedWorkspaces | null>;
-  saveWorkspaces(ws: PersistedWorkspaces): Promise<void>;
-
-  /** Snapshot of the grid (agent panes + tiling trees) for restore-on-launch. */
-  loadGrid(): Promise<PersistedGrid | null>;
-  saveGrid(grid: PersistedGrid): Promise<void>;
-
-  /** Workspace presets (named layouts of agent templates). null = never saved → seed. */
-  loadWorkspacePresets(): Promise<WorkspacePreset[] | null>;
-  saveWorkspacePresets(presets: WorkspacePreset[]): Promise<void>;
-
   /**
-   * null when no Claude Code login is found (UI hides the meters); transient
-   * fetch errors reject so callers can keep showing the last known values.
+   * Top-level `schemaVersion` key of swarmz.json — the migration anchor
+   * (see lib/schema-version.ts). null = pre-versioning store.
    */
-  fetchSubscriptionLimits(): Promise<SubscriptionLimits | null>;
+  loadSchemaVersion(): Promise<number | null>;
+  saveSchemaVersion(version: number): Promise<void>;
 
   /**
    * Account-level Codex rate limits from the newest `rate_limits` session

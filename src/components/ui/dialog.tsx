@@ -12,17 +12,17 @@ export const DialogContent = React.forwardRef<
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content>
 >(({ className, children, ...props }, ref) => (
   <DialogPrimitive.Portal>
-    <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/60 backdrop-blur-[2px] data-[state=open]:animate-in" />
+    <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-[rgba(5,5,8,0.6)] backdrop-blur-[3px] data-[state=open]:animate-zoverlay" />
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        "fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border bg-popover p-5 shadow-[0_16px_48px_-12px_rgba(0,0,0,0.7)] data-[state=open]:animate-dialog-in",
+        "fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-line2 bg-pop p-6 shadow-modal data-[state=open]:animate-zdialog",
         className,
       )}
       {...props}
     >
       {children}
-      <DialogPrimitive.Close className="absolute right-4 top-4 rounded-sm text-faint hover:text-foreground transition-colors no-drag focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40">
+      <DialogPrimitive.Close className="no-drag absolute right-4 top-4 rounded-xs text-fnt transition-colors hover:text-txt focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-acc/40">
         <X size={16} />
       </DialogPrimitive.Close>
     </DialogPrimitive.Content>
@@ -40,7 +40,7 @@ export const DialogTitle = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Title
     ref={ref}
-    className={cn("text-base font-semibold tracking-tight text-foreground", className)}
+    className={cn("text-16 font-semibold tracking-[-0.01em] text-txt", className)}
     {...props}
   />
 ));
@@ -52,7 +52,7 @@ export const DialogDescription = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Description
     ref={ref}
-    className={cn("text-sm text-muted-foreground", className)}
+    className={cn("text-12 leading-normal text-fnt", className)}
     {...props}
   />
 ));

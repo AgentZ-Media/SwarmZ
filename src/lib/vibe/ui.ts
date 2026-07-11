@@ -53,6 +53,27 @@ export function oldestPendingApprovalAt(entry: VibeSessionEntry): number | null 
 }
 
 /**
+ * The signal-triad derivation from primitives — the ONE decay rule shared by
+ * the fleet grid, the Deck counters and the stage header (their selectors
+ * stay pure/primitive; `now` comes from the caller's render tick, never from
+ * a getSnapshot). Needs-you (a pending approval) wins over busy — a paused
+ * turn waiting on the human is the thing to surface; "finished" decays to
+ * "idle" once `now` leaves the window.
+ */
+export function decayedSignal(
+  busy: boolean,
+  needsYou: boolean,
+  lastBusyEndAt: number | null,
+  now: number,
+): VibeSignal {
+  if (needsYou) return "needsYou";
+  if (busy) return "working";
+  if (lastBusyEndAt !== null && now - lastBusyEndAt < VIBE_FINISHED_WINDOW_MS)
+    return "finished";
+  return "idle";
+}
+
+/**
  * One session's signal-triad state. Needs-you (a pending approval) wins over
  * busy — a paused turn waiting on the human is the thing to surface.
  */
@@ -61,14 +82,7 @@ export function vibeSignal(
   busy: boolean,
   now: number,
 ): VibeSignal {
-  if (hasPendingApproval(entry)) return "needsYou";
-  if (busy) return "working";
-  if (
-    entry.lastBusyEndAt !== null &&
-    now - entry.lastBusyEndAt < VIBE_FINISHED_WINDOW_MS
-  )
-    return "finished";
-  return "idle";
+  return decayedSignal(busy, hasPendingApproval(entry), entry.lastBusyEndAt, now);
 }
 
 /** Compact age for status lines: "now" / "4m" / "2h". */
@@ -87,6 +101,31 @@ export function totalTokens(
   let sum = 0;
   for (const v of Object.values(bucket)) if (typeof v === "number") sum += v;
   return sum;
+}
+
+/**
+ * The CURRENT context footprint of a turn's token bucket, in tokens. Codex'
+ * `totalTokens` field IS that footprint (input — which already carries the
+ * whole prior context — plus output); summing every field of the bucket
+ * (as `totalTokens()` does) double-counts it, so this prefers the explicit
+ * field and falls back to `inputTokens + outputTokens` when it is absent.
+ * Used by the context gauges and the compaction threshold so both reflect
+ * the real footprint.
+ */
+export function contextTokens(
+  bucket: Record<string, number> | null | undefined,
+): number {
+  if (!bucket) return 0;
+  const explicit = bucket.totalTokens;
+  if (typeof explicit === "number" && explicit > 0) return explicit;
+  // fallback for buckets without the explicit field: input + output ONLY —
+  // `cachedInputTokens` / `reasoningOutputTokens` are SUBSETS of those, so
+  // summing every field (totalTokens()) reads false-high on partial/old
+  // buckets and would trip the gauge + auto-compaction threshold early
+  const input = typeof bucket.inputTokens === "number" ? bucket.inputTokens : 0;
+  const output =
+    typeof bucket.outputTokens === "number" ? bucket.outputTokens : 0;
+  return input + output;
 }
 
 /** A human command string from an approval's raw request payload. */

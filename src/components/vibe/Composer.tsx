@@ -8,11 +8,8 @@ import {
   type VibeApprovalDecision,
 } from "@/lib/vibe/controller";
 import { approvalCommand } from "@/lib/vibe/ui";
-import {
-  changeToDiffData,
-  parsedFileToDiffData,
-  splitUnifiedDiff,
-} from "@/lib/vibe/diff";
+import { splitUnifiedDiff } from "@/lib/vibe/diff";
+import { changeToPatchText } from "@/lib/vibe/diff-pierre";
 import { cn } from "@/lib/utils";
 import type { VibeFileChange, VibeItem } from "@/types";
 import { CompactDiffPreview } from "./DiffCard";
@@ -83,7 +80,7 @@ function MessageComposer({ sessionId }: { sessionId: string }) {
   };
 
   return (
-    <div className="mx-auto mb-4 flex w-full max-w-[46rem] items-end gap-2 rounded-[10px] border border-input bg-card px-3 py-2.5 focus-within:border-ring/60">
+    <div className="mx-auto mb-4 flex w-full max-w-[46rem] shrink-0 items-end gap-2 rounded-xl border border-line bg-card px-3 py-2.5 transition-colors focus-within:border-acc/55">
       <textarea
         ref={taRef}
         value={text}
@@ -95,24 +92,24 @@ function MessageComposer({ sessionId }: { sessionId: string }) {
             send();
           }
         }}
-        placeholder="Message this session…"
-        className="min-h-[20px] flex-1 resize-none bg-transparent text-xs leading-relaxed text-foreground placeholder:text-faint focus:outline-none select-text"
+        placeholder="Message this agent…"
+        className="min-h-5 flex-1 select-text resize-none bg-transparent text-13 leading-relaxed text-txt placeholder:text-fnt focus:outline-none"
       />
       {busy ? (
         <button
           onClick={() => interrupt(sessionId)}
           title="Stop the running turn"
-          className="focus-ring flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-border px-2.5 font-mono text-[10px] text-muted-foreground hover:bg-accent"
+          className="focus-ring flex h-7 shrink-0 items-center gap-1.5 rounded-sm border border-line2 px-2.5 font-mono text-11 text-mut hover:text-txt"
         >
-          <Square size={11} className="fill-current" /> Stop
+          <Square size={10} className="fill-current" /> Stop
         </button>
       ) : (
         <button
           onClick={send}
-          disabled={!text.trim()}
           title="Send (↵)"
           className={cn(
-            "focus-ring flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground disabled:opacity-40",
+            "focus-ring flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-acc text-white hover:brightness-110",
+            !text.trim() && "opacity-40",
           )}
         >
           <ArrowUp size={14} />
@@ -167,23 +164,24 @@ function ApprovalTakeover({
       ref={rootRef}
       tabIndex={0}
       onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== "Escape") return;
+        // ALWAYS claim ⏎/⎋ while the takeover owns the composer — also while
+        // a response is in flight, or the global ⎋ handler (App.tsx checks
+        // defaultPrevented) would collapse the stage mid-responding
+        e.preventDefault();
         if (responding) return;
-        if (e.key === "Enter") {
-          e.preventDefault();
-          respond("accept");
-        } else if (e.key === "Escape") {
-          e.preventDefault();
-          respond("decline");
-        }
+        respond(e.key === "Enter" ? "accept" : "decline");
       }}
-      className="mx-auto mb-4 w-full max-w-[46rem] overflow-hidden rounded-[10px] border border-attn/55 bg-card outline-none focus-visible:border-attn"
+      className="animate-zfadeup mx-auto mb-4 w-full max-w-[46rem] shrink-0 overflow-hidden rounded-xl border border-attn/55 bg-card outline-none focus-visible:border-attn"
     >
-      <div className="flex items-center gap-2 border-b border-attn/25 bg-attn/10 px-3 py-1.5 font-mono text-[10px] text-attn">
-        <span aria-hidden>⚑</span>
-        <span className="font-semibold uppercase tracking-wider">
+      <div className="flex items-center gap-2 border-b border-attn/25 bg-attn/10 px-3 py-2 font-mono text-11 text-attn">
+        <span aria-hidden className="animate-zattn shrink-0">
+          ⚑
+        </span>
+        <span className="font-bold uppercase tracking-[.08em]">
           Pending approval
         </span>
-        <span className="font-normal text-attn/80">— {summary}</span>
+        <span className="font-normal opacity-80">— {summary}</span>
         {count > 1 && (
           <span className="ml-auto rounded-full border border-attn/40 px-1.5 tabular-nums text-attn/90">
             1 of {count}
@@ -191,7 +189,7 @@ function ApprovalTakeover({
         )}
       </div>
 
-      <div className="max-h-[280px] overflow-auto px-3 py-2.5">
+      <div className="max-h-[280px] overflow-auto p-3">
         <ApprovalPreview
           sessionId={sessionId}
           isFileChange={isFileChange}
@@ -199,34 +197,34 @@ function ApprovalTakeover({
         />
       </div>
 
-      <div className="flex flex-wrap items-center gap-2 border-t border-border px-3 py-2.5">
+      <div className="flex flex-wrap items-center gap-2 border-t border-line px-3 py-2.5">
         <button
           onClick={() => respond("decline")}
           disabled={responding}
-          className="focus-ring rounded-md border border-destructive/50 px-3 py-1 font-mono text-[10px] text-destructive hover:bg-destructive/10 disabled:opacity-40"
+          className="focus-ring rounded-md border border-err/50 px-3 py-1.5 font-mono text-11 text-err hover:bg-err/10 disabled:opacity-40"
         >
-          Decline <span className="text-destructive/60">⎋</span>
+          Decline <span className="opacity-60">⎋</span>
         </button>
         <button
           onClick={() => respond("cancel")}
           disabled={responding}
-          className="focus-ring rounded-md px-3 py-1 font-mono text-[10px] text-muted-foreground hover:bg-accent disabled:opacity-40"
+          className="focus-ring rounded-md px-3 py-1.5 font-mono text-11 text-mut hover:bg-pop disabled:opacity-40"
         >
           Cancel turn
         </button>
         <button
           onClick={() => respond("acceptForSession")}
           disabled={responding}
-          className="focus-ring ml-auto rounded-md border border-border px-3 py-1 font-mono text-[10px] text-muted-foreground hover:bg-accent disabled:opacity-40"
+          className="focus-ring ml-auto rounded-md border border-line2 px-3 py-1.5 font-mono text-11 text-mut hover:bg-pop hover:text-txt disabled:opacity-40"
         >
           Allow for session
         </button>
         <button
           onClick={() => respond("accept")}
           disabled={responding}
-          className="focus-ring rounded-md border border-foreground bg-foreground px-3 py-1 font-mono text-[10px] font-semibold text-background hover:bg-foreground/90 disabled:opacity-40"
+          className="focus-ring rounded-md bg-acc px-4 py-1.5 font-mono text-11 font-bold text-white hover:brightness-110 disabled:opacity-40"
         >
-          Allow <span className="text-background/60">↵</span>
+          Allow <span className="opacity-70">↵</span>
         </button>
       </div>
     </div>
@@ -250,23 +248,23 @@ function ApprovalPreview({
   );
   const turnDiff = useVibe((s) => s.sessions[sessionId]?.diff ?? null);
 
-  // resolve the best-available preview diff data for a file-change approval
-  const previewData = useMemo(() => {
+  // resolve the best-available preview patch for a file-change approval
+  const previewPatch = useMemo(() => {
     if (!isFileChange) return null;
     // 1. the linked fileChange item's first change
     if (linked && linked.kind === "fileChange" && linked.changes.length > 0) {
-      return changeToDiffData(linked.changes[0]);
+      return changeToPatchText(linked.changes[0]);
     }
     // 2. changes carried on the payload itself
     const raw = Array.isArray(payload.changes)
       ? (payload.changes as VibeFileChange[])
       : [];
     if (raw.length > 0 && typeof raw[0]?.path === "string") {
-      return changeToDiffData(raw[0]);
+      return changeToPatchText(raw[0]);
     }
     // 3. the turn's aggregated diff, first file
     const files = splitUnifiedDiff(turnDiff);
-    if (files.length > 0) return parsedFileToDiffData(files[0]);
+    if (files.length > 0) return files[0].diff;
     return null;
   }, [isFileChange, linked, payload, turnDiff]);
 
@@ -279,17 +277,17 @@ function ApprovalPreview({
             {files.map((f) => (
               <span
                 key={f}
-                className="truncate font-mono text-[10.5px] text-muted-foreground select-text"
+                className="select-text truncate font-mono text-11 text-mut"
               >
                 {f}
               </span>
             ))}
           </div>
         )}
-        {previewData ? (
-          <CompactDiffPreview data={previewData} />
+        {previewPatch ? (
+          <CompactDiffPreview patchText={previewPatch} />
         ) : (
-          <p className="font-mono text-[10.5px] text-faint">no preview available</p>
+          <p className="font-mono text-11 text-fnt">no preview available</p>
         )}
       </div>
     );
@@ -302,20 +300,16 @@ function ApprovalPreview({
   return (
     <div className="flex flex-col gap-1.5">
       {command ? (
-        <pre className="overflow-x-auto rounded-md border border-border bg-background/40 px-2.5 py-1.5 font-mono text-[10.5px] leading-relaxed text-foreground select-text">
+        <pre className="select-text overflow-x-auto rounded-md border border-line bg-bg px-3 py-2 font-mono text-12 leading-relaxed text-txt">
           {command}
         </pre>
       ) : (
-        <p className="font-mono text-[10.5px] text-faint">no command</p>
+        <p className="font-mono text-11 text-fnt">no command</p>
       )}
       {cwd && (
-        <span className="font-mono text-[10px] text-faint select-text">
-          in {cwd}
-        </span>
+        <span className="select-text font-mono text-11 text-fnt">in {cwd}</span>
       )}
-      {reason && (
-        <p className="text-[11px] leading-relaxed text-muted-foreground">{reason}</p>
-      )}
+      {reason && <p className="text-12 leading-normal text-mut">{reason}</p>}
     </div>
   );
 }

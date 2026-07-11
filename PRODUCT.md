@@ -1,5 +1,12 @@
 # Product
 
+> **⚠️ Legacy / interim (rebuild `codex-only-v1`):** this document still
+> describes the pre-rebuild terminal-grid product (PTY panes, workspaces,
+> Claude runtime, dictation). Do NOT build against it — the app is codex-only
+> now (see `docs/plans/rebuild-codex-only-v1.md` and `AGENTS.md`). The product
+> doc is rewritten in a later phase.
+
+
 ## Register
 
 product

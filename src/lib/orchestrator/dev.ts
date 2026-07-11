@@ -1,13 +1,12 @@
-// Dev-only smoke-test surface for the orchestrator (Phase 1 sensing +
-// Phase 2 tool bus + Phase 3 app-server brain). Loaded from App.tsx via a
-// DEV-guarded dynamic import, so production builds tree-shake the whole
-// module. In the devtools console:
+// Dev-only smoke-test surface for the orchestrator (sensing + tool bus +
+// app-server brain). Loaded from App.tsx via a DEV-guarded dynamic import,
+// so production builds tree-shake the whole module. In the devtools console:
 //
-//   __orch.snapshot()                              // fleet snapshot
-//   __orch.summary()                               // "8 panes · 3 busy · …"
+//   __orch.snapshot()                              // session snapshot
+//   __orch.summary()                               // "3 sessions · 1 working · …"
 //   await __orch.discoverProjects([])              // merged project list
 //   await __orch.projectDocs("/path/to/repo")      // README/AGENTS/CLAUDE.md
-//   await __orch.readTranscript({ cwd, sessionId, runtime: "claude" })
+//   await __orch.readTranscript({ sessionId })
 //
 //   await __orch.tools()                           // { instructions, tools }
 //   await __orch.tool("fleet_snapshot", {})        // FULL roundtrip:
@@ -15,13 +14,12 @@
 //
 //   await __orch.chatStatus()                      // spawn + version + account
 //   const { chat_id } = await __orch.chatStart()   // new brain chat
-//   await __orch.chatSend(chat_id, "Welche Panes sind offen?")
+//   await __orch.chatSend(chat_id, "Welche Sessions laufen?")
 //     // streamed events log as `[orch chat-1] tool_call …` while it runs
 //   await __orch.chatInterrupt(chat_id)            // stop the running turn
 
 import { invoke } from "@tauri-apps/api/core";
-import { useSwarm } from "@/store";
-import { fleetSnapshot, fleetSummaryLine } from "./snapshot";
+import { fleetSummaryLine } from "./snapshot";
 import { fleetSessions } from "./executors";
 import { discoverProjects, projectDocs, readTranscript } from "./native";
 import {
@@ -37,7 +35,7 @@ import type { OrchestratorToolsResponse } from "./types";
 declare global {
   interface Window {
     __orch?: {
-      snapshot: () => ReturnType<typeof fleetSnapshot>;
+      snapshot: () => ReturnType<typeof fleetSessions>;
       summary: () => string;
       readTranscript: typeof readTranscript;
       projectDocs: typeof projectDocs;
@@ -46,7 +44,7 @@ declare global {
       tools: () => Promise<OrchestratorToolsResponse>;
       /** run one tool through the full Rust→webview→Rust roundtrip */
       tool: (name: string, args?: Record<string, unknown>) => Promise<unknown>;
-      /** Phase 3 — Codex app-server brain */
+      /** Codex app-server brain */
       chatStart: typeof chatStart;
       chatSend: typeof chatSend;
       chatInterrupt: typeof chatInterrupt;
@@ -69,27 +67,27 @@ if (import.meta.env.DEV) {
   };
 
   window.__orch = {
-    snapshot: () => fleetSnapshot(useSwarm.getState()),
+    snapshot: () => fleetSessions(),
     // session-aware, like the fleet-summary Rust prepends to every turn
-    summary: () => fleetSummaryLine(useSwarm.getState(), fleetSessions()),
+    summary: () => fleetSummaryLine(fleetSessions()),
     readTranscript,
     projectDocs,
     discoverProjects,
     tools: () => invoke<OrchestratorToolsResponse>("orchestrator_tools"),
     tool: (name, args = {}) =>
       invoke("orchestrator_run_tool", { tool: name, args }),
-    chatStart: () => {
+    chatStart: (project) => {
       ensureEventLog();
-      return chatStart();
+      return chatStart(project);
     },
     chatSend: (chatId, text) => {
       ensureEventLog();
       return chatSend(chatId, text);
     },
     chatInterrupt,
-    chatResume: (threadId) => {
+    chatResume: (threadId, project) => {
       ensureEventLog();
-      return chatResume(threadId);
+      return chatResume(threadId, project);
     },
     chatStatus,
   };

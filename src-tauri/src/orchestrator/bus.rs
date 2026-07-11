@@ -30,6 +30,10 @@ pub struct ToolRequest {
     /// dev-hook / internal calls. The webview maps it to its store chat and
     /// hands executors the chat context (Phase-5 touched-pane tracking).
     pub chat_id: Option<String>,
+    /// Project of the Conductor instance behind the call (Phase 3) — the
+    /// executors scope session resolution + fleet_snapshot on it. None for
+    /// dev-hook calls (unscoped).
+    pub project_id: Option<String>,
 }
 
 /// In-flight tool requests awaiting their webview response.
@@ -90,6 +94,7 @@ pub async fn run_tool_via<E>(
     tool: &str,
     args: Value,
     chat_id: Option<String>,
+    project_id: Option<String>,
     timeout_override: Option<u64>,
 ) -> ToolResult
 where
@@ -116,6 +121,7 @@ where
         tool: tool.to_string(),
         args,
         chat_id,
+        project_id,
     };
     if let Err(e) = emit(&request) {
         pending.remove(&id);
@@ -172,6 +178,7 @@ mod tests {
             json!({}),
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -186,14 +193,49 @@ mod tests {
         let err = run_tool_via(
             &pending,
             |_req| panic!("must not emit for invalid args"),
-            "prompt_pane",
-            json!({ "pane_id": "abc" }), // text missing
+            "prompt_agent",
+            json!({ "agent": "abc" }), // text missing
+            None,
             None,
             None,
         )
         .await
         .unwrap_err();
         assert!(err.contains("text"), "unexpected error: {err}");
+        assert_eq!(pending.len(), 0);
+    }
+
+    /// Audit R1 (frozen): a Conductor tool call asking for full access is
+    /// refused AT THE BUS — no request ever reaches the webview, so no
+    /// session can start or reconfigure with `danger-full-access` on the
+    /// Conductor's behalf, whatever the model (or a prompt injection) sends.
+    #[tokio::test]
+    async fn full_access_is_refused_at_the_bus_entry() {
+        let pending = PendingMap::default();
+        let err = run_tool_via(
+            &pending,
+            |_req| panic!("a full-access spawn must never reach the webview"),
+            "spawn_agents",
+            json!({ "agents": [{ "task": "x", "worktree": "new", "access": "full" }] }),
+            Some("chat-1".into()),
+            Some("proj-1".into()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+        let err = run_tool_via(
+            &pending,
+            |_req| panic!("a full-access retune must never reach the webview"),
+            "set_agent_config",
+            json!({ "agent": "maya", "access": "full" }),
+            Some("chat-1".into()),
+            Some("proj-1".into()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
         assert_eq!(pending.len(), 0);
     }
 
@@ -205,6 +247,7 @@ mod tests {
             |_req| Ok(()), // emitted, but nobody ever responds
             "fleet_snapshot",
             json!({}),
+            None,
             None,
             Some(25),
         )
@@ -227,6 +270,7 @@ mod tests {
             },
             "fleet_snapshot",
             json!({}),
+            None,
             None,
             Some(5_000),
         );
@@ -251,16 +295,17 @@ mod tests {
                 Ok(())
             },
             "git_status",
-            json!({ "pane_id": "nope" }),
+            json!({ "agent": "nope" }),
+            None,
             None,
             Some(5_000),
         );
         let respond = async {
             let id = rx.recv().unwrap();
-            pending.resolve(&id, Err("unknown pane_id \"nope\"".into()));
+            pending.resolve(&id, Err("unknown agent \"nope\"".into()));
         };
         let (result, ()) = tokio::join!(call, respond);
-        assert!(result.unwrap_err().contains("unknown pane_id"));
+        assert!(result.unwrap_err().contains("unknown agent"));
     }
 
     #[tokio::test]
@@ -270,15 +315,18 @@ mod tests {
         let call = run_tool_via(
             &pending,
             |req| {
-                // the owning chat rides along so the webview executors can
-                // track touched panes (Phase 5); dev-hook calls pass None
+                // the owning chat AND its project ride along so the webview
+                // executors can track touched panes (Phase 5) and scope
+                // session resolution to the Conductor's project (Phase 3)
                 assert_eq!(req.chat_id.as_deref(), Some("chat-7"));
+                assert_eq!(req.project_id.as_deref(), Some("proj-1"));
                 tx.send(req.id.clone()).unwrap();
                 Ok(())
             },
             "fleet_snapshot",
             json!({}),
             Some("chat-7".to_string()),
+            Some("proj-1".to_string()),
             Some(5_000),
         );
         let respond = async {

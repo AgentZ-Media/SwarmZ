@@ -40,7 +40,7 @@ use std::time::Duration;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
@@ -113,21 +113,112 @@ impl PendingRpc {
     }
 }
 
+/// How long a graceful shutdown (stdin EOF) may take before the child is
+/// force-killed — a codex that ignores the EOF must not linger as a zombie.
+const SHUTDOWN_KILL_AFTER_MS: u64 = 5_000;
+
+/// Hard cap on ONE protocol line from the child's stdout (audit R8): a
+/// broken/hostile child streaming an endless line must not OOM the app.
+/// Generous — real codex events (full-diff notifications included) stay far
+/// below this; an oversized line is consumed and DROPPED with a log (the
+/// protocol is line-delimited JSON, so one lost record degrades a feature,
+/// never corrupts the framing).
+const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+/// Stderr is log output — one line beyond this is noise, not data.
+const MAX_STDERR_LINE_BYTES: usize = 8 * 1024;
+/// Server-event queue between the reader task and the router (audit R8):
+/// bounded so a flood backpressures the child's stdout pipe instead of
+/// growing an unbounded queue. The router forwards to per-thread route
+/// queues that are bounded too (F10, `ROUTE_CHANNEL_CAPACITY`) — a stalled
+/// consumer backpressures end to end instead of ballooning memory.
+const EVENTS_CHANNEL_CAPACITY: usize = 4_096;
+/// Outgoing-line queue to the writer task (audit R8): RPCs and approval
+/// responses are small and rare; a full queue means the child stopped
+/// reading its stdin — failing fast is correct then.
+const STDIN_CHANNEL_CAPACITY: usize = 1_024;
+
+/// One bounded read from a line-delimited stream.
+enum BoundedLine {
+    Line(String),
+    /// the line exceeded the cap — it was fully consumed and discarded
+    Oversize,
+    Eof,
+}
+
+/// Read the next newline-terminated line without ever buffering more than
+/// `max` bytes (audit R8 — `BufRead::lines()` would buffer the whole line).
+async fn next_line_bounded<R>(reader: &mut R, max: usize) -> std::io::Result<BoundedLine>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut skipping = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            // EOF
+            return Ok(if skipping {
+                BoundedLine::Oversize
+            } else if buf.is_empty() {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Line(String::from_utf8_lossy(&buf).into_owned())
+            });
+        }
+        match chunk.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                let over = !skipping && buf.len() + pos > max;
+                if !skipping && !over {
+                    buf.extend_from_slice(&chunk[..pos]);
+                }
+                reader.consume(pos + 1);
+                if skipping || over {
+                    return Ok(BoundedLine::Oversize);
+                }
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+                return Ok(BoundedLine::Line(String::from_utf8_lossy(&buf).into_owned()));
+            }
+            None => {
+                let len = chunk.len();
+                if !skipping {
+                    if buf.len() + len > max {
+                        buf = Vec::new(); // drop what we buffered
+                        skipping = true;
+                    } else {
+                        buf.extend_from_slice(chunk);
+                    }
+                }
+                reader.consume(len);
+            }
+        }
+    }
+}
+
 /// Handle to one running `codex app-server` process.
 pub struct Client {
-    stdin_tx: mpsc::UnboundedSender<String>,
+    /// Writer channel — `None` after `shutdown()` (closing it drops the
+    /// child's stdin → EOF → codex exits; the reader task then reaps it).
+    /// Bounded (audit R8): a child that stopped reading fails sends fast.
+    stdin_tx: Mutex<Option<mpsc::Sender<String>>>,
     pending: Arc<PendingRpc>,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
+    /// fired by the shutdown watchdog once the EOF grace period elapsed —
+    /// the reader task (which owns the child) then force-kills it
+    kill: Arc<tokio::sync::Notify>,
 }
 
 impl Client {
     /// Spawn `<program> app-server` and wire the stdio pumps. Server-initiated
-    /// requests and notifications go to `events`; responses resolve the
-    /// pending map. Must run inside a tokio runtime.
+    /// requests and notifications go to `events` (bounded — see
+    /// `EVENTS_CHANNEL_CAPACITY`); responses resolve the pending map. Must
+    /// run inside a tokio runtime.
     pub async fn spawn(
         program: &str,
-        events: mpsc::UnboundedSender<ServerEvent>,
+        events: mpsc::Sender<ServerEvent>,
     ) -> Result<Self, String> {
         // enrich the child's PATH with the binary's own dir — the built app's
         // minimal GUI PATH otherwise breaks anything codex spawns by name
@@ -137,8 +228,18 @@ impl Client {
             let base = std::env::var("PATH").unwrap_or_default();
             cmd.env("PATH", format!("{}:{}", dir.display(), base));
         }
+        // SwarmZ processes run WITHOUT the user's global MCP servers (see
+        // `mcp_disable_args`) — the user's config.toml is only READ, never
+        // modified. The read is tiny but still file I/O → spawn_blocking.
+        // FAIL-CLOSED (audit R12): an enabled server whose name cannot ride
+        // the `-c` disable path refuses the spawn instead of silently
+        // booting that server into every SwarmZ child.
+        let mcp_off = tokio::task::spawn_blocking(mcp_disable_args)
+            .await
+            .map_err(|e| e.to_string())??;
         let mut child = cmd
             .arg("app-server")
+            .args(&mcp_off)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -149,7 +250,7 @@ impl Client {
         let stdout = child.stdout.take().ok_or("app-server: no stdout")?;
         let stderr = child.stderr.take();
 
-        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+        let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(STDIN_CHANNEL_CAPACITY);
         let pending = Arc::new(PendingRpc::default());
         let alive = Arc::new(AtomicBool::new(true));
 
@@ -166,55 +267,119 @@ impl Client {
             // channel closed (Client dropped) → stdin drops → EOF → codex exits
         });
 
-        // stderr → log lines (codex logs there; useful when things go wrong)
+        // stderr → log lines (codex logs there; useful when things go wrong).
+        // Bounded per line (audit R8/R12): a flooding child can't OOM the
+        // logger, and one runaway line is truncated instead of echoed whole.
         if let Some(err) = stderr {
             tokio::spawn(async move {
-                let mut lines = BufReader::new(err).lines();
-                while let Ok(Some(l)) = lines.next_line().await {
-                    eprintln!("[codex app-server] {l}");
+                let mut reader = BufReader::new(err);
+                loop {
+                    match next_line_bounded(&mut reader, MAX_STDERR_LINE_BYTES).await {
+                        Ok(BoundedLine::Line(l)) => eprintln!("[codex app-server] {l}"),
+                        Ok(BoundedLine::Oversize) => {
+                            eprintln!("[codex app-server] (oversized stderr line truncated)")
+                        }
+                        Ok(BoundedLine::Eof) | Err(_) => break,
+                    }
                 }
             });
         }
 
-        // reader: classify each line; owns the child for reaping on EOF
+        let kill = Arc::new(tokio::sync::Notify::new());
+
+        // reader: classify each line; owns the child for reaping on EOF and
+        // for the force-kill fallback (the kill notify fires when a graceful
+        // shutdown's EOF grace period elapsed). Lines are read BOUNDED
+        // (audit R8) and events go into a BOUNDED queue — a flood
+        // backpressures the child's stdout pipe instead of growing memory.
         {
             let pending = pending.clone();
             let alive = alive.clone();
+            let kill = kill.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    match protocol::parse_line(&line) {
-                        Some(Incoming::Response { id, result }) => {
-                            if !pending.resolve(id, result) {
-                                eprintln!("[codex host] app-server response for unknown id {id} — ignored");
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    tokio::select! {
+                        line = next_line_bounded(&mut reader, MAX_LINE_BYTES) => {
+                            let line = match line {
+                                Ok(BoundedLine::Line(line)) => line,
+                                Ok(BoundedLine::Oversize) => {
+                                    eprintln!("[codex host] dropped an oversized protocol line (> {MAX_LINE_BYTES} bytes)");
+                                    continue;
+                                }
+                                Ok(BoundedLine::Eof) | Err(_) => break,
+                            };
+                            match protocol::parse_line(&line) {
+                                Some(Incoming::Response { id, result }) => {
+                                    if !pending.resolve(id, result) {
+                                        eprintln!("[codex host] app-server response for unknown id {id} — ignored");
+                                    }
+                                }
+                                Some(Incoming::ServerRequest { id, method, params }) => {
+                                    let _ = events.send(ServerEvent::Request { id, method, params }).await;
+                                }
+                                Some(Incoming::Notification { method, params }) => {
+                                    let _ = events.send(ServerEvent::Notification { method, params }).await;
+                                }
+                                None => {} // unknown/unparseable line: ignore silently
                             }
                         }
-                        Some(Incoming::ServerRequest { id, method, params }) => {
-                            let _ = events.send(ServerEvent::Request { id, method, params });
+                        _ = kill.notified() => {
+                            // graceful shutdown ignored — force-kill; the
+                            // stream then EOFs and the normal cleanup runs
+                            eprintln!("[codex host] app-server ignored stdin EOF — force-killing");
+                            let _ = child.start_kill();
                         }
-                        Some(Incoming::Notification { method, params }) => {
-                            let _ = events.send(ServerEvent::Notification { method, params });
-                        }
-                        None => {} // unknown/unparseable line: ignore silently
                     }
                 }
                 alive.store(false, Ordering::SeqCst);
                 pending.fail_all("codex app-server exited");
-                let _ = events.send(ServerEvent::Exited);
+                let _ = events.send(ServerEvent::Exited).await;
                 let _ = child.wait().await; // reap
             });
         }
 
         Ok(Client {
-            stdin_tx,
+            stdin_tx: Mutex::new(Some(stdin_tx)),
             pending,
             next_id: AtomicU64::new(1),
             alive,
+            kill,
         })
     }
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Send one line to the writer task. Err = writer gone (shutdown/exited)
+    /// or the queue is full (the child stopped reading its stdin — audit R8:
+    /// fail fast instead of queueing without bound).
+    fn send_line(&self, line: String) -> Result<(), ()> {
+        match &*self.stdin_tx.lock() {
+            Some(tx) => tx.try_send(line).map_err(|_| ()),
+            None => Err(()),
+        }
+    }
+
+    /// Graceful shutdown: close the writer channel — the writer task ends,
+    /// the child's stdin drops (EOF) and codex exits; the reader task then
+    /// fails pending RPCs and emits `Exited`. A watchdog force-kills the
+    /// child if it ignores the EOF for `SHUTDOWN_KILL_AFTER_MS` (no zombies
+    /// until app quit). Idempotent.
+    pub fn shutdown(&self) {
+        let armed = self.stdin_tx.lock().take().is_some();
+        if !armed {
+            return; // already shut down — don't arm a second watchdog
+        }
+        let alive = self.alive.clone();
+        let kill = self.kill.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(SHUTDOWN_KILL_AFTER_MS)).await;
+            if alive.load(Ordering::SeqCst) {
+                kill.notify_waiters();
+            }
+        });
     }
 
     /// One request/response roundtrip with a timeout.
@@ -230,8 +395,7 @@ impl Client {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let rx = self.pending.register(id);
         if self
-            .stdin_tx
-            .send(protocol::request_line(id, method, &params))
+            .send_line(protocol::request_line(id, method, &params))
             .is_err()
         {
             self.pending.remove(id);
@@ -248,25 +412,26 @@ impl Client {
     }
 
     pub fn notify(&self, method: &str) {
-        let _ = self.stdin_tx.send(protocol::notification_line(method));
+        let _ = self.send_line(protocol::notification_line(method));
     }
 
     /// Answer a server-initiated request.
     pub fn respond(&self, id: &Value, result: &Value) {
-        let _ = self.stdin_tx.send(protocol::response_line(id, result));
+        let _ = self.send_line(protocol::response_line(id, result));
     }
 
     pub fn respond_error(&self, id: &Value, code: i64, message: &str) {
-        let _ = self
-            .stdin_tx
-            .send(protocol::error_response_line(id, code, message));
+        let _ = self.send_line(protocol::error_response_line(id, code, message));
     }
 }
 
 /// initialize (experimentalApi — required for dynamicTools) + `initialized`.
 /// Returns the server's userAgent (carries the codex version). The
 /// clientInfo name "SwarmZ" also lands as `originator` in the session
-/// rollouts — that is how SwarmZ-born sessions are recognizable on disk.
+/// rollouts — that is how SwarmZ-born sessions are recognizable on disk
+/// (live-verified on 0.144.1: `session_meta.payload.originator` echoes the
+/// clientInfo name, while `source` is always "vscode" for app-server
+/// clients — never use `source` for own-session detection).
 pub async fn handshake(client: &Client) -> Result<String, String> {
     let res = client
         .request(
@@ -391,12 +556,116 @@ fn invalidate_resolved_program() {
 }
 
 // ---------------------------------------------------------------------------
+// MCP opt-out — SwarmZ children never boot the user's global MCP servers
+// ---------------------------------------------------------------------------
+//
+// Every `codex app-server` child inherits the user's `~/.codex/config.toml`,
+// including its `[mcp_servers.*]` entries (the ChatGPT desktop app installs a
+// heavyweight `node_repl` with `startup_timeout_sec = 120`). Those servers
+// boot PER THREAD on the first turn; live on 0.144.1 that boot both delays
+// the turn and trips the codex tool router (`timeout_ms must be at least
+// 10000` → the Conductor's first dynamic tool call gets "cancelled before
+// receiving a response"). SwarmZ agents don't use those servers, so every
+// spawn disables them for THIS PROCESS ONLY.
+//
+// Live-verified mechanism (0.144.1, see docs/ARCHITECTURE.md):
+//   · `-c mcp_servers={}` does NOT work — `-c` table overrides MERGE into the
+//     config table instead of replacing it (probed: a dummy entry is added,
+//     the user's servers keep booting). Same for a per-thread
+//     `thread/start {config: {mcp_servers: {}}}`.
+//   · `-c mcp_servers.<name>.enabled=false` DOES work per server → we
+//     enumerate the names by READING the user's config.toml (never writing
+//     it) and emit one disable per entry.
+//   · `--disable apps` (= `-c features.apps=false`) turns off the built-in
+//     `codex_apps` MCP server that otherwise boots per thread regardless of
+//     config.
+
+/// The user's codex config file (`$CODEX_HOME/config.toml`, default
+/// `~/.codex/config.toml`) — read-only.
+fn codex_config_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
+    Some(home.join("config.toml"))
+}
+
+/// Only names expressible as a bare TOML key segment ride in a `-c` dotted
+/// path. Codex constrains MCP server names to this charset anyway; anything
+/// else is skipped (and logged) rather than guessed at.
+fn is_bare_toml_key(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The per-spawn CLI args that disable MCP servers for one `codex
+/// app-server` child (pure — unit-tested; `config_text` is the user's
+/// config.toml, empty/unparseable degrades to just the `apps` opt-out —
+/// codex itself refuses a config IT can't parse, so nothing boots then).
+///
+/// FAIL-CLOSED (audit R12): a server whose name cannot ride a bare `-c`
+/// dotted path CANNOT be disabled per process — if that server is ENABLED,
+/// this errors and the spawn refuses, instead of silently letting the
+/// undisableable server boot into every SwarmZ child. A quoted-name server
+/// that is already `enabled = false` in the config is safely skipped.
+pub(crate) fn mcp_disable_args_from(config_text: &str) -> Result<Vec<String>, String> {
+    let mut args: Vec<String> = vec!["--disable".into(), "apps".into()];
+    let parsed: toml::Table = match config_text.parse() {
+        Ok(v) => v,
+        Err(_) => return Ok(args), // codex itself will complain about its config
+    };
+    let Some(servers) = parsed.get("mcp_servers").and_then(|v| v.as_table()) else {
+        return Ok(args);
+    };
+    for (name, table) in servers {
+        if is_bare_toml_key(name) {
+            args.push("-c".into());
+            args.push(format!("mcp_servers.{name}.enabled=false"));
+        } else {
+            let already_disabled = table
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .map(|b| !b)
+                .unwrap_or(false);
+            if !already_disabled {
+                return Err(format!(
+                    "mcp server name {name:?} in ~/.codex/config.toml cannot be disabled per process (not a bare TOML key) — disable it in the config or rename it before SwarmZ can spawn codex"
+                ));
+            }
+        }
+    }
+    Ok(args)
+}
+
+/// Read the user's config.toml (READ-ONLY) and build the disable args.
+/// Missing file = no user servers = just the `apps` opt-out. Recomputed per
+/// spawn so config edits apply to the next process.
+fn mcp_disable_args() -> Result<Vec<String>, String> {
+    let text = codex_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    mcp_disable_args_from(&text)
+}
+
+// ---------------------------------------------------------------------------
 // Thread registry + Connection — per-threadId event routing
 // ---------------------------------------------------------------------------
 
+/// Per-thread route queue capacity (final hardening F10): the raw event
+/// queue is bounded, so the routes it drains into must be bounded too or
+/// the end-to-end backpressure collapses into an unbounded consumer queue.
+/// A full route makes the router `.await` — which backpressures the raw
+/// queue and ultimately the child's stdout pipe. Consumers (the session and
+/// orchestrator dispatchers) drain fast and never await back into the
+/// router, so a full queue means a genuine flood, not a deadlock.
+pub const ROUTE_CHANNEL_CAPACITY: usize = 1_024;
+
 /// Where a registered thread's server events land. Multiple threads may
 /// share one sink (the orchestrator does — one dispatcher for all chats).
-pub type EventSink = mpsc::UnboundedSender<ThreadEvent>;
+/// BOUNDED (F10) — create with `mpsc::channel(ROUTE_CHANNEL_CAPACITY)`.
+pub type EventSink = mpsc::Sender<ThreadEvent>;
 
 /// Answer handle for a routed server request — carries the request id and
 /// the owning client, so the consumer never has to track which process
@@ -486,7 +755,7 @@ impl Connection {
     /// from scratch (codex may have moved/uninstalled).
     async fn open() -> Result<Arc<Connection>, String> {
         let program = resolved_program().await?;
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
         let client = match Client::spawn(&program, events_tx).await {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -538,6 +807,12 @@ impl Connection {
     pub fn unregister_thread(&self, thread_id: &str) {
         self.routes.remove(thread_id);
     }
+
+    /// Graceful process shutdown (see `Client::shutdown`) — the registered
+    /// sinks still receive their `Exited` once the reader observes EOF.
+    pub fn shutdown(&self) {
+        self.client.shutdown();
+    }
 }
 
 /// The per-connection router: forwards each raw server event to the sink
@@ -548,7 +823,7 @@ impl Connection {
 fn spawn_router(
     client: Arc<Client>,
     routes: Arc<RouteTable>,
-    mut rx: mpsc::UnboundedReceiver<ServerEvent>,
+    mut rx: mpsc::Receiver<ServerEvent>,
 ) {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
@@ -564,11 +839,16 @@ fn spawn_router(
                     };
                     match sink {
                         Some(s) => {
-                            if let Err(failed) = s.send(ThreadEvent::Request {
-                                method,
-                                params,
-                                responder,
-                            }) {
+                            // bounded send (F10): a full route AWAITS —
+                            // backpressure instead of unbounded growth
+                            if let Err(failed) = s
+                                .send(ThreadEvent::Request {
+                                    method,
+                                    params,
+                                    responder,
+                                })
+                                .await
+                            {
                                 // consumer gone (sink dropped) — the request
                                 // must still be answered or the server hangs
                                 if let ThreadEvent::Request { responder, .. } = failed.0 {
@@ -585,13 +865,13 @@ fn spawn_router(
                         .and_then(|v| v.as_str())
                         .and_then(|tid| routes.get(tid))
                     {
-                        let _ = sink.send(ThreadEvent::Notification { method, params });
+                        let _ = sink.send(ThreadEvent::Notification { method, params }).await;
                     }
                     // no sink: account-level or foreign-thread notification — ignore
                 }
                 ServerEvent::Exited => {
                     for sink in routes.drain_distinct() {
-                        let _ = sink.send(ThreadEvent::Exited);
+                        let _ = sink.send(ThreadEvent::Exited).await;
                     }
                     break;
                 }
@@ -659,6 +939,17 @@ impl ProcessHost {
     pub async fn last_version(&self) -> Option<String> {
         self.state.lock().await.last_version.clone()
     }
+
+    /// Gracefully end the slot's process (idle reaping): the connection is
+    /// dropped from the slot and its stdin closed — codex exits on EOF and
+    /// every registered sink hears `Exited`. The next `ensure()` respawns
+    /// with a bumped generation, so consumers transparently `thread/resume`.
+    pub async fn shutdown(&self) {
+        let mut st = self.state.lock().await;
+        if let Some(conn) = st.conn.take() {
+            conn.shutdown();
+        }
+    }
 }
 
 impl Default for ProcessHost {
@@ -688,8 +979,9 @@ impl ResumeError {
 }
 
 /// Does this error text mean "the server does not know this thread"?
-/// "no rollout found" is what codex 0.142.5 actually answers (live-verified
-/// in the session spike: `no rollout found for thread id … (code -32600)`);
+/// "no rollout found" is what codex actually answers — live-verified on
+/// 0.142.5 and re-verified verbatim on 0.144.1
+/// (`no rollout found for thread id … (code -32600)`);
 /// the other substrings follow t3code's recoverable-resume matcher for
 /// robustness across versions.
 pub fn is_unknown_thread_error(err: &str) -> bool {
@@ -785,9 +1077,100 @@ mod tests {
     }
 
     #[test]
+    fn mcp_disable_args_enumerate_the_users_servers() {
+        // shape of the user's real config (ChatGPT desktop app entries)
+        let config = r#"
+model = "gpt-5.6-sol"
+
+[mcp_servers.node_repl]
+command = "/Applications/ChatGPT.app/…/node_repl"
+startup_timeout_sec = 120
+
+[mcp_servers.node_repl.env]
+CODEX_HOME = "/Users/x/.codex"
+
+[mcp_servers.computer-use]
+command = "…"
+enabled = false
+"#;
+        let args = mcp_disable_args_from(config).unwrap();
+        assert_eq!(args[0..2], ["--disable".to_string(), "apps".to_string()]);
+        assert!(args
+            .chunks(2)
+            .any(|c| c == ["-c", "mcp_servers.node_repl.enabled=false"]));
+        // already-disabled entries get the (harmless) explicit disable too
+        assert!(args
+            .chunks(2)
+            .any(|c| c == ["-c", "mcp_servers.computer-use.enabled=false"]));
+        assert_eq!(args.len(), 6);
+    }
+
+    #[test]
+    fn mcp_disable_args_handle_edge_configs() {
+        // no config / no mcp_servers table → just the built-in apps opt-out
+        for text in ["", "model = \"o3\"", "not [ valid toml"] {
+            assert_eq!(
+                mcp_disable_args_from(text).unwrap(),
+                vec!["--disable".to_string(), "apps".to_string()],
+                "{text:?}"
+            );
+        }
+        // inline-table form counts too
+        let args = mcp_disable_args_from(r#"mcp_servers = { foo = { command = "x" } }"#).unwrap();
+        assert!(args.chunks(2).any(|c| c == ["-c", "mcp_servers.foo.enabled=false"]));
+        // FAIL-CLOSED (audit R12): an ENABLED server whose name can't ride a
+        // bare dotted -c path refuses the spawn — never silently boots
+        let err = mcp_disable_args_from("[mcp_servers.\"we ird\"]\ncommand = \"x\"\n").unwrap_err();
+        assert!(err.contains("cannot be disabled"), "{err}");
+        // …but a quoted-name server that is ALREADY disabled is safely skipped
+        let args = mcp_disable_args_from(
+            "[mcp_servers.\"we ird\"]\ncommand = \"x\"\nenabled = false\n",
+        )
+        .unwrap();
+        assert_eq!(args, vec!["--disable".to_string(), "apps".to_string()]);
+    }
+
+    /// Audit R8 (frozen): the bounded line reader never buffers more than the
+    /// cap — an endless line is consumed and DROPPED, framing stays intact.
+    #[tokio::test]
+    async fn bounded_line_reader_drops_oversize_and_keeps_framing() {
+        let data = {
+            let mut v = Vec::new();
+            v.extend_from_slice(b"short line\n");
+            v.extend_from_slice(&vec![b'x'; 1024]); // oversized (cap below: 64)
+            v.push(b'\n');
+            v.extend_from_slice(b"after\r\n");
+            v.extend_from_slice(b"tail without newline");
+            v
+        };
+        let mut reader = BufReader::new(std::io::Cursor::new(data));
+        assert!(matches!(
+            next_line_bounded(&mut reader, 64).await.unwrap(),
+            BoundedLine::Line(l) if l == "short line"
+        ));
+        assert!(matches!(
+            next_line_bounded(&mut reader, 64).await.unwrap(),
+            BoundedLine::Oversize
+        ));
+        // the NEXT line still parses cleanly (framing preserved, \r stripped)
+        assert!(matches!(
+            next_line_bounded(&mut reader, 64).await.unwrap(),
+            BoundedLine::Line(l) if l == "after"
+        ));
+        assert!(matches!(
+            next_line_bounded(&mut reader, 64).await.unwrap(),
+            BoundedLine::Line(l) if l == "tail without newline"
+        ));
+        assert!(matches!(
+            next_line_bounded(&mut reader, 64).await.unwrap(),
+            BoundedLine::Eof
+        ));
+    }
+
+    #[test]
     fn unknown_thread_errors_are_classified() {
         for msg in [
-            // verbatim live answer from codex 0.142.5 (session spike)
+            // verbatim live answer from codex (0.142.5 spike, re-verified on 0.144.1)
             "no rollout found for thread id 019f0000-0000-7000-8000-000000000000 (code -32600)",
             "thread not found (code -32600)",
             "Unknown thread id 019f…",
@@ -804,8 +1187,8 @@ mod tests {
     #[tokio::test]
     async fn route_table_routes_and_broadcasts_exit_once_per_sink() {
         let routes = RouteTable::default();
-        let (shared_tx, mut shared_rx) = mpsc::unbounded_channel();
-        let (solo_tx, mut solo_rx) = mpsc::unbounded_channel();
+        let (shared_tx, mut shared_rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
+        let (solo_tx, mut solo_rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
         // two threads share one sink (orchestrator pattern), one has its own
         routes.insert("t-1", shared_tx.clone());
         routes.insert("t-2", shared_tx.clone());
@@ -819,7 +1202,7 @@ mod tests {
 
         // process death: each distinct sink hears Exited exactly once
         for sink in routes.drain_distinct() {
-            let _ = sink.send(ThreadEvent::Exited);
+            let _ = sink.send(ThreadEvent::Exited).await;
         }
         assert!(matches!(shared_rx.recv().await, Some(ThreadEvent::Exited)));
         assert!(matches!(solo_rx.recv().await, Some(ThreadEvent::Exited)));
@@ -893,7 +1276,7 @@ mod tests {
             .to_string();
         push(&log, format!("thread started: {thread_id}"));
 
-        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+        let (sink_tx, mut sink_rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
         conn.register_thread(&thread_id, sink_tx);
 
         // apply_patch under "untrusted" triggers a fileChange approval;
@@ -1061,7 +1444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn session_spike() {
         let base = std::env::temp_dir().join("swarmz-session-spike");
         let cwd_a = base.join("a");
@@ -1128,5 +1511,160 @@ mod tests {
                 s.label
             );
         }
+    }
+
+    // ---- MCP-disable spike (Phase 6 live-fix) ----
+    //
+    // Live proof against the REAL installed codex CLI that a SwarmZ-spawned
+    // app-server (a) boots NO MCP servers — neither the user's global
+    // `[mcp_servers.*]` entries nor the built-in `codex_apps` — and (b) runs
+    // a FIRST dynamic tool call cleanly on the first attempt (the bug this
+    // fixes: the inherited node_repl boot raced the Conductor's first
+    // spawn_agents call into `timeout_ms must be at least 10000` + "dynamic
+    // tool call was cancelled before receiving a response"). Requires codex
+    // + login + a config.toml with MCP servers to be meaningful; run with:
+    //   cargo test mcp_disable_spike -- --ignored --nocapture
+
+    #[tokio::test]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
+    async fn mcp_disable_spike() {
+        let cwd = std::env::temp_dir().join("swarmz-mcp-disable-spike");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // context: what the user's config would boot WITHOUT the fix
+        let disable_args = mcp_disable_args().expect("mcp disable args");
+        println!("disable args: {disable_args:?}");
+
+        let host = ProcessHost::new();
+        let (conn, generation) = host.ensure().await.expect("spawn app-server");
+        println!("process up (generation {generation}, {})", conn.version());
+
+        // one dynamic tool, exactly the Conductor's spec shape (adapter.rs)
+        let started = conn
+            .request(
+                "thread/start",
+                json!({
+                    "cwd": cwd.to_string_lossy(),
+                    "sandbox": "read-only",
+                    "approvalPolicy": "never",
+                    "ephemeral": true,
+                    "developerInstructions":
+                        "You are a test agent with one dynamic tool. Use it exactly as asked.",
+                    "dynamicTools": [{
+                        "type": "function",
+                        "name": "ping",
+                        "description": "Answers with pong. Call it whenever asked.",
+                        "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+                    }],
+                }),
+                THREAD_TIMEOUT_MS,
+            )
+            .await
+            .expect("thread/start");
+        let thread_id = started
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .expect("thread id")
+            .to_string();
+        let (sink_tx, mut sink_rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
+        conn.register_thread(&thread_id, sink_tx);
+
+        // the FIRST turn asks for the tool immediately — without the fix this
+        // is the turn that raced the user's MCP boot
+        let t_turn = std::time::Instant::now();
+        conn.request(
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text":
+                    "Call the ping tool once (empty arguments), then reply with exactly the text it returned." }],
+            }),
+            RPC_TIMEOUT_MS,
+        )
+        .await
+        .expect("turn/start");
+
+        let mut mcp_boots: Vec<String> = Vec::new();
+        let mut tool_calls = 0usize;
+        let mut first_tool_call_ms: Option<u128> = None;
+        let mut final_message = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+        let turn_status = loop {
+            let ev = tokio::time::timeout_at(deadline, sink_rx.recv())
+                .await
+                .expect("mcp spike timed out")
+                .expect("event sink closed");
+            match ev {
+                ThreadEvent::Request { method, params, responder } => match method.as_str() {
+                    "item/tool/call" => {
+                        tool_calls += 1;
+                        first_tool_call_ms.get_or_insert(t_turn.elapsed().as_millis());
+                        println!(
+                            "[{:>6} ms] item/tool/call #{tool_calls}: {}",
+                            t_turn.elapsed().as_millis(),
+                            params.get("tool").and_then(|v| v.as_str()).unwrap_or("?"),
+                        );
+                        responder.ok(&json!({
+                            "success": true,
+                            "contentItems": [{ "type": "inputText", "text": "pong" }],
+                        }));
+                    }
+                    other => {
+                        println!("unexpected server request {other} — refusing");
+                        responder.error(-32601, "not supported by the spike");
+                    }
+                },
+                ThreadEvent::Notification { method, params } => match method.as_str() {
+                    "mcpServer/startupStatus/updated" => {
+                        let line = format!(
+                            "{}: {}",
+                            params.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                            params.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+                        );
+                        println!("MCP STARTUP (must not happen): {line}");
+                        mcp_boots.push(line);
+                    }
+                    "item/completed" => {
+                        let item = params.get("item").cloned().unwrap_or(Value::Null);
+                        if item.get("type").and_then(|v| v.as_str()) == Some("agentMessage") {
+                            final_message = item
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                        }
+                    }
+                    "turn/completed" => {
+                        break params
+                            .pointer("/turn/status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                    }
+                    _ => {}
+                },
+                ThreadEvent::Exited => panic!("app-server exited mid-spike"),
+            }
+        };
+
+        println!("\n==== mcp disable spike summary ====");
+        println!("turn status: {turn_status}");
+        println!("mcp servers booted: {}", mcp_boots.len());
+        println!("dynamic tool calls: {tool_calls} (first after {first_tool_call_ms:?} ms)");
+        println!("final message: {final_message:?}");
+
+        assert_eq!(turn_status, "completed", "the FIRST turn must complete cleanly");
+        assert!(
+            mcp_boots.is_empty(),
+            "a SwarmZ-spawned app-server must boot NO MCP servers, got: {mcp_boots:?}"
+        );
+        assert!(
+            tool_calls >= 1,
+            "the first dynamic tool call must arrive on the first attempt"
+        );
+        assert!(
+            final_message.to_lowercase().contains("pong"),
+            "the tool result must round-trip into the reply: {final_message:?}"
+        );
     }
 }

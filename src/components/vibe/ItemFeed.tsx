@@ -2,9 +2,10 @@ import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { VList, type VListHandle } from "virtua";
 import { useVibe } from "@/lib/vibe/session-store";
-import { respondApproval } from "@/lib/vibe/controller";
+import { reportForItem } from "@/lib/vibe/report-item";
 import { approvalCommand, commandExit } from "@/lib/vibe/ui";
 import { cn } from "@/lib/utils";
+import type { AgentReport } from "@/lib/orchestrator/report";
 import type { VibeFileChange, VibeItem } from "@/types";
 import { FileChangeCard } from "./DiffCard";
 import { OrchestratorMarkdown } from "@/components/OrchestratorMarkdown";
@@ -60,20 +61,16 @@ export function ItemFeed({ sessionId }: { sessionId: string }) {
   if (!order || order.length === 0) {
     return (
       <div className="flex flex-1 items-center justify-center px-6 text-center">
-        <p className="max-w-xs text-xs leading-relaxed text-faint">
+        <p className="max-w-xs text-12 leading-normal text-fnt">
           No messages yet. Say what you want built below — commands, diffs and
-          approvals will appear here as the session works.
+          approvals will appear here as the agent works.
         </p>
       </div>
     );
   }
 
   return (
-    <VList
-      ref={ref}
-      onScroll={onScroll}
-      className="min-h-0 flex-1 px-5 py-4"
-    >
+    <VList ref={ref} onScroll={onScroll} className="min-h-0 flex-1 px-6 py-6">
       {order.map((iid) => (
         <ItemRow key={iid} sessionId={sessionId} itemId={iid} />
       ))}
@@ -93,32 +90,33 @@ const ItemRow = memo(function ItemRow({
   const item = useVibe((s) => s.sessions[sessionId]?.items[itemId]);
   if (!item) return null;
   return (
-    <div className="mx-auto w-full max-w-[46rem] pb-3">
-      <RenderItem sessionId={sessionId} item={item} />
+    <div className="mx-auto w-full max-w-[46rem] pb-4">
+      <RenderItem item={item} />
     </div>
   );
 });
 
-function RenderItem({
-  sessionId,
-  item,
-}: {
-  sessionId: string;
-  item: VibeItem;
-}) {
+function RenderItem({ item }: { item: VibeItem }) {
   switch (item.kind) {
     case "user":
-      return <UserRow text={item.text} />;
-    case "assistant":
+      return <UserRow text={item.text} via={item.via} />;
+    case "assistant": {
+      // an expect_report turn's final message renders as a report card, not
+      // as raw JSON (the gate is strict: stamped `report: true` AND parses)
+      const report = reportForItem(item);
+      if (report) return <ReportCard report={report} />;
       return <AssistantRow text={item.text} streaming={!!item.streaming} />;
+    }
     case "command":
       return <CommandRow item={item} />;
     case "fileChange":
       return <FileChangeCard changes={item.changes} status={item.status} />;
     case "approval":
-      return <ApprovalRow sessionId={sessionId} item={item} />;
+      return <ApprovalRow item={item} />;
     case "warning":
       return <WarningRow text={item.text} />;
+    case "notice":
+      return <NoticeRow text={item.text} />;
     case "plan":
       return item.explanation ? <PlanExplanationRow text={item.explanation} /> : null;
     case "webSearch":
@@ -128,10 +126,25 @@ function RenderItem({
   }
 }
 
-function UserRow({ text }: { text: string }) {
+/** User bubble — pop surface, 12/12/4/12 radius (reference). A prompt the
+ * Conductor injected (prompt_agent / spawn_agents) carries a small "via
+ * Conductor" label so it's distinguishable from a message the human typed. */
+function UserRow({ text, via }: { text: string; via?: "conductor" }) {
   return (
-    <div className="flex justify-end">
-      <div className="max-w-[80%] whitespace-pre-wrap rounded-2xl border border-border bg-secondary px-3.5 py-2 text-[13.5px] leading-relaxed text-foreground select-text">
+    <div className="flex flex-col items-end gap-1">
+      {via === "conductor" && (
+        <span className="flex items-center gap-1 pr-1 font-mono text-10 text-acc/80">
+          <span aria-hidden>//</span> via Conductor
+        </span>
+      )}
+      <div
+        className={cn(
+          "max-w-[82%] select-text whitespace-pre-wrap rounded-xl rounded-br-[4px] border px-3.5 py-2.5 text-13 leading-relaxed text-txt",
+          via === "conductor"
+            ? "border-acc/30 bg-acc/[0.06]"
+            : "border-line2 bg-pop",
+        )}
+      >
         {text}
       </div>
     </div>
@@ -153,34 +166,109 @@ const AssistantRow = memo(function AssistantRow({
 }) {
   if (streaming) {
     return (
-      <div className="w-full whitespace-pre-wrap text-[13.5px] leading-relaxed text-foreground/90 select-text">
+      <div className="w-full select-text whitespace-pre-wrap text-13 leading-relaxed text-txt/90">
         {text}
-        <span className="streaming-caret ml-0.5 inline-block h-[14px] w-[6px] translate-y-[2px] bg-foreground/70 align-baseline" />
+        <span className="animate-zcaret ml-0.5 inline-block h-[13px] w-[6px] translate-y-[2px] rounded-[1px] bg-txt/70 align-baseline" />
       </div>
     );
   }
   return (
-    <div className="w-full text-[13.5px] leading-relaxed text-foreground/90 select-text">
+    <div className="w-full select-text text-13 leading-relaxed text-txt/90">
       <OrchestratorMarkdown text={text} />
     </div>
   );
 });
 
-function CardHead({
-  children,
-  className,
-}: {
-  children: React.ReactNode;
-  className?: string;
-}) {
+// ---- agent status report (Phase 5 expect_report turns) ----
+
+/** How many files_changed rows the card paints before collapsing to "+N". */
+const REPORT_FILES_SHOWN = 6;
+
+/**
+ * A completed `expect_report` turn's schema-forced final message, rendered
+ * as a compact report card instead of raw JSON (the Conductor still parses
+ * the JSON machine-side — this is presentation only). Signal logic follows
+ * DESIGN.md: needs-you = attn (like the approval card), done = a green
+ * checkmark on a quiet card, in-progress = neutral.
+ */
+function ReportCard({ report }: { report: AgentReport }) {
+  const needsYou = report.needsHuman;
+  const status = needsYou ? "needs you" : report.done ? "done" : "in progress";
+  const glyph = needsYou ? "⚑" : report.done ? "✓" : "▸";
+  const glyphCls = needsYou ? "text-attn" : report.done ? "text-ok" : "text-fnt";
+  const tests =
+    report.testsPass === null ? null : report.testsPass ? "tests pass" : "tests FAIL";
+  const shownFiles = report.filesChanged.slice(0, REPORT_FILES_SHOWN);
+  const moreFiles = report.filesChanged.length - shownFiles.length;
+
   return (
     <div
       className={cn(
-        "flex items-center gap-2 border-b border-border px-3 py-1.5 font-mono text-[10px] text-muted-foreground",
-        className,
+        "max-w-[88%] overflow-hidden rounded-lg border bg-card",
+        needsYou ? "border-attn/55" : "border-line",
       )}
     >
-      {children}
+      <div
+        className={cn(
+          "flex items-center gap-1.5 border-b px-3 py-1.5 font-mono text-11",
+          needsYou
+            ? "border-attn/25 bg-attn/10 text-attn"
+            : "border-line text-fnt",
+        )}
+      >
+        <span aria-hidden className={glyphCls}>
+          {glyph}
+        </span>
+        <span className="font-semibold">report</span>
+        <span className="opacity-75">— {status}</span>
+        {tests && (
+          <span
+            className={cn(
+              "ml-auto shrink-0",
+              report.testsPass ? "text-ok" : "text-err",
+            )}
+          >
+            {tests}
+          </span>
+        )}
+      </div>
+      {report.summary && (
+        <p className="select-text px-3 py-2.5 text-13 leading-relaxed text-txt">
+          {report.summary}
+        </p>
+      )}
+      {needsYou && report.question && (
+        <p className="select-text border-t border-attn/25 bg-attn/10 px-3 py-2 text-13 leading-relaxed text-attn">
+          {report.question}
+        </p>
+      )}
+      {shownFiles.length > 0 && (
+        <div className="flex flex-col gap-0.5 border-t border-line px-3 py-2">
+          {shownFiles.map((f, i) => (
+            <span
+              key={`${i}:${f}`}
+              className="select-text truncate font-mono text-11 text-mut"
+            >
+              {f}
+            </span>
+          ))}
+          {moreFiles > 0 && (
+            <span className="font-mono text-11 text-fnt">+{moreFiles} more</span>
+          )}
+        </div>
+      )}
+      {report.followups.length > 0 && (
+        <div className="flex flex-col gap-1 border-t border-line px-3 py-2">
+          {report.followups.map((f, i) => (
+            <span key={i} className="select-text text-12 leading-normal text-mut">
+              <span aria-hidden className="mr-1.5 text-fnt">
+                →
+              </span>
+              {f}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -196,35 +284,40 @@ function CommandRow({ item }: { item: Extract<VibeItem, { kind: "command" }> }) 
       : item.output;
 
   return (
-    <div className="max-w-[86%] overflow-hidden rounded-lg border border-border bg-card">
+    <div className="max-w-[88%] overflow-hidden rounded-lg border border-line bg-card">
       <button
         onClick={() => hasOutput && setOpen((o) => !o)}
         className={cn(
-          "flex w-full items-center gap-2 border-b border-border px-3 py-1.5 text-left font-mono text-[10px] text-muted-foreground",
-          hasOutput && "hover:bg-accent",
+          "focus-ring flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-11 text-mut",
+          hasOutput && "hover:bg-pop",
         )}
       >
         {hasOutput && (
           <ChevronRight
-            size={11}
-            className={cn("shrink-0 text-faint transition-transform", open && "rotate-90")}
+            size={10}
+            className={cn(
+              "shrink-0 text-fnt transition-transform",
+              open && "rotate-90",
+            )}
           />
         )}
-        <span className="shrink-0 text-faint">$</span>
-        <span className="min-w-0 flex-1 truncate text-foreground">
+        <span aria-hidden className="shrink-0 text-fnt">
+          $
+        </span>
+        <span className="min-w-0 flex-1 truncate text-txt">
           {item.command || "command"}
         </span>
         <span
           className={cn(
             "shrink-0",
-            running ? "text-muted-foreground" : failed ? "text-destructive" : "text-success",
+            running ? "animate-zcaret text-fnt" : failed ? "text-err" : "text-ok",
           )}
         >
           {text}
         </span>
       </button>
       {open && hasOutput && (
-        <pre className="max-h-64 overflow-auto px-3 py-2 font-mono text-[10.5px] leading-relaxed text-muted-foreground select-text">
+        <pre className="max-h-[190px] select-text overflow-auto border-t border-line px-3 py-2.5 font-mono text-11 leading-[1.6] text-mut">
           {shown}
         </pre>
       )}
@@ -233,10 +326,8 @@ function CommandRow({ item }: { item: Extract<VibeItem, { kind: "command" }> }) 
 }
 
 function ApprovalRow({
-  sessionId,
   item,
 }: {
-  sessionId: string;
   item: Extract<VibeItem, { kind: "approval" }>;
 }) {
   const pending = item.status === "pending";
@@ -249,55 +340,72 @@ function ApprovalRow({
   return (
     <div
       className={cn(
-        "max-w-[86%] overflow-hidden rounded-lg border bg-card",
-        pending ? "border-attn/55" : "border-border",
+        "max-w-[88%] overflow-hidden rounded-lg border bg-card",
+        pending ? "border-attn/55" : "border-line",
       )}
     >
-      <CardHead
-        className={cn(pending && "border-b-attn/25 text-attn")}
+      <div
+        className={cn(
+          "flex items-center gap-1.5 border-b px-3 py-1.5 font-mono text-11",
+          pending ? "border-attn/25 bg-attn/10 text-attn" : "border-line text-fnt",
+        )}
       >
         <span aria-hidden>⚑</span>
-        <span className="font-semibold">
-          approval — {item.approvalKind === "fileChange" ? "wants to write files" : "wants to run a command"}
+        <span className="font-semibold">approval</span>
+        <span className="opacity-75">
+          —{" "}
+          {item.approvalKind === "fileChange"
+            ? "wants to write files"
+            : "wants to run a command"}
         </span>
-      </CardHead>
+      </div>
       {command && (
-        <pre className="overflow-x-auto px-3 py-2 font-mono text-[10.5px] leading-relaxed text-foreground select-text">
+        <pre className="select-text overflow-x-auto px-3 py-2 font-mono text-11 leading-relaxed text-txt">
           {command}
         </pre>
       )}
       {files.length > 0 && (
-        <div className="flex flex-col px-3 py-2">
+        <div className="flex flex-col gap-0.5 px-3 py-2">
           {files.map((f) => (
-            <span key={f} className="truncate font-mono text-[10.5px] text-muted-foreground select-text">
+            <span key={f} className="select-text truncate font-mono text-11 text-mut">
               {f}
             </span>
           ))}
         </div>
       )}
       {reason && (
-        <p className="px-3 pb-1 text-[11px] leading-relaxed text-muted-foreground">
-          {reason}
-        </p>
+        <p className="px-3 pb-1.5 text-12 leading-normal text-mut">{reason}</p>
       )}
       {pending ? (
-        <div className="flex gap-2 border-t border-border px-3 py-2">
-          <button
-            onClick={() => respondApproval(sessionId, item.id, "accept")}
-            className="focus-ring rounded-md border border-foreground bg-foreground px-3 py-1 font-mono text-[10px] font-semibold text-background"
-          >
-            Approve
-          </button>
-          <button
-            onClick={() => respondApproval(sessionId, item.id, "decline")}
-            className="focus-ring rounded-md border border-border px-3 py-1 font-mono text-[10px] text-muted-foreground hover:bg-accent"
-          >
-            Decline
-          </button>
+        // The interactive decision lives in the composer takeover (the single
+        // "Allow" surface for the focused session — U6). The inline card stays
+        // read-only so a screen never shows two competing Allow buttons.
+        <div className="flex items-center gap-1.5 border-t border-attn/25 bg-attn/10 px-3 py-1.5 font-mono text-11 text-attn">
+          <span aria-hidden className="animate-zattn shrink-0">
+            ↓
+          </span>
+          <span>awaiting your decision below</span>
         </div>
       ) : (
-        <div className="border-t border-border px-3 py-1.5 font-mono text-[10px] text-faint">
-          {resolvedLabel(item.status)}
+        <div
+          className={cn(
+            "flex items-center gap-1.5 border-t border-line px-3 py-1.5 font-mono text-11",
+            item.status === "accepted" || item.status === "acceptedForSession"
+              ? "text-ok"
+              : "text-fnt",
+          )}
+        >
+          <span>{resolvedLabel(item.status)}</span>
+          {item.decidedBy === "conductor" && (
+            // attribution — the human must see, at a glance, the approvals they
+            // did NOT give themselves (the Conductor decided this routine one)
+            <span
+              className="ml-auto shrink-0 rounded-sm border border-acc/40 bg-acc/10 px-1.5 py-px text-10 text-acc"
+              title="Decided autonomously by the Conductor (a routine, read-only/test approval). Destructive approvals always wait for you."
+            >
+              ⟐ Conductor{item.escalation === "routine" ? " · routine" : ""}
+            </span>
+          )}
         </div>
       )}
     </div>
@@ -321,15 +429,26 @@ function resolvedLabel(status: string): string {
 
 function WarningRow({ text }: { text: string }) {
   return (
-    <div className="max-w-[86%] text-[11px] leading-relaxed text-warning select-text">
+    <div className="max-w-[88%] select-text text-12 leading-normal text-warn">
       {text}
+    </div>
+  );
+}
+
+/** A neutral centered divider (context compaction) — reads as info, not error. */
+function NoticeRow({ text }: { text: string }) {
+  return (
+    <div className="flex items-center gap-2 py-0.5 text-11 text-fnt">
+      <span className="h-px flex-1 bg-line" />
+      <span className="select-text">{text}</span>
+      <span className="h-px flex-1 bg-line" />
     </div>
   );
 }
 
 function PlanExplanationRow({ text }: { text: string }) {
   return (
-    <div className="max-w-[82%] whitespace-pre-wrap text-[11px] leading-relaxed text-muted-foreground select-text">
+    <div className="max-w-[82%] select-text whitespace-pre-wrap text-12 leading-normal text-fnt">
       {text}
     </div>
   );
@@ -337,8 +456,8 @@ function PlanExplanationRow({ text }: { text: string }) {
 
 function WebSearchRow({ query }: { query: string }) {
   return (
-    <div className="max-w-[82%] font-mono text-[10.5px] text-faint select-text">
-      🔍 {query}
+    <div className="max-w-[82%] select-text font-mono text-11 text-fnt">
+      ⌕ {query}
     </div>
   );
 }

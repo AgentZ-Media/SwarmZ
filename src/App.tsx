@@ -1,238 +1,126 @@
 import { useEffect, useRef, useState } from "react";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { TitleBar } from "./components/TitleBar";
-import { WorkspaceLayer } from "./components/WorkspaceLayer";
 import { VibeLayer } from "./components/vibe/VibeLayer";
-import { FloatingTerminals } from "./components/FloatingTerminals";
 import { Deck } from "./components/Deck";
-import { CloseAgentDialog } from "./components/CloseAgentDialog";
-import { CloseBusyDialog } from "./components/CloseBusyDialog";
-import { CloseWorkspaceDialog } from "./components/CloseWorkspaceDialog";
-import { CloseWorktreeDialog } from "./components/CloseWorktreeDialog";
+import { Toasts } from "./components/Toasts";
 import { CommandPalette } from "./components/CommandPalette";
-import { InsertCommandPalette } from "./components/InsertCommandPalette";
 import { QuitConfirmDialog } from "./components/QuitConfirmDialog";
-import { NewAgentDialog } from "./components/NewAgentDialog";
-import { LoadPresetDialog } from "./components/LoadPresetDialog";
-import { SavePresetDialog } from "./components/SavePresetDialog";
-import { ProfilesDialog } from "./components/ProfilesDialog";
+import { CloseWorktreeDialog } from "./components/CloseWorktreeDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { QuickNotesPanel } from "./components/QuickNotesPanel";
-import { OrchestratorPanel } from "./components/OrchestratorPanel";
 import { UsageDashboard } from "./components/UsageDashboard";
+import { GitHubPanel } from "./components/GitHubPanel";
 import { useSwarm } from "./store";
-import { useOrchestrator } from "./lib/orchestrator/chat-store";
+import { useVibe } from "./lib/vibe/session-store";
+import { hasPendingApproval } from "./lib/vibe/ui";
 import { useVibeUi } from "./lib/vibe/ui-store";
 import { useUpdates } from "./lib/updates";
 import { useLimits } from "./lib/limits";
-import { startGitPolling } from "./lib/git";
 import { startQuitGuard } from "./lib/quit";
-import { startFileDropListener } from "./lib/dnd";
 import { startOrchestratorBus } from "./lib/orchestrator/bus";
 import {
-  startOrchestratorActivityWatcher,
+  deliverTimerTurn,
+  notifyTimerNotice,
+  runAutonomousTurn,
   startVibeSessionActivityWatcher,
 } from "./lib/orchestrator/controller";
-import { fetchKeyStatus } from "./lib/openrouter";
-import { fetchLocalSttStatus } from "./lib/local-stt";
 import {
-  armHoldDictation,
-  cancelHoldDictation,
-  dictationReady,
-  finishHoldDictation,
-  startDictation,
-  stopDictation,
-} from "./lib/dictation";
-import { cn, encodeProjectDir } from "./lib/utils";
+  registerTimerDelivery,
+  registerTimerNotice,
+} from "./lib/orchestrator/timers";
+import { registerAutonomousRunner } from "./lib/orchestrator/triggers";
+import { startGithubController } from "./lib/github/controller";
+import { vibeTriageEntries } from "./lib/vibe/triage";
 import {
-  ensureNotifyPermission,
-  fetchUsageForSession,
-  getHome,
-  notify,
-  onUsageChanged,
-} from "./lib/transport";
+  activateProjectByIndex,
+  closeSession,
+  focusSession,
+} from "./lib/vibe/controller";
+import { ensureNotifyPermission, notify } from "./lib/transport";
 
 // dev-only orchestrator smoke-test hook (`window.__orch`) — the DEV guard
 // makes production builds drop the import entirely
 if (import.meta.env.DEV) void import("./lib/orchestrator/dev");
-// dev-only Vibe-Mode smoke-test hook (`window.__vibe`) — same DEV guard
+// dev-only Vibe smoke-test hook (`window.__vibe`) — same DEV guard
 if (import.meta.env.DEV) void import("./lib/vibe/dev");
 
 export default function App() {
   const hydrate = useSwarm((s) => s.hydrate);
-  const setUsage = useSwarm((s) => s.setUsage);
-  const setNewAgentOpen = useSwarm((s) => s.setNewAgentOpen);
-  const splitActive = useSwarm((s) => s.splitActive);
-  const requestRemoveAgent = useSwarm((s) => s.requestRemoveAgent);
-  const createFloatingTerminal = useSwarm((s) => s.createFloatingTerminal);
-  const adjustFontSize = useSwarm((s) => s.adjustFontSize);
-  const uiMode = useSwarm((s) => s.settings.uiMode ?? "grid");
 
-  const [profilesOpen, setProfilesOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const homeRef = useRef<string>("");
   const notifyGranted = useRef(false);
-  const prevAttention = useRef<Set<string>>(new Set());
+  const prevPending = useRef<Set<string>>(new Set());
 
   // init
   useEffect(() => {
+    // conductor timers deliver autonomous turns through the controller —
+    // registered BEFORE hydrate so missed timers can fire right away; the
+    // notice sink makes expired/claim-dropped timers visible in the chat
+    registerTimerDelivery(deliverTimerTurn);
+    registerTimerNotice(notifyTimerNotice);
+    // the Phase-5 trigger router runs event-triggered autonomous turns
+    // (agent finished/blocked, approval escalation, idle) through the same
+    // budget-gated core — registered, not imported, to keep imports acyclic
+    registerAutonomousRunner(runAutonomousTurn);
     void hydrate();
-    void getHome().then((h) => (homeRef.current = h));
     void ensureNotifyPermission().then((g) => (notifyGranted.current = g));
     const updates = useUpdates.getState();
     updates.startBackgroundPolling();
     const stopLimits = useLimits.getState().start();
-    const stopGit = startGitPolling();
     const stopQuitGuard = startQuitGuard();
-    const stopFileDrop = startFileDropListener();
     // orchestrator tool bus: executes Rust-dispatched tool requests against
-    // the store (Phase 2) — registered once, guarded against double starts
+    // the stores — registered once, guarded against double starts
     const stopOrchestratorBus = startOrchestratorBus();
-    // orchestrator status pings: busy → idle/waiting transitions of panes an
-    // orchestrator chat prompted become system pings in that chat (Phase 5)
-    const stopOrchestratorPings = startOrchestratorActivityWatcher();
-    // same, for native Vibe sessions the orchestrator prompted (Phase 5)
+    // orchestrator status pings: busy → idle / pending-approval transitions
+    // of sessions an orchestrator chat prompted become system pings there
     const stopVibePings = startVibeSessionActivityWatcher();
-    // dictation UI is hidden until a working OpenRouter key is found
-    // (or, with the local engine, the local speech model is installed)
-    void fetchKeyStatus()
-      .then((st) => useSwarm.getState().setOpenrouterStatus(st))
-      .catch(() => {});
-    void fetchLocalSttStatus()
-      .then((st) => useSwarm.getState().setLocalSttStatus(st))
-      .catch(() => {});
+    // GitHub integration (Phase 7): repo/PR detection, the Rust write-gate
+    // sync, the PR watcher and its pr-changed → ticker/autonomy routing
+    const stopGithub = startGithubController();
     return () => {
       updates.stopBackgroundPolling();
       stopLimits();
-      stopGit();
       stopQuitGuard();
-      stopFileDrop();
       stopOrchestratorBus();
-      stopOrchestratorPings();
       stopVibePings();
+      stopGithub();
     };
   }, [hydrate]);
 
-  // usage refresh — each agent shows ONLY its own session's usage.
-  // Watcher events are filtered to the project dirs of open agents, all
-  // triggers are coalesced (min 2s apart), and nothing runs while the
-  // window is hidden (one refresh fires on becoming visible again).
+  // the motion off-switch (Settings → Appearance): data-motion="off" on the
+  // root collapses every nonessential animation (styles.css)
+  const reduceMotion = useSwarm((s) => !!s.settings.reduceMotion);
   useEffect(() => {
-    let alive = true;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let lastRun = 0;
-    let pendingWhileHidden = false;
-    const MIN_GAP_MS = 2000;
+    document.documentElement.setAttribute(
+      "data-motion",
+      reduceMotion ? "off" : "on",
+    );
+  }, [reduceMotion]);
 
-    const refresh = async () => {
-      const { agents, order } = useSwarm.getState();
-      await Promise.all(
-        order.map(async (id) => {
-          const a = agents[id];
-          if (!a) return;
-          const runtime = a.runtime ?? "claude";
-          if (runtime === "shell") return;
-          const dir = a.cwd || homeRef.current;
-          if (!dir) return;
-          // Claude session discovery is gated on real activity: a pane whose CLI
-          // never went busy has no session file of its own and would latch
-          // (and later resume) a sibling session born in the same folder
-          if (!a.sessionId && runtime === "claude" && !a.firstBusyAt) return;
-          // discovery floor: only files born around the first activity match,
-          // not anything since pane creation (5s + backend skew). A latched
-          // session parses the whole file — the backend ignores `since` then
-          const since = a.sessionId
-            ? a.createdAt
-            : runtime === "claude"
-              ? Math.max(a.createdAt, a.firstBusyAt! - 5000)
-              : a.createdAt;
-          // sessions other agents have latched onto — with several agents in
-          // the same folder, an unlatched pane must never match a sibling's file
-          const exclude = order
-            .filter((oid) => oid !== id)
-            .filter((oid) => (agents[oid]?.runtime ?? "claude") === runtime)
-            .map((oid) => agents[oid]?.sessionId)
-            .filter((s): s is string => !!s);
-          try {
-            const u = await fetchUsageForSession(
-              dir,
-              since,
-              a.sessionId,
-              exclude,
-              runtime,
-            );
-            if (alive && u) setUsage(id, u);
-          } catch {
-            /* ignore */
-          }
-        }),
-      );
-    };
-
-    const schedule = () => {
-      if (!alive) return;
-      if (document.hidden) {
-        pendingWhileHidden = true;
-        return;
-      }
-      if (timer) return; // a run is already scheduled — coalesce
-      const wait = Math.max(0, lastRun + MIN_GAP_MS - Date.now());
-      timer = setTimeout(() => {
-        timer = null;
-        lastRun = Date.now();
-        void refresh();
-      }, wait);
-    };
-
-    lastRun = Date.now();
-    void refresh();
-    const interval = setInterval(schedule, 4000);
-    const unlistenP = onUsageChanged((changedDirs) => {
-      // ignore Claude changes from sessions we're not displaying; Codex
-      // watcher events use empty = unknown → refresh all
-      if (changedDirs && changedDirs.length > 0) {
-        const { agents, order } = useSwarm.getState();
-        const watched = new Set(
-          order
-            .map((id) => agents[id]?.cwd || homeRef.current)
-            .filter(Boolean)
-            .map(encodeProjectDir),
-        );
-        if (!changedDirs.some((d) => watched.has(d))) return;
-      }
-      schedule();
-    });
-    const onVisibility = () => {
-      if (!document.hidden && pendingWhileHidden) {
-        pendingWhileHidden = false;
-        schedule();
-      }
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-
-    return () => {
-      alive = false;
-      if (timer) clearTimeout(timer);
-      clearInterval(interval);
-      document.removeEventListener("visibilitychange", onVisibility);
-      void unlistenP.then((u) => u());
-    };
-  }, [setUsage]);
-
-  // native notification when an agent rings the bell / needs attention
+  // native notification when a session raises a pending approval (needs-you);
+  // seeded from the current state so hydrated pre-existing approvals never
+  // re-notify on launch (same lesson as Toasts' lastSeenRef)
   useEffect(() => {
-    const unsub = useSwarm.subscribe((state) => {
-      const nowAttention = new Set<string>();
+    const seed = new Set<string>();
+    const initial = useVibe.getState();
+    for (const id of initial.order) {
+      const entry = initial.sessions[id];
+      if (entry && hasPendingApproval(entry)) seed.add(id);
+    }
+    prevPending.current = seed;
+    const unsub = useVibe.subscribe((state) => {
+      const nowPending = new Set<string>();
       for (const id of state.order) {
-        const a = state.agents[id];
-        if (a?.attention) {
-          nowAttention.add(id);
-          if (!prevAttention.current.has(id) && notifyGranted.current) {
-            void notify(`🔔 ${a.name}`, "Agent needs your attention");
+        const entry = state.sessions[id];
+        if (entry && hasPendingApproval(entry)) {
+          nowPending.add(id);
+          if (!prevPending.current.has(id) && notifyGranted.current) {
+            void notify(`🔔 ${entry.session.name}`, "Session needs your approval");
           }
         }
       }
-      prevAttention.current = nowAttention;
+      prevPending.current = nowPending;
     });
     return unsub;
   }, []);
@@ -240,56 +128,46 @@ export default function App() {
   // keyboard shortcuts
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // ⎋ — collapse the focused agent back to the fleet grid (wide first).
+      // Guards: dialogs own their Escape (Radix + the approval takeover call
+      // preventDefault before this window listener runs), and typing surfaces
+      // keep Escape for themselves.
+      if (e.key === "Escape" && !e.metaKey && !e.ctrlKey) {
+        if (e.defaultPrevented) return;
+        if (document.querySelector('[role="dialog"]')) return;
+        const t = e.target as HTMLElement | null;
+        if (
+          t &&
+          (t.tagName === "INPUT" ||
+            t.tagName === "TEXTAREA" ||
+            t.isContentEditable)
+        )
+          return;
+        const ui = useVibeUi.getState();
+        if (ui.wide) {
+          e.preventDefault();
+          ui.setWide(false);
+        } else if (ui.stageMode === "session") {
+          e.preventDefault();
+          ui.backToFleet();
+        }
+        return;
+      }
       if (!(e.metaKey || e.ctrlKey)) return;
       const k = e.key.toLowerCase();
       const s = useSwarm.getState();
       // Radix dialogs trap focus but keydown still bubbles to the window —
-      // shortcuts must not act on the app underneath an open dialog (a
-      // habitual ⌘W would kill the pane *behind* Settings)
+      // shortcuts must not act on the app underneath an open dialog
       const dialogOpen = !!document.querySelector('[role="dialog"]');
-      if (k === "meta") {
-        // plain ⌘ is the push-to-talk key (hold mode): recording arms after a
-        // short delay so ⌘-shortcuts never open the mic. Never arm while a
-        // dialog is open or the user is typing in a real text field — the
-        // transcript would be pasted into a pane they aren't looking at.
-        // (xterm's hidden helper textarea is exactly where dictation SHOULD
-        // work, so it doesn't count as a text field.)
-        const t = e.target as HTMLElement | null;
-        const editing =
-          !!t &&
-          (t.tagName === "INPUT" ||
-            t.tagName === "TEXTAREA" ||
-            t.isContentEditable) &&
-          !t.closest(".xterm");
-        if (
-          (s.settings.dictationHotkeyMode ?? "hold") === "hold" &&
-          !e.repeat &&
-          !dialogOpen &&
-          !editing
-        ) {
-          armHoldDictation(() => {
-            const st = useSwarm.getState();
-            return st.focusedAgentId ?? st.activeAgentId();
-          });
-        }
-        return;
-      }
-      // any other key while plain-⌘ dictation is armed/recording means a
-      // shortcut, not speech — abort silently, then handle the shortcut
-      cancelHoldDictation();
       if (dialogOpen) {
-        // the palettes own their toggles — ⌘K/⌘⇧K may still close them;
-        // nothing else reaches the app while a dialog is up. ⌘W/⌘⇧W are
-        // still claimed (no-op): unprevented they'd reach the native
-        // menu's Close Window item and quit the app from under the dialog.
-        if (k === "k" && e.shiftKey && s.commandPickerOpen) {
-          e.preventDefault();
-          s.setCommandPickerOpen(false);
-        } else if (k === "k" && !e.shiftKey && s.paletteOpen) {
+        // the palette owns its toggle — ⌘K may still close it; the notes
+        // drawer counts as a dialog — ⌘N may still toggle it shut. ⌘W stays
+        // claimed (no-op): unprevented it'd reach the native menu's Close
+        // Window item and quit the app from under the dialog.
+        if (k === "k" && s.paletteOpen) {
           e.preventDefault();
           s.setPaletteOpen(false);
         } else if (k === "n" && !e.shiftKey && s.notesOpen) {
-          // the notes drawer counts as a dialog — ⌘N may still toggle it shut
           e.preventDefault();
           s.setNotesOpen(false);
         } else if (k === "w") {
@@ -297,204 +175,82 @@ export default function App() {
         }
         return;
       }
-      if (k === "t") {
-        e.preventDefault();
-        setNewAgentOpen(true);
-      } else if (k === ",") {
+      if (k === ",") {
         // macOS convention: ⌘, opens settings
         e.preventDefault();
         setSettingsOpen(true);
-      } else if (k === "k" && e.shiftKey) {
-        // ⌘⇧K must come before plain ⌘K — that branch doesn't check shift
-        e.preventDefault();
-        s.setCommandPickerOpen(!s.commandPickerOpen);
       } else if (k === "k") {
         e.preventDefault();
         s.setPaletteOpen(!s.paletteOpen);
-      } else if (k === "e") {
+      } else if (k === "t") {
+        // new native Codex agent
         e.preventDefault();
-        s.setFleetOpen(!s.fleetOpen);
+        useVibeUi.getState().setNewSessionOpen(true);
+      } else if (k === "b") {
+        // ⌘B — toggle the Conductor sidebar
+        e.preventDefault();
+        useVibeUi.getState().toggleConductor();
       } else if (k === "o" && e.shiftKey) {
-        // ⌘⇧O — the orchestrator surface. In grid mode that is the chat
-        // sidebar (NOT a dialog: it stays open during work and global
-        // shortcuts keep firing while it's up). In Vibe Mode the Conductor
-        // stage IS the orchestrator surface — the sidebar would duplicate
-        // it, so the shortcut focuses the Conductor instead. (No plain ⌘O
-        // exists today; keep this branch before one if it ever does.)
+        // ⌘⇧O — the orchestrator surface: show the Conductor sidebar + fleet
         e.preventDefault();
-        if ((s.settings.uiMode ?? "grid") === "vibe") {
-          useVibeUi.getState().setStageMode("conductor");
-        } else {
-          useOrchestrator.getState().togglePanel();
-        }
-      } else if (k === "v" && e.shiftKey) {
-        // ⌘⇧V — toggle the app-wide view (grid tiling wall ↔ vibe sessions).
-        // Before plain-⌘ branches: nothing claims plain ⌘V (paste is native).
-        e.preventDefault();
-        s.setUiMode((s.settings.uiMode ?? "grid") === "vibe" ? "grid" : "vibe");
+        useVibeUi.getState().showConductor();
       } else if (k === "a" && e.shiftKey) {
-        // jump to the next agent waiting for input, across all workspaces
+        // jump to the oldest session waiting on the human
         e.preventDefault();
-        s.attentionJump();
-      } else if (k === "n" && e.shiftKey) {
-        e.preventDefault();
-        s.createWorkspace();
+        const entries = vibeTriageEntries(useVibe.getState());
+        if (entries.length) focusSession(entries[0].id);
       } else if (k === "n") {
         // quick notes drawer (closing while open is handled in the dialog branch)
         e.preventDefault();
         s.setNotesOpen(true);
-      } else if (k === "d") {
+      } else if (k >= "1" && k <= "9" && !e.shiftKey && !e.altKey) {
+        // ⌘1–⌘9 — switch to the n-th project tab
         e.preventDefault();
-        splitActive(e.shiftKey ? "column" : "row");
-      } else if (k === "w" && e.shiftKey) {
-        e.preventDefault();
-        s.requestCloseWorkspace(s.activeWorkspaceId);
+        activateProjectByIndex(Number(k) - 1);
       } else if (k === "w") {
-        // always claim ⌘W: unhandled it falls through to the native menu's
-        // Close Window item and closes the whole app from an empty workspace
+        // ⌘W — close the FOCUSED agent (browser-tab muscle memory). Always
+        // preventDefault first: unhandled it falls through to the native menu's
+        // Close Window item and quits the whole app (the invariant). With no
+        // agent focused it stays a safe no-op — ⌘W never closes a project tab
+        // (that stays an explicit gesture, and closing a tab keeps its agents).
         e.preventDefault();
-        const id = s.activeAgentId();
-        if (id) requestRemoveAgent(id);
-      } else if (k === "j") {
-        // floating terminal for the active pane
-        const id = s.activeAgentId();
-        if (id) {
-          e.preventDefault();
-          createFloatingTerminal(id);
-        }
-      } else if (k === "m" && e.shiftKey) {
-        // ⌘⇧M — toggle-mode dictation (hold mode listens to plain ⌘ instead)
-        e.preventDefault();
-        if (e.repeat || !dictationReady()) return;
-        if ((s.settings.dictationHotkeyMode ?? "hold") !== "toggle") return;
-        const d = s.dictation;
-        if (d?.phase === "recording") {
-          void stopDictation();
-          return;
-        }
-        if (d) return; // transcribing — let it finish
-        const target = s.focusedAgentId ?? s.activeAgentId();
-        if (target) void startDictation(target);
-      } else if (k >= "1" && k <= "9") {
-        // ⌘1–9 switch workspaces
-        const wid = s.workspaceOrder[Number(k) - 1];
-        if (wid) {
-          e.preventDefault();
-          s.setActiveWorkspace(wid);
-        }
-      } else if (e.shiftKey && (k === "[" || k === "{" || k === "]" || k === "}")) {
-        // ⌘⇧[ / ⌘⇧] cycle workspaces
-        e.preventDefault();
-        const idx = s.workspaceOrder.indexOf(s.activeWorkspaceId);
-        const delta = k === "[" || k === "{" ? -1 : 1;
-        const next =
-          s.workspaceOrder[
-            (idx + delta + s.workspaceOrder.length) % s.workspaceOrder.length
-          ];
-        if (next) s.setActiveWorkspace(next);
-      } else if (k === "[" || k === "]") {
-        // ⌘[ / ⌘] cycle panes within the active workspace — layout order,
-        // wrapping; updates the active pane and puts the cursor in its
-        // terminal. (macOS text editors use ⌘] for indent; terminals don't.)
-        e.preventDefault();
-        s.cycleActivePane(k === "[" ? -1 : 1);
-      } else if (k === "+" || k === "=" || k === "-" || k === "0") {
-        // per-pane zoom — "=" covers ⌘+ on layouts where + needs shift (US)
-        const id = s.activeAgentId();
-        if (id) {
-          e.preventDefault();
-          adjustFontSize(id, k === "0" ? "reset" : k === "-" ? -1 : 1);
+        const ui = useVibeUi.getState();
+        if (ui.stageMode === "session") {
+          const v = useVibe.getState();
+          const id = v.activeId;
+          if (id && v.sessions[id]) {
+            // busy → the same confirm dialog the card's close button raises
+            if (v.busy[id]) ui.setCloseConfirmId(id);
+            else void closeSession(id);
+          }
         }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [setNewAgentOpen, splitActive, requestRemoveAgent, createFloatingTerminal, adjustFontSize]);
-
-  // push-to-talk release: letting go of ⌘ finishes (transcribes) a hold-mode
-  // dictation; recordings shorter than ~1s are discarded in lib/dictation.ts.
-  // Losing window focus mid-recording also finishes rather than cancels.
-  useEffect(() => {
-    const onKeyUp = (e: KeyboardEvent) => {
-      if (e.key === "Meta") finishHoldDictation();
-    };
-    const onBlur = () => finishHoldDictation();
-    window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", onBlur);
-    return () => {
-      window.removeEventListener("keyup", onKeyUp);
-      window.removeEventListener("blur", onBlur);
-    };
   }, []);
 
   return (
     <TooltipProvider delayDuration={300}>
-      <div className="flex h-screen w-screen flex-col overflow-hidden bg-background">
-        <TitleBar
-          onManageProfiles={() => setProfilesOpen(true)}
-          onOpenSettings={() => setSettingsOpen(true)}
-        />
-        <main className="flex min-h-0 min-w-0 flex-1">
-          {/* workspace column: grid area on top, the Deck below it — the
-              orchestrator panel stays a full-height flex sibling */}
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-            {/* the grid area is its own positioning context so the fleet
-                overlay and floating terminals keep covering exactly the grid
-                (never the Deck or the orchestrator panel) */}
-            <div className="relative min-h-0 min-w-0 flex-1">
-              {/* Both views stay mounted always; the inactive one is only
-                  hidden (visibility) — grids keep their PTYs, the vibe feed
-                  keeps its scroll. Same lossless pattern as WorkspaceLayer's
-                  per-workspace grids. */}
-              <div
-                className={cn(
-                  "absolute inset-0",
-                  uiMode === "vibe" && "invisible pointer-events-none",
-                )}
-              >
-                {/* all workspace grids stay mounted in here — see WorkspaceLayer */}
-                <WorkspaceLayer />
-              </div>
-              <div
-                className={cn(
-                  "absolute inset-0",
-                  uiMode !== "vibe" && "invisible pointer-events-none",
-                )}
-              >
-                <VibeLayer />
-              </div>
-              {/* floating terminals live above both views — and survive them (detached) */}
-              <FloatingTerminals />
-            </div>
-            {/* the Deck: triage queue, event ticker, meters, orch status */}
-            <Deck />
+      <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg">
+        <TitleBar onOpenSettings={() => setSettingsOpen(true)} />
+        <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <div className="relative min-h-0 min-w-0 flex-1">
+            <VibeLayer />
           </div>
-          {/* orchestrator chat sidebar (⌘⇧O) — resizes the grid, not an overlay */}
-          {/* grid-only: in Vibe Mode the Conductor stage is the orchestrator
-              surface — mounting the sidebar too would show the same chat
-              twice. Unmounting is safe (the chat lives in its own store);
-              panelOpen persists and the panel reappears back in grid mode. */}
-          {uiMode !== "vibe" && <OrchestratorPanel />}
+          {/* the Deck: fleet counters, event ticker, meters, conductor dot */}
+          <Deck />
         </main>
       </div>
 
-      <CloseAgentDialog />
-      <CloseBusyDialog />
-      <CloseWorkspaceDialog />
-      <CloseWorktreeDialog />
+      <Toasts />
       <QuitConfirmDialog />
-      <NewAgentDialog />
-      <LoadPresetDialog />
-      <SavePresetDialog />
-      <CommandPalette
-        onOpenProfiles={() => setProfilesOpen(true)}
-        onOpenSettings={() => setSettingsOpen(true)}
-      />
-      <InsertCommandPalette />
-      <ProfilesDialog open={profilesOpen} onOpenChange={setProfilesOpen} />
+      <CloseWorktreeDialog />
+      <CommandPalette onOpenSettings={() => setSettingsOpen(true)} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       <UsageDashboard />
       <QuickNotesPanel />
+      <GitHubPanel />
     </TooltipProvider>
   );
 }

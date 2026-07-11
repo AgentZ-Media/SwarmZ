@@ -8,7 +8,7 @@ export const Input = React.forwardRef<
   <input
     ref={ref}
     className={cn(
-      "flex h-9 w-full rounded-md border border-border bg-secondary/60 px-3 py-1 text-sm text-foreground placeholder:text-faint focus-visible:outline-none focus-visible:border-ring/60 focus-visible:ring-2 focus-visible:ring-ring/25 transition-colors select-text",
+      "flex h-8 w-full select-text rounded-md border border-line bg-card px-3 py-1 text-13 text-txt transition-colors placeholder:text-fnt focus-visible:border-acc/55 focus-visible:outline-none",
       className,
     )}
     {...props}
@@ -16,6 +16,7 @@ export const Input = React.forwardRef<
 ));
 Input.displayName = "Input";
 
+/** Form section label — the reference's mono uppercase micro-label. */
 export const Label = React.forwardRef<
   HTMLLabelElement,
   React.LabelHTMLAttributes<HTMLLabelElement>
@@ -23,7 +24,7 @@ export const Label = React.forwardRef<
   <label
     ref={ref}
     className={cn(
-      "text-xs font-medium text-muted-foreground mb-1.5 block",
+      "mb-2 block font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt",
       className,
     )}
     {...props}

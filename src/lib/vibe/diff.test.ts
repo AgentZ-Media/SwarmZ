@@ -137,9 +137,11 @@ describe("changeToDiffData", () => {
 
 describe("splitUnifiedDiff", () => {
   it("splits a multi-file diff on diff --git headers", () => {
+    // the second file carries the `index <sha>..<sha>` line codex 0.144+
+    // emits in turn/diff/updated (0.142.5 omitted it) — must be tolerated
     const agg =
       "diff --git a/one.ts b/one.ts\n--- a/one.ts\n+++ b/one.ts\n@@\n+a\n-b\n" +
-      "diff --git a/two.ts b/two.ts\nnew file mode 100644\n--- /dev/null\n+++ b/two.ts\n@@ -0,0 +1,1 @@\n+hello\n";
+      "diff --git a/two.ts b/two.ts\nnew file mode 100644\nindex 0000000000000000000000000000000000000000..45b983be36b73c0788dc9cbcb76cbb80fc7bb057\n--- /dev/null\n+++ b/two.ts\n@@ -0,0 +1,1 @@\n+hello\n";
     const files = splitUnifiedDiff(agg);
     expect(files.map((f) => f.path)).toEqual(["one.ts", "two.ts"]);
     expect(files[0].kind).toBe("update");

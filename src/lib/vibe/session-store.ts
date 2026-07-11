@@ -15,6 +15,8 @@
 
 import { create } from "zustand";
 import { loadVibeSessions, saveVibeSessions } from "@/lib/transport";
+import { useProjects } from "@/lib/projects/store";
+import type { MigratableSession } from "@/lib/projects/core";
 import type {
   PersistedVibeSession,
   PersistedVibeSessions,
@@ -24,13 +26,15 @@ import type {
   VibeItem,
   VibePlanStep,
   VibeSession,
+  VibeSessionWorktree,
+  VibeSpawnedBy,
   VibeTokenUsage,
 } from "@/types";
 
 /** Per-session item cap — oldest items drop first (display + persistence). */
 export const MAX_ITEMS = 500;
-/** Total session cap — oldest sessions are dropped first. */
-export const MAX_SESSIONS = 30;
+/** Session cap PER PROJECT — a project's oldest sessions are dropped first. */
+export const MAX_SESSIONS_PER_PROJECT = 30;
 /** Live command output cap held in memory (per command item). */
 export const OUTPUT_CAP = 64 * 1024;
 /** Command output cap written to disk (per item) — smaller than the live one. */
@@ -65,6 +69,12 @@ export interface VibeSessionEntry {
 export interface NewVibeSession {
   id: string;
   name: string;
+  /** owning project tab — resolved by the controller (never empty) */
+  projectId: string;
+  /** the generated agent identity (defaults to `name` when omitted) */
+  agentName?: string;
+  spawnedBy?: VibeSpawnedBy;
+  worktree?: VibeSessionWorktree | null;
   projectDir: string;
   model?: string;
   effort?: string;
@@ -96,7 +106,8 @@ export function buildVibePersistSnapshot(): PersistedVibeSessions {
 function snapshot(): PersistedVibeSessions {
   const s = useVibe.getState();
   return {
-    version: 1,
+    // v2 = sessions carry projectId/agentName/spawnedBy/worktree
+    version: 2,
     sessions: s.order
       .map((id) => s.sessions[id])
       .filter((e): e is VibeSessionEntry => !!e)
@@ -108,6 +119,7 @@ function snapshot(): PersistedVibeSessions {
           .map(persistOneItem),
       })),
     activeId: s.activeId,
+    activeIdByProject: s.activeIdByProject,
   };
 }
 
@@ -138,8 +150,15 @@ export interface VibeState {
   /** session order, newest first */
   order: string[];
   activeId: string | null;
+  /** remembered selection per project — `activateProject` restores it when
+   * switching tabs (persisted; entries validate on hydrate) */
+  activeIdByProject: Record<string, string>;
   /** sessions with a turn in flight — set by the controller (in-memory) */
   busy: Record<string, boolean>;
+  /** true once hydrateVibeSessions SUCCEEDED (incl. a fresh install) — the
+   * chat→project migration resolves touched sessions against this store and
+   * must not run before/without it. In-memory, never persisted. */
+  hydrated: boolean;
 
   setActive: (id: string | null) => void;
 
@@ -154,6 +173,17 @@ export interface VibeState {
     id: string,
     patch: { model?: string; effort?: string },
   ) => void;
+  /**
+   * Re-home the session (worktree assignment, Phase 4): new working
+   * directory + worktree meta in one identity-preserving patch. The backend
+   * cwd switch (thread/settings/update) is the controller's job.
+   */
+  assignWorktree: (
+    id: string,
+    patch: { projectDir: string; worktree: VibeSessionWorktree | null },
+  ) => void;
+  /** flip the shared flag of a session's worktree meta (co-tenant joined) */
+  setWorktreeShared: (id: string, shared: boolean) => void;
 
   // ---- turn state (controller) ----
   setBusy: (id: string, busy: boolean) => void;
@@ -172,12 +202,63 @@ export interface VibeState {
   patchItem: (id: string, itemId: string, patch: Partial<VibeItem>) => void;
   /** append text to a command item's output (capped) */
   appendCommandOutput: (id: string, itemId: string, delta: string) => void;
-  /** set an approval item's status */
+  /** set an approval item's status (+ who decided it, for attribution) */
   setApprovalStatus: (
     id: string,
     approvalId: string,
     status: VibeApprovalStatus,
+    decidedBy?: "conductor" | "human",
   ) => void;
+}
+
+/**
+ * Enforce the per-project session cap on a newest-first id order: each
+ * project keeps its newest MAX_SESSIONS_PER_PROJECT sessions. Ids without a
+ * live entry drop out too.
+ */
+function capPerProject(
+  order: string[],
+  sessions: Record<string, VibeSessionEntry>,
+): string[] {
+  const counts = new Map<string, number>();
+  const kept: string[] = [];
+  for (const id of order) {
+    const e = sessions[id];
+    if (!e) continue;
+    const n = (counts.get(e.session.projectId) ?? 0) + 1;
+    counts.set(e.session.projectId, n);
+    if (n <= MAX_SESSIONS_PER_PROJECT) kept.push(id);
+  }
+  return kept;
+}
+
+/**
+ * Backend cleanup sink for sessions the per-project cap EVICTS. Registered by
+ * the controller (a store→controller import would be a cycle — same
+ * registration pattern as the timer/autonomy sinks). The store removes the
+ * evicted entry from its OWN state; this sink ends the Rust child process and
+ * drops the controller's per-session maps (liveBackends / streams /
+ * lastTurnOutcomes / schemaTurns / compacting / usage-mirror timers) — without
+ * it the process and those maps leak on every eviction. Called with the
+ * entries STILL PRESENT in the store so the sink can flush final usage
+ * accounting before they vanish.
+ */
+let evictionSink: ((ids: string[]) => void) | null = null;
+
+/** Install the eviction sink (controller.ts, at module load). */
+export function registerSessionEvictionSink(
+  fn: ((ids: string[]) => void) | null,
+): void {
+  evictionSink = fn;
+}
+
+function notifyEvicted(ids: string[]): void {
+  if (!ids.length || !evictionSink) return;
+  try {
+    evictionSink(ids);
+  } catch {
+    /* a broken sink must never break a store update */
+  }
 }
 
 /** Replace one session entry immutably, only touching that entry's reference. */
@@ -195,12 +276,27 @@ export const useVibe = create<VibeState>((set, get) => ({
   sessions: {},
   order: [],
   activeId: null,
+  activeIdByProject: {},
   busy: {},
+  hydrated: false,
 
   setActive: (id) => {
-    if (get().activeId === id) return;
-    if (id !== null && !get().sessions[id]) return;
-    set({ activeId: id });
+    const state = get();
+    if (state.activeId === id) return;
+    const entry = id !== null ? state.sessions[id] : undefined;
+    if (id !== null && !entry) return;
+    set({
+      activeId: id,
+      // remember the pick per project so a tab switch can restore it
+      ...(entry
+        ? {
+            activeIdByProject: {
+              ...state.activeIdByProject,
+              [entry.session.projectId]: id as string,
+            },
+          }
+        : {}),
+    });
     schedulePersist();
   },
 
@@ -211,6 +307,10 @@ export const useVibe = create<VibeState>((set, get) => ({
       session: {
         id: s.id,
         name: s.name,
+        projectId: s.projectId,
+        agentName: s.agentName ?? s.name,
+        spawnedBy: s.spawnedBy ?? "user",
+        worktree: s.worktree ?? null,
         projectDir: s.projectDir,
         ...(s.model !== undefined ? { model: s.model } : {}),
         ...(s.effort !== undefined ? { effort: s.effort } : {}),
@@ -226,12 +326,24 @@ export const useVibe = create<VibeState>((set, get) => ({
       tokenUsage: null,
       lastBusyEndAt: null,
     };
-    // newest first — the cap drops the oldest sessions from the end
-    const order = [s.id, ...state.order].slice(0, MAX_SESSIONS);
-    const dropped = state.order.filter((oid) => !order.includes(oid));
+    // newest first — the PER-PROJECT cap drops that project's oldest sessions
     const sessions = { ...state.sessions, [s.id]: entry };
-    for (const oid of dropped) delete sessions[oid];
-    set({ sessions, order, activeId: s.id });
+    const order = capPerProject([s.id, ...state.order], sessions);
+    const evicted = state.order.filter((oid) => !order.includes(oid));
+    // close the evicted sessions' backends BEFORE removing them from state —
+    // the sink reads the live entry to flush final usage accounting, then
+    // ends the Rust process + controller maps (the real per-eviction leak fix)
+    if (evicted.length) notifyEvicted(evicted);
+    for (const oid of evicted) delete sessions[oid];
+    set({
+      sessions,
+      order,
+      activeId: s.id,
+      activeIdByProject: {
+        ...state.activeIdByProject,
+        [s.projectId]: s.id,
+      },
+    });
     schedulePersist();
   },
 
@@ -242,10 +354,15 @@ export const useVibe = create<VibeState>((set, get) => ({
     const idx = state.order.indexOf(id);
     const { [id]: _gone, ...sessions } = state.sessions;
     const { [id]: _b, ...busy } = state.busy;
+    const activeIdByProject = { ...state.activeIdByProject };
+    for (const [pid, sid] of Object.entries(activeIdByProject)) {
+      if (sid === id) delete activeIdByProject[pid];
+    }
     set({
       sessions,
       order,
       busy,
+      activeIdByProject,
       activeId:
         state.activeId === id
           ? (order[Math.min(idx, order.length - 1)] ?? null)
@@ -299,6 +416,34 @@ export const useVibe = create<VibeState>((set, get) => ({
               ...e.session,
               ...(model !== undefined ? { model } : { model: undefined }),
               ...(effort !== undefined ? { effort } : { effort: undefined }),
+            },
+          },
+    );
+    if (!patch) return;
+    set(patch);
+    schedulePersist();
+  },
+
+  assignWorktree: (id, { projectDir, worktree }) => {
+    const patch = withEntry(get(), id, (e) =>
+      e.session.projectDir === projectDir && e.session.worktree === worktree
+        ? e
+        : { ...e, session: { ...e.session, projectDir, worktree } },
+    );
+    if (!patch) return;
+    set(patch);
+    schedulePersist();
+  },
+
+  setWorktreeShared: (id, shared) => {
+    const patch = withEntry(get(), id, (e) =>
+      !e.session.worktree || e.session.worktree.shared === shared
+        ? e
+        : {
+            ...e,
+            session: {
+              ...e.session,
+              worktree: { ...e.session.worktree, shared },
             },
           },
     );
@@ -397,13 +542,20 @@ export const useVibe = create<VibeState>((set, get) => ({
     schedulePersist();
   },
 
-  setApprovalStatus: (id, approvalId, status) => {
+  setApprovalStatus: (id, approvalId, status, decidedBy) => {
     const next = withEntry(get(), id, (e) => {
       const item = e.items[approvalId];
       if (!item || item.kind !== "approval") return e;
       return {
         ...e,
-        items: { ...e.items, [approvalId]: { ...item, status } },
+        items: {
+          ...e.items,
+          [approvalId]: {
+            ...item,
+            status,
+            ...(decidedBy ? { decidedBy } : {}),
+          },
+        },
       };
     });
     if (!next) return;
@@ -416,14 +568,43 @@ export const useVibe = create<VibeState>((set, get) => ({
 // Hydration — per-entry graceful degradation (a broken entry costs only itself)
 // ---------------------------------------------------------------------------
 
+/** Tolerant worktree hydration — Phase 4 fills the field, Phase 2 carries it. */
+function sanitizeWorktree(raw: unknown): VibeSessionWorktree | null {
+  if (!raw || typeof raw !== "object") return null;
+  const w = raw as Record<string, unknown>;
+  if (typeof w.root !== "string" || typeof w.branch !== "string") return null;
+  return { root: w.root, branch: w.branch, shared: w.shared === true };
+}
+
+/**
+ * One persisted session, hardened field by field. Pre-v2 sessions come out
+ * with `projectId: ""` — the hydrate migration assigns them to a project
+ * derived from their `projectDir` (see `useProjects.adoptSessions`).
+ */
 function sanitizeSession(raw: unknown): VibeSession | null {
   if (!raw || typeof raw !== "object") return null;
   const s = raw as Record<string, unknown>;
   if (typeof s.id !== "string" || typeof s.projectDir !== "string") return null;
+  // ids become dynamic object-map keys — a persisted "__proto__"/
+  // "constructor"/"prototype" id could pollute those maps
+  if (isDangerousKey(s.id)) return null;
   const access: VibeAccess = s.access === "full" ? "full" : "workspace";
+  const name =
+    typeof s.name === "string" && s.name.trim() ? s.name : "Vibe session";
   return {
     id: s.id,
-    name: typeof s.name === "string" && s.name.trim() ? s.name : "Vibe session",
+    name,
+    projectId:
+      typeof s.projectId === "string" && !isDangerousKey(s.projectId)
+        ? s.projectId
+        : "",
+    // migrated (pre-v2) sessions carry their old display name as identity
+    agentName:
+      typeof s.agentName === "string" && s.agentName.trim()
+        ? s.agentName
+        : name,
+    spawnedBy: s.spawnedBy === "conductor" ? "conductor" : "user",
+    worktree: sanitizeWorktree(s.worktree),
     projectDir: s.projectDir,
     ...(typeof s.model === "string" && s.model ? { model: s.model } : {}),
     ...(typeof s.effort === "string" && s.effort ? { effort: s.effort } : {}),
@@ -460,16 +641,31 @@ function sanitizePlanSteps(raw: unknown): VibePlanStep[] {
 }
 
 /** One persisted item, hardened field by field. Unknown kinds are dropped. */
+/** Persisted ids become dynamic object-map keys — reject the identifiers
+ * that would mutate a plain object's prototype (CWE-1321). */
+function isDangerousKey(id: string): boolean {
+  return id === "__proto__" || id === "constructor" || id === "prototype";
+}
+
 function sanitizeItem(raw: unknown): VibeItem | null {
   if (!raw || typeof raw !== "object") return null;
   const m = raw as Record<string, unknown>;
-  if (typeof m.id !== "string") return null;
+  if (typeof m.id !== "string" || isDangerousKey(m.id)) return null;
   const id = m.id;
   const at = typeof m.at === "number" ? m.at : Date.now();
   const text = typeof m.text === "string" ? m.text : "";
   switch (m.kind) {
     case "user":
+      // Conductor-authorship survives restarts (the "via Conductor" mark)
+      return {
+        id,
+        at,
+        kind: "user",
+        text,
+        ...(m.via === "conductor" ? { via: "conductor" as const } : {}),
+      };
     case "warning":
+    case "notice": // compaction dividers survive restarts
       return { id, at, kind: m.kind, text };
     case "assistant":
       // never restore `streaming` — a quit mid-stream must not leave a caret
@@ -479,6 +675,8 @@ function sanitizeItem(raw: unknown): VibeItem | null {
         kind: "assistant",
         text,
         ...(typeof m.phase === "string" ? { phase: m.phase } : {}),
+        // the report stamp survives restarts — the card keeps rendering
+        ...(m.report === true ? { report: true } : {}),
       };
     case "command":
       return {
@@ -536,6 +734,14 @@ function sanitizeItem(raw: unknown): VibeItem | null {
         kind: "approval",
         approvalKind,
         status,
+        // routing class survives hydration; anything else = destructive
+        ...(m.escalation === "routine" || m.escalation === "destructive"
+          ? { escalation: m.escalation }
+          : {}),
+        // attribution survives hydration (who decided a resolved approval)
+        ...(m.decidedBy === "conductor" || m.decidedBy === "human"
+          ? { decidedBy: m.decidedBy }
+          : {}),
         payload:
           m.payload && typeof m.payload === "object"
             ? (m.payload as Record<string, unknown>)
@@ -548,26 +754,37 @@ function sanitizeItem(raw: unknown): VibeItem | null {
 }
 
 /**
- * Load persisted sessions — called from store.ts hydrate(). A session created
- * before hydrate resolved survives (merged after the persisted ones). Sessions
- * are NOT auto-reconnected here — the controller resumes a session's thread
- * lazily on the next send (Phase 3 wires the UI).
+ * Load persisted sessions — called from store.ts hydrate() AFTER the project
+ * store hydrated. A session created before hydrate resolved survives (merged
+ * after the persisted ones). Sessions are NOT auto-reconnected here — the
+ * controller resumes a session's thread lazily on the next send.
+ *
+ * Schema-v2 migration: every hydrated session is run through the project
+ * assignment (`useProjects.adoptSessions`) — a valid `projectId` passes
+ * through, pre-v2 sessions (and sessions whose project record was lost) get
+ * projects derived/created from their `projectDir`s (deduped). The stamped
+ * result is persisted right away so the migration runs once.
  */
 export async function hydrateVibeSessions(): Promise<void> {
   let data: PersistedVibeSessions | null = null;
   try {
     data = await loadVibeSessions();
   } catch {
+    // load failed — `hydrated` stays false, downstream migrations skip
     return;
   }
-  if (!data) return;
-  const sessions: Record<string, VibeSessionEntry> = {};
+  if (!data) {
+    // fresh install: nothing persisted IS a successful hydration
+    useVibe.setState({ hydrated: true });
+    return;
+  }
+  const sessions: Record<string, VibeSessionEntry> = Object.create(null);
   const order: string[] = [];
   for (const raw of Array.isArray(data.sessions) ? data.sessions : []) {
     try {
       const session = sanitizeSession((raw as PersistedVibeSession)?.session);
       if (!session || sessions[session.id]) continue;
-      const items: Record<string, VibeItem> = {};
+      const items: Record<string, VibeItem> = Object.create(null);
       const itemOrder: string[] = [];
       const rawItems = Array.isArray((raw as PersistedVibeSession).items)
         ? (raw as PersistedVibeSession).items
@@ -593,27 +810,84 @@ export async function hydrateVibeSessions(): Promise<void> {
       /* skip this session only */
     }
   }
+
+  // ---- project assignment (v2 migration + self-heal) ----
+  let migrated = false;
+  try {
+    const migratable: MigratableSession[] = order.map((id) => ({
+      id,
+      projectDir: sessions[id].session.projectDir,
+      projectId: sessions[id].session.projectId || null,
+    }));
+    const assignments = useProjects.getState().adoptSessions(migratable);
+    for (const id of order) {
+      const assigned = assignments[id];
+      if (assigned && sessions[id].session.projectId !== assigned) {
+        sessions[id] = {
+          ...sessions[id],
+          session: { ...sessions[id].session, projectId: assigned },
+        };
+        migrated = true;
+      }
+    }
+  } catch {
+    /* keep sessions hydrated even if the assignment failed */
+  }
+
   const state = useVibe.getState();
   // a session created before hydrate resolved wins; append persisted after
-  const mergedOrder = state.order.length
-    ? [...state.order, ...order.filter((id) => !state.sessions[id])].slice(
-        0,
-        MAX_SESSIONS,
-      )
-    : order.slice(0, MAX_SESSIONS);
-  const mergedSessions: Record<string, VibeSessionEntry> = { ...sessions };
+  // (null-prototype map — dynamic keys must not be able to hit a setter on
+  // Object.prototype; ids are additionally rejected in the sanitizers)
+  const mergedSessions: Record<string, VibeSessionEntry> = Object.assign(
+    Object.create(null),
+    sessions,
+  );
   for (const id of Object.keys(state.sessions))
     mergedSessions[id] = state.sessions[id];
-  // drop anything beyond the cap
+  const mergedOrder = capPerProject(
+    state.order.length
+      ? [...state.order, ...order.filter((id) => !state.sessions[id])]
+      : order,
+    mergedSessions,
+  );
+  // drop anything beyond the per-project cap — a LIVE pre-hydrate session
+  // dropped here (rare: live picks are newest, so normally kept) still needs
+  // its backend torn down, so route the eviction through the sink too
+  const evictedOnHydrate: string[] = [];
   for (const id of Object.keys(mergedSessions))
-    if (!mergedOrder.includes(id)) delete mergedSessions[id];
+    if (!mergedOrder.includes(id)) {
+      delete mergedSessions[id];
+      evictedOnHydrate.push(id);
+    }
+  if (evictedOnHydrate.length) notifyEvicted(evictedOnHydrate);
+  // per-project selection map: only entries whose session survived AND still
+  // belongs to that project; live (pre-hydrate) picks win
+  const activeIdByProject: Record<string, string> = Object.create(null);
+  const rawMap =
+    data.activeIdByProject && typeof data.activeIdByProject === "object"
+      ? data.activeIdByProject
+      : {};
+  for (const [pid, sid] of Object.entries(rawMap)) {
+    if (
+      typeof sid === "string" &&
+      mergedSessions[sid]?.session.projectId === pid
+    )
+      activeIdByProject[pid] = sid;
+  }
+  for (const [pid, sid] of Object.entries(state.activeIdByProject)) {
+    activeIdByProject[pid] = sid;
+  }
   useVibe.setState({
     sessions: mergedSessions,
     order: mergedOrder,
+    activeIdByProject,
     activeId:
       state.activeId ??
       (typeof data.activeId === "string" && mergedOrder.includes(data.activeId)
         ? data.activeId
         : (mergedOrder[0] ?? null)),
+    hydrated: true,
   });
+  // the one-time migration result must survive a quit without further edits
+  if (migrated || (data.version ?? 1) < 2) schedulePersist();
 }

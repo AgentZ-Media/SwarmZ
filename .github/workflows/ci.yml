@@ -30,6 +30,12 @@ jobs:
       - name: Type-check + build
         run: pnpm build
 
+      - name: Unit tests
+        # The vitest suite freezes security-critical pure logic (approval
+        # classification mirrors, autonomy budget/breaker, trigger router,
+        # report parsing, path pills). It must gate CI, not just build.
+        run: pnpm test
+
   rust:
     name: Rust tests
     runs-on: macos-latest
@@ -39,6 +45,12 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: src-tauri
 
       - name: Rust tests
         run: cargo test

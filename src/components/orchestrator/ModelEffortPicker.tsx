@@ -6,7 +6,7 @@
 // up model/effort as a per-turn override.
 
 import { type ReactNode, useState } from "react";
-import { Check, Pencil } from "lucide-react";
+import { Pencil } from "lucide-react";
 import {
   Popover,
   PopoverContent,
@@ -40,7 +40,7 @@ export function ModelEffortPicker({
   effort?: string;
   /** recently-used model ids to offer (recentCodexModels) */
   models: string[];
-  /** hide the effort section (OpenRouter chats have no reasoning effort) */
+  /** hide the effort section */
   showEffort?: boolean;
   onApply: (next: ModelEffortSelection) => void;
   align?: "start" | "center" | "end";
@@ -121,15 +121,15 @@ export function ModelEffortPicker({
                 }}
                 placeholder="model id, e.g. gpt-5.5"
                 spellCheck={false}
-                className="focus-ring h-6 w-full rounded bg-secondary px-1.5 font-mono text-[11px] text-foreground outline-none placeholder:text-faint"
+                className="focus-ring h-6 w-full rounded-md border border-line bg-card px-1.5 font-mono text-11 text-txt outline-none placeholder:text-fnt"
               />
             </form>
           ) : (
             <button
               onClick={() => setCustom(true)}
-              className="focus-ring flex items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+              className="focus-ring flex items-center gap-1.5 rounded-md px-2 py-1 text-left text-11 text-mut transition-colors hover:bg-line hover:text-txt"
             >
-              <Pencil size={11} className="text-faint" /> Custom…
+              <Pencil size={11} className="text-fnt" /> Custom…
             </button>
           )}
         </div>
@@ -137,15 +137,14 @@ export function ModelEffortPicker({
         {showEffort && (
           <>
             <PickerLabel className="mt-2">Reasoning effort</PickerLabel>
-            <div className="flex flex-col">
-              <OptionRow
+            <div className="flex flex-wrap gap-1 px-1 py-0.5">
+              <EffortButton
                 selected={!effort}
-                label="Default"
-                hint="codex config"
+                label="default"
                 onClick={() => applyEffort(undefined)}
               />
               {CODEX_EFFORTS.map((e) => (
-                <OptionRow
+                <EffortButton
                   key={e}
                   selected={e === effort}
                   label={e}
@@ -156,7 +155,7 @@ export function ModelEffortPicker({
           </>
         )}
 
-        <p className="px-2 pt-2 pb-1 text-[10px] leading-snug text-faint">
+        <p className="px-2 pt-2 pb-1 text-10 leading-snug text-fnt">
           {footer}
         </p>
       </PopoverContent>
@@ -174,7 +173,7 @@ function PickerLabel({
   return (
     <div
       className={cn(
-        "px-2 pb-1 pt-1 font-mono text-[9px] uppercase tracking-[0.12em] text-faint",
+        "px-2 pb-1 pt-1 font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt",
         className,
       )}
     >
@@ -200,22 +199,48 @@ function OptionRow({
     <button
       onClick={onClick}
       className={cn(
-        "focus-ring flex items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors hover:bg-accent",
-        selected ? "text-foreground" : "text-muted-foreground",
+        "focus-ring flex items-center gap-2 rounded-md px-2 py-1 text-left text-12 transition-colors hover:bg-line",
+        selected ? "bg-line text-txt" : "text-mut",
       )}
     >
-      <Check
-        size={12}
-        className={cn("shrink-0", selected ? "text-ring" : "opacity-0")}
+      <span
+        className={cn(
+          "size-1.5 shrink-0 rounded-full",
+          selected ? "bg-acc" : "bg-transparent",
+        )}
       />
       <span className={cn("min-w-0 flex-1 truncate", mono && "font-mono")}>
         {label}
       </span>
       {hint && hint !== label && (
-        <span className="shrink-0 truncate font-mono text-[9px] text-faint">
+        <span className="shrink-0 truncate font-mono text-10 text-fnt">
           {hint}
         </span>
       )}
+    </button>
+  );
+}
+
+function EffortButton({
+  selected,
+  label,
+  onClick,
+}: {
+  selected: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "focus-ring rounded-md border px-2 py-1 font-mono text-11 transition-colors",
+        selected
+          ? "border-acc/50 bg-acc/15 text-txt"
+          : "border-line text-fnt hover:text-mut",
+      )}
+    >
+      {label}
     </button>
   );
 }

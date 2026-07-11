@@ -9,6 +9,7 @@ import {
   X,
 } from "lucide-react";
 import { useSwarm } from "@/store";
+import { useVibe } from "@/lib/vibe/session-store";
 import { ScrollArea } from "./ui/misc";
 import { cn, folderName, shortPath } from "@/lib/utils";
 import type { NoteItem } from "@/types";
@@ -26,7 +27,7 @@ export function QuickNotesPanel() {
   const moveNote = useSwarm((s) => s.moveNote);
   const clearDoneNotes = useSwarm((s) => s.clearDoneNotes);
 
-  // scope (null = global) defaults to the active pane's project at open time
+  // scope (null = global) defaults to the active session's project at open time
   const [scope, setScope] = useState<string | null>(null);
   // remembered so the active project keeps its chip even while it has no notes
   const [projectRoot, setProjectRoot] = useState<string | null>(null);
@@ -37,7 +38,11 @@ export function QuickNotesPanel() {
 
   useEffect(() => {
     if (!open) return;
-    const root = useSwarm.getState().activeProjectRoot();
+    // the active vibe session's project scopes the notes
+    const v = useVibe.getState();
+    const root = v.activeId
+      ? (v.sessions[v.activeId]?.session.projectDir ?? null)
+      : null;
     setProjectRoot(root);
     setScope(root);
     // capture should be instant — focus the input once the drawer mounted
@@ -45,7 +50,7 @@ export function QuickNotesPanel() {
   }, [open]);
 
   // Escape closes the drawer; capture + stopPropagation so window-level
-  // handlers (fleet exit in WorkspaceLayer) don't react to the same press
+  // handlers don't react to the same press
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -122,7 +127,7 @@ export function QuickNotesPanel() {
   return (
     <>
       <div
-        className="fixed inset-0 z-30 bg-black/40"
+        className="animate-zoverlay fixed inset-0 z-30 bg-[rgba(5,5,8,0.55)] backdrop-blur-[2px]"
         onClick={() => setOpen(false)}
       />
       <div
@@ -130,12 +135,12 @@ export function QuickNotesPanel() {
         role="dialog"
         aria-label="Quick Notes"
         tabIndex={-1}
-        className="animate-slide-in-right fixed right-0 top-0 z-40 flex h-full w-[380px] flex-col border-l border-border bg-background shadow-[-24px_0_48px_-24px_rgba(0,0,0,0.6)] outline-none"
+        className="animate-ztoast fixed right-0 top-0 z-40 flex h-full w-[380px] flex-col border-l border-line2 bg-panel shadow-modal outline-none"
       >
-        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+        <div className="flex items-center justify-between border-b border-line px-4 py-3">
           <div className="min-w-0">
-            <h2 className="text-sm font-semibold tracking-tight">Quick Notes</h2>
-            <p className="truncate text-[11px] text-faint" title={scope ?? undefined}>
+            <h2 className="text-14 font-semibold tracking-[-0.01em]">Quick Notes</h2>
+            <p className="truncate font-mono text-11 text-fnt" title={scope ?? undefined}>
               {scope ? shortPath(scope) : "Global · not tied to a project"}
             </p>
           </div>
@@ -143,7 +148,7 @@ export function QuickNotesPanel() {
             {doneCount > 0 && (
               <button
                 onClick={() => clearDoneNotes(scope)}
-                className="focus-ring flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-faint transition-colors hover:bg-accent hover:text-foreground"
+                className="focus-ring flex items-center gap-1 rounded-md px-1.5 py-0.5 text-10 text-fnt transition-colors hover:bg-card hover:text-txt"
                 title={`Remove ${doneCount} completed item${doneCount === 1 ? "" : "s"}`}
               >
                 <Trash2 size={11} /> Clear done
@@ -151,7 +156,7 @@ export function QuickNotesPanel() {
             )}
             <button
               onClick={() => setOpen(false)}
-              className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
+              className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt"
             >
               <X size={16} />
             </button>
@@ -159,7 +164,7 @@ export function QuickNotesPanel() {
         </div>
 
         {/* scope chips: Global + per-project lists */}
-        <div className="no-scrollbar flex gap-1 overflow-x-auto border-b border-border px-4 py-2">
+        <div className="no-scrollbar flex gap-1 overflow-x-auto border-b border-line px-4 py-2">
           <ScopeChip
             label="Global"
             active={scope === null}
@@ -184,7 +189,7 @@ export function QuickNotesPanel() {
         <ScrollArea className="flex-1">
           <div ref={listRef} className="space-y-0.5 p-2">
             {list.length === 0 && (
-              <p className="px-2 py-6 text-center text-xs text-faint">
+              <p className="px-2 py-6 text-center text-12 text-fnt">
                 Nothing here yet — capture an idea below.
               </p>
             )}
@@ -200,22 +205,22 @@ export function QuickNotesPanel() {
         </ScrollArea>
 
         <form
-          className="flex items-center gap-2 border-t border-border px-3 py-2.5"
+          className="flex items-center gap-2 border-t border-line px-3 py-2.5"
           onSubmit={(e) => {
             e.preventDefault();
             submitDraft();
           }}
         >
-          <Plus size={14} className="shrink-0 text-faint" />
+          <Plus size={14} className="shrink-0 text-fnt" />
           <input
             ref={inputRef}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder="Add a note… (Enter)"
-            className="h-8 min-w-0 flex-1 rounded-md bg-secondary px-2 text-xs text-foreground outline-none placeholder:text-faint focus:ring-1 focus:ring-ring select-text"
+            className="h-8 min-w-0 flex-1 rounded-md bg-pop px-2 text-12 text-txt outline-none placeholder:text-fnt focus:ring-1 focus:ring-acc select-text"
           />
           {openCount > 0 && (
-            <span className="shrink-0 font-mono text-[10px] tabular-nums text-faint">
+            <span className="shrink-0 font-mono text-10 tabular-nums text-fnt">
               {openCount} open
             </span>
           )}
@@ -243,13 +248,13 @@ function ScopeChip({
       onClick={onClick}
       title={title}
       className={cn(
-        "focus-ring flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-        active ? "bg-accent text-foreground" : "text-faint hover:text-foreground",
+        "focus-ring flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-12 font-medium transition-colors",
+        active ? "bg-acc/10 text-txt" : "text-fnt hover:text-txt",
       )}
     >
       <span className="max-w-32 truncate">{label}</span>
       {count > 0 && (
-        <span className="font-mono text-[10px] tabular-nums text-faint">
+        <span className="font-mono text-10 tabular-nums text-fnt">
           {count}
         </span>
       )}
@@ -280,26 +285,26 @@ function NoteRow({
   return (
     <div
       data-note-row={note.id}
-      className="group/note flex items-start gap-1.5 rounded-md px-1.5 py-1.5 hover:bg-accent/50"
+      className="group/note flex items-start gap-1.5 rounded-md px-1.5 py-1.5 hover:bg-card"
     >
       <span
         onMouseDown={onDragStart}
-        className="mt-px hidden h-4 w-3 shrink-0 cursor-grab items-center justify-center text-faint group-hover/note:flex"
+        className="mt-px hidden h-4 w-3 shrink-0 cursor-grab items-center justify-center text-fnt group-hover/note:flex"
       >
         <GripVertical size={11} />
       </span>
       <span className="mt-px block h-4 w-3 shrink-0 group-hover/note:hidden" />
 
       {note.plain ? (
-        <span className="mt-[7px] h-1 w-1 shrink-0 rounded-full bg-faint" />
+        <span className="mt-[7px] h-1 w-1 shrink-0 rounded-full bg-fnt" />
       ) : (
         <button
           onClick={() => updateNote(scope, note.id, { done: !note.done })}
           className={cn(
             "focus-ring mt-px flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors",
             note.done
-              ? "border-transparent bg-success/80 text-background"
-              : "border-border bg-secondary hover:border-ring/60",
+              ? "border-transparent bg-ok/80 text-bg"
+              : "border-line bg-pop hover:border-acc/60",
           )}
         >
           {note.done && <Check size={11} strokeWidth={3} />}
@@ -319,15 +324,15 @@ function NoteRow({
             if (e.key === "Enter") (e.target as HTMLInputElement).blur();
             if (e.key === "Escape") setEditing(false);
           }}
-          className="min-w-0 flex-1 rounded bg-secondary px-1 text-xs leading-4 text-foreground outline-none select-text"
+          className="min-w-0 flex-1 rounded bg-pop px-1 text-12 leading-4 text-txt outline-none select-text"
         />
       ) : (
         <span
           onClick={() => setEditing(true)}
           className={cn(
-            "min-w-0 flex-1 cursor-text whitespace-pre-wrap break-words text-xs leading-4",
-            note.done ? "text-faint line-through" : "text-foreground",
-            note.plain && "text-muted-foreground",
+            "min-w-0 flex-1 cursor-text whitespace-pre-wrap break-words text-12 leading-4",
+            note.done ? "text-fnt line-through" : "text-txt",
+            note.plain && "text-mut",
           )}
         >
           {note.text}
@@ -341,14 +346,14 @@ function NoteRow({
           onClick={() =>
             updateNote(scope, note.id, { plain: !note.plain, done: false })
           }
-          className="focus-ring flex h-4 w-4 items-center justify-center rounded text-faint hover:bg-accent hover:text-foreground"
+          className="focus-ring flex h-4 w-4 items-center justify-center rounded text-fnt hover:bg-card hover:text-txt"
           title={note.plain ? "Turn into checkbox item" : "Turn into plain text"}
         >
           {note.plain ? <Square size={10} /> : <Type size={10} />}
         </button>
         <button
           onClick={() => deleteNote(scope, note.id)}
-          className="focus-ring flex h-4 w-4 items-center justify-center rounded text-faint hover:bg-destructive/15 hover:text-destructive"
+          className="focus-ring flex h-4 w-4 items-center justify-center rounded text-fnt hover:bg-err/15 hover:text-err"
           title="Delete note"
         >
           <X size={11} />

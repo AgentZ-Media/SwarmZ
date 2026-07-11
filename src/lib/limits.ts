@@ -1,14 +1,10 @@
 import { create } from "zustand";
-import {
-  fetchCodexAccountLimits,
-  fetchSubscriptionLimits,
-} from "./transport";
-import type { CodexAccountLimits, SubscriptionLimits } from "@/types";
+import { fetchCodexAccountLimits } from "./transport";
+import type { CodexAccountLimits } from "@/types";
 
 const POLL_MS = 60_000;
 
 interface LimitsState {
-  limits: SubscriptionLimits | null;
   /**
    * Account-level Codex limits (newest `rate_limits` event on disk).
    * `null` (or `limits: null` inside) = no data ever → the Deck shows
@@ -21,12 +17,11 @@ interface LimitsState {
 }
 
 /**
- * Subscription/rate limits, polled once a minute: the Claude OAuth usage
- * endpoint plus the account-level Codex `rate_limits` scan. Pauses while the
- * window is hidden and refreshes immediately when it becomes visible again.
+ * Codex subscription/rate limits, polled once a minute (the account-level
+ * `rate_limits` scan). Pauses while the window is hidden and refreshes
+ * immediately when it becomes visible again.
  */
 export const useLimits = create<LimitsState>((set) => ({
-  limits: null,
   codex: null,
   loaded: false,
   start: () => {
@@ -34,19 +29,13 @@ export const useLimits = create<LimitsState>((set) => ({
 
     const refresh = async () => {
       try {
-        // null = no Claude login on this machine → hide the meters
-        set({ limits: await fetchSubscriptionLimits(), loaded: true });
-      } catch {
-        // transient fetch error → keep showing the last known values
-        set({ loaded: true });
-      }
-      try {
         const codex = await fetchCodexAccountLimits();
         // `limits: null` = still no data on disk — keep the last real values
         // so a purged/rotated session tree doesn't blank a live meter
-        if (codex.limits) set({ codex });
+        set((s) => ({ loaded: true, codex: codex.limits ? codex : s.codex }));
       } catch {
-        /* transient error → keep the last known values */
+        // transient error → keep the last known values
+        set({ loaded: true });
       }
     };
     const startTimer = () => {

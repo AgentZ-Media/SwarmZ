@@ -1,353 +1,224 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Command } from "cmdk";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
-import {
-  BarChart3,
-  Bell,
-  Bot,
-  LayoutGrid,
-  LayoutTemplate,
-  Plus,
-  ScrollText,
-  Search,
-  Settings,
-  SlidersHorizontal,
-  Sparkles,
-  SquarePlus,
-} from "lucide-react";
-import { presetKey, useSwarm } from "@/store";
+import { Search } from "lucide-react";
+import { useSwarm } from "@/store";
+import { useVibe, type VibeSessionEntry } from "@/lib/vibe/session-store";
+import { activateProject, focusSession } from "@/lib/vibe/controller";
+import { useProjects, openProjectIds } from "@/lib/projects/store";
+import { vibeTriageEntries } from "@/lib/vibe/triage";
+import { hasPendingApproval } from "@/lib/vibe/ui";
 import { useVibeUi } from "@/lib/vibe/ui-store";
-import { focusTerm } from "@/lib/term-host";
-import { extractInputLabels } from "@/lib/command-vars";
-import { insertCommandText } from "@/lib/insert-command";
+import { pickDirectory } from "@/lib/transport";
 import { cn, shortPath } from "@/lib/utils";
-import type { Agent, CustomCommand } from "@/types";
 
 /**
- * ⌘K — fuzzy-jump to any agent or workspace and reach every global action
- * without the mouse. Built on cmdk; opens above everything, closes on Escape
- * or after running a command. Custom commands (⌘⇧K snippets) surface here too
- * once a search is typed — same semantics as the insert picker (↵ pastes,
- * ⌘↵ pastes & runs, {{input}} commands detour through the picker's form).
+ * ⌘K — fuzzy-jump to any session and reach every global action without the
+ * mouse. Built on cmdk; opens above everything, closes on Escape or after
+ * running a command.
  */
 export function CommandPalette({
-  onOpenProfiles,
   onOpenSettings,
 }: {
-  onOpenProfiles: () => void;
   onOpenSettings: () => void;
 }) {
   const open = useSwarm((s) => s.paletteOpen);
   const setOpen = useSwarm((s) => s.setPaletteOpen);
-  const agents = useSwarm((s) => s.agents);
-  const order = useSwarm((s) => s.order);
-  const workspaces = useSwarm((s) => s.workspaces);
-  const workspaceOrder = useSwarm((s) => s.workspaceOrder);
-  const customCommands = useSwarm((s) => s.customCommands);
-  const targetId = useSwarm((s) => s.focusedAgentId ?? s.activeAgentId());
+  const order = useVibe((s) => s.order);
+  const sessions = useVibe((s) => s.sessions);
+  // primitive signature — never a fresh array from the selector
+  const projectIdsSig = useProjects((s) => openProjectIds(s).join("|"));
+  const projectIds = projectIdsSig ? projectIdsSig.split("|") : [];
+  const projects = useProjects((s) => s.projects);
+  const activeProjectId = useProjects((s) => s.activeProjectId);
 
   const [search, setSearch] = useState("");
-  // ⌘ state of the Enter keydown that triggered cmdk's onSelect (fired
-  // synchronously inside the same event) — mouse clicks leave it false
-  const submitRef = useRef(false);
 
   useEffect(() => {
     if (open) setSearch("");
   }, [open]);
 
-  /** close first, then act — actions may move focus into a terminal */
+  /** close first, then act — actions may move focus elsewhere */
   const run = (action: () => void) => {
     setOpen(false);
     action();
   };
 
-  const targetAgent = targetId ? agents[targetId] : undefined;
-  const folderKey = targetAgent ? presetKey(targetAgent.cwd) : null;
-  const folderCmds = folderKey
-    ? (customCommands.folders[folderKey] ?? [])
-    : [];
-  const globalCmds = customCommands.global;
-  // only while searching — the default palette view stays uncluttered
-  const showCommands =
-    search.trim().length > 0 &&
-    !!targetId &&
-    folderCmds.length + globalCmds.length > 0;
-
-  const runCommand = (cmd: CustomCommand) => {
-    const submit = submitRef.current;
-    submitRef.current = false;
-    if (!targetId) return;
-    setOpen(false);
-    if (extractInputLabels(cmd.text).length) {
-      // needs {{input}} values — detour through the insert picker's form
-      const s = useSwarm.getState();
-      s.setCommandPickerPreselect({ cmd, submit });
-      s.setCommandPickerOpen(true);
-    } else {
-      insertCommandText(targetId, cmd.text, submit);
-    }
-  };
-
-  const jumpToAgent = (id: string) => {
-    const s = useSwarm.getState();
-    s.setFleetOpen(false);
-    s.focusAgent(id);
-    focusTerm(id);
-  };
-
-  const waiting = order.filter((id) => {
-    const a = agents[id];
-    return a && (a.attention || a.activity === "waiting");
-  }).length;
-
-  const activeHasGrid = useSwarm((s) => !!s.layouts[s.activeWorkspaceId]);
-  const uiMode = useSwarm((s) => s.settings.uiMode ?? "grid");
+  const waiting = vibeTriageEntries(useVibe.getState()).length;
 
   return (
     <DialogPrimitive.Root open={open} onOpenChange={setOpen}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50 data-[state=open]:animate-overlay-in" />
+        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-[rgba(5,5,8,0.55)] backdrop-blur-[2px] data-[state=open]:animate-zoverlay" />
         <DialogPrimitive.Content
-          className="fixed left-1/2 top-[18%] z-50 w-full max-w-lg -translate-x-1/2 overflow-hidden rounded-xl border border-border bg-popover shadow-[0_16px_48px_-12px_rgba(0,0,0,0.7)] data-[state=open]:animate-in"
-          // palette actions focus a terminal themselves — don't restore focus
+          className="fixed left-1/2 top-[16%] z-50 w-full max-w-[560px] -translate-x-1/2 overflow-hidden rounded-2xl border border-line2 bg-pop shadow-modal data-[state=open]:animate-zfadeup"
           onCloseAutoFocus={(e) => e.preventDefault()}
         >
           <DialogPrimitive.Title className="sr-only">
             Command palette
           </DialogPrimitive.Title>
-          <Command
-            label="Command palette"
-            loop
-            onKeyDownCapture={(e) => {
-              if (e.key === "Enter") submitRef.current = e.metaKey;
-            }}
-          >
-            <div className="flex items-center gap-2 border-b border-border px-3">
-              <Search size={14} className="shrink-0 text-faint" />
+          <Command label="Command palette" loop>
+            <div className="flex items-center gap-2 border-b border-line px-3">
+              <Search size={14} className="shrink-0 text-fnt" />
               <Command.Input
                 value={search}
                 onValueChange={setSearch}
-                placeholder="Jump to an agent, workspace or action…"
-                className="h-11 w-full bg-transparent text-sm text-foreground outline-none placeholder:text-faint"
+                placeholder="Jump to an agent or action…"
+                className="h-11 w-full bg-transparent text-14 text-txt outline-none placeholder:text-fnt"
               />
-              <kbd className="rounded border border-border bg-secondary px-1.5 py-0.5 font-mono text-[10px] text-faint">
+              <kbd className="rounded-xs border border-line2 px-1 font-mono text-10 text-fnt">
                 esc
               </kbd>
             </div>
             <Command.List className="max-h-80 overflow-y-auto p-1.5">
-              <Command.Empty className="px-3 py-6 text-center text-sm text-faint">
+              <Command.Empty className="px-3 py-6 text-center text-13 text-fnt">
                 Nothing found.
               </Command.Empty>
 
-              <PaletteGroup heading="Agents">
-                {order.map((id) => {
-                  const a = agents[id];
-                  if (!a) return null;
-                  const ws = workspaces[a.workspaceId];
+              <PaletteGroup heading="Projects">
+                {projectIds.map((id, i) => {
+                  const p = projects[id];
+                  if (!p) return null;
                   return (
                     <PaletteItem
                       key={id}
-                      value={`agent ${a.name} ${ws?.name ?? ""} ${a.cwd ?? ""} ${id}`}
-                      onSelect={() => run(() => jumpToAgent(id))}
+                      value={`project ${p.name} ${p.dir} ${id}`}
+                      onSelect={() => run(() => activateProject(id))}
                     >
-                      <AgentDot agent={a} />
-                      <span className="truncate text-foreground">{a.name}</span>
-                      <span className="ml-auto flex min-w-0 items-center gap-2 pl-3 font-mono text-[10px] text-faint">
-                        {ws && <span className="truncate">{ws.name}</span>}
-                        {a.cwd && (
-                          <span className="hidden truncate sm:inline">
-                            {shortPath(a.cwd)}
-                          </span>
+                      <span
+                        className={cn(
+                          "h-1.5 w-1.5 shrink-0 rounded-full",
+                          activeProjectId === id ? "bg-acc" : "bg-fnt",
                         )}
+                      />
+                      <span className="truncate text-txt">{p.name}</span>
+                      <span className="ml-auto min-w-0 truncate pl-3 font-mono text-10 text-fnt">
+                        {shortPath(p.dir)}
+                      </span>
+                      {i <= 8 && <Shortcut>⌘{i + 1}</Shortcut>}
+                    </PaletteItem>
+                  );
+                })}
+                <PaletteItem
+                  value="open project folder tab"
+                  onSelect={() =>
+                    run(() => {
+                      void pickDirectory()
+                        .then(async (dir) => {
+                          if (!dir) return;
+                          const id = await useProjects
+                            .getState()
+                            .openProject(dir);
+                          activateProject(id);
+                        })
+                        .catch((e) => {
+                          console.error("Failed to open project:", e);
+                        });
+                    })
+                  }
+                >
+                  <ActionDot />
+                  <span className="truncate text-txt">Open project…</span>
+                </PaletteItem>
+              </PaletteGroup>
+
+              <PaletteGroup heading="Agents">
+                {order.map((id) => {
+                  const entry = sessions[id];
+                  if (!entry) return null;
+                  const s = entry.session;
+                  return (
+                    <PaletteItem
+                      key={id}
+                      value={`agent session ${s.name} ${s.projectDir} ${id}`}
+                      onSelect={() => run(() => focusSession(id))}
+                    >
+                      <SessionDot entry={entry} />
+                      <span className="truncate text-txt">{s.name}</span>
+                      <span className="ml-auto min-w-0 truncate pl-3 font-mono text-10 text-fnt">
+                        {shortPath(s.projectDir)}
                       </span>
                     </PaletteItem>
                   );
                 })}
               </PaletteGroup>
 
-              <PaletteGroup heading="Workspaces">
-                {workspaceOrder.map((id, i) => (
-                  <PaletteItem
-                    key={id}
-                    value={`workspace ${workspaces[id]?.name ?? ""} ${id}`}
-                    onSelect={() =>
-                      run(() => useSwarm.getState().setActiveWorkspace(id))
-                    }
-                  >
-                    <LayoutGrid size={13} className="shrink-0 text-faint" />
-                    <span className="truncate">{workspaces[id]?.name}</span>
-                    <Shortcut>⌘{i + 1}</Shortcut>
-                  </PaletteItem>
-                ))}
-                <PaletteItem
-                  value="workspace new create"
-                  onSelect={() =>
-                    run(() => useSwarm.getState().createWorkspace())
-                  }
-                >
-                  <SquarePlus size={13} className="shrink-0 text-faint" />
-                  New workspace
-                  <Shortcut>⌘⇧N</Shortcut>
-                </PaletteItem>
-              </PaletteGroup>
-
-              {showCommands && (
-                <PaletteGroup heading="Commands · ↵ paste · ⌘↵ run">
-                  {[...folderCmds, ...globalCmds].map((c) => (
-                    <PaletteItem
-                      key={c.id}
-                      value={`command ${c.label} ${c.text} ${c.id}`}
-                      onSelect={() => runCommand(c)}
-                    >
-                      <ScrollText size={13} className="shrink-0 text-faint" />
-                      <span className="truncate text-foreground">{c.label}</span>
-                      <span className="ml-auto max-w-[45%] truncate pl-3 font-mono text-[10px] text-faint">
-                        {c.text.replace(/\s+/g, " ")}
-                      </span>
-                    </PaletteItem>
-                  ))}
-                </PaletteGroup>
-              )}
-
               <PaletteGroup heading="Actions">
                 <PaletteItem
-                  value="new agent launch terminal"
+                  value="new codex session native agent"
                   onSelect={() =>
-                    run(() => useSwarm.getState().setNewAgentOpen(true))
+                    run(() => useVibeUi.getState().setNewSessionOpen(true))
                   }
                 >
-                  <Plus size={13} className="shrink-0 text-faint" />
-                  New agent
+                  <ActionDot />
+                  <span className="truncate text-txt">New agent</span>
                   <Shortcut>⌘T</Shortcut>
                 </PaletteItem>
                 <PaletteItem
-                  value="fleet overview all workspaces"
-                  onSelect={() => run(() => useSwarm.getState().setFleetOpen(true))}
-                >
-                  <LayoutGrid size={13} className="shrink-0 text-faint" />
-                  Fleet overview
-                  <Shortcut>⌘E</Shortcut>
-                </PaletteItem>
-                <PaletteItem
-                  value={
-                    uiMode === "vibe"
-                      ? "switch to grid mode view terminals"
-                      : "switch to vibe mode view sessions conductor"
-                  }
+                  value="focus conductor orchestrator chat"
                   onSelect={() =>
-                    run(() =>
-                      useSwarm.getState().setUiMode(uiMode === "vibe" ? "grid" : "vibe"),
-                    )
+                    run(() => useVibeUi.getState().showConductor())
                   }
                 >
-                  {uiMode === "vibe" ? (
-                    <LayoutGrid size={13} className="shrink-0 text-faint" />
-                  ) : (
-                    <Sparkles size={13} className="shrink-0 text-faint" />
-                  )}
-                  {uiMode === "vibe" ? "Switch to Grid mode" : "Switch to Vibe mode"}
-                  <Shortcut>⌘⇧V</Shortcut>
+                  <ActionDot />
+                  <span className="truncate text-txt">Focus Conductor</span>
+                  <Shortcut>⌘⇧O</Shortcut>
                 </PaletteItem>
                 <PaletteItem
-                  value="focus conductor orchestrator vibe chat"
+                  value="toggle conductor sidebar show hide"
+                  onSelect={() =>
+                    run(() => useVibeUi.getState().toggleConductor())
+                  }
+                >
+                  <ActionDot />
+                  <span className="truncate text-txt">
+                    Toggle Conductor sidebar
+                  </span>
+                  <Shortcut>⌘B</Shortcut>
+                </PaletteItem>
+                <PaletteItem
+                  value="next attention waiting session jump approval"
                   onSelect={() =>
                     run(() => {
-                      useSwarm.getState().setUiMode("vibe");
-                      useVibeUi.getState().setStageMode("conductor");
+                      const entries = vibeTriageEntries(useVibe.getState());
+                      if (entries.length) focusSession(entries[0].id);
                     })
                   }
                 >
-                  <Bot size={13} className="shrink-0 text-faint" />
-                  Focus Conductor
-                </PaletteItem>
-                <PaletteItem
-                  value="new codex session native vibe agent"
-                  onSelect={() =>
-                    run(() => {
-                      useSwarm.getState().setUiMode("vibe");
-                      useVibeUi.getState().setNewSessionOpen(true);
-                    })
-                  }
-                >
-                  <Plus size={13} className="shrink-0 text-faint" />
-                  New Codex session
-                </PaletteItem>
-                <PaletteItem
-                  value="next pane cycle focus"
-                  onSelect={() =>
-                    run(() => useSwarm.getState().cycleActivePane(1))
-                  }
-                >
-                  <LayoutGrid size={13} className="shrink-0 text-faint" />
-                  Next pane
-                  <Shortcut>⌘]</Shortcut>
-                </PaletteItem>
-                <PaletteItem
-                  value="previous pane cycle focus"
-                  onSelect={() =>
-                    run(() => useSwarm.getState().cycleActivePane(-1))
-                  }
-                >
-                  <LayoutGrid size={13} className="shrink-0 text-faint" />
-                  Previous pane
-                  <Shortcut>⌘[</Shortcut>
-                </PaletteItem>
-                <PaletteItem
-                  value="next attention waiting agent jump"
-                  onSelect={() => run(() => useSwarm.getState().attentionJump())}
-                >
-                  <Bell size={13} className="shrink-0 text-faint" />
-                  Jump to agent waiting for input
+                  <ActionDot />
+                  <span className="truncate text-txt">
+                    Jump to agent waiting for input
+                  </span>
                   {waiting > 0 && (
-                    <span className="ml-1.5 rounded bg-ring/15 px-1 font-mono text-[10px] tabular-nums text-ring">
+                    <span className="ml-1.5 rounded-xs bg-acc/15 px-1 font-mono text-10 tabular-nums text-acc">
                       {waiting}
                     </span>
                   )}
                   <Shortcut>⌘⇧A</Shortcut>
                 </PaletteItem>
                 <PaletteItem
-                  value="insert custom command snippet prompt"
-                  onSelect={() =>
-                    run(() => useSwarm.getState().setCommandPickerOpen(true))
-                  }
+                  value="quick notes checklist"
+                  onSelect={() => run(() => useSwarm.getState().setNotesOpen(true))}
                 >
-                  <ScrollText size={13} className="shrink-0 text-faint" />
-                  Insert command
-                  <Shortcut>⌘⇧K</Shortcut>
+                  <ActionDot />
+                  <span className="truncate text-txt">Quick notes</span>
+                  <Shortcut>⌘N</Shortcut>
                 </PaletteItem>
-                {activeHasGrid && (
-                  <PaletteItem
-                    value="save workspace as preset layout"
-                    onSelect={() =>
-                      run(() => useSwarm.getState().setSavePresetOpen(true))
-                    }
-                  >
-                    <LayoutTemplate size={13} className="shrink-0 text-faint" />
-                    Save workspace as preset
-                  </PaletteItem>
-                )}
                 <PaletteItem
                   value="usage dashboard tokens cost"
                   onSelect={() =>
                     run(() => useSwarm.getState().setDashboardOpen(true))
                   }
                 >
-                  <BarChart3 size={13} className="shrink-0 text-faint" />
-                  Usage dashboard
-                </PaletteItem>
-                <PaletteItem
-                  value="profiles manage"
-                  onSelect={() => run(onOpenProfiles)}
-                >
-                  <SlidersHorizontal size={13} className="shrink-0 text-faint" />
-                  Profiles
+                  <ActionDot />
+                  <span className="truncate text-txt">Usage dashboard</span>
                 </PaletteItem>
                 <PaletteItem
                   value="settings preferences"
                   onSelect={() => run(onOpenSettings)}
                 >
-                  <Settings size={13} className="shrink-0 text-faint" />
-                  Settings
+                  <ActionDot />
+                  <span className="truncate text-txt">Settings</span>
                   <Shortcut>⌘,</Shortcut>
                 </PaletteItem>
               </PaletteGroup>
@@ -369,7 +240,7 @@ export function PaletteGroup({
   return (
     <Command.Group
       heading={heading}
-      className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider [&_[cmdk-group-heading]]:text-faint"
+      className="[&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:font-mono [&_[cmdk-group-heading]]:text-10 [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-[.08em] [&_[cmdk-group-heading]]:text-fnt"
     >
       {children}
     </Command.Group>
@@ -392,8 +263,8 @@ export function PaletteItem({
       value={value}
       onSelect={onSelect}
       className={cn(
-        "flex cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground",
-        "data-[selected=true]:bg-accent data-[selected=true]:text-foreground",
+        "flex cursor-default select-none items-center gap-2 rounded-md px-3 py-1.5 text-13 text-mut",
+        "data-[selected=true]:bg-line data-[selected=true]:text-txt",
         className,
       )}
     >
@@ -404,37 +275,33 @@ export function PaletteItem({
 
 export function Shortcut({ children }: { children: React.ReactNode }) {
   return (
-    <kbd className="ml-auto pl-3 font-mono text-[10px] tabular-nums text-faint">
+    <kbd className="ml-auto pl-3 font-mono text-10 tabular-nums text-fnt">
       {children}
     </kbd>
   );
 }
 
-/** Status dot matching the pane header's signal triad, condensed: amber
- * dot + ⚑ for needs-you, quiet muted dot for busy, green for idle/alive. */
-function AgentDot({ agent }: { agent: Agent }) {
-  const state =
-    agent.status === "running" && agent.activity
-      ? agent.activity
-      : agent.status;
-  const needsYou =
-    agent.status !== "exited" &&
-    (agent.attention || agent.activity === "waiting");
-  const color = needsYou
-    ? "var(--attn)"
-    : state === "busy" || state === "starting"
-      ? "var(--muted-foreground)"
-      : state === "exited"
-        ? "var(--faint)"
-        : "var(--success)";
+/** Action rows carry the accent dot — "this takes you somewhere". */
+function ActionDot() {
+  return <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-acc" />;
+}
+
+/** Status dot matching the signal triad, condensed: amber dot + ⚑ for
+ * needs-you (pending approval), accent dot for working (DESIGN.md: working =
+ * accent), faint for idle. */
+function SessionDot({ entry }: { entry: VibeSessionEntry }) {
+  const busy = useVibe((s) => !!s.busy[entry.session.id]);
+  const needsYou = hasPendingApproval(entry);
   return (
     <>
       <span
-        className="h-1.5 w-1.5 shrink-0 rounded-full"
-        style={{ backgroundColor: color }}
+        className={cn(
+          "h-1.5 w-1.5 shrink-0 rounded-full",
+          needsYou ? "bg-attn" : busy ? "bg-acc" : "bg-fnt",
+        )}
       />
       {needsYou && (
-        <span className="shrink-0 font-mono text-[10px] font-semibold leading-none text-attn">
+        <span className="shrink-0 font-mono text-10 font-semibold leading-none text-attn">
           ⚑
         </span>
       )}

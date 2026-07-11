@@ -1,58 +1,93 @@
-// Orchestrator tool executors (Phase 2) — one async function per tool in the
-// Rust registry (src-tauri/src/orchestrator/registry.rs, the single source
-// of names/schemas). They run in the webview because that's where the
-// Zustand store lives; the bus (bus.ts) dispatches `orchestrator://tool-
-// request` events here and reports results back to Rust.
+// Orchestrator tool executors — one async function per tool in the Rust
+// registry (src-tauri/src/orchestrator/registry.rs, the single source of
+// names/schemas). They run in the webview because that's where the Zustand
+// stores live; the bus (bus.ts) dispatches `orchestrator://tool-request`
+// events here and reports results back to Rust.
 //
 // Args arrive pre-validated by the Rust registry (required props + basic
 // types) — executors still throw clear errors for everything semantic
-// (unknown pane ids, non-repo worktree requests, …). A thrown error becomes
-// the tool call's error message.
+// (unknown agent ids, non-repo git requests, gated cleanups, …). A thrown
+// error becomes the tool call's error message.
 
-import { defaultStartupForRuntime, useSwarm } from "@/store";
-import type { Agent, NoteItem, PresetLayoutNode } from "@/types";
-import { fetchGitInfo, getHome } from "@/lib/transport";
-import { insertCommandText } from "@/lib/insert-command";
+import { invoke } from "@tauri-apps/api/core";
+import { useSwarm } from "@/store";
+import type { NoteItem, VibeAccess } from "@/types";
+import { fetchGitInfo } from "@/lib/transport";
+import { useProjects } from "@/lib/projects/store";
 import { pushFleetEvent } from "@/lib/events";
-import { addWorktree, generateBranchName } from "@/lib/worktree";
-import { runtimeFromStartup } from "@/lib/utils";
 import { useVibe, type VibeSessionEntry } from "@/lib/vibe/session-store";
 import {
-  sendMessage as vibeSendMessage,
+  // STRICT on purpose: the orchestrator must never report `delivered:true`
+  // for a turn that never started (the UI path swallows failures — they are
+  // already visible in the transcript as warning items)
+  sendMessageStrict as vibeSendMessage,
+  steerMessageStrict as vibeSteerMessage,
   startSession as startVibeSession,
+  closeSession as closeVibeSession,
+  interrupt as interruptVibeSession,
+  // STRICT: the server-anchored Conductor path — Rust refuses anything not
+  // classified "routine", the UI status commits only after Rust's ack
+  respondApprovalStrict as respondVibeApproval,
+  setAccess as setVibeAccess,
+  setModelEffort as setVibeModelEffort,
+  assignWorktreeToSession,
+  reviewSession,
+  waitForSessionIdle,
 } from "@/lib/vibe/controller";
 import { renderSessionTranscript } from "@/lib/vibe/transcript";
+import { pickAgentName, branchSlugForAgent } from "@/lib/vibe/names";
 import {
-  buildArrangement,
-  collectPanes,
-  combineLayouts,
-  findPaneByAgent,
-  removePaneByAgent,
-  splitPane,
-  type Arrangement,
-} from "@/lib/layout";
+  addWorktree,
+  listWorktrees,
+  removeWorktree,
+  worktreeStatus,
+} from "@/lib/worktree";
+import {
+  fetchGhAuthStatus,
+  fetchGhPrList,
+  fetchGhPrView,
+  ghCommentPr,
+  ghCreatePr,
+  ghReviewPr,
+} from "@/lib/github/api";
+import { unwrapGh } from "@/lib/github/core";
+import { useGithub } from "@/lib/github/store";
+import {
+  refreshProjectGithub,
+  unwatchPr,
+  watchPr,
+} from "@/lib/github/controller";
 import { useOrchestrator } from "./chat-store";
+import { isAutonomousTurnInFlight } from "./controller";
+import { isFlattenedChar } from "./triggers-core";
 import {
-  crowdingNote,
-  fleetSnapshot,
+  AGENT_REPORT_SCHEMA,
+  bindReportExpectation,
+  clearReportExpectation,
+  noteReportExpected,
+  REPORT_PROMPT_SUFFIX,
+} from "./report";
+import {
   fleetSummaryLine,
   sessionSnapshot,
-  type LayoutDims,
+  worktreeOccupancy,
 } from "./snapshot";
-import {
-  MIN_PANE,
-  planPlacement,
-  type PlanSpec,
-  type WsMeta,
-} from "./placement";
-import { discoverProjects, projectDocs, readTranscript } from "./native";
+import { discoverProjects, projectDocs } from "./native";
 import { appendMemory } from "./memory";
+import {
+  cancelTimer,
+  createTimer,
+  listTimers,
+} from "./timers";
+import { describeRemaining, resolveFireAt } from "./timers-core";
 import type {
-  CreatePaneResult,
-  CreatePaneSpec,
-  CreatePanesResult,
+  ConductorPlanDocument,
+  ConductorPlanInfo,
   OrchestratorToolName,
-  PromptPaneResult,
+  PromptAgentResult,
+  SpawnAgentResult,
+  SpawnAgentSpec,
+  SpawnAgentsResult,
   ToolNoteItem,
 } from "./types";
 
@@ -60,10 +95,13 @@ import type {
  * Per-call context the bus passes alongside the args. `chatId` is the STORE
  * chat id of the orchestrator chat whose turn triggered the call (the bus
  * resolves the backend id) — null for dev-hook calls (`__orch.tool`), which
- * therefore never track touched panes.
+ * therefore never track touched sessions. `projectId` is the Conductor
+ * instance's project — session resolution, worktrees, timers and plans are
+ * all scoped on it; null = unscoped (dev-hook).
  */
 export interface ToolCallContext {
   chatId: string | null;
+  projectId: string | null;
 }
 
 export type ToolExecutor = (
@@ -71,179 +109,100 @@ export type ToolExecutor = (
   ctx: ToolCallContext,
 ) => Promise<unknown>;
 
-// ---- Phase-5 write guards + touched-pane tracking ----
+// ---- write guards + touched-session tracking ----
 
-/** Two orchestrator prompts into the SAME pane within this window error. */
+/** Two orchestrator prompts into the SAME session within this window error. */
 export const DOUBLE_PROMPT_WINDOW_MS = 2_000;
 
 /**
- * Last orchestrator prompt delivery per pane id — across ALL chats and
- * including create_panes startup prompts (in-memory; the guard is about
+ * Last orchestrator prompt delivery per session id — across ALL chats and
+ * including spawn_agents startup tasks (in-memory; the guard is about
  * accidental duplicates within seconds, not restarts).
  */
 const lastPromptDelivery = new Map<string, number>();
 
 /**
- * Double-prompt protection + the Phase-6 busy policy — the single choke
- * point for every orchestrator write into a pane. With
- * `orchestratorBusyPolicy: "refuse"` a busy pane rejects the prompt outright
- * (the default "deliver" keeps the queue-with-warning behavior).
+ * The duplicate-delivery guard. Since Phase 4 a BUSY session no longer
+ * refuses — prompt_agent steers the running turn instead — so this guard is
+ * the only precondition left.
  */
-function assertPromptAllowed(agent: Agent): void {
-  const last = lastPromptDelivery.get(agent.id);
-  if (last !== undefined && Date.now() - last < DOUBLE_PROMPT_WINDOW_MS) {
-    throw new Error(
-      `pane "${agent.name}" (${agent.id}) already received an orchestrator prompt ${Date.now() - last} ms ago — this looks like a duplicate call; wait a moment and re-send only if it was intentional`,
-    );
-  }
-  const busyPolicy =
-    useSwarm.getState().settings.orchestratorBusyPolicy ?? "deliver";
-  if (busyPolicy === "refuse" && agent.activity === "busy") {
-    throw new Error(
-      `pane "${agent.name}" (${agent.id}) is busy and the user's busy policy is "refuse" — wait until it finishes, then prompt it (or tell the user it is still working)`,
-    );
-  }
-}
-
-/**
- * Phase-6 global auto-submit gate: `orchestratorAutoSubmit: false` = review
- * mode — orchestrator prompts (prompt_pane AND create_panes startup prompts)
- * paste but never submit; the user presses Enter themselves.
- */
-function reviewModeActive(): boolean {
-  return useSwarm.getState().settings.orchestratorAutoSubmit === false;
-}
-
-/**
- * The session variant of the write choke point (Phase 5): the same
- * double-prompt guard, but a busy session is always REFUSED (a native session
- * runs one turn at a time — the backend rejects a second turn — so there is no
- * "queue into the input" like a terminal pane). Review mode does not apply:
- * a session turn is a single atomic submit, not a paste the user can inspect.
- */
-function assertSessionPromptAllowed(sessionId: string, name: string): void {
+function assertNoDoublePrompt(sessionId: string, name: string): void {
   const last = lastPromptDelivery.get(sessionId);
   if (last !== undefined && Date.now() - last < DOUBLE_PROMPT_WINDOW_MS) {
     throw new Error(
-      `session "${name}" (${sessionId}) already received an orchestrator prompt ${Date.now() - last} ms ago — this looks like a duplicate call; wait a moment and re-send only if it was intentional`,
-    );
-  }
-  if (useVibe.getState().busy[sessionId]) {
-    throw new Error(
-      `session "${name}" (${sessionId}) is busy — wait for it to finish, then prompt it (or tell the user it is still working)`,
+      `agent "${name}" (${sessionId}) already received an orchestrator prompt ${Date.now() - last} ms ago — this looks like a duplicate call; wait a moment and re-send only if it was intentional`,
     );
   }
 }
 
 /**
  * Record a delivered prompt: feeds the double-prompt guard, and — when the
- * call carries a chat context — the chat's touchedPanes (the Phase-5
- * activity watcher only pings panes recorded here). Every delivery also
- * lands in the Deck's fleet event feed (`▸ orch → pane`).
+ * call carries a chat context — the chat's touchedPanes (the activity
+ * watcher only pings sessions recorded here). Every delivery also lands in
+ * the Deck's fleet event feed (`▸ orch → session`).
  */
 function notePromptDelivered(
-  paneId: string,
-  paneName: string,
+  sessionId: string,
+  sessionName: string,
   ctx: ToolCallContext,
 ): void {
-  lastPromptDelivery.set(paneId, Date.now());
+  lastPromptDelivery.set(sessionId, Date.now());
   if (ctx.chatId)
-    useOrchestrator.getState().recordTouchedPane(ctx.chatId, paneId, paneName);
-  pushFleetEvent({
-    kind: "orch_prompt",
-    paneId,
-    paneName,
-    workspaceId: useSwarm.getState().agents[paneId]?.workspaceId ?? "",
-  });
+    useOrchestrator
+      .getState()
+      .recordTouchedPane(ctx.chatId, sessionId, sessionName);
+  pushFleetEvent({ kind: "orch_prompt", sessionId, sessionName });
 }
 
-/** Resolve a pane_id to its agent, or fail listing every valid pane id. */
-function requireAgent(paneId: unknown): Agent {
-  const s = useSwarm.getState();
-  const agent = typeof paneId === "string" ? s.agents[paneId] : undefined;
-  if (agent) return agent;
-  const valid = s.order
-    .map((id) => {
-      const a = s.agents[id];
-      return a ? `${id} ("${a.name}")` : null;
-    })
-    .filter(Boolean)
-    .join(", ");
-  throw new Error(
-    `unknown pane_id ${JSON.stringify(String(paneId))} — valid pane ids: ${valid || "(no panes open)"}`,
-  );
-}
-
-/** Ordered native Vibe session entries (newest first, matching the rail). */
-function orderedSessions(): VibeSessionEntry[] {
+/** Ordered session entries (rail order), optionally scoped to one project. */
+function orderedSessions(projectId: string | null): VibeSessionEntry[] {
   const v = useVibe.getState();
   return v.order
     .map((id) => v.sessions[id])
-    .filter((e): e is VibeSessionEntry => !!e);
+    .filter((e): e is VibeSessionEntry => !!e)
+    .filter((e) => projectId === null || e.session.projectId === projectId);
 }
 
-/** The native-session snapshot section shared by fleet_snapshot + the summary. */
-export function fleetSessions() {
+/** The session snapshot shared by fleet_snapshot + the summary (scoped). */
+export function fleetSessions(projectId: string | null = null) {
   const v = useVibe.getState();
-  return sessionSnapshot({ sessions: orderedSessions(), busy: v.busy });
+  return sessionSnapshot({ sessions: orderedSessions(projectId), busy: v.busy });
 }
 
 /**
- * Real DOM measurement of one workspace's grid container. All grids stay
- * mounted (inactive ones are `visibility:hidden`), and `clientWidth/Height`
- * are LAYOUT boxes — unaffected by the fleet view's CSS scale transform — so
- * this reports the true size a workspace renders at. Null for empty
- * workspaces (no grid container) or a zero-size box.
+ * Resolve an `agent` argument to its session entry WITHIN the call's project
+ * scope, or fail listing every valid id. Accepts a raw session id, or a
+ * session name / agent name (optionally `@`-prefixed, case-insensitive)
+ * that is unique within the scope.
  */
-function gridDims(wsId: string): LayoutDims | null {
-  if (typeof document === "undefined") return null;
-  const el = document.querySelector(
-    `[data-ws-grid="${wsId}"]`,
-  ) as HTMLElement | null;
-  if (!el) return null;
-  const w = el.clientWidth;
-  const h = el.clientHeight;
-  return w > 0 && h > 0 ? { w, h } : null;
-}
-
-/** Measure every workspace's grid container (workspaceId → dims | null). */
-function gatherGridDims(order: string[]): Record<string, LayoutDims | null> {
-  const out: Record<string, LayoutDims | null> = {};
-  for (const id of order) out[id] = gridDims(id);
-  return out;
-}
-
-/**
- * A prompt/read target is either an agent pane or a native Vibe session — the
- * write/read tools accept either id (panes checked first, then sessions).
- */
-type Target =
-  | { kind: "pane"; agent: Agent }
-  | { kind: "session"; entry: VibeSessionEntry };
-
-function resolveTarget(paneId: unknown): Target | null {
-  if (typeof paneId !== "string") return null;
-  const agent = useSwarm.getState().agents[paneId];
-  if (agent) return { kind: "pane", agent };
-  const entry = useVibe.getState().sessions[paneId];
-  if (entry) return { kind: "session", entry };
-  return null;
-}
-
-/** Resolve a pane_id to a pane or a session, or fail listing all valid ids. */
-function requireTarget(paneId: unknown): Target {
-  const target = resolveTarget(paneId);
-  if (target) return target;
-  const s = useSwarm.getState();
-  const panes = s.order
-    .map((id) => (s.agents[id] ? `${id} ("${s.agents[id].name}")` : null))
-    .filter(Boolean);
-  const sessions = orderedSessions().map(
-    (e) => `${e.session.id} ("${e.session.name}", native session)`,
-  );
-  const valid = [...panes, ...sessions].join(", ");
+function requireSession(agent: unknown, ctx: ToolCallContext): VibeSessionEntry {
+  const scoped = orderedSessions(ctx.projectId);
+  if (typeof agent === "string" && agent.trim()) {
+    const byId = scoped.find((e) => e.session.id === agent);
+    if (byId) return byId;
+    // name resolution: "@Maya" / "maya" — unique within the project scope
+    const needle = agent.trim().replace(/^@/, "").toLowerCase();
+    const byName = scoped.filter(
+      (e) =>
+        e.session.name.toLowerCase() === needle ||
+        e.session.agentName.toLowerCase() === needle,
+    );
+    if (byName.length === 1) return byName[0];
+    if (byName.length > 1) {
+      throw new Error(
+        `ambiguous agent name ${JSON.stringify(String(agent))} — matches: ${byName
+          .map((e) => `${e.session.id} ("${e.session.name}")`)
+          .join(", ")}; use the id`,
+      );
+    }
+  }
+  const valid = scoped
+    .map((e) => `${e.session.id} ("${e.session.name}")`)
+    .join(", ");
   throw new Error(
-    `unknown pane_id ${JSON.stringify(String(paneId))} — valid ids: ${valid || "(no panes or sessions open)"}`,
+    `unknown agent ${JSON.stringify(String(agent))} — valid agents${
+      ctx.projectId ? " in this project" : ""
+    }: ${valid || "(no agents)"}`,
   );
 }
 
@@ -251,362 +210,549 @@ function stripNotes(items: NoteItem[]): ToolNoteItem[] {
   return items.map((n) => ({ text: n.text, done: n.done }));
 }
 
-/** All pane templates of a preset layout tree, in layout order. */
-function presetPanes(node: PresetLayoutNode): Extract<PresetLayoutNode, { type: "pane" }>[] {
-  if (node.type === "pane") return [node];
-  return node.children.flatMap(presetPanes);
-}
-
 /**
- * Wait until the pane's PTY reports running, then give the agent CLI a short
- * grace period to boot before pasting. There is no readiness signal from the
- * CLIs today (OSC 9;4 only fires once they DO something, Codex activity only
- * on task start), so this is deliberately a bounded poll + fixed settle
- * delay: pasting into the not-yet-started CLI would feed the shell instead.
- * Review mode (orchestratorAutoSubmit off) pastes without submitting and
- * says so in the note; failures come back as `delivered: false` + note.
+ * The (trailing-slash-normalized) folder paths whose quick-notes THIS project
+ * may see: its own project dir plus every path its sessions work in (session
+ * cwds + worktree roots). Returns null when there is no project context
+ * (dev-hook call) — the caller then exposes NO folder notes, only global.
  */
-async function deliverStartupPrompt(
-  agentId: string,
-  prompt: string,
-): Promise<{ delivered: boolean; note?: string }> {
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-  const fail = (note: string) => ({ delivered: false, note });
-  const deadline = Date.now() + 20_000;
-  for (;;) {
-    const agent = useSwarm.getState().agents[agentId];
-    if (!agent) return fail("prompt not delivered: pane was closed");
-    if (agent.status === "exited")
-      return fail("prompt not delivered: pane exited before it became ready");
-    if (agent.status === "running") break;
-    if (Date.now() > deadline)
-      return fail("prompt not delivered: pane never reached running state");
-    await sleep(150);
+function allowedProjectNotePaths(ctx: ToolCallContext): Set<string> | null {
+  if (!ctx.projectId) return null;
+  const norm = (p: string) => p.replace(/\/+$/, "");
+  const allowed = new Set<string>();
+  const dir = useProjects.getState().projects[ctx.projectId]?.dir?.trim();
+  if (dir) allowed.add(norm(dir));
+  for (const e of orderedSessions(ctx.projectId)) {
+    if (e.session.projectDir?.trim()) allowed.add(norm(e.session.projectDir));
+    if (e.session.worktree?.root) allowed.add(norm(e.session.worktree.root));
   }
-  const runtime = useSwarm.getState().agents[agentId]?.runtime ?? "claude";
-  // shell prompts are ready almost immediately; agent CLIs get typed into a
-  // login shell first and need a moment to take over stdin
-  await sleep(runtime === "shell" ? 300 : 2_000);
-  const agent = useSwarm.getState().agents[agentId];
-  if (!agent || agent.status === "exited")
-    return fail("prompt not delivered: pane exited while waiting for the CLI");
-  const submit = !reviewModeActive();
-  insertCommandText(agentId, prompt, submit);
-  return {
-    delivered: true,
-    note: submit
-      ? undefined
-      : "review mode — startup prompt pasted but not submitted; the user presses Enter in the pane to run it",
-  };
+  return allowed;
 }
 
-interface PendingPrompt {
-  id: string;
-  text: string;
-  /** native session prompt (vibe turn) vs. terminal-pane startup prompt */
-  native: boolean;
+/** The Conductor's project record — required by project-scoped tools. */
+function requireProject(ctx: ToolCallContext): { id: string; dir: string } {
+  const projectId = ctx.projectId ?? "";
+  const dir = useProjects.getState().projects[projectId]?.dir?.trim() ?? "";
+  if (!projectId || !dir)
+    throw new Error(
+      "this tool needs a project context — no project folder available",
+    );
+  return { id: projectId, dir };
+}
+
+/** Names already used by sessions of the scope (collision set). */
+function takenAgentNames(projectId: string | null): string[] {
+  const taken: string[] = [];
+  for (const e of orderedSessions(projectId)) {
+    taken.push(e.session.agentName, e.session.name);
+  }
+  return taken;
+}
+
+function gitBin(): string | undefined {
+  return useSwarm.getState().settings.gitPath?.trim() || undefined;
+}
+
+/** The Settings master toggle of the GitHub integration (Phase 7). */
+function githubEnabled(): boolean {
+  return !!useSwarm.getState().settings.githubIntegration;
 }
 
 /**
- * Create one native Vibe session (create_panes native:true). Worktree /
- * runtime / profile do not apply (V1) — cwd, model, reasoning→effort, name and
- * prompt do. Access defaults to workspace-write for orchestrator-created
- * sessions (the human still decides approvals).
+ * Hard gate of every github tool except `github_status` (which reports the
+ * state instead). The registry keeps the tools statically declared — this
+ * runtime refusal is the enforceable gate (see the github section below).
  */
-async function createOneNativeSession(
-  spec: CreatePaneSpec,
-): Promise<{ result: CreatePaneResult; prompt?: PendingPrompt }> {
-  const cwd = typeof spec.cwd === "string" ? spec.cwd.trim() : "";
-  if (!cwd) throw new Error("cwd is required and must be a non-empty path");
-  const model = typeof spec.model === "string" ? spec.model.trim() : "";
-  if (model && !/^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(model))
-    throw new Error(`invalid model "${model}" — letters, digits and . _ : / - only`);
-  const effort = typeof spec.reasoning === "string" ? spec.reasoning : undefined;
-  if (effort && !["minimal", "low", "medium", "high", "xhigh"].includes(effort))
-    throw new Error(`invalid reasoning "${effort}"`);
-  const id = await startVibeSession({
-    name: typeof spec.name === "string" && spec.name.trim() ? spec.name.trim() : "Session",
-    projectDir: cwd,
-    ...(model ? { model } : {}),
-    ...(effort ? { effort } : {}),
-    access: "workspace",
-  });
-  const name = useVibe.getState().sessions[id]?.session.name ?? spec.name ?? null;
-  return {
-    result: { id, name, cwd, native: true },
-    prompt:
-      typeof spec.prompt === "string" && spec.prompt.trim()
-        ? { id, text: spec.prompt, native: true }
-        : undefined,
-  };
+function requireGithub(): void {
+  if (!githubEnabled())
+    throw new Error(
+      "GitHub integration is disabled (Settings → GitHub) — this tool is unavailable. Do not retry; if the user wants GitHub work, tell them to enable the integration.",
+    );
 }
 
-async function createOnePane(
-  spec: CreatePaneSpec,
-  gitBin: string | undefined,
-): Promise<{ result: CreatePaneResult; prompt?: PendingPrompt }> {
-  if (spec.native) return createOneNativeSession(spec);
-  const cwd = typeof spec.cwd === "string" ? spec.cwd.trim() : "";
-  if (!cwd) throw new Error("cwd is required and must be a non-empty path");
-  const state = useSwarm.getState();
+/**
+ * Gate of the OUTWARD-FACING github writes (create_pr, comment_pr, and
+ * review_pr when it POSTS): these push to origin / post on github.com on the
+ * user's behalf. In an AUTONOMOUS turn (a fleet event, not a user message,
+ * drove it) they must NOT run unless the user explicitly opted in
+ * (Settings → autonomousGithubWrites, default off) — otherwise a
+ * prompt-injected autonomous cascade could open/approve/comment on the user's
+ * repo. A HUMAN-triggered turn (the user asked for it directly) stays allowed
+ * under the normal master toggle. The Conductor keeps its ability to PROPOSE
+ * the write and act on the user's next message — it only loses the ability to
+ * fire it unattended.
+ */
+function guardOutwardGithub(ctx: ToolCallContext, action: string): void {
+  if (!isAutonomousTurnInFlight(ctx.chatId)) return; // human-triggered — allowed
+  if (useSwarm.getState().settings.autonomousGithubWrites === true) return;
+  throw new Error(
+    `refused: ${action} posts to GitHub on the user's behalf and this is an AUTONOMOUS turn. Outward GitHub writes stay with the user unless they enable Settings → "Autonomous GitHub actions". Report what you would ${action} and let the user run it (or ask them to).`,
+  );
+}
 
-  const profile = spec.profile_id
-    ? state.profiles.find((p) => p.id === spec.profile_id)
-    : undefined;
-  if (spec.profile_id && !profile) {
-    const valid = state.profiles.map((p) => `${p.id} ("${p.name}")`).join(", ");
+/**
+ * Does an approval's command perform an OUTWARD GitHub write (push / PR /
+ * release / issue mutation / `gh api`)? Used by `decide_approval` as the
+ * TF5 defense-in-depth twin: in an autonomous turn with `autonomousGithubWrites`
+ * off, the Conductor must not ACCEPT such an approval even if it somehow
+ * reached it classified "routine" (the Rust classifier already marks these
+ * destructive — this is belt and braces). Pure + exported for unit tests.
+ * File-change approvals are never outward writes.
+ */
+const GH_WRITE_COMMAND_RE =
+  /\bgit\s+push\b|\bgh\s+(?:pr\s+(?:create|comment|review|merge|close|edit|ready|reopen)|release\s+(?:create|edit|delete|upload)|issue\s+(?:create|comment|close|edit|reopen)|api)\b/i;
+
+/**
+ * Strip shell quotes so the write detection sees the same tokens the Rust
+ * tokenizer does: `gh 'pr' 'comment'` / `gh "pr" comment` must reduce to the
+ * bare `gh pr comment` the regex matches — otherwise a quoted form Rust
+ * accepts would slip past this defense-in-depth twin. Removes every `'`/`"`
+ * (quotes never appear inside a real gh subcommand token) and collapses
+ * whitespace. Over-flagging a read command only costs a human click; missing a
+ * quoted write is the failure we must avoid.
+ */
+function stripShellQuotes(text: string): string {
+  return text
+    .replace(/['"]/g, "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .join(" ");
+}
+
+export function approvalLooksLikeGithubWrite(approval: {
+  approvalKind: "command" | "fileChange";
+  payload: Record<string, unknown>;
+}): boolean {
+  if (approval.approvalKind !== "command") return false;
+  const cmd = approval.payload?.command;
+  const text = Array.isArray(cmd)
+    ? cmd.map((c) => (typeof c === "string" ? c : "")).join(" ")
+    : typeof cmd === "string"
+      ? cmd
+      : "";
+  // test both the raw text and a quote-stripped, whitespace-normalized form so
+  // quoted subcommands (`gh 'pr' 'comment'`, `gh "pr" comment`) match too
+  return (
+    GH_WRITE_COMMAND_RE.test(text) ||
+    GH_WRITE_COMMAND_RE.test(stripShellQuotes(text))
+  );
+}
+
+/**
+ * Strip any userinfo (`user:token@`) from a remote URL before it reaches the
+ * model — a PAT embedded in an `origin` URL must never leak into a tool
+ * result. Idempotent with the Rust-side redaction (git.rs); belt and braces.
+ */
+export function redactRemoteUrl(url: string | null): string | null {
+  if (!url) return null;
+  return url.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@]*@/, "$1");
+}
+
+/** Validate a PR `number` argument. */
+function requirePrNumber(raw: unknown): number {
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0)
+    throw new Error("number must be a positive PR number (from list_prs)");
+  return raw;
+}
+
+/** Trailing-slash-insensitive path equality. */
+function samePath(a: string, b: string): boolean {
+  return a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+}
+
+/** Sessions (ALL projects) working in `path` — cleanup/shared bookkeeping. */
+function sessionsInPath(path: string): VibeSessionEntry[] {
+  return orderedSessions(null).filter((e) =>
+    samePath(e.session.projectDir, path),
+  );
+}
+
+/** Resolve symlinks (macOS /tmp → /private/tmp) — falls back to the input. */
+function canonicalizePath(path: string): Promise<string> {
+  return invoke<string>("canonicalize_path", { path }).catch(() => path);
+}
+
+/**
+ * Find one SwarmZ worktree entry by path, scoped to the CALLING Conductor's
+ * project repo ONLY — a Conductor must never assign agents into or clean up
+ * another project's worktrees, so the persisted cross-project registry is
+ * deliberately NOT consulted. The model-supplied path is canonicalized
+ * before matching (git reports canonical paths).
+ */
+async function findWorktreeEntry(path: string, ctx: ToolCallContext) {
+  const { dir } = requireProject(ctx);
+  const canonical = await canonicalizePath(path);
+  const scan = await listWorktrees([dir], gitBin());
+  return (
+    scan.entries.find(
+      (e) => samePath(e.path, canonical) || samePath(e.path, path),
+    ) ?? null
+  );
+}
+
+/**
+ * Per-worktree async mutex: cleanup, assignment and the shared occupancy /
+ * status re-checks of ONE worktree path run strictly serialized, so a
+ * cleanup can never interleave with a re-homing or a second cleanup between
+ * its final checks and the removal. Keyed by canonical path.
+ */
+const worktreeLocks = new Map<string, Promise<unknown>>();
+
+async function withWorktreeLock<T>(
+  path: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = (await canonicalizePath(path)).replace(/\/+$/, "");
+  const tail = worktreeLocks.get(key) ?? Promise.resolve();
+  const run = tail.then(fn, fn); // previous failures don't poison the queue
+  worktreeLocks.set(
+    key,
+    run.catch(() => {}),
+  );
+  return run;
+}
+
+// ---- spawn_agents ----
+
+const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/;
+
+/**
+ * Resolve an agent's access for a CONDUCTOR-driven tool. The Conductor can
+ * only ever grant "workspace" — "full" (danger-full-access + approvalPolicy
+ * never = the guard bypassed) is human-only, set via the session access
+ * toggle in the UI. The Rust registry drops "full" from the model-callable
+ * schema; this is the defense-in-depth twin — if "full" reaches the executor
+ * anyway it is REFUSED (never silently downgraded, so the model learns why).
+ */
+export function resolveAgentAccess(raw: unknown): VibeAccess {
+  if (raw === "full")
     throw new Error(
-      `unknown profile_id "${spec.profile_id}" — valid profiles: ${valid || "(none)"}`,
+      'access "full" (danger-full-access) is human-only — the Conductor can only use "workspace". If full access is truly needed, ask the user to grant it via the agent\'s access toggle.',
+    );
+  return "workspace";
+}
+
+/**
+ * Single-line-sanitize a model-supplied agent name: control chars, the C1
+ * range and the Unicode line/para separators collapse to spaces (an agent
+ * name is interpolated into UNTRUSTED autonomous wires as «name» — a smuggled
+ * newline must never fabricate a structural line), whitespace collapses, and
+ * the result is length-capped. Empty after sanitizing = treat as "no name".
+ */
+export function sanitizeAgentName(raw: string): string {
+  let out = "";
+  for (const c of raw) {
+    out += isFlattenedChar(c.charCodeAt(0)) ? " " : c;
+  }
+  return out.replace(/\s+/g, " ").trim().slice(0, 60);
+}
+
+/**
+ * How long a shared lane's NEXT initial turn waits for the previous agent's
+ * turn to finish (one writer per worktree). Kept under the tool's registry
+ * timeout so an over-busy lane degrades into an honest per-agent warning,
+ * never a bus timeout.
+ */
+const SHARED_LANE_WAIT_MS = 8 * 60 * 1000;
+
+/** Placement of one agent: worktree "new" | "shared:<agent>" | "none". */
+async function resolvePlacement(
+  spec: SpawnAgentSpec,
+  name: string,
+  ctx: ToolCallContext,
+  projectDir: string,
+): Promise<{
+  cwd: string;
+  worktree: { root: string; branch: string; shared: boolean } | null;
+  sharedHostId?: string;
+}> {
+  const placement = String(spec.worktree ?? "").trim();
+  if (placement === "none") {
+    return { cwd: projectDir, worktree: null };
+  }
+  if (placement === "new") {
+    const base = branchSlugForAgent(name, spec.task);
+    let lastErr = "";
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const branch = attempt === 0 ? base : `${base}-${attempt + 1}`;
+      try {
+        const info = await addWorktree({
+          cwd: projectDir,
+          branch,
+          copyEnv: true,
+          gitBin: gitBin(),
+        });
+        useSwarm.getState().registerWorktreeRepo(info.root);
+        return {
+          cwd: info.path,
+          worktree: { root: info.root, branch: info.branch, shared: false },
+        };
+      } catch (e) {
+        lastErr = e instanceof Error ? e.message : String(e);
+        // branch/folder collisions retry with a suffix; real git errors abort
+        if (!/already exists/i.test(lastErr)) break;
+      }
+    }
+    throw new Error(`could not create a worktree: ${lastErr}`);
+  }
+  if (placement.startsWith("shared:")) {
+    const hostName = placement.slice("shared:".length).trim();
+    if (!hostName) throw new Error('placement "shared:" needs an agent name');
+    const host = requireSession(hostName, ctx);
+    if (!host.session.worktree) {
+      throw new Error(
+        `agent "${host.session.name}" has no worktree to share — place it in one first (worktree "new" or assign_worktree)`,
+      );
+    }
+    return {
+      cwd: host.session.projectDir,
+      worktree: {
+        root: host.session.worktree.root,
+        branch: host.session.worktree.branch,
+        shared: true,
+      },
+      sharedHostId: host.session.id,
+    };
+  }
+  throw new Error(
+    `unknown worktree placement ${JSON.stringify(placement)} — use "new", "shared:<agentName>" or "none"`,
+  );
+}
+
+/**
+ * Create one agent session (marked conductor-spawned) per its spec.
+ * `reservedNames` is the BATCH's case-insensitive name reservation: explicit
+ * names collide loudly (against live sessions AND earlier batch entries —
+ * duplicate names would make `shared:<name>` and every name-based tool
+ * ambiguous), auto-picked names avoid the whole set; the chosen name is
+ * added before any await, so a parallel retry can't re-use it.
+ */
+async function spawnOneAgent(
+  spec: SpawnAgentSpec,
+  ctx: ToolCallContext,
+  projectId: string,
+  projectDir: string,
+  reservedNames: Set<string>,
+): Promise<{
+  result: SpawnAgentResult;
+  task?: { id: string; text: string; expectReport: boolean };
+}> {
+  const task = typeof spec.task === "string" ? spec.task.trim() : "";
+  if (!task) throw new Error("task must not be empty");
+  const model = typeof spec.model === "string" ? spec.model.trim() : "";
+  if (model && !MODEL_RE.test(model))
+    throw new Error(`invalid model "${model}" — letters, digits and . _ : / - only`);
+  const effort =
+    typeof spec.effort === "string" && spec.effort.trim()
+      ? spec.effort.trim()
+      : "medium"; // swarm default: sub-agents run medium unless chosen otherwise
+  const access: VibeAccess = resolveAgentAccess(spec.access);
+  const explicit =
+    typeof spec.name === "string" ? sanitizeAgentName(spec.name) : "";
+  if (explicit && reservedNames.has(explicit.toLowerCase())) {
+    throw new Error(
+      `agent name "${explicit}" is already in use in this project — pick a different name or omit it`,
     );
   }
-  // an explicit runtime without a profile pins the matching startup command —
-  // otherwise createAgent would fall back to the settings default, which may
-  // belong to a different runtime
-  let startup =
-    !profile && spec.runtime ? defaultStartupForRuntime(spec.runtime) : undefined;
+  const name = explicit || pickAgentName([...reservedNames]);
+  reservedNames.add(name.toLowerCase());
 
-  // Optional model override ("open an Opus pane"): appended as a CLI flag to
-  // the pane's effective startup. Strictly validated — the startup line runs
-  // in a shell, so the model id must never carry shell metacharacters.
-  const model = typeof spec.model === "string" ? spec.model.trim() : "";
-  const reasoning = typeof spec.reasoning === "string" ? spec.reasoning : "";
-  if (model || reasoning) {
-    if (model && !/^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(model))
+  const placement = await resolvePlacement(spec, name, ctx, projectDir);
+  let id: string;
+  try {
+    id = await startVibeSession({
+      name,
+      agentName: name,
+      projectDir: placement.cwd,
+      projectId,
+      spawnedBy: "conductor",
+      worktree: placement.worktree,
+      ...(model ? { model } : {}),
+      effort,
+      access,
+    });
+  } catch (err) {
+    // a FRESH worktree created for this agent must not orphan when the
+    // session never started — roll it back (it is clean by construction;
+    // the gated non-force removal double-checks that)
+    const msg = err instanceof Error ? err.message : String(err);
+    if (placement.worktree && !placement.worktree.shared) {
+      let rolledBack = false;
+      try {
+        await removeWorktree({
+          root: placement.worktree.root,
+          path: placement.cwd,
+          branch: placement.worktree.branch,
+          force: false,
+          gitBin: gitBin(),
+        });
+        rolledBack = true;
+        // re-scan so a now-empty repo root is pruned from the registry again
+        void useSwarm.getState().refreshWorktrees();
+      } catch {
+        /* rollback failed — name the path below so nothing orphans silently */
+      }
       throw new Error(
-        `invalid model "${model}" — letters, digits and . _ : / - only`,
+        rolledBack
+          ? `${msg} (the freshly created worktree was rolled back)`
+          : `${msg} — AND the fresh worktree could not be rolled back; clean it up via cleanup_worktree: ${placement.cwd}`,
       );
-    if (reasoning && !["minimal", "low", "medium", "high", "xhigh"].includes(reasoning))
-      throw new Error(`invalid reasoning "${reasoning}"`);
-    const base =
-      profile?.startup ??
-      startup ??
-      state.settings.defaultStartup?.trim() ??
-      defaultStartupForRuntime(state.settings.defaultRuntime ?? "codex");
-    const effRuntime =
-      spec.runtime ?? profile?.runtime ?? runtimeFromStartup(base);
-    if (effRuntime === "shell")
-      throw new Error(
-        "model/reasoning need an agent runtime (claude or codex) — this pane would be a plain shell",
-      );
-    if (effRuntime === "claude" && reasoning)
-      throw new Error('reasoning is codex-only — omit it for claude panes');
-    // note: appended to the END of the startup line — fine for the simple
-    // single-command startups profiles/defaults use; compound custom commands
-    // would need smarter splicing (not a supported orchestrator path today)
-    startup =
-      base +
-      (model ? (effRuntime === "claude" ? ` --model ${model}` : ` -m ${model}`) : "") +
-      (reasoning ? ` -c model_reasoning_effort="${reasoning}"` : "");
+    }
+    throw err instanceof Error ? err : new Error(msg);
   }
-
-  let worktree: { root: string; branch: string } | undefined;
-  let paneCwd = cwd;
-  if (spec.worktree) {
-    // worktree FIRST, exactly like NewAgentDialog: repo check, generated
-    // branch, `.worktrees/<slug>` + env copy via the native flow. A non-repo
-    // folder is an ERROR — never a silent downgrade to a plain pane.
-    const info = await fetchGitInfo(cwd, gitBin).catch(() => null);
-    if (!info?.repo)
-      throw new Error(
-        `worktree requested but "${cwd}" is not inside a git repository`,
-      );
-    const branch = spec.branch?.trim() || generateBranchName(info.repo);
-    const wt = await addWorktree({ cwd, branch, copyEnv: true, gitBin });
-    worktree = { root: wt.root, branch: wt.branch };
-    paneCwd = wt.path;
+  // joining an existing worktree marks the host shared too
+  if (placement.sharedHostId) {
+    useVibe.getState().setWorktreeShared(placement.sharedHostId, true);
   }
-
-  const id = useSwarm.getState().createAgent(
-    {
-      name: spec.name,
-      runtime: spec.runtime,
-      cwd: paneCwd,
-      startup,
-      profileId: profile?.id,
-      worktree,
-    },
-    "row",
-  );
-  const agent = useSwarm.getState().agents[id];
+  const entry = useVibe.getState().sessions[id];
   return {
     result: {
       id,
-      name: agent?.name ?? spec.name ?? null,
-      cwd: paneCwd,
-      worktree: worktree ?? null,
+      name: entry?.session.name ?? name,
+      cwd: placement.cwd,
+      branch: placement.worktree?.branch ?? null,
+      shared: placement.worktree?.shared ?? false,
     },
-    prompt:
-      typeof spec.prompt === "string" && spec.prompt.trim()
-        ? { id, text: spec.prompt, native: false }
-        : undefined,
+    task: { id, text: task, expectReport: spec.expect_report === true },
   };
 }
 
-/** Grouping key for placement: the pane's project (cwd folder basename). */
-function projectBasename(cwd: unknown): string | null {
-  if (typeof cwd !== "string" || !cwd.trim()) return null;
-  const parts = cwd.trim().replace(/\/+$/, "").split("/");
-  return parts[parts.length - 1] || null;
-}
-
-/** Container aspect ratio (w/h), with a sensible fallback when unmeasured. */
-function aspectOf(dims: LayoutDims | null): number {
-  return dims && dims.h > 0 ? dims.w / dims.h : 1.6;
-}
-
-/** Honest, human-readable account of where the batch's panes landed. */
-function buildPlacementSummary(results: CreatePaneResult[]): string {
-  const byWs = new Map<string, { name: string; count: number }>();
-  let created = 0;
-  let failed = 0;
-  let native = 0;
-  for (const r of results) {
-    if (r.error) {
-      failed++;
-      continue;
-    }
-    if (r.native) {
-      native++;
-      continue;
-    }
-    if (r.id) {
-      created++;
-      const key = r.workspace_id ?? "?";
-      const e = byWs.get(key) ?? { name: r.workspace_name ?? "workspace", count: 0 };
-      e.count++;
-      byWs.set(key, e);
-    }
-  }
-  const segs = [...byWs.values()].map((e) => `${e.count} in «${e.name}»`);
-  let summary =
-    created > 0
-      ? `created ${created} pane${created === 1 ? "" : "s"}: ${segs.join("; ")}`
-      : "created 0 panes";
-  if (byWs.size > 1)
-    summary += " — overflowed into a new workspace to keep panes readable";
-  if (native)
-    summary += `; ${native} native session${native === 1 ? "" : "s"}`;
+/** Honest, human-readable account of what the batch created. */
+function buildSummary(results: SpawnAgentResult[]): string {
+  const created = results.filter((r) => r.id && !r.error).length;
+  const failed = results.filter((r) => r.error).length;
+  let summary = `spawned ${created} agent${created === 1 ? "" : "s"}`;
   if (failed) summary += `; ${failed} failed`;
   return summary;
 }
 
+// ---- plans (thin invoke wrappers — Rust owns the confinement) ----
+
+function planWrite(
+  projectDir: string,
+  title: string,
+  markdown: string,
+): Promise<ConductorPlanInfo> {
+  return invoke<ConductorPlanInfo>("conductor_plan_write", {
+    projectDir,
+    title,
+    markdown,
+  });
+}
+
+function planList(projectDir: string): Promise<ConductorPlanInfo[]> {
+  return invoke<ConductorPlanInfo[]>("conductor_plan_list", { projectDir });
+}
+
+function planRead(
+  projectDir: string,
+  slug: string,
+): Promise<ConductorPlanDocument> {
+  return invoke<ConductorPlanDocument>("conductor_plan_read", {
+    projectDir,
+    slug,
+  });
+}
+
 export const executors: Record<OrchestratorToolName, ToolExecutor> = {
-  // ---- read tools ----
+  // ---- sensing ----
 
-  fleet_snapshot: async () => {
-    const s = useSwarm.getState();
-    const sessions = fleetSessions();
-    const dims = gatherGridDims(s.workspaceOrder);
-    const workspaces = fleetSnapshot(s, dims);
-    const crowd = crowdingNote(workspaces);
-    const base = fleetSummaryLine(s, sessions);
+  fleet_snapshot: async (_args, ctx) => {
+    const sessions = fleetSessions(ctx.projectId);
+    const project = ctx.projectId
+      ? (useProjects.getState().projects[ctx.projectId] ?? null)
+      : null;
+    const now = Date.now();
+    const timers = ctx.projectId
+      ? listTimers(ctx.projectId).map((t) => ({
+          id: t.id,
+          note: t.note,
+          fires_at: new Date(t.at).toISOString(),
+          remaining: describeRemaining(t.at, now),
+        }))
+      : [];
     return {
-      summary: crowd ? `${base} · ${crowd}` : base,
-      ui_mode: s.settings.uiMode ?? "grid",
-      workspaces,
+      // the Conductor's own project heads the snapshot (null = unscoped dev call)
+      project: project
+        ? { id: project.id, name: project.name, dir: project.dir }
+        : null,
+      summary: fleetSummaryLine(sessions),
       sessions,
+      // who works where — sessions without a worktree work in the project dir
+      worktrees: worktreeOccupancy(sessions),
+      timers,
     };
   },
 
-  read_transcript: async (args) => {
-    const target = requireTarget(args.pane_id);
-    // native session: render its structured items compactly (pure fn)
-    if (target.kind === "session") {
-      const entry = target.entry;
-      const items = entry.order
-        .map((id) => entry.items[id])
-        .filter((i): i is NonNullable<typeof i> => !!i);
-      const tail =
-        typeof args.tail_messages === "number" ? args.tail_messages : undefined;
-      return {
-        session: {
-          id: entry.session.id,
-          name: entry.session.name,
-          cwd: entry.session.projectDir,
-          model: entry.session.model ?? null,
-          access: entry.session.access,
-        },
-        native: true,
-        transcript: renderSessionTranscript(items, { tail }),
-      };
-    }
-    const agent = target.agent;
-    const runtime = agent.runtime ?? "claude";
-    if (runtime === "shell")
-      throw new Error("no transcript: shell pane (plain terminal, no agent session)");
-    if (!agent.sessionId)
-      throw new Error(
-        "no transcript: the pane's agent session has not been discovered yet (it may not have done anything so far)",
-      );
-    const cwd = agent.cwd ?? (await getHome());
-    const transcript = await readTranscript({
-      cwd,
-      sessionId: agent.sessionId,
-      runtime,
-      tailMessages:
-        typeof args.tail_messages === "number" ? args.tail_messages : undefined,
-      includeFirstUserMessage:
-        typeof args.include_first_user_message === "boolean"
-          ? args.include_first_user_message
-          : undefined,
-    });
+  read_agent: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const items = entry.order
+      .map((id) => entry.items[id])
+      .filter((i): i is NonNullable<typeof i> => !!i);
+    const tail =
+      typeof args.tail_messages === "number" ? args.tail_messages : undefined;
     return {
-      pane: { id: agent.id, name: agent.name, runtime, cwd: agent.cwd ?? null },
-      transcript,
+      agent: {
+        id: entry.session.id,
+        name: entry.session.name,
+        cwd: entry.session.projectDir,
+        model: entry.session.model ?? null,
+        access: entry.session.access,
+        worktree: entry.session.worktree,
+      },
+      transcript: renderSessionTranscript(items, { tail }),
     };
   },
 
-  read_project_docs: async (args) => {
-    const hasPane = typeof args.pane_id === "string" && args.pane_id.trim();
+  read_project_docs: async (args, ctx) => {
+    const hasAgent = typeof args.agent === "string" && args.agent.trim();
     const hasPath = typeof args.path === "string" && args.path.trim();
-    if (!!hasPane === !!hasPath)
-      throw new Error('exactly one of "pane_id" or "path" is required');
-    let root: string;
-    if (hasPane) {
-      // resolve panes first, then native Vibe sessions (their projectDir) —
-      // same id semantics as prompt_pane / read_transcript
-      const target = requireTarget(args.pane_id);
-      const targetRoot =
-        target.kind === "pane"
-          ? target.agent.worktree?.root ?? target.agent.cwd
-          : target.entry.session.projectDir;
-      if (!targetRoot) {
-        const label =
-          target.kind === "pane" ? `pane "${target.agent.name}"` : `session "${target.entry.session.name}"`;
-        throw new Error(
-          `${label} has no working directory (home) — pass "path" instead`,
-        );
-      }
-      root = targetRoot;
-    } else {
-      root = (args.path as string).trim();
-    }
+    if (!!hasAgent === !!hasPath)
+      throw new Error('exactly one of "agent" or "path" is required');
+    const root = hasAgent
+      ? requireSession(args.agent, ctx).session.projectDir
+      : (args.path as string).trim();
+    if (!root)
+      throw new Error("the agent has no working directory — pass \"path\" instead");
     return projectDocs(root);
   },
 
-  read_notes: async () => {
+  read_notes: async (_args, ctx) => {
     const { quickNotes } = useSwarm.getState();
-    return {
-      global: stripNotes(quickNotes.global),
-      folders: Object.fromEntries(
-        Object.entries(quickNotes.folders).map(([path, items]) => [
-          path,
-          stripNotes(items),
-        ]),
-      ),
-    };
+    // scope folder notes to the CALLING project only — a project's Conductor
+    // must never see another project's folder notes. Allowed paths: the
+    // project dir + every path its own sessions work in (their cwds and
+    // worktree roots). Global notes are the deliberately-shared surface.
+    const allowed = allowedProjectNotePaths(ctx);
+    const folders: Record<string, ToolNoteItem[]> = {};
+    if (allowed) {
+      for (const [path, items] of Object.entries(quickNotes.folders)) {
+        if (allowed.has(path.replace(/\/+$/, "")))
+          folders[path] = stripNotes(items);
+      }
+    }
+    return { global: stripNotes(quickNotes.global), folders };
   },
 
-  git_status: async (args) => {
-    const agent = requireAgent(args.pane_id);
-    const pane = { id: agent.id, name: agent.name, cwd: agent.cwd ?? null };
-    if (agent.git === null)
-      return { pane, git: null, note: `not a git repository: ${agent.cwd ?? "~"}` };
-    if (!agent.git)
-      return { pane, git: null, note: "git status not polled yet for this pane" };
-    const g = agent.git;
+  git_status: async (args, ctx) => {
+    const hasAgent = typeof args.agent === "string" && args.agent.trim();
+    const hasPath = typeof args.path === "string" && args.path.trim();
+    if (!!hasAgent === !!hasPath)
+      throw new Error('exactly one of "agent" or "path" is required');
+    let cwd: string;
+    let agent: { id: string; name: string } | null = null;
+    if (hasAgent) {
+      const entry = requireSession(args.agent, ctx);
+      cwd = entry.session.projectDir;
+      agent = { id: entry.session.id, name: entry.session.name };
+    } else {
+      cwd = (args.path as string).trim();
+    }
+    const g = await fetchGitInfo(cwd, gitBin()).catch(() => null);
+    if (!g) return { agent, cwd, git: null, note: `not a git repository: ${cwd}` };
     return {
-      pane,
+      agent,
+      cwd,
       git: {
         repo: g.repo,
         branch: g.branch,
@@ -614,9 +760,8 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         deletions: g.deletions,
         untracked: g.untracked,
         dirty: g.insertions + g.deletions + g.untracked > 0,
-        remote_url: g.remote_url,
+        remote_url: redactRemoteUrl(g.remote_url),
       },
-      worktree: agent.worktree ?? null,
     };
   },
 
@@ -629,358 +774,863 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     return discoverProjects(scanRoots);
   },
 
-  list_blueprints: async () => {
-    const s = useSwarm.getState();
-    // "which models exist here" — honestly derived from real usage (open
-    // panes + persisted usage history) instead of a hardcoded list that
-    // would go stale. These ids are directly usable as create_panes.model.
-    const recentModels: Record<"claude" | "codex", Set<string>> = {
-      claude: new Set(),
-      codex: new Set(),
-    };
-    const note = (runtime: string | undefined, model: string | undefined) => {
-      if (!model) return;
-      if (runtime === "codex") recentModels.codex.add(model);
-      else if (runtime === "claude" || runtime === undefined)
-        recentModels.claude.add(model);
-    };
-    for (const a of Object.values(s.agents)) {
-      note(a.runtime, a.usage?.primary_model ?? undefined);
-      for (const m of a.usage?.by_model ?? []) note(a.runtime, m.model);
-    }
-    const history = Object.values(s.usageHistory)
-      .sort((a, b) => b.last_updated - a.last_updated)
-      .slice(0, 120);
-    for (const e of history) for (const m of e.by_model) note(e.runtime, m.model);
-    return {
-      default_runtime: s.settings.defaultRuntime ?? "codex",
-      runtimes: {
-        claude: {
-          default_startup: defaultStartupForRuntime("claude"),
-          recently_used_models: [...recentModels.claude].slice(0, 12),
-        },
-        codex: {
-          default_startup: defaultStartupForRuntime("codex"),
-          recently_used_models: [...recentModels.codex].slice(0, 12),
-        },
-      },
-      profiles: s.profiles.map((p) => ({
-        id: p.id,
-        name: p.name,
-        runtime: p.runtime ?? runtimeFromStartup(p.startup),
-        startup: p.startup,
-        defaultCwd: p.defaultCwd ?? null,
-      })),
-      workspace_presets: s.workspacePresets.map((preset) => {
-        const panes = presetPanes(preset.layout);
-        return {
-          id: preset.id,
-          name: preset.name,
-          pane_count: panes.length,
-          panes: panes.map((n) => ({
-            runtime:
-              n.runtime ??
-              (n.startup !== undefined ? runtimeFromStartup(n.startup) : null),
-            cwd: n.cwd ?? null,
-            name: n.name ?? null,
-          })),
-        };
-      }),
-    };
-  },
+  // ---- agents ----
 
-  // ---- write tools ----
-
-  prompt_pane: async (args, ctx) => {
-    const target = requireTarget(args.pane_id);
+  prompt_agent: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    // capability-reuse guard (TF5): a FULL-access session (danger-full-access,
+    // approvalPolicy "never" — the sandbox bypassed) must never be driven by
+    // the Conductor. The Conductor can only ever CREATE "workspace" agents
+    // (resolveAgentAccess), so a full-access lane was elevated by a HUMAN for
+    // direct use — reusing it via the Conductor (especially in an autonomous
+    // turn) would launder full access through the swarm. The human's composer
+    // / @session path is separate (vibe controller) and stays unaffected.
+    if (entry.session.access === "full")
+      throw new Error(
+        `agent "${entry.session.name}" runs with FULL access (danger-full-access) — the Conductor cannot drive it. Ask the user to prompt it directly via the composer.`,
+      );
     const text = String(args.text ?? "");
     if (!text) throw new Error("text must not be empty");
-
-    // native Vibe session: submit one turn (busy sessions REFUSE — unlike
-    // panes, which queue — because the backend rejects a second turn too)
-    if (target.kind === "session") {
-      const entry = target.entry;
-      const id = entry.session.id;
-      const name = entry.session.name;
-      assertSessionPromptAllowed(id, name);
-      await vibeSendMessage(id, text);
-      notePromptDelivered(id, name, ctx);
-      return {
-        delivered: true,
-        session: { id, name },
-        submitted: true,
-      };
-    }
-
-    const agent = target.agent;
-    if (agent.status === "exited")
-      throw new Error(
-        `pane "${agent.name}" (${agent.id}) has exited — cannot deliver text`,
+    const id = entry.session.id;
+    const name = entry.session.name;
+    assertNoDoublePrompt(id, name);
+    // expect_report (Phase 5): the fresh turn is outputSchema-constrained so
+    // the agent ends with a machine-readable status report. Schema AND
+    // report suffix apply ONLY to FRESH turns (freshTurnText) — a steered
+    // running turn keeps its own format and must not receive a report
+    // instruction it has no schema/expectation for (documented in the
+    // registry description).
+    const expectReport = args.expect_report === true;
+    // registered BEFORE the send — a very fast completion event must not
+    // beat the registration and lose the structured parsing; cleared again
+    // on a steer (no schema applied) or a failed send
+    if (expectReport) noteReportExpected(id);
+    let how: { mode: "steered" | "queued"; turnId: string | null };
+    try {
+      // steerMessageStrict routes by state: busy → turn/steer (mid-flight
+      // injection), idle → a fresh turn. Both STRICT — failures reject.
+      how = await vibeSteerMessage(
+        id,
+        text,
+        expectReport
+          ? {
+              via: "conductor",
+              // Conductor path: Rust refuses a full-access session (the
+              // capability-reuse guard, authoritative at the backend)
+              requireWorkspace: true,
+              outputSchema:
+                AGENT_REPORT_SCHEMA as unknown as Record<string, unknown>,
+              freshTurnText: text + REPORT_PROMPT_SUFFIX,
+            }
+          : { via: "conductor", requireWorkspace: true },
       );
-    assertPromptAllowed(agent);
-    // review mode (orchestratorAutoSubmit off) overrides the model's submit
-    const reviewMode = reviewModeActive();
-    const submit = !reviewMode && args.submit !== false;
-    const activity = agent.activity ?? null;
-    // LOAD-BEARING: delivery goes through insertCommandText (term.paste() =
-    // bracketed paste + a SEPARATE \r on submit) — never raw ptyWrite
-    insertCommandText(agent.id, text, submit);
-    notePromptDelivered(agent.id, agent.name, ctx);
-    const result: PromptPaneResult = {
+    } catch (err) {
+      if (expectReport) clearReportExpectation(id);
+      throw err;
+    }
+    if (expectReport) {
+      if (how.mode === "steered") clearReportExpectation(id);
+      else bindReportExpectation(id, how.turnId);
+    }
+    notePromptDelivered(id, name, ctx);
+    const result: PromptAgentResult = {
       delivered: true,
-      pane: { id: agent.id, name: agent.name, runtime: agent.runtime ?? "claude" },
-      activity_at_send: activity,
-      submitted: submit,
+      agent: { id, name },
+      mode: how.mode === "steered" ? "steered" : "turn",
     };
-    if (reviewMode && args.submit !== false)
-      result.note =
-        "review mode — the text was pasted but not submitted; the user presses Enter in the pane to run it";
-    if (activity === "busy")
-      result.warning = "pane was busy — text queued in its input";
     return result;
   },
 
-  create_panes: async (args, ctx) => {
-    const specs = args.panes as CreatePaneSpec[];
+  spawn_agents: async (args, ctx) => {
+    const specs = args.agents as SpawnAgentSpec[];
     if (!Array.isArray(specs) || specs.length < 1 || specs.length > 8)
-      throw new Error("panes must contain 1–8 entries");
-    const arrangement =
-      typeof args.arrangement === "string" ? args.arrangement : "auto";
-    if (!["auto", "rows", "columns", "grid"].includes(arrangement))
-      throw new Error(
-        `invalid arrangement "${arrangement}" — one of auto, rows, columns, grid`,
-      );
-    const gitBin =
-      useSwarm.getState().settings.gitPath?.trim() || undefined;
+      throw new Error("agents must contain 1–8 entries");
+    const { id: projectId, dir: projectDir } = requireProject(ctx);
 
-    const results: (CreatePaneResult | undefined)[] = new Array(specs.length);
-    const prompts: (PendingPrompt & { index: number })[] = [];
-    const errResult = (i: number, e: unknown): CreatePaneResult => ({
-      error: e instanceof Error ? e.message : String(e),
-      cwd: typeof specs[i]?.cwd === "string" ? specs[i].cwd : null,
-      name: typeof specs[i]?.name === "string" ? specs[i].name : null,
-    });
+    // case-insensitive name reservation for the whole batch: live sessions
+    // of the project + every name this batch hands out — explicit duplicate
+    // names fail their spec instead of creating ambiguous `shared:<name>` /
+    // name-based-tool targets
+    const reservedNames = new Set(
+      takenAgentNames(projectId).map((n) => n.toLowerCase()),
+    );
 
-    // Native sessions (native:true) are layout-agnostic — created up front,
-    // ignoring workspace/arrangement/beside (documented in the schema).
-    const nativeIdx: number[] = [];
-    const termIdx: number[] = [];
-    specs.forEach((sp, i) => (sp.native ? nativeIdx : termIdx).push(i));
-    for (const i of nativeIdx) {
+    const results: SpawnAgentResult[] = new Array(specs.length);
+    const tasks: {
+      index: number;
+      id: string;
+      text: string;
+      expectReport: boolean;
+    }[] = [];
+    // sequential on purpose — each start creates a worktree (git checkout)
+    // and spawns a codex process; "shared:" placements may reference agents
+    // spawned earlier in the SAME batch
+    for (let i = 0; i < specs.length; i++) {
       try {
-        const { result, prompt } = await createOneNativeSession(specs[i]);
+        const { result, task } = await spawnOneAgent(
+          specs[i],
+          ctx,
+          projectId,
+          projectDir,
+          reservedNames,
+        );
         results[i] = result;
-        if (prompt) prompts.push({ index: i, ...prompt });
+        if (task) tasks.push({ index: i, ...task });
       } catch (e) {
-        results[i] = errResult(i, e);
+        // the failure path stores the model-supplied name too — sanitize it
+        // like the success path before it can reach any wire/UI surface
+        const rawName = specs[i]?.name;
+        results[i] = {
+          error: e instanceof Error ? e.message : String(e),
+          name: typeof rawName === "string" ? sanitizeAgentName(rawName) : null,
+        };
       }
     }
 
-    // ---- terminal panes: plan placement (capacity, overflow, grouping, beside)
-    const s = useSwarm.getState();
-    const dims = gatherGridDims(s.workspaceOrder);
-    const activeDims =
-      dims[s.activeWorkspaceId] ??
-      s.workspaceOrder.map((id) => dims[id]).find((d): d is LayoutDims => !!d) ??
-      null;
-
-    // beside targets validated up front — an unknown target fails only its pane
-    const planEntries: { origIndex: number; spec: PlanSpec }[] = [];
-    for (const i of termIdx) {
-      const b = specs[i].beside;
-      const project = projectBasename(specs[i].cwd);
-      if (b && typeof b.pane_id === "string") {
-        if (!s.agents[b.pane_id]) {
-          results[i] = errResult(
-            i,
-            new Error(`beside: unknown pane_id ${JSON.stringify(b.pane_id)}`),
-          );
-          continue;
-        }
-        planEntries.push({
-          origIndex: i,
-          spec: {
-            project,
-            beside: {
-              paneId: b.pane_id,
-              direction: b.direction === "below" ? "below" : "right",
-            },
-          },
-        });
-      } else {
-        planEntries.push({ origIndex: i, spec: { project } });
+    // initial tasks once all agents exist — GROUPED BY WORKTREE: within one
+    // lane the next agent's turn starts only after the previous agent's turn
+    // FINISHED (one writer per worktree — a Promise.all kickoff would have
+    // several agents mutating the same checkout at once); distinct lanes
+    // still kick off in parallel. A lane that stays busy past the deadline
+    // hands the remaining tasks back to the Conductor instead of starting a
+    // second writer.
+    const deliver = async ({
+      index,
+      id,
+      text,
+      expectReport,
+    }: (typeof tasks)[number]) => {
+      try {
+        // expect_report (Phase 5): the task turn is outputSchema-constrained
+        // so the agent ends with a machine-readable status report. The
+        // expectation registers BEFORE the send (a racing completion event
+        // must not lose the parsing), binds to the acked turn id after, and
+        // clears on a failed send (catch below).
+        if (expectReport) noteReportExpected(id);
+        const sent = await vibeSendMessage(
+          id,
+          expectReport ? text + REPORT_PROMPT_SUFFIX : text,
+          expectReport
+            ? {
+                via: "conductor",
+                requireWorkspace: true,
+                outputSchema:
+                  AGENT_REPORT_SCHEMA as unknown as Record<string, unknown>,
+              }
+            : { via: "conductor", requireWorkspace: true },
+        );
+        if (expectReport) bindReportExpectation(id, sent.turnId);
+        notePromptDelivered(
+          id,
+          useVibe.getState().sessions[id]?.session.name ??
+            results[index]?.name ??
+            id,
+          ctx,
+        );
+        return true;
+      } catch (e) {
+        if (expectReport) clearReportExpectation(id);
+        const r = results[index];
+        if (r)
+          r.warning = `task not delivered: ${e instanceof Error ? e.message : String(e)}`;
+        return false;
       }
+    };
+    const lanes = new Map<string, typeof tasks>();
+    for (const t of tasks) {
+      const cwd = results[t.index]?.cwd ?? t.id;
+      const lane = lanes.get(cwd) ?? [];
+      lane.push(t);
+      lanes.set(cwd, lane);
     }
-
-    let primaryWsId: string | null = null;
-    if (planEntries.length) {
-      const workspaces: WsMeta[] = s.workspaceOrder.map((id) => ({
-        id,
-        name: s.workspaces[id]?.name ?? "",
-        panes: collectPanes(s.layouts[id] ?? null).length,
-        dims: dims[id] ?? null,
-      }));
-      const plan = planPlacement({
-        workspace: typeof args.workspace === "string" ? args.workspace : undefined,
-        workspaceId:
-          typeof args.workspace_id === "string" ? args.workspace_id : undefined,
-        arrangement: arrangement as Arrangement,
-        activeWorkspaceId: s.activeWorkspaceId,
-        workspaces,
-        newWorkspaceDims: activeDims,
-        specs: planEntries.map((e) => e.spec),
-        min: MIN_PANE,
-      });
-      if (plan.error) throw new Error(plan.error);
-
-      // A. auto buckets — create the panes, then apply a BALANCED equal-size
-      // layout (fixes the "each new pane smaller than the last" cascade).
-      // Sequential on purpose: parallel `git worktree add` races on git locks.
-      for (let bi = 0; bi < plan.buckets.length; bi++) {
-        const bucket = plan.buckets[bi];
-        const wsId =
-          bucket.ref.kind === "existing"
-            ? bucket.ref.id
-            : useSwarm.getState().createWorkspace({ name: bucket.ref.name });
-        if (bi === 0) primaryWsId = wsId;
-        if (useSwarm.getState().activeWorkspaceId !== wsId)
-          useSwarm.getState().setActiveWorkspace(wsId);
-        const wsName = useSwarm.getState().workspaces[wsId]?.name ?? "";
-        const originalLayout = useSwarm.getState().layouts[wsId] ?? null;
-        const createdIds: string[] = [];
-        for (const planIdx of bucket.indices) {
-          const i = planEntries[planIdx].origIndex;
-          try {
-            const { result, prompt } = await createOnePane(specs[i], gitBin);
-            result.workspace_id = wsId;
-            result.workspace_name = wsName;
-            results[i] = result;
-            if (result.id) createdIds.push(result.id);
-            if (prompt) prompts.push({ index: i, ...prompt });
-          } catch (e) {
-            results[i] = errResult(i, e);
-          }
-        }
-        const aspect = aspectOf(dims[wsId] ?? activeDims);
-        const added = buildArrangement(createdIds, bucket.arrangement, aspect);
-        if (added && createdIds.length) {
-          const finalLayout = originalLayout
-            ? combineLayouts(originalLayout, added, aspect)
-            : added;
-          useSwarm.getState().setWorkspaceLayout(wsId, finalLayout, createdIds[0]);
-        }
-      }
-
-      // B. beside panes — create, then graft next to the target pane.
-      for (const bp of plan.beside) {
-        const i = planEntries[bp.index].origIndex;
-        const targetAgent = useSwarm.getState().agents[bp.targetPaneId];
-        if (!targetAgent) {
-          results[i] = errResult(
-            i,
-            new Error(`beside: target pane ${bp.targetPaneId} is gone`),
-          );
-          continue;
-        }
-        const wsId = targetAgent.workspaceId;
-        primaryWsId ??= wsId;
-        if (useSwarm.getState().activeWorkspaceId !== wsId)
-          useSwarm.getState().setActiveWorkspace(wsId);
-        try {
-          const { result, prompt } = await createOnePane(specs[i], gitBin);
-          result.workspace_id = wsId;
-          result.workspace_name =
-            useSwarm.getState().workspaces[wsId]?.name ?? "";
-          results[i] = result;
-          if (result.id) {
-            const cur = useSwarm.getState().layouts[wsId] ?? null;
-            const base = removePaneByAgent(cur, result.id);
-            const targetPane = base ? findPaneByAgent(base, bp.targetPaneId) : null;
-            if (base && targetPane) {
-              const grafted = splitPane(
-                base,
-                targetPane.id,
-                result.id,
-                bp.direction === "below" ? "column" : "row",
-              );
-              useSwarm.getState().setWorkspaceLayout(wsId, grafted, result.id);
+    await Promise.all(
+      [...lanes.values()].map(async (lane) => {
+        for (let i = 0; i < lane.length; i++) {
+          if (i > 0) {
+            const prev = lane[i - 1];
+            const prevName =
+              useVibe.getState().sessions[prev.id]?.session.name ?? prev.id;
+            const idle = await waitForSessionIdle(prev.id, SHARED_LANE_WAIT_MS);
+            if (!idle) {
+              for (let j = i; j < lane.length; j++) {
+                const r = results[lane[j].index];
+                if (r && !r.warning)
+                  r.warning = `task not delivered: the shared worktree is still busy with «${prevName}» — prompt this agent once the lane is free (one writer per worktree)`;
+              }
+              break;
             }
           }
-          if (prompt) prompts.push({ index: i, ...prompt });
-        } catch (e) {
-          results[i] = errResult(i, e);
+          await deliver(lane[i]);
         }
-      }
-    }
-
-    // land the user back on the primary target
-    primaryWsId ??= useSwarm.getState().activeWorkspaceId;
-    if (useSwarm.getState().activeWorkspaceId !== primaryWsId)
-      useSwarm.getState().setActiveWorkspace(primaryWsId);
-
-    // startup prompts in parallel once all panes/sessions exist. Native
-    // sessions submit a turn straight away (the thread is live once started);
-    // terminal panes wait for their CLI to boot (deliverStartupPrompt).
-    await Promise.all(
-      prompts.map(async ({ index, id, text, native }) => {
-        if (native) {
-          await vibeSendMessage(id, text);
-          notePromptDelivered(
-            id,
-            useVibe.getState().sessions[id]?.session.name ??
-              results[index]?.name ??
-              id,
-            ctx,
-          );
-          return;
-        }
-        const { delivered, note } = await deliverStartupPrompt(id, text);
-        const r = results[index];
-        if (note && r) r.warning = note;
-        // delivered startup prompts count as orchestrator prompts too
-        // (submitted or not): guard window + touched-pane tracking for the
-        // activity pings
-        if (delivered)
-          notePromptDelivered(
-            id,
-            useSwarm.getState().agents[id]?.name ?? results[index]?.name ?? id,
-            ctx,
-          );
       }),
     );
 
-    const finalResults: CreatePaneResult[] = results.map(
-      (r) => r ?? { error: "not created" },
-    );
-    const out: CreatePanesResult = {
-      workspace_id: primaryWsId,
-      panes: finalResults,
-      summary: buildPlacementSummary(finalResults),
+    const out: SpawnAgentsResult = {
+      agents: results,
+      summary: buildSummary(results),
     };
     return out;
   },
 
-  create_workspace: async (args) => {
-    const s = useSwarm.getState();
-    const id = s.createWorkspace({
-      name: typeof args.name === "string" ? args.name : undefined,
-      defaultCwd:
-        typeof args.default_cwd === "string" && args.default_cwd.trim()
-          ? args.default_cwd.trim()
-          : undefined,
-    });
-    const ws = useSwarm.getState().workspaces[id];
-    return { id, name: ws?.name ?? "" };
+  interrupt_agent: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const id = entry.session.id;
+    if (!useVibe.getState().busy[id]) {
+      return {
+        interrupted: false,
+        agent: { id, name: entry.session.name },
+        note: "no turn is running — nothing to interrupt",
+      };
+    }
+    interruptVibeSession(id);
+    return { interrupted: true, agent: { id, name: entry.session.name } };
   },
 
-  // ---- memory tool ----
+  close_agent: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const { id, name, worktree, projectDir } = entry.session;
+    await closeVibeSession(id);
+    return {
+      closed: true,
+      agent: { id, name },
+      ...(worktree
+        ? {
+            note: `the agent's worktree stays (${projectDir}) — clean it via cleanup_worktree once the work is merged or discarded`,
+          }
+        : {}),
+    };
+  },
 
-  remember: async (args) => {
+  set_agent_config: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const id = entry.session.id;
+    const touched: string[] = [];
+    if (args.model !== undefined || args.effort !== undefined) {
+      const model =
+        args.model === undefined
+          ? entry.session.model
+          : String(args.model).trim() || undefined;
+      if (model && !MODEL_RE.test(model))
+        throw new Error(`invalid model "${model}"`);
+      const effort =
+        args.effort === undefined
+          ? entry.session.effort
+          : String(args.effort).trim() || undefined;
+      await setVibeModelEffort(id, model, effort);
+      if (args.model !== undefined) touched.push("model");
+      if (args.effort !== undefined) touched.push("effort");
+    }
+    if (args.access !== undefined) {
+      // the Conductor can only set "workspace" — "full" is human-only
+      const access = resolveAgentAccess(args.access);
+      await setVibeAccess(id, access);
+      touched.push("access");
+    }
+    if (touched.length === 0)
+      throw new Error("nothing to change — pass model, effort and/or access");
+    const after = useVibe.getState().sessions[id]?.session;
+    return {
+      agent: { id, name: entry.session.name },
+      changed: touched,
+      config: {
+        model: after?.model ?? null,
+        effort: after?.effort ?? null,
+        access: after?.access ?? entry.session.access,
+      },
+      note: "takes effect from the agent's next turn",
+    };
+  },
+
+  review_agent: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const target = typeof args.target === "string" ? args.target : "uncommitted";
+    // C3: the Conductor must not launder a HUMAN-granted full-access session
+    // through a detached review — pass the strict flag (Rust's
+    // `conductor_access_gate` is authoritative).
+    const res = await reviewSession(entry.session.id, target, {
+      requireWorkspace: true,
+    });
+    return {
+      agent: { id: entry.session.id, name: entry.session.name },
+      cwd: entry.session.projectDir,
+      target: target || "uncommitted",
+      status: res.status,
+      review: res.review ?? "(the review returned no findings text)",
+    };
+  },
+
+  decide_approval: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const decision = args.decision === "decline" ? "decline" : "accept";
+    const wanted =
+      typeof args.approval_id === "string" && args.approval_id.trim()
+        ? args.approval_id.trim()
+        : null;
+    const pending = entry.order
+      .map((iid) => entry.items[iid])
+      .filter(
+        (i): i is Extract<NonNullable<typeof i>, { kind: "approval" }> =>
+          !!i && i.kind === "approval" && i.status === "pending",
+      );
+    if (pending.length === 0)
+      throw new Error(
+        `agent "${entry.session.name}" has no pending approval to decide`,
+      );
+    const approval = wanted
+      ? pending.find((a) => a.id === wanted)
+      : pending[0];
+    if (!approval)
+      throw new Error(
+        `no pending approval "${wanted}" on agent "${entry.session.name}" — pending: ${pending
+          .map((a) => a.id)
+          .join(", ")}`,
+      );
+    if (approval.escalation !== "routine")
+      throw new Error(
+        "this approval is classified DESTRUCTIVE — only the human may decide it; tell the user it is waiting",
+      );
+    // TF5 defense-in-depth: even a "routine"-classified approval that performs
+    // an OUTWARD GitHub write (push / PR / release) must NOT be accepted in an
+    // AUTONOMOUS turn while the user has not opted into autonomous GitHub
+    // actions — mirrors guardOutwardGithub for the direct-approval path (the
+    // Rust classifier already marks such commands destructive; this is the
+    // belt-and-braces twin). A human-triggered turn stays allowed.
+    if (
+      decision === "accept" &&
+      isAutonomousTurnInFlight(ctx.chatId) &&
+      useSwarm.getState().settings.autonomousGithubWrites !== true &&
+      approvalLooksLikeGithubWrite(approval)
+    )
+      throw new Error(
+        'refused: this approval performs an outward GitHub write (push / PR / release) and this is an AUTONOMOUS turn. Such writes stay with the user unless they enable Settings → "Autonomous GitHub actions". Leave it for the human to decide.',
+      );
+    // the STRICT server-anchored path: Rust re-checks the class stored next
+    // to the blocked Responder and refuses anything non-routine — the check
+    // above is a fast courtesy, never the authority. Errors (already
+    // resolved by the human, dead session, destructive) propagate; nothing
+    // is marked optimistically.
+    await respondVibeApproval(entry.session.id, approval.id, decision);
+    return {
+      decided: true,
+      agent: { id: entry.session.id, name: entry.session.name },
+      approval_id: approval.id,
+      decision,
+    };
+  },
+
+  // ---- worktrees ----
+
+  create_worktree: async (args, ctx) => {
+    const { dir } = requireProject(ctx);
+    const branch =
+      (typeof args.branch === "string" && args.branch.trim()) ||
+      `swarm/lane-${1000 + Math.floor(Math.random() * 9000)}`;
+    const info = await addWorktree({
+      cwd: dir,
+      branch,
+      copyEnv: true,
+      gitBin: gitBin(),
+    });
+    useSwarm.getState().registerWorktreeRepo(info.root);
+    return {
+      root: info.root,
+      path: info.path,
+      branch: info.branch,
+      copied_env_files: info.copied,
+    };
+  },
+
+  assign_worktree: async (args, ctx) => {
+    const entry = requireSession(args.agent, ctx);
+    const path = String(args.path ?? "").trim();
+    if (!path) throw new Error("path must not be empty");
+    // same lock as cleanup_worktree: a re-homing can never interleave with a
+    // cleanup's final occupancy check on the same worktree
+    return withWorktreeLock(path, async () => {
+      const wt = await findWorktreeEntry(path, ctx);
+      if (!wt)
+        throw new Error(
+          `no SwarmZ worktree at ${path} in this project — create one first (create_worktree / spawn_agents worktree:"new")`,
+        );
+      if (wt.missing)
+        throw new Error(`the worktree folder is gone: ${path}`);
+      // shared iff another agent already works there
+      const others = sessionsInPath(wt.path).filter(
+        (e) => e.session.id !== entry.session.id,
+      );
+      const shared = others.length > 0;
+      // rejects busy sessions; commits metadata only after the backend ack
+      await assignWorktreeToSession(entry.session.id, {
+        path: wt.path,
+        root: wt.root,
+        branch: wt.branch,
+        shared,
+      });
+      if (shared) {
+        for (const other of others)
+          useVibe.getState().setWorktreeShared(other.session.id, true);
+      }
+      return {
+        agent: { id: entry.session.id, name: entry.session.name },
+        path: wt.path,
+        branch: wt.branch,
+        shared,
+        note: "the agent works there from its next turn on",
+      };
+    });
+  },
+
+  worktree_status: async (_args, ctx) => {
+    const { dir } = requireProject(ctx);
+    const scan = await listWorktrees([dir], gitBin());
+    return {
+      worktrees: scan.entries.map((e) => ({
+        path: e.path,
+        branch: e.branch,
+        dirty: e.dirty,
+        ahead: e.ahead,
+        ...(e.ahead_unknown ? { ahead_unknown: true } : {}),
+        missing: e.missing,
+        agents: sessionsInPath(e.path).map((s) => s.session.name),
+      })),
+    };
+  },
+
+  cleanup_worktree: async (args, ctx) => {
+    const path = String(args.path ?? "").trim();
+    if (!path) throw new Error("path must not be empty");
+    // ONE per-worktree lock around occupancy + status + removal: nothing may
+    // re-home into (assign_worktree takes the same lock) or re-check this
+    // path while the cleanup decides. The removal itself is the GATED
+    // non-force path — Rust re-checks dirty/ahead inside the call and `git
+    // worktree remove` (without --force) refuses even later-appearing work.
+    return withWorktreeLock(path, async () => {
+      const wt = await findWorktreeEntry(path, ctx);
+      if (!wt) throw new Error(`no SwarmZ worktree at ${path} in this project`);
+      const occupants = sessionsInPath(wt.path);
+      if (occupants.length > 0)
+        throw new Error(
+          `refused: agent${occupants.length === 1 ? "" : "s"} ${occupants
+            .map((e) => `"${e.session.name}"`)
+            .join(", ")} still work${occupants.length === 1 ? "s" : ""} in this worktree — close or re-home them first`,
+        );
+      // SAFE GATE: re-check at execution time — on ANY doubt (including an
+      // uncomputable ahead count) the worktree stays
+      const st = await worktreeStatus(wt.path, gitBin());
+      if (st.exists && st.dirty)
+        throw new Error(
+          "refused: the worktree has uncommitted changes — commit, merge or explicitly discard them first (or ask the user)",
+        );
+      if ((st.exists && st.ahead_unknown) || (!st.exists && wt.ahead_unknown))
+        throw new Error(
+          `refused: could not verify whether branch "${wt.branch}" holds unmerged commits — resolve manually (or ask the user)`,
+        );
+      const ahead = st.exists ? st.ahead : wt.ahead;
+      if (ahead > 0)
+        throw new Error(
+          `refused: branch "${wt.branch}" holds ${ahead} commit${ahead === 1 ? "" : "s"} no other branch has — merge or push it first (or ask the user)`,
+        );
+      await removeWorktree({
+        root: wt.root,
+        path: wt.path,
+        branch: wt.branch,
+        force: false,
+        gitBin: gitBin(),
+      });
+      void useSwarm.getState().refreshWorktrees();
+      return { removed: true, path: wt.path, branch: wt.branch };
+    });
+  },
+
+  // ---- timers ----
+
+  set_timer: async (args, ctx) => {
+    const { id: projectId } = requireProject(ctx);
+    const note = typeof args.note === "string" ? args.note.trim() : "";
+    if (!note) throw new Error("note must not be empty");
+    const resolved = resolveFireAt(Date.now(), args.delay_seconds, args.at_iso);
+    if ("error" in resolved) throw new Error(resolved.error);
+    const timer = createTimer(projectId, note, resolved.at);
+    return {
+      timer_id: timer.id,
+      note: timer.note,
+      fires_at: new Date(timer.at).toISOString(),
+      remaining: describeRemaining(timer.at, Date.now()),
+    };
+  },
+
+  list_timers: async (_args, ctx) => {
+    const { id: projectId } = requireProject(ctx);
+    const now = Date.now();
+    return {
+      timers: listTimers(projectId).map((t) => ({
+        timer_id: t.id,
+        note: t.note,
+        fires_at: new Date(t.at).toISOString(),
+        remaining: describeRemaining(t.at, now),
+      })),
+    };
+  },
+
+  cancel_timer: async (args, ctx) => {
+    const { id: projectId } = requireProject(ctx);
+    const timerId = String(args.timer_id ?? "").trim();
+    const timer = cancelTimer(projectId, timerId);
+    return { cancelled: true, timer_id: timer.id, note: timer.note };
+  },
+
+  // ---- plans ----
+
+  write_plan: async (args, ctx) => {
+    const { dir } = requireProject(ctx);
+    const title = String(args.title ?? "");
+    const markdown = String(args.markdown ?? "");
+    const info = await planWrite(dir, title, markdown);
+    return {
+      written: true,
+      slug: info.slug,
+      path: info.path,
+      note: "agents can read this file — reference the path in their briefs",
+    };
+  },
+
+  list_plans: async (_args, ctx) => {
+    const { dir } = requireProject(ctx);
+    return { plans: await planList(dir) };
+  },
+
+  read_plan: async (args, ctx) => {
+    const { dir } = requireProject(ctx);
+    return planRead(dir, String(args.slug ?? ""));
+  },
+
+  // ---- github (Phase 7 — gated on the Settings master toggle) ----
+  //
+  // GATING DECISION (documented in AGENTS.md): the tools stay in the static
+  // registry catalog and are gated HERE at runtime. Dynamic registration
+  // can't be enforced anyway — dynamicTools are declared at thread/start and
+  // live in the rollout, so a mid-run Settings toggle could never retract
+  // them from running threads; a uniform runtime refusal is the only gate
+  // that always holds (and Rust re-gates the write commands server-side).
+  // `github_status` is the one tool that always answers — it reports the
+  // disabled state instead of erroring, so the Conductor can explain it.
+
+  github_status: async (_args, ctx) => {
+    if (!githubEnabled()) {
+      return {
+        integration_enabled: false,
+        note: "The GitHub integration is disabled (Settings → GitHub). Every other github tool refuses while it is off — if the user asks for GitHub work, tell them to enable it there.",
+      };
+    }
+    const { id: projectId, dir } = requireProject(ctx);
+    const auth = await fetchGhAuthStatus();
+    if (!auth.installed || !auth.authenticated) {
+      return {
+        integration_enabled: true,
+        auth,
+        note: auth.installed
+          ? "gh is installed but not logged in — the user must run `gh auth login`"
+          : "the GitHub CLI (gh) is not installed on this machine",
+      };
+    }
+    // detection through the shared controller path keeps the panel cache warm
+    await refreshProjectGithub(projectId, { force: true });
+    const gh = useGithub.getState();
+    const project = gh.byProject[projectId];
+    if (!project || project.repoStatus !== "ok" || !project.repo) {
+      return {
+        integration_enabled: true,
+        auth: { login: auth.login },
+        repo: null,
+        note:
+          project?.repoStatus === "no_remote"
+            ? `this project (${dir}) has no GitHub remote`
+            : `GitHub repo detection failed: ${project?.repoError ?? project?.repoStatus ?? "unknown"}`,
+      };
+    }
+    const watched = gh.watched[projectId] ?? [];
+    return {
+      integration_enabled: true,
+      auth: { login: auth.login },
+      repo: project.repo,
+      open_prs: project.prs.map((p) => ({
+        number: p.number,
+        title: p.title,
+        head: p.head_ref,
+        draft: p.is_draft,
+        checks: p.checks,
+        review_decision: p.review_decision,
+        watched: watched.includes(p.number),
+      })),
+    };
+  },
+
+  list_prs: async (_args, ctx) => {
+    requireGithub();
+    const { id: projectId, dir } = requireProject(ctx);
+    const prs = unwrapGh(await fetchGhPrList(dir), "list PRs");
+    // keep the panel/Deck cache in sync with what the Conductor just saw
+    useGithub.getState().patchProject(projectId, {
+      repoStatus: "ok",
+      prs,
+      prsFetchedAt: Date.now(),
+      prsError: null,
+    });
+    const watched = useGithub.getState().watched[projectId] ?? [];
+    return {
+      prs: prs.map((p) => ({
+        number: p.number,
+        title: p.title,
+        author: p.author,
+        head: p.head_ref,
+        base: p.base_ref,
+        draft: p.is_draft,
+        mergeable: p.mergeable,
+        review_decision: p.review_decision,
+        checks: p.checks,
+        url: p.url,
+        watched: watched.includes(p.number),
+      })),
+    };
+  },
+
+  read_pr: async (args, ctx) => {
+    requireGithub();
+    const { dir } = requireProject(ctx);
+    const number = requirePrNumber(args.number);
+    const includeDiff = args.include_diff !== false;
+    const detail = unwrapGh(
+      await fetchGhPrView(dir, number, includeDiff),
+      `read PR #${number}`,
+    );
+    return {
+      number: detail.number,
+      title: detail.title,
+      author: detail.author,
+      head: detail.head_ref,
+      base: detail.base_ref,
+      draft: detail.is_draft,
+      mergeable: detail.mergeable,
+      review_decision: detail.review_decision,
+      checks: detail.checks,
+      url: detail.url,
+      body: detail.body,
+      stats: {
+        additions: detail.additions,
+        deletions: detail.deletions,
+        changed_files: detail.changed_files,
+      },
+      files: detail.files,
+      reviews: detail.reviews,
+      ...(includeDiff
+        ? {
+            diff: detail.diff ?? "(diff unavailable)",
+            ...(detail.diff_truncated ? { diff_truncated: true } : {}),
+          }
+        : {}),
+    };
+  },
+
+  create_pr: async (args, ctx) => {
+    requireGithub();
+    guardOutwardGithub(ctx, "open a pull request");
+    const { id: projectId } = requireProject(ctx);
+    const title = String(args.title ?? "").trim();
+    const body = String(args.body ?? "").trim();
+    if (!title) throw new Error("title must not be empty");
+    if (!body) throw new Error("body must not be empty — describe what changed and why");
+    const hasAgent = typeof args.agent === "string" && args.agent.trim();
+    const wantedBranch =
+      typeof args.branch === "string" ? args.branch.trim() : "";
+    if (!!hasAgent === !!wantedBranch)
+      throw new Error('exactly one of "agent" or "branch" is required');
+    // resolve the checkout the PR comes from: the agent's worktree, or the
+    // project worktree carrying the named branch
+    let checkoutDir: string;
+    let branch: string;
+    if (hasAgent) {
+      const entry = requireSession(args.agent, ctx);
+      if (!entry.session.worktree)
+        throw new Error(
+          `agent "${entry.session.name}" works directly in the project folder — a PR comes from a worktree branch (place the agent in one first)`,
+        );
+      checkoutDir = entry.session.projectDir;
+      branch = entry.session.worktree.branch;
+    } else {
+      const { dir } = requireProject(ctx);
+      const scan = await listWorktrees([dir], gitBin());
+      const wt = scan.entries.find((e) => e.branch === wantedBranch && !e.missing);
+      if (!wt)
+        throw new Error(
+          `no worktree on branch "${wantedBranch}" in this project — worktree_status lists the valid branches`,
+        );
+      checkoutDir = wt.path;
+      branch = wt.branch;
+    }
+    const created = unwrapGh(
+      await ghCreatePr({
+        dir: checkoutDir,
+        title,
+        body,
+        base:
+          typeof args.base === "string" && args.base.trim()
+            ? args.base.trim()
+            : undefined,
+        draft: args.draft === true,
+      }),
+      "create PR",
+    );
+    void refreshProjectGithub(projectId, { force: true });
+    return {
+      created: true,
+      url: created.url,
+      branch,
+      note: "the branch was pushed to origin (plain push) and the PR opened — merging stays with the user",
+    };
+  },
+
+  review_pr: async (args, ctx) => {
+    requireGithub();
+    const { dir } = requireProject(ctx);
+    const number = requirePrNumber(args.number);
+    // the PR's refs decide the review target (branch:<base>)
+    const detail = unwrapGh(
+      await fetchGhPrView(dir, number, false),
+      `read PR #${number}`,
+    );
+    // the reviewing session: explicit agent, else the unique agent whose
+    // worktree sits on the PR's head branch
+    let entry: VibeSessionEntry;
+    if (typeof args.agent === "string" && args.agent.trim()) {
+      entry = requireSession(args.agent, ctx);
+    } else {
+      const onBranch = orderedSessions(ctx.projectId).filter(
+        (e) => e.session.worktree?.branch === detail.head_ref,
+      );
+      if (onBranch.length === 0)
+        throw new Error(
+          `no agent of this project works on the PR's head branch "${detail.head_ref}" — spawn/assign one into a worktree on that branch (or read_pr ${number} and judge the diff yourself)`,
+        );
+      if (onBranch.length > 1)
+        throw new Error(
+          `several agents work on "${detail.head_ref}" (${onBranch
+            .map((e) => e.session.name)
+            .join(", ")}) — pass one explicitly as "agent"`,
+        );
+      entry = onBranch[0];
+    }
+    if (entry.session.worktree?.branch !== detail.head_ref)
+      throw new Error(
+        `agent "${entry.session.name}" is not on the PR's head branch "${detail.head_ref}" — the review must run in a checkout of that branch`,
+      );
+    const base = detail.base_ref || "main";
+    // C3: strict Conductor review path — no full-access reuse (Rust gate authoritative)
+    const res = await reviewSession(entry.session.id, `branch:${base}`, {
+      requireWorkspace: true,
+    });
+    const reviewText = res.review ?? "(the review returned no findings text)";
+    const post = args.post === true;
+    // POSTING the review to GitHub is outward-facing — gate it in autonomous
+    // turns (running the review locally to REPORT findings stays allowed)
+    if (post) guardOutwardGithub(ctx, "post a review to");
+    let posted = false;
+    let postError: string | null = null;
+    if (post) {
+      const action =
+        args.action === "approve" || args.action === "request_changes"
+          ? args.action
+          : "comment";
+      try {
+        unwrapGh(
+          await ghReviewPr(
+            dir,
+            number,
+            action,
+            // GitHub caps review bodies — keep the posted text bounded
+            reviewText.length > 60_000
+              ? `${reviewText.slice(0, 60_000)}\n\n…(truncated)`
+              : reviewText,
+          ),
+          "post the review",
+        );
+        posted = true;
+      } catch (e) {
+        postError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    return {
+      number,
+      agent: { id: entry.session.id, name: entry.session.name },
+      target: `branch:${base}`,
+      status: res.status,
+      review: reviewText,
+      posted,
+      ...(postError ? { post_error: postError } : {}),
+    };
+  },
+
+  comment_pr: async (args, ctx) => {
+    requireGithub();
+    guardOutwardGithub(ctx, "comment on a pull request");
+    const { dir } = requireProject(ctx);
+    const number = requirePrNumber(args.number);
+    const body = String(args.body ?? "").trim();
+    if (!body) throw new Error("body must not be empty");
+    const res = unwrapGh(
+      await ghCommentPr(dir, number, body),
+      `comment on PR #${number}`,
+    );
+    return { commented: true, number, ...(res as object) };
+  },
+
+  watch_pr: async (args, ctx) => {
+    requireGithub();
+    const { id: projectId, dir } = requireProject(ctx);
+    const number = requirePrNumber(args.number);
+    if (args.action === "unwatch") {
+      const removed = unwatchPr(projectId, number);
+      return {
+        watching: false,
+        number,
+        note: removed
+          ? `PR #${number} is no longer watched`
+          : `PR #${number} was not watched`,
+      };
+    }
+    // verify the PR exists before promising to watch it
+    const prs = unwrapGh(await fetchGhPrList(dir), "list PRs");
+    if (!prs.some((p) => p.number === number))
+      throw new Error(
+        `PR #${number} is not an open PR of this repo — list_prs shows the valid numbers`,
+      );
+    watchPr(projectId, number);
+    return {
+      watching: true,
+      number,
+      note: "every real change (checks, reviews, draft/ready, close/merge) wakes you with an autonomous [pr update] turn. The watch lasts for this app run — set a timer for follow-ups that must survive a restart.",
+    };
+  },
+
+  // ---- memory ----
+
+  remember: async (args, ctx) => {
     const text = typeof args.text === "string" ? args.text.trim() : "";
     if (!text) throw new Error("nothing to remember: text must not be empty");
+    // scope "project" is the default — it needs the Conductor's project
+    // context; an unscoped (dev-hook) call without an explicit scope falls
+    // back to global instead of erroring
+    const requested =
+      args.scope === "global" || args.scope === "project"
+        ? args.scope
+        : undefined;
+    const scope = requested ?? (ctx.projectId ? "project" : "global");
+    if (scope === "project" && !ctx.projectId)
+      throw new Error(
+        'no project context for scope "project" — use scope "global"',
+      );
     // Rust enforces the caps + FIFO and returns an honest note (e.g. dropped
     // the oldest entry). The remember chip shows in the chat via tool_call/done.
-    const res = await appendMemory(text);
-    return { remembered: text, ...res };
+    const res = await appendMemory(text, scope, ctx.projectId ?? undefined);
+    return { remembered: text, scope, ...res };
   },
 };

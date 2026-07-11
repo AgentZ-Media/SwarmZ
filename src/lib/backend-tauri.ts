@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl as openerOpenUrl } from "@tauri-apps/plugin-opener";
@@ -12,58 +11,20 @@ import { LazyStore } from "@tauri-apps/plugin-store";
 import type {
   AppSettings,
   CodexAccountLimits,
-  CustomCommandsData,
-  DetectedCommand,
-  FolderCommands,
   GitInfo,
-  PersistedGrid,
+  PersistedAutonomyBudgets,
+  PersistedConductorTimers,
   PersistedOrchestratorChats,
+  PersistedProjects,
   PersistedVibeSessions,
-  PersistedWorkspaces,
-  Profile,
   QuickNotesData,
-  SessionUsage,
-  SubscriptionLimits,
   UsageHistoryEntry,
-  UsageTotals,
-  WorkspacePreset,
 } from "@/types";
-import type { Backend, PtyDataEvent, PtyExitEvent } from "./backend-types";
+import type { Backend } from "./backend-types";
 
 const store = new LazyStore("swarmz.json");
 
 export const tauriBackend: Backend = {
-  ptySpawn: (args) => invoke<void>("pty_spawn", args),
-  ptyWrite: (id, data) => invoke<void>("pty_write", { id, data }),
-  ptyResize: (id, cols, rows) => invoke<void>("pty_resize", { id, cols, rows }),
-  ptyKill: (id) => invoke<void>("pty_kill", { id }),
-  ptyHasChildren: async (id) => {
-    try {
-      return await invoke<boolean>("pty_has_children", { id });
-    } catch {
-      return false;
-    }
-  },
-
-  onPtyData: (id: string, cb: (e: PtyDataEvent) => void) =>
-    listen<PtyDataEvent>(`pty://data/${id}`, (ev) => cb(ev.payload)),
-  onPtyExit: (id: string, cb: (e: PtyExitEvent) => void) =>
-    listen<PtyExitEvent>(`pty://exit/${id}`, (ev) => cb(ev.payload)),
-
-  fetchUsageForDir: (cwd, runtime) =>
-    invoke<SessionUsage | null>("usage_for_dir", { cwd, runtime }),
-  fetchUsageForSession: (cwd, sinceMs, sessionId, excludeSessionIds, runtime) =>
-    invoke<SessionUsage | null>("usage_for_session", {
-      cwd,
-      since: sinceMs,
-      session: sessionId,
-      exclude: excludeSessionIds,
-      runtime,
-    }),
-  fetchUsageTotals: () => invoke<UsageTotals>("usage_totals"),
-  onUsageChanged: (cb) =>
-    listen<string[]>("usage://changed", (ev) => cb(ev.payload)),
-
   pickDirectory: async () => {
     const sel = await openDialog({ directory: true, multiple: false });
     return typeof sel === "string" ? sel : undefined;
@@ -81,53 +42,6 @@ export const tauriBackend: Backend = {
   },
   notify: async (title, body) => {
     sendNotification({ title, body });
-  },
-
-  detectProjectCommands: async (cwd) => {
-    try {
-      return await invoke<DetectedCommand[]>("project_commands", { cwd });
-    } catch {
-      return [];
-    }
-  },
-
-  loadProfiles: async () => {
-    try {
-      return (await store.get<Profile[]>("profiles")) ?? null;
-    } catch {
-      return null;
-    }
-  },
-  saveProfiles: async (profiles) => {
-    await store.set("profiles", profiles);
-    await store.save();
-  },
-
-  loadCommandPresets: async () => {
-    try {
-      return (
-        (await store.get<Record<string, FolderCommands>>("commandPresets")) ??
-        null
-      );
-    } catch {
-      return null;
-    }
-  },
-  saveCommandPresets: async (presets) => {
-    await store.set("commandPresets", presets);
-    await store.save();
-  },
-
-  loadCustomCommands: async () => {
-    try {
-      return (await store.get<CustomCommandsData>("customCommands")) ?? null;
-    } catch {
-      return null;
-    }
-  },
-  saveCustomCommands: async (data) => {
-    await store.set("customCommands", data);
-    await store.save();
   },
 
   loadQuickNotes: async () => {
@@ -169,6 +83,56 @@ export const tauriBackend: Backend = {
     await store.save();
   },
 
+  loadProjects: async () => {
+    try {
+      return (await store.get<PersistedProjects>("projects")) ?? null;
+    } catch {
+      return null;
+    }
+  },
+  saveProjects: async (data) => {
+    await store.set("projects", data);
+    await store.save();
+  },
+
+  loadAutonomyBudgets: async () => {
+    // a store READ ERROR must THROW (like loadConductorTimers) — swallowing it
+    // would make "unreadable" look like "fresh install" and silently un-latch
+    // a tripped breaker / mint a fresh allowance after a corrupt store. The
+    // hydrate distinguishes the throw (fail closed — pause autonomy) from a
+    // genuinely missing key (null = fresh, no restriction).
+    return (
+      (await store.get<PersistedAutonomyBudgets>("autonomyBudgets")) ?? null
+    );
+  },
+  saveAutonomyBudgets: async (data) => {
+    await store.set("autonomyBudgets", data);
+    await store.save();
+  },
+
+  loadConductorTimers: async () => {
+    // a store READ ERROR must throw (the hydrate keeps its in-memory state
+    // and persists nothing then) — only a genuinely missing key is null.
+    // Swallowing the error here would make "unreadable" look like "fresh
+    // install" and let the hydrate persist every timer away.
+    return (
+      (await store.get<PersistedConductorTimers>("conductorTimers")) ?? null
+    );
+  },
+  saveConductorTimers: async (data) => {
+    await store.set("conductorTimers", data);
+    await store.save();
+  },
+
+  deleteStoreKeys: async (keys) => {
+    let changed = false;
+    for (const key of keys) {
+      // delete() resolves true only when the key existed
+      if (await store.delete(key)) changed = true;
+    }
+    if (changed) await store.save();
+  },
+
   loadUsageHistory: async () => {
     try {
       return (await store.get<UsageHistoryEntry[]>("usageHistory")) ?? null;
@@ -193,44 +157,17 @@ export const tauriBackend: Backend = {
     await store.save();
   },
 
-  loadWorkspaces: async () => {
+  loadSchemaVersion: async () => {
     try {
-      return (await store.get<PersistedWorkspaces>("workspaces")) ?? null;
+      return (await store.get<number>("schemaVersion")) ?? null;
     } catch {
       return null;
     }
   },
-  saveWorkspaces: async (ws) => {
-    await store.set("workspaces", ws);
+  saveSchemaVersion: async (version) => {
+    await store.set("schemaVersion", version);
     await store.save();
   },
-
-  loadGrid: async () => {
-    try {
-      return (await store.get<PersistedGrid>("grid")) ?? null;
-    } catch {
-      return null;
-    }
-  },
-  saveGrid: async (grid) => {
-    await store.set("grid", grid);
-    await store.save();
-  },
-
-  loadWorkspacePresets: async () => {
-    try {
-      return (await store.get<WorkspacePreset[]>("workspacePresets")) ?? null;
-    } catch {
-      return null;
-    }
-  },
-  saveWorkspacePresets: async (presets) => {
-    await store.set("workspacePresets", presets);
-    await store.save();
-  },
-
-  fetchSubscriptionLimits: () =>
-    invoke<SubscriptionLimits | null>("subscription_limits"),
 
   fetchCodexAccountLimits: () =>
     invoke<CodexAccountLimits>("codex_account_limits"),

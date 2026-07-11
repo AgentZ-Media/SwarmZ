@@ -1,9 +1,14 @@
-// Orchestrator tool registry (Phase 2) — the SINGLE source of truth for the
-// tool catalog: names, LLM-facing descriptions, JSON-Schema parameters and
-// per-tool timeouts. Phase 3 hands `tool_definitions()` to the Codex
-// app-server as `dynamicTools`; Phase 6 hands the same list to an OpenRouter
-// tool loop. The frontend mirrors the NAMES only (executor lookup) — schemas
-// live here and nowhere else.
+// Orchestrator tool registry — the SINGLE source of truth for the tool
+// catalog: names, LLM-facing descriptions, JSON-Schema parameters and
+// per-tool timeouts. The catalog is handed to the Codex app-server as
+// `dynamicTools`. The frontend mirrors the NAMES only (executor lookup) —
+// schemas live here and nowhere else.
+//
+// Phase 4 "tool arsenal v2": the Conductor is a fully capable engineering
+// lead now — agents (spawn/prompt-with-steer/interrupt/close/configure/
+// review), worktrees, timers, approval routing (routine decisions),
+// plan documents. Every tool stays SESSION-only and project-scoped through
+// the chat_id → project_id line the bus carries.
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -11,9 +16,30 @@ use serde_json::{json, Value};
 /// Default roundtrip budget: the webview executors are store lookups plus at
 /// most one sensing command — anything slower is a bug.
 pub const DEFAULT_TIMEOUT_MS: u64 = 15_000;
-/// `create_panes` may create git worktrees (subprocesses + env-file copies)
-/// and waits for agent CLIs to boot before delivering startup prompts.
-const CREATE_PANES_TIMEOUT_MS: u64 = 120_000;
+/// `spawn_agents` creates worktrees (a full checkout each) and spawns codex
+/// app-server processes (one per agent) plus initial prompts — an 8-agent
+/// batch on a big repo can legitimately take minutes. The bus timeout does
+/// NOT cancel the webview executor, so a timeout mid-batch would leave the
+/// batch running while the model retries into duplicate agents; the generous
+/// deadline (plus the batch's case-insensitive name reservation) is what
+/// keeps that from happening.
+const SPAWN_AGENTS_TIMEOUT_MS: u64 = 600_000;
+/// Worktree creation checks out a whole tree and copies the environment.
+const WORKTREE_TIMEOUT_MS: u64 = 150_000;
+/// `review_agent` runs a full detached codex review turn.
+const REVIEW_TIMEOUT_MS: u64 = 600_000;
+/// `prompt_agent` may steer a running turn (an extra app-server roundtrip).
+const PROMPT_TIMEOUT_MS: u64 = 30_000;
+/// GitHub reads go over the network (`gh` → GitHub API). Must OUTLAST the
+/// executor's worst case (`github_status` chains auth + repo + PR list ≈
+/// 3 × the 30 s gh subprocess deadline; `read_pr` runs view + diff) — the bus
+/// timeout can't cancel the webview executor, only orphan it.
+const GITHUB_TIMEOUT_MS: u64 = 90_000;
+/// `create_pr` pushes the branch first (a possibly large upload): worktree
+/// resolve + repo info (30 s) + push (120 s) + gh pr create (120 s) headroom.
+const CREATE_PR_TIMEOUT_MS: u64 = 300_000;
+/// `review_pr` runs a whole detached codex review before (optionally) posting.
+const REVIEW_PR_TIMEOUT_MS: u64 = 600_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolDefinition {
@@ -28,37 +54,42 @@ fn empty_params() -> Value {
     json!({ "type": "object", "properties": {} })
 }
 
-/// The V1 tool catalog. Built fresh per call (it serializes straight into
+/// Schema fragment for the `agent` argument (used by every per-agent tool).
+fn agent_param() -> Value {
+    json!({ "type": "string", "description": "agent session id, or the agent's unique name within this project (from fleet_snapshot)" })
+}
+
+/// The tool catalog. Built fresh per call (it serializes straight into
 /// provider payloads); callers cache if they need to.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
+        // ---- sensing ----
         ToolDefinition {
             name: "fleet_snapshot",
-            description: "Current state of the whole fleet: every workspace with its agent panes (runtime, project, branch, busy/idle/waiting activity, model, context usage), a `sessions` section listing the native Vibe-Mode Codex sessions (exact status working/idle/pending-approval), `ui_mode` (\"grid\" or \"vibe\" — the view the user is currently in) and a one-line summary. Cheap — call this first to orient yourself and to learn valid pane and session ids.",
+            description: "Current state of YOUR project's fleet: every agent (name, model, access, exact status working/idle/pending-approval, context usage, worktree), the project's worktrees (who works where, shared or not), your active timers, and the pending-approval situation incl. each approval's routing class (routine = you may decide, destructive = human only). Cheap — call this first to orient yourself and to learn valid agent names/ids.",
             parameters: empty_params(),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
         ToolDefinition {
-            name: "read_transcript",
-            description: "Read the conversation tail of one agent pane's session OR one native Vibe session: user/assistant messages, one-line tool summaries, compaction summaries, and optionally the session's first user prompt. For a native session id it renders the structured steps ($ command → exit N, file changes +N −M, approvals, plan). Fails for shell panes and panes whose session has not been discovered yet.",
+            name: "read_agent",
+            description: "Read the conversation tail of one agent in this project: user/assistant messages and the structured steps ($ command → exit N, file changes +N −M, approvals, plan).",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "agent pane id or native session id (from fleet_snapshot)" },
-                    "tail_messages": { "type": "integer", "description": "return only the last N messages (default 20)" },
-                    "include_first_user_message": { "type": "boolean", "description": "also return the session's original first user prompt (default true)" }
+                    "agent": agent_param(),
+                    "tail_messages": { "type": "integer", "description": "return only the last N items (default: 20)" }
                 },
-                "required": ["pane_id"]
+                "required": ["agent"]
             }),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
         ToolDefinition {
             name: "read_project_docs",
-            description: "README.md / AGENTS.md / CLAUDE.md of a project root, content capped. Pass EXACTLY ONE of pane_id (a pane's project root — worktree panes resolve to their main repo — OR a native Vibe session id, whose project folder is read) or path (an absolute folder).",
+            description: "README.md / AGENTS.md / CLAUDE.md of a project root, content capped. Pass EXACTLY ONE of agent (an agent id/name — its working root is read; worktree paths resolve to their main repo) or path (an absolute folder).",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "agent pane id OR native session id — reads the docs of that pane/session's project root" },
+                    "agent": agent_param(),
                     "path": { "type": "string", "description": "absolute path of a project folder" }
                 }
             }),
@@ -72,19 +103,19 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "git_status",
-            description: "Cached git snapshot of one pane's working directory: branch, inserted/deleted lines, untracked files, derived dirty flag. Returns git: null with a note when the folder is not a git repo (or not polled yet).",
+            description: "Live git snapshot of an agent's working directory (or any absolute path — worktrees included): branch, inserted/deleted lines, untracked files, derived dirty flag. Pass EXACTLY ONE of agent or path. Returns git: null with a note when the folder is not a git repo.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "agent pane id (from fleet_snapshot)" }
-                },
-                "required": ["pane_id"]
+                    "agent": agent_param(),
+                    "path": { "type": "string", "description": "absolute path of a folder" }
+                }
             }),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
         ToolDefinition {
             name: "list_projects",
-            description: "Discover the user's project folders: Claude/Codex session history, folders the app already knows, and a shallow scan of extra roots for git repos. When scan_roots is omitted, the user's configured default scan folders are used. Sorted by last activity, most recent first.",
+            description: "Discover the user's project folders: Codex session history, folders the app already knows, and a shallow scan of extra roots for git repos. When scan_roots is omitted, the user's configured default scan folders are used. Sorted by last activity, most recent first.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -97,89 +128,321 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
+        // ---- agents ----
         ToolDefinition {
-            name: "list_blueprints",
-            description: "Reusable launch blueprints: agent profiles (id, name, runtime, startup command, default folder), workspace presets (id, name, pane templates), plus per-runtime info: the default startup command and recently used model ids (from real usage on this machine — directly usable as create_panes model). Use profile ids / preset shapes / model ids when creating panes.",
-            parameters: empty_params(),
-            timeout_ms: DEFAULT_TIMEOUT_MS,
-        },
-        ToolDefinition {
-            name: "prompt_pane",
-            description: "Send a prompt to an agent pane OR a native Vibe session (accepts either id — panes are checked first, then sessions). For a pane: bracketed-paste the text into its terminal and optionally submit with Enter (a busy pane still receives the text — it queues in the CLI's input — and the response carries a warning). For a native session: submit one turn to it; a busy session refuses (wait for it to finish).",
+            name: "spawn_agents",
+            description: "Bring in 1–8 new agents for this project. Each entry: a task (submitted as the agent's first order — write it self-contained), a worktree placement (\"new\" = a fresh git worktree on an own branch, \"shared:<agentName>\" = work in an EXISTING agent's worktree, \"none\" = directly in the project folder — for read/analysis tasks), and optional model/effort/access/name overrides. Names are picked automatically (collision-free); the result returns each agent's name, id and worktree path. Per-entry errors do not abort the batch.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string", "description": "agent pane id or native session id (from fleet_snapshot)" },
-                    "text": { "type": "string", "description": "the prompt/command text to deliver" },
-                    "submit": { "type": "boolean", "description": "press Enter after pasting (default true)" }
-                },
-                "required": ["pane_id", "text"]
-            }),
-            timeout_ms: DEFAULT_TIMEOUT_MS,
-        },
-        ToolDefinition {
-            name: "create_panes",
-            description: "Create 1–8 new agents in a workspace. Each entry gets a working directory, optionally a runtime or profile, a model override (omit = the user's default configuration), a name, an initial prompt (delivered once the agent is ready), and optionally a fresh git worktree (own branch + folder under <repo>/.worktrees/). New panes are laid out with EQUAL sizes (the system owns the geometry — no manual sizing) and the system OVERFLOWS into a fresh workspace automatically if the target can't hold them above a readable minimum (~380×240 px), so you never have to compute whether panes fit. Use `workspace` to target a workspace, `arrangement` to shape the new panes, and per-pane `beside` for contextual placement next to an existing pane; consult fleet_snapshot's layout section (grid size + effective pane px) first. Set native:true to create a native Vibe-Mode Codex session instead of a terminal pane (prefer this when the user works in Vibe Mode / ui_mode is \"vibe\"); native sessions ignore runtime/profile/worktree AND all layout params (workspace/arrangement/beside). A worktree request on a non-repo folder FAILS for that pane — it is never silently downgraded to a plain pane. Per-entry errors do not abort the batch.",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "workspace": { "type": "string", "description": "where the new terminal panes go: \"current\" (default), \"new\" (a fresh workspace), or the NAME of an existing workspace (case-insensitive; unknown name → error). Ignored for native sessions" },
-                    "workspace_id": { "type": "string", "description": "legacy id-based target (used only when `workspace` is omitted; default: the active workspace). Prefer `workspace`. Ignored for native sessions" },
-                    "arrangement": { "type": "string", "enum": ["auto", "rows", "columns", "grid"], "description": "how to arrange the NEW panes among themselves: \"auto\" (default — tiles by count and screen shape), \"rows\" (stacked), \"columns\" (side by side), \"grid\". Existing panes keep their layout. Ignored for native sessions and for panes with `beside`" },
-                    "panes": {
+                    "agents": {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 8,
                         "items": {
                             "type": "object",
                             "properties": {
-                                "cwd": { "type": "string", "description": "absolute working directory for the pane / native session" },
-                                "native": { "type": "boolean", "description": "create a native Vibe-Mode Codex session instead of a terminal pane. Native sessions have structured transcripts and an exact status, and prompt_pane can prompt them directly by id. runtime/profile/worktree/branch and all layout params do NOT apply to native sessions (V1); cwd, model, reasoning, name and prompt do" },
-                                "runtime": { "type": "string", "enum": ["claude", "codex", "shell"], "description": "agent CLI to launch (default: the app's default runtime). Ignored when native:true (always codex)" },
-                                "profile_id": { "type": "string", "description": "launch profile id (from list_blueprints) — sets runtime + startup command. Ignored when native:true" },
-                                "model": { "type": "string", "description": "model id for the agent (claude: --model, codex: -m; native: the session model). Use ids from list_blueprints runtimes.*.recently_used_models when the user names a model; OMIT for the user's default configuration" },
-                                "reasoning": { "type": "string", "enum": ["minimal", "low", "medium", "high", "xhigh"], "description": "codex only: model_reasoning_effort — omit unless the user asks for it" },
-                                "name": { "type": "string", "description": "pane / session name (default: auto)" },
-                                "prompt": { "type": "string", "description": "initial prompt, submitted once the agent is ready" },
-                                "worktree": { "type": "boolean", "description": "create a fresh git worktree off the repo at cwd and run the pane inside it. NOT applicable to native sessions (V1)" },
-                                "branch": { "type": "string", "description": "worktree branch name (default: a generated one)" },
-                                "beside": {
-                                    "type": "object",
-                                    "description": "place this pane next to an existing one (a targeted split; ignores workspace/arrangement distribution and lands in the target pane's workspace). Not applicable to native sessions",
-                                    "properties": {
-                                        "pane_id": { "type": "string", "description": "id of the existing pane to split off (from fleet_snapshot)" },
-                                        "direction": { "type": "string", "enum": ["right", "below"], "description": "which side of the target pane (default: right)" }
-                                    },
-                                    "required": ["pane_id"]
-                                }
+                                "task": { "type": "string", "description": "the agent's first order — self-contained: context + goal + boundaries" },
+                                "worktree": { "type": "string", "description": "\"new\" | \"shared:<agentName>\" | \"none\" — where the agent works" },
+                                "model": { "type": "string", "description": "codex model id; OMIT for the default (gpt-5.6-sol)" },
+                                "effort": { "type": "string", "description": "reasoning effort (e.g. low, medium, high, xhigh); OMIT for medium" },
+                                // SECURITY (audit R1): "full" (danger-full-access, approvals off)
+                                // is deliberately NOT model-callable — only the human can grant
+                                // it via the session's access toggle. The bus validates against
+                                // this enum server-side, so a Conductor call asking for "full"
+                                // is refused before any session starts.
+                                "access": { "type": "string", "enum": ["workspace"], "description": "sandbox level — always the workspace sandbox; full access can only be granted by the human in the UI" },
+                                "name": { "type": "string", "description": "agent name (default: auto from the pool)" },
+                                "expect_report": { "type": "boolean", "description": "true = the agent must end its task turn with a machine-readable status report (done, summary, files_changed, tests_pass, needs_human, question, followups) — set it for implementation tasks whose completion you will judge; the report reaches you with the agent-finished notice" }
                             },
-                            "required": ["cwd"]
+                            "required": ["task", "worktree"]
                         }
                     }
                 },
-                "required": ["panes"]
+                "required": ["agents"]
             }),
-            timeout_ms: CREATE_PANES_TIMEOUT_MS,
+            timeout_ms: SPAWN_AGENTS_TIMEOUT_MS,
         },
         ToolDefinition {
-            name: "create_workspace",
-            description: "Create a new (empty) workspace tab. Returns its id — use it as workspace_id in create_panes.",
+            name: "prompt_agent",
+            description: "Send a prompt to an agent in this project. An idle agent gets it as its next turn; a BUSY agent is STEERED — the text is injected into its running turn and absorbed immediately (use this to correct course mid-flight). The result says which of the two happened.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "tab name (default: auto-numbered / named after the first project)" },
-                    "default_cwd": { "type": "string", "description": "default working directory prefilled for new panes in this workspace" }
-                }
+                    "agent": agent_param(),
+                    "text": { "type": "string", "description": "the prompt text to deliver" },
+                    "expect_report": { "type": "boolean", "description": "true = the agent must end this turn with a machine-readable status report (see spawn_agents). Applies only when the prompt starts a FRESH turn — a steered (busy) agent keeps its running turn's format" }
+                },
+                "required": ["agent", "text"]
+            }),
+            timeout_ms: PROMPT_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "interrupt_agent",
+            description: "Stop an agent's running turn (its turn resolves as interrupted; the agent keeps its context and can be re-prompted).",
+            parameters: json!({
+                "type": "object",
+                "properties": { "agent": agent_param() },
+                "required": ["agent"]
             }),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
         ToolDefinition {
-            name: "remember",
-            description: "Add one durable, user-relevant fact to your persistent memory (a small curated list injected into every future session). Store ONLY things worth keeping across sessions: stable user preferences, corrections you were given, model choices per task type, recurring workflows, and project facts that are NOT written in the repo. Do NOT store ephemeral fleet state (that lives in fleet_snapshot), repo documentation (use read_project_docs), secrets, or whole transcripts. If you are unsure whether a fact is worth remembering, do not call this — propose it to the user first and only store it after they confirm. The memory is capped; when it is full the oldest entry is dropped and the result says so.",
+            name: "close_agent",
+            description: "Close an agent session for good: its running turn is interrupted, pending approvals are cancelled and the session disappears from the fleet. Its worktree stays (clean it separately via cleanup_worktree when the work is merged or discarded).",
+            parameters: json!({
+                "type": "object",
+                "properties": { "agent": agent_param() },
+                "required": ["agent"]
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "set_agent_config",
+            description: "Retune an agent mid-session: model, reasoning effort and/or access level. Takes effect from the agent's next turn. Pass only the fields to change; an empty string clears model/effort back to the default.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "text": { "type": "string", "description": "the single fact to remember, as one concise sentence" }
+                    "agent": agent_param(),
+                    "model": { "type": "string", "description": "codex model id (\"\" clears the override)" },
+                    "effort": { "type": "string", "description": "reasoning effort (\"\" clears the override)" },
+                    // SECURITY (audit R1): no "full" here either — see spawn_agents.
+                    // The Conductor may re-confine an agent to workspace, never widen it.
+                    "access": { "type": "string", "enum": ["workspace"], "description": "sandbox level — always the workspace sandbox; full access can only be granted by the human in the UI" }
+                },
+                "required": ["agent"]
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "review_agent",
+            description: "Run a native codex code review over an agent's work (a detached review thread — the agent itself is not disturbed). target: \"uncommitted\" (default — the agent's working tree) | \"branch:<base>\" (diff against a base branch) | \"commit:<sha>\". Returns the structured review report (prioritized findings with file:line references). Use it before reporting an agent's work as done.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "agent": agent_param(),
+                    "target": { "type": "string", "description": "\"uncommitted\" (default) | \"branch:<base>\" | \"commit:<sha>\"" }
+                },
+                "required": ["agent"]
+            }),
+            timeout_ms: REVIEW_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "decide_approval",
+            description: "Decide one of an agent's PENDING approvals (a command or file change waiting for permission). Only approvals classified \"routine\" may be decided here — \"destructive\" ones are hard-reserved for the human and this tool refuses them. decision: accept | decline. Omit approval_id to decide the agent's oldest pending approval.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "agent": agent_param(),
+                    "decision": { "type": "string", "enum": ["accept", "decline"] },
+                    "approval_id": { "type": "string", "description": "a specific approval id (from fleet_snapshot) — omit for the oldest pending" }
+                },
+                "required": ["agent", "decision"]
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        // ---- worktrees ----
+        ToolDefinition {
+            name: "create_worktree",
+            description: "Create a fresh git worktree of this project under <repo>/.worktrees/ on a new branch (environment files like .env are copied over). Returns root, path and branch. Assign it to an agent with assign_worktree, or spawn directly into a new worktree via spawn_agents worktree:\"new\".",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "branch": { "type": "string", "description": "branch name — omit for an auto-generated swarm/<slug> name" }
+                }
+            }),
+            timeout_ms: WORKTREE_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "assign_worktree",
+            description: "Move an agent into a worktree: the agent's working directory switches to the worktree path from its next turn on. Multiple agents may share one worktree — one WRITER at a time is the rule; the fleet marks it shared.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "agent": agent_param(),
+                    "path": { "type": "string", "description": "absolute worktree path (from create_worktree / worktree_status)" }
+                },
+                "required": ["agent", "path"]
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "worktree_status",
+            description: "All worktrees of this project with live state: path, branch, dirty (uncommitted changes), ahead (commits only this branch holds), and which agents work in each.",
+            parameters: empty_params(),
+            timeout_ms: WORKTREE_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "cleanup_worktree",
+            description: "Remove one worktree (folder + branch) — SAFE-GATED: the state is re-checked at execution time and the removal is refused when the worktree holds uncommitted changes or commits no other branch has, or when an agent still works in it. A refused cleanup returns the reason — merge/commit the work first or ask the user.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "absolute worktree path" }
+                },
+                "required": ["path"]
+            }),
+            timeout_ms: WORKTREE_TIMEOUT_MS,
+        },
+        // ---- timers ----
+        ToolDefinition {
+            name: "set_timer",
+            description: "Set yourself a follow-up timer for this project. When it fires, YOU get an autonomous turn with the note as context — use it to check on agents, nudge stalled work, or follow up on promises. Pass exactly one of delay_seconds or at_iso. Timers persist across app restarts; missed ones fire at the next launch.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "delay_seconds": { "type": "integer", "description": "fire after N seconds from now" },
+                    "at_iso": { "type": "string", "description": "fire at an absolute time (ISO 8601, e.g. 2026-07-10T18:30:00)" },
+                    "note": { "type": "string", "description": "what to do when the timer fires — written to future-you" }
+                },
+                "required": ["note"]
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "list_timers",
+            description: "Your pending timers for this project: id, note, fire time, remaining seconds.",
+            parameters: empty_params(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "cancel_timer",
+            description: "Cancel one of your pending timers by id (from list_timers).",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "timer_id": { "type": "string" }
+                },
+                "required": ["timer_id"]
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        // ---- plans ----
+        ToolDefinition {
+            name: "write_plan",
+            description: "Write one of YOUR OWN plan/analysis documents (Markdown) into this project's dedicated plans area (<project>/.swarmz/plans/<slug>.md) — the ONLY place you may write files. Use it for decompositions, architecture notes, task briefs agents should read (point them at the returned path). Same title = the document is replaced.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "document title — becomes the file slug" },
+                    "markdown": { "type": "string", "description": "the full document content (Markdown)" }
+                },
+                "required": ["title", "markdown"]
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "list_plans",
+            description: "Your plan documents in this project's plans area: slug, title, last modified, size.",
+            parameters: empty_params(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "read_plan",
+            description: "Read one of your plan documents by slug (from list_plans).",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string" }
+                },
+                "required": ["slug"]
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        // ---- github (Phase 7 — usable only while the user's GitHub
+        //      integration toggle is ON; executors refuse otherwise) ----
+        ToolDefinition {
+            name: "github_status",
+            description: "GitHub situation of this project: whether the user's GitHub integration is enabled, gh auth state (account), the project's GitHub repo (owner/name, default branch) and the open-PR count. Always answers — when the integration is disabled it says so; every other github tool refuses then. Call this first before any GitHub work.",
+            parameters: empty_params(),
+            timeout_ms: GITHUB_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "list_prs",
+            description: "Open pull requests of this project's GitHub repo: number, title, author, head/base branch, draft state, mergeable, review decision and a CI checks summary (passing/failing/pending). Requires the GitHub integration to be enabled.",
+            parameters: empty_params(),
+            timeout_ms: GITHUB_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "read_pr",
+            description: "One pull request in detail: description, reviews, changed files, CI checks, and (by default) the unified diff — capped for large PRs. Requires the GitHub integration to be enabled.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "number": { "type": "integer", "description": "PR number (from list_prs)" },
+                    "include_diff": { "type": "boolean", "description": "include the unified diff (default true) — pass false for a cheap metadata-only read" }
+                },
+                "required": ["number"]
+            }),
+            timeout_ms: GITHUB_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "create_pr",
+            description: "OUTWARD-FACING: push an agent's worktree branch to origin (plain push, never force, never the default branch) and open a pull request from it. Use it ONLY on the user's explicit order or their standing instruction for this goal. Pass exactly one of agent (the branch of that agent's worktree) or branch (a worktree branch of this project). Requires the GitHub integration to be enabled.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "agent": agent_param(),
+                    "branch": { "type": "string", "description": "a worktree branch of this project (alternative to agent)" },
+                    "title": { "type": "string", "description": "PR title" },
+                    "body": { "type": "string", "description": "PR description (Markdown) — say what changed and why" },
+                    "base": { "type": "string", "description": "base branch — omit for the repo default" },
+                    "draft": { "type": "boolean", "description": "open as a draft PR (default false)" }
+                },
+                "required": ["title", "body"]
+            }),
+            timeout_ms: CREATE_PR_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "review_pr",
+            description: "Run the native codex review machinery over a pull request's changes: the PR's head branch must be checked out in one of this project's worktrees (pass that agent, or it is found by branch); the detached review diffs it against the PR's base and returns prioritized findings. Set post:true to also submit the findings to GitHub as a PR review (outward-facing — only on the user's order or standing instruction). Requires the GitHub integration to be enabled.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "number": { "type": "integer", "description": "PR number (from list_prs)" },
+                    "agent": agent_param(),
+                    "post": { "type": "boolean", "description": "also submit the review to GitHub (default false — findings only reach you)" },
+                    "action": { "type": "string", "enum": ["comment", "approve", "request_changes"], "description": "review verdict when posting (default comment)" }
+                },
+                "required": ["number"]
+            }),
+            timeout_ms: REVIEW_PR_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "comment_pr",
+            description: "OUTWARD-FACING: post a comment on a pull request (visible to everyone on GitHub). Use it only on the user's explicit order or their standing instruction. Requires the GitHub integration to be enabled.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "number": { "type": "integer", "description": "PR number (from list_prs)" },
+                    "body": { "type": "string", "description": "the comment (Markdown)" }
+                },
+                "required": ["number", "body"]
+            }),
+            timeout_ms: GITHUB_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "watch_pr",
+            description: "Watch a pull request: while the app runs, every real change (checks turning green/red, review decisions, ready/draft flips, close/merge) wakes you with an autonomous [pr update] turn. action \"unwatch\" stops it. Watches last for the current app run — set a timer for follow-ups that must survive a restart. Requires the GitHub integration to be enabled.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "number": { "type": "integer", "description": "PR number (from list_prs)" },
+                    "action": { "type": "string", "enum": ["watch", "unwatch"], "description": "omit for \"watch\"" }
+                },
+                "required": ["number"]
+            }),
+            timeout_ms: GITHUB_TIMEOUT_MS,
+        },
+        // ---- memory ----
+        ToolDefinition {
+            name: "remember",
+            description: "Add one durable, user-relevant fact to your persistent memory (small curated lists injected into every future session). Scope \"project\" (the default) stores it for THIS project only; scope \"global\" stores it for every project — use global only for cross-project user preferences. Store things worth keeping across sessions: stable user preferences, corrections you were given, model choices per task type, recurring workflows, observed working style, and project facts that are NOT written in the repo. Do NOT store ephemeral fleet state (that lives in fleet_snapshot), repo documentation (use read_project_docs), secrets, or whole transcripts. Preference OBSERVATIONS you are confident about may be stored proactively; uncertain FACTS you propose to the user first and store after they confirm. Each memory is capped; when it is full the oldest entry is dropped and the result says so.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "the single fact to remember, as one concise sentence" },
+                    "scope": { "type": "string", "enum": ["project", "global"], "description": "where to store it — omit for \"project\" (this project)" }
                 },
                 "required": ["text"]
             }),
@@ -280,27 +543,98 @@ pub fn validate_args(def: &ToolDefinition, args: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// The frozen Phase-4 catalog + the Phase-7 GitHub tools — a missing or
+    /// extra tool fails loudly.
+    pub const EXPECTED_TOOLS: [&str; 30] = [
+        "fleet_snapshot",
+        "read_agent",
+        "read_project_docs",
+        "read_notes",
+        "git_status",
+        "list_projects",
+        "spawn_agents",
+        "prompt_agent",
+        "interrupt_agent",
+        "close_agent",
+        "set_agent_config",
+        "review_agent",
+        "decide_approval",
+        "create_worktree",
+        "assign_worktree",
+        "worktree_status",
+        "cleanup_worktree",
+        "set_timer",
+        "list_timers",
+        "cancel_timer",
+        "write_plan",
+        "list_plans",
+        "read_plan",
+        "github_status",
+        "list_prs",
+        "read_pr",
+        "create_pr",
+        "review_pr",
+        "comment_pr",
+        "watch_pr",
+    ];
+
+    /// Audit R1 (frozen): the Conductor can NEVER request full access.
+    /// "full" is absent from every model-callable schema, and the Rust-side
+    /// bus validation (`validate_args`, enum check in `run_tool_via`)
+    /// hard-refuses it BEFORE any session starts or reconfigures. Full
+    /// access remains a human-only UI action (`vibe_session_set_access`).
     #[test]
-    fn catalog_has_all_eleven_tools_and_serializes() {
+    fn conductor_cannot_request_full_access() {
+        let spawn = find_tool("spawn_agents").unwrap();
+        assert_eq!(
+            spawn.parameters["properties"]["agents"]["items"]["properties"]["access"]["enum"],
+            json!(["workspace"]),
+            "spawn_agents access enum must be workspace-only"
+        );
+        let config = find_tool("set_agent_config").unwrap();
+        assert_eq!(
+            config.parameters["properties"]["access"]["enum"],
+            json!(["workspace"]),
+            "set_agent_config access enum must be workspace-only"
+        );
+        // the bus-side validation refuses "full" outright…
+        let err = validate_args(
+            &spawn,
+            &json!({ "agents": [{ "task": "x", "worktree": "none", "access": "full" }] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+        let err = validate_args(&config, &json!({ "agent": "maya", "access": "full" })).unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+        // …while "workspace" (and omitting access) keeps working
+        assert!(validate_args(
+            &spawn,
+            &json!({ "agents": [{ "task": "x", "worktree": "none", "access": "workspace" }] })
+        )
+        .is_ok());
+        assert!(validate_args(&config, &json!({ "agent": "maya", "access": "workspace" })).is_ok());
+        // no other tool sneaks in an access enum carrying "full"
+        for def in tool_definitions() {
+            let s = serde_json::to_string(&def.parameters).unwrap();
+            assert!(
+                !s.contains(r#""enum":["workspace","full"]"#)
+                    && !s.contains(r#""enum": ["workspace", "full"]"#),
+                "tool {} still offers full access",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_is_the_frozen_phase7_arsenal_and_serializes() {
         let defs = tool_definitions();
         let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
-        for expected in [
-            "fleet_snapshot",
-            "read_transcript",
-            "read_project_docs",
-            "read_notes",
-            "git_status",
-            "list_projects",
-            "list_blueprints",
-            "prompt_pane",
-            "create_panes",
-            "create_workspace",
-            "remember",
-        ] {
+        for expected in EXPECTED_TOOLS {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
-        assert_eq!(defs.len(), 11);
-        // serializable — this exact shape is handed to Codex dynamicTools later
+        assert!(names.contains(&"remember"));
+        assert_eq!(defs.len(), EXPECTED_TOOLS.len() + 1, "unexpected tool count");
+        // serializable — this exact shape is handed to Codex dynamicTools
         let json = serde_json::to_value(&defs).expect("serialize");
         for def in json.as_array().unwrap() {
             assert!(def["name"].is_string());
@@ -311,116 +645,169 @@ mod tests {
     }
 
     #[test]
-    fn remember_requires_text() {
+    fn pane_era_tool_names_are_gone() {
+        for legacy in ["create_panes", "prompt_pane", "read_transcript"] {
+            assert!(find_tool(legacy).is_none(), "legacy tool {legacy} still present");
+        }
+    }
+
+    #[test]
+    fn remember_requires_text_and_validates_scope() {
         let def = find_tool("remember").unwrap();
         let err = validate_args(&def, &json!({})).unwrap_err();
         assert!(err.contains("text"), "unexpected error: {err}");
-        assert!(validate_args(&def, &json!({ "text": "reviews go to Opus" })).is_ok());
+        assert!(validate_args(&def, &json!({ "text": "reviews get high effort" })).is_ok());
+        assert!(validate_args(&def, &json!({ "text": "x", "scope": "global" })).is_ok());
+        assert!(validate_args(&def, &json!({ "text": "x", "scope": "project" })).is_ok());
+        let err = validate_args(&def, &json!({ "text": "x", "scope": "everywhere" })).unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
     }
 
     #[test]
     fn required_args_are_enforced() {
-        let def = find_tool("prompt_pane").unwrap();
-        let err = validate_args(&def, &json!({ "pane_id": "abc" })).unwrap_err();
+        let def = find_tool("prompt_agent").unwrap();
+        let err = validate_args(&def, &json!({ "agent": "maya" })).unwrap_err();
         assert!(err.contains("text"), "unexpected error: {err}");
-        assert!(validate_args(&def, &json!({ "pane_id": "abc", "text": "hi" })).is_ok());
+        assert!(validate_args(&def, &json!({ "agent": "maya", "text": "hi" })).is_ok());
+        assert!(validate_args(
+            &def,
+            &json!({ "agent": "maya", "text": "hi", "expect_report": true })
+        )
+        .is_ok());
+
+        let def = find_tool("decide_approval").unwrap();
+        let err = validate_args(&def, &json!({ "agent": "maya" })).unwrap_err();
+        assert!(err.contains("decision"), "unexpected error: {err}");
+        assert!(validate_args(&def, &json!({ "agent": "maya", "decision": "accept" })).is_ok());
+        let err =
+            validate_args(&def, &json!({ "agent": "maya", "decision": "maybe" })).unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+
+        let def = find_tool("set_timer").unwrap();
+        let err = validate_args(&def, &json!({ "delay_seconds": 60 })).unwrap_err();
+        assert!(err.contains("note"), "unexpected error: {err}");
+        assert!(validate_args(&def, &json!({ "delay_seconds": 60, "note": "check Maya" })).is_ok());
+
+        let def = find_tool("write_plan").unwrap();
+        let err = validate_args(&def, &json!({ "title": "Plan" })).unwrap_err();
+        assert!(err.contains("markdown"), "unexpected error: {err}");
     }
 
     #[test]
     fn basic_types_are_enforced() {
-        let def = find_tool("prompt_pane").unwrap();
-        let err = validate_args(&def, &json!({ "pane_id": "abc", "text": 5 })).unwrap_err();
+        let def = find_tool("prompt_agent").unwrap();
+        let err = validate_args(&def, &json!({ "agent": "abc", "text": 5 })).unwrap_err();
         assert!(err.contains("expected string"), "unexpected error: {err}");
         let err = validate_args(&def, &json!("not an object")).unwrap_err();
         assert!(err.contains("JSON object"), "unexpected error: {err}");
     }
 
     #[test]
-    fn nested_array_items_are_checked() {
-        let def = find_tool("create_panes").unwrap();
+    fn spawn_agents_batch_is_validated() {
+        let def = find_tool("spawn_agents").unwrap();
         // empty batch → minItems
-        let err = validate_args(&def, &json!({ "panes": [] })).unwrap_err();
+        let err = validate_args(&def, &json!({ "agents": [] })).unwrap_err();
         assert!(err.contains("at least 1"), "unexpected error: {err}");
-        // per-item required cwd
-        let err = validate_args(&def, &json!({ "panes": [{ "name": "x" }] })).unwrap_err();
-        assert!(err.contains("cwd"), "unexpected error: {err}");
-        // enum on runtime
+        // task + worktree are required per entry
+        let err = validate_args(&def, &json!({ "agents": [{ "task": "x" }] })).unwrap_err();
+        assert!(err.contains("worktree"), "unexpected error: {err}");
+        let err = validate_args(&def, &json!({ "agents": [{ "worktree": "new" }] })).unwrap_err();
+        assert!(err.contains("task"), "unexpected error: {err}");
+        // access is enum-checked; effort is an open string (catalog-driven)
         let err = validate_args(
             &def,
-            &json!({ "panes": [{ "cwd": "/tmp/x", "runtime": "bash" }] }),
+            &json!({ "agents": [{ "task": "x", "worktree": "none", "access": "root" }] }),
         )
         .unwrap_err();
         assert!(err.contains("one of"), "unexpected error: {err}");
+        // expect_report is a boolean (Phase 5 — structured status reports)
+        let err = validate_args(
+            &def,
+            &json!({ "agents": [{ "task": "x", "worktree": "none", "expect_report": "yes" }] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("expected boolean"), "unexpected error: {err}");
         assert!(validate_args(
             &def,
-            &json!({ "panes": [{ "cwd": "/tmp/x", "runtime": "codex", "worktree": true }] })
+            &json!({ "agents": [{ "task": "x", "worktree": "new", "expect_report": true }] })
         )
         .is_ok());
-        // native sessions are a first-class per-pane option (Phase 5)
         assert!(validate_args(
             &def,
-            &json!({ "panes": [{ "cwd": "/tmp/x", "native": true, "model": "gpt-5-codex" }] })
+            &json!({ "agents": [
+                { "task": "fix checkout", "worktree": "new", "model": "gpt-5.6-sol", "effort": "high" },
+                { "task": "review it", "worktree": "shared:Maya", "access": "workspace" },
+                { "task": "analyze deps", "worktree": "none" }
+            ] })
         )
         .is_ok());
+        // 9 entries → maxItems
+        let nine: Vec<Value> = (0..9)
+            .map(|i| json!({ "task": format!("t{i}"), "worktree": "none" }))
+            .collect();
+        let err = validate_args(&def, &json!({ "agents": nine })).unwrap_err();
+        assert!(err.contains("at most 8"), "unexpected error: {err}");
     }
 
     #[test]
-    fn create_panes_exposes_the_native_session_flag() {
-        let def = find_tool("create_panes").unwrap();
-        let item_props =
-            &def.parameters["properties"]["panes"]["items"]["properties"];
-        assert_eq!(item_props["native"]["type"], "boolean", "native flag missing");
-        assert!(def.description.contains("native"), "description omits native sessions");
+    fn timeouts_match_the_work_behind_the_tool() {
+        assert_eq!(find_tool("spawn_agents").unwrap().timeout_ms, SPAWN_AGENTS_TIMEOUT_MS);
+        assert_eq!(find_tool("review_agent").unwrap().timeout_ms, REVIEW_TIMEOUT_MS);
+        assert_eq!(find_tool("create_worktree").unwrap().timeout_ms, WORKTREE_TIMEOUT_MS);
+        assert_eq!(find_tool("cleanup_worktree").unwrap().timeout_ms, WORKTREE_TIMEOUT_MS);
+        assert_eq!(find_tool("prompt_agent").unwrap().timeout_ms, PROMPT_TIMEOUT_MS);
+        assert_eq!(find_tool("fleet_snapshot").unwrap().timeout_ms, DEFAULT_TIMEOUT_MS);
+        // GitHub: network reads, a push-heavy create, a full review turn
+        assert_eq!(find_tool("github_status").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+        assert_eq!(find_tool("list_prs").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+        assert_eq!(find_tool("read_pr").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+        assert_eq!(find_tool("create_pr").unwrap().timeout_ms, CREATE_PR_TIMEOUT_MS);
+        assert_eq!(find_tool("review_pr").unwrap().timeout_ms, REVIEW_PR_TIMEOUT_MS);
+        assert_eq!(find_tool("comment_pr").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+        assert_eq!(find_tool("watch_pr").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
     }
 
     #[test]
-    fn create_panes_exposes_layout_params() {
-        let def = find_tool("create_panes").unwrap();
-        let props = &def.parameters["properties"];
-        // top-level workspace + arrangement
-        assert_eq!(props["workspace"]["type"], "string", "workspace param missing");
-        let arr = props["arrangement"]["enum"].as_array().unwrap();
-        for want in ["auto", "rows", "columns", "grid"] {
-            assert!(
-                arr.iter().any(|v| v == want),
-                "arrangement enum missing {want}"
-            );
+    fn github_tool_args_are_validated() {
+        let def = find_tool("read_pr").unwrap();
+        let err = validate_args(&def, &json!({})).unwrap_err();
+        assert!(err.contains("number"), "unexpected error: {err}");
+        assert!(validate_args(&def, &json!({ "number": 12 })).is_ok());
+        assert!(validate_args(&def, &json!({ "number": 12, "include_diff": false })).is_ok());
+        let err = validate_args(&def, &json!({ "number": "12" })).unwrap_err();
+        assert!(err.contains("expected integer"), "unexpected error: {err}");
+
+        let def = find_tool("create_pr").unwrap();
+        let err = validate_args(&def, &json!({ "title": "x" })).unwrap_err();
+        assert!(err.contains("body"), "unexpected error: {err}");
+        assert!(validate_args(
+            &def,
+            &json!({ "agent": "Maya", "title": "Fix checkout", "body": "…", "draft": true })
+        )
+        .is_ok());
+
+        let def = find_tool("review_pr").unwrap();
+        assert!(validate_args(&def, &json!({ "number": 3, "post": true, "action": "approve" })).is_ok());
+        let err =
+            validate_args(&def, &json!({ "number": 3, "action": "merge" })).unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+
+        let def = find_tool("comment_pr").unwrap();
+        let err = validate_args(&def, &json!({ "number": 3 })).unwrap_err();
+        assert!(err.contains("body"), "unexpected error: {err}");
+
+        let def = find_tool("watch_pr").unwrap();
+        assert!(validate_args(&def, &json!({ "number": 3 })).is_ok());
+        let err = validate_args(&def, &json!({ "number": 3, "action": "mute" })).unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+    }
+
+    /// There is deliberately NO merge/close tool — merging PRs stays a human
+    /// action (see the approval classification: `gh pr merge` is destructive).
+    #[test]
+    fn no_pr_merge_or_close_tool_exists() {
+        for forbidden in ["merge_pr", "close_pr", "pr_merge", "pr_close"] {
+            assert!(find_tool(forbidden).is_none(), "{forbidden} must not exist");
         }
-        // per-pane beside { pane_id, direction }
-        let beside = &props["panes"]["items"]["properties"]["beside"];
-        assert_eq!(beside["type"], "object", "beside param missing");
-        assert_eq!(beside["properties"]["pane_id"]["type"], "string");
-        let dir = beside["properties"]["direction"]["enum"].as_array().unwrap();
-        assert!(dir.iter().any(|v| v == "right") && dir.iter().any(|v| v == "below"));
-        assert!(def.description.contains("overflow") || def.description.contains("OVERFLOW"));
-    }
-
-    #[test]
-    fn create_panes_validates_new_params() {
-        let def = find_tool("create_panes").unwrap();
-        // arrangement enum enforced
-        let err = validate_args(
-            &def,
-            &json!({ "arrangement": "diagonal", "panes": [{ "cwd": "/tmp/x" }] }),
-        )
-        .unwrap_err();
-        assert!(err.contains("one of"), "unexpected error: {err}");
-        // beside requires pane_id
-        let err = validate_args(
-            &def,
-            &json!({ "panes": [{ "cwd": "/tmp/x", "beside": { "direction": "right" } }] }),
-        )
-        .unwrap_err();
-        assert!(err.contains("pane_id"), "unexpected error: {err}");
-        // a fully-specified layout call passes
-        assert!(validate_args(
-            &def,
-            &json!({
-                "workspace": "current",
-                "arrangement": "grid",
-                "panes": [{ "cwd": "/tmp/x", "beside": { "pane_id": "abc", "direction": "below" } }]
-            })
-        )
-        .is_ok());
     }
 }

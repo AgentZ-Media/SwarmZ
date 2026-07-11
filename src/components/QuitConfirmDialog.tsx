@@ -1,6 +1,6 @@
-import { Loader2, Terminal } from "lucide-react";
 import { useSwarm } from "@/store";
-import { agentIsBusy, resolveQuitConfirm } from "@/lib/quit";
+import { resolveQuitConfirm } from "@/lib/quit";
+import { summarizeBlockers } from "@/lib/quit-core";
 import { useVibe } from "@/lib/vibe/session-store";
 import { Button } from "./ui/button";
 import {
@@ -12,30 +12,34 @@ import {
 } from "./ui/dialog";
 
 /**
- * Raised when the app is about to close while quitting would lose something:
- * An agent still working in one or more panes (the run gets interrupted), or —
- * with restore-on-launch disabled — terminals that are simply still open.
+ * Raised when the app is about to close while quitting would interrupt work:
+ * sessions with a turn running, a Conductor mid-turn, a Conductor timer
+ * mid-fire (its durable claim is stamped — quitting drops it), a gh/git
+ * write in flight (a push / PR mutation), a detached code review or a
+ * worktree git op. Pending timers are listed as info — they persist and
+ * re-fire on the next launch, so they never block on their own.
  */
 export function QuitConfirmDialog() {
   const quitConfirm = useSwarm((s) => s.quitConfirm);
-  const agents = useSwarm((s) => s.agents);
-  const floats = useSwarm((s) => s.floatingTerminals);
   const vibeSessions = useVibe((s) => s.sessions);
 
-  // blocker ids are agent panes, floating terminals (floats block when a
-  // process still runs in them — never restored) or busy Vibe sessions
-  const listed = (quitConfirm ?? [])
+  const sessions = (quitConfirm?.sessionIds ?? [])
     .map((id) => {
-      const a = agents[id];
-      if (a) return { id, name: a.name, cwd: a.cwd, busy: agentIsBusy(a) };
-      const f = floats[id];
-      if (f) return { id, name: f.name, cwd: f.cwd, busy: true };
       const v = vibeSessions[id]?.session;
-      if (v) return { id, name: v.name, cwd: v.projectDir, busy: true };
+      if (v) return { id, name: v.name, cwd: v.projectDir };
       return null;
     })
     .filter((e): e is NonNullable<typeof e> => !!e);
-  const busyCount = listed.filter((e) => e.busy).length;
+
+  const conductors = quitConfirm?.conductorProjects ?? [];
+  const pendingTimers = quitConfirm?.pendingTimers ?? 0;
+  const claimedTimers = quitConfirm?.claimedTimers ?? 0;
+  const ghWrites = quitConfirm?.ghWrites ?? 0;
+  const reviews = quitConfirm?.reviews ?? 0;
+  const worktreeOps = quitConfirm?.worktreeOps ?? 0;
+  const summary = quitConfirm
+    ? summarizeBlockers(quitConfirm)
+    : "Work is still running — quitting will interrupt it.";
 
   return (
     <Dialog
@@ -47,44 +51,96 @@ export function QuitConfirmDialog() {
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Quit SwarmZ?</DialogTitle>
-          <DialogDescription>
-            {busyCount > 0
-              ? busyCount === 1
-                ? "An agent is still working — quitting will interrupt it."
-                : `${busyCount} agents are still working — quitting will interrupt them.`
-              : listed.length === 1
-                ? "A terminal is still open — it won't be restored on the next launch."
-                : `${listed.length} terminals are still open — they won't be restored on the next launch.`}
-          </DialogDescription>
+          <DialogDescription>{summary}</DialogDescription>
         </DialogHeader>
 
         <ul className="mb-4 space-y-1">
-          {listed.map((a) => (
+          {sessions.map((a) => (
             <li
               key={a.id}
-              className="flex items-center gap-2 rounded-md border border-border bg-secondary/40 px-2 py-1.5 font-mono text-[11px] text-foreground"
+              className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt"
             >
-              {a.busy ? (
-                <Loader2
-                  size={12}
-                  className="shrink-0 animate-spin text-warning"
-                />
-              ) : (
-                <Terminal size={12} className="shrink-0 text-muted-foreground" />
-              )}
+              <span className="shrink-0 font-mono leading-none text-err">■</span>
               <span className="truncate">{a.name}</span>
               {a.cwd && (
-                <span className="ml-auto truncate pl-2 text-faint">
+                <span className="ml-auto truncate pl-2 font-mono text-10 text-fnt">
                   {a.cwd}
                 </span>
               )}
             </li>
           ))}
+          {conductors.map((name) => (
+            <li
+              key={`cond-${name}`}
+              className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt"
+            >
+              <span className="shrink-0 font-mono leading-none text-err">■</span>
+              <span className="truncate">Conductor · {name}</span>
+              <span className="ml-auto pl-2 font-mono text-10 text-fnt">mid-turn</span>
+            </li>
+          ))}
+          {claimedTimers > 0 && (
+            <li className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt">
+              <span className="shrink-0 font-mono leading-none text-err">■</span>
+              <span className="truncate">
+                {claimedTimers === 1
+                  ? "A Conductor timer is firing right now — quitting drops it"
+                  : `${claimedTimers} Conductor timers are firing right now — quitting drops them`}
+              </span>
+            </li>
+          )}
+          {ghWrites > 0 && (
+            <li className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt">
+              <span className="shrink-0 font-mono leading-none text-err">■</span>
+              <span className="truncate">
+                {ghWrites === 1
+                  ? "A GitHub write (push / PR) is in progress"
+                  : `${ghWrites} GitHub writes (push / PR) are in progress`}
+              </span>
+            </li>
+          )}
+          {ghWrites < 0 && (
+            <li className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt">
+              <span className="shrink-0 font-mono leading-none text-err">■</span>
+              <span className="truncate">
+                Couldn't verify GitHub writes — one may still be in progress
+              </span>
+            </li>
+          )}
+          {reviews > 0 && (
+            <li className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt">
+              <span className="shrink-0 font-mono leading-none text-err">■</span>
+              <span className="truncate">
+                {reviews === 1
+                  ? "A code review is running"
+                  : `${reviews} code reviews are running`}
+              </span>
+            </li>
+          )}
+          {worktreeOps > 0 && (
+            <li className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt">
+              <span className="shrink-0 font-mono leading-none text-err">■</span>
+              <span className="truncate">
+                {worktreeOps === 1
+                  ? "A worktree operation (git) is running"
+                  : `${worktreeOps} worktree operations (git) are running`}
+              </span>
+            </li>
+          )}
         </ul>
+
+        {pendingTimers > 0 && (
+          <p className="mb-4 text-11 text-fnt">
+            {pendingTimers === 1
+              ? "1 Conductor timer is pending"
+              : `${pendingTimers} Conductor timers are pending`}{" "}
+            — they persist and fire again on the next launch.
+          </p>
+        )}
 
         <div className="flex justify-end gap-2">
           <Button
-            variant="outline"
+            variant="secondary"
             size="sm"
             onClick={() => resolveQuitConfirm(false)}
           >

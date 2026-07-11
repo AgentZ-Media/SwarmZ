@@ -3,27 +3,29 @@ import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "@/lib/utils";
 
+/**
+ * Vibe v3 buttons. `default` is the accent CTA ("where I am" — New agent,
+ * Start, Send); `confirm` is the light-on-dark hard-confirm move ("Allow");
+ * `danger` the solid destructive CTA (close-confirms); `secondary`/`ghost`/
+ * `outline` recede onto the surface ladder.
+ */
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:pointer-events-none disabled:opacity-40 [&_svg]:shrink-0 select-none cursor-default",
+  "inline-flex cursor-default select-none items-center justify-center gap-2 whitespace-nowrap rounded-md text-13 font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-acc/40 disabled:pointer-events-none disabled:opacity-40 [&_svg]:shrink-0",
   {
     variants: {
       variant: {
-        default:
-          "bg-primary text-primary-foreground hover:bg-primary/90 shadow-sm",
-        secondary:
-          "bg-secondary text-secondary-foreground border border-border hover:bg-accent hover:border-input",
-        ghost:
-          "text-muted-foreground hover:text-foreground hover:bg-accent",
-        danger:
-          "bg-transparent text-destructive border border-destructive/30 hover:bg-destructive/10",
-        outline:
-          "border border-input bg-transparent text-foreground hover:bg-accent",
+        default: "bg-acc font-semibold text-white hover:brightness-110",
+        confirm: "bg-txt font-semibold text-bg hover:brightness-90",
+        secondary: "border border-line bg-pop text-txt hover:border-line2",
+        ghost: "text-mut hover:bg-card hover:text-txt",
+        danger: "bg-err font-semibold text-white hover:brightness-110",
+        outline: "border border-line2 bg-transparent text-txt hover:bg-pop",
       },
       size: {
-        default: "h-9 px-4",
-        sm: "h-8 px-3 text-xs",
+        default: "h-8 px-4",
+        sm: "h-7 px-3 text-12",
         icon: "h-8 w-8",
-        xs: "h-6 w-6 text-xs",
+        xs: "h-6 w-6 text-12",
       },
     },
     defaultVariants: { variant: "default", size: "default" },

@@ -1,7 +1,6 @@
-// Payload types of the orchestrator sensing commands (Phase 1) and the tool
-// bus (Phase 2) — keep in sync with the serde structs in
-// src-tauri/src/transcript.rs / projects.rs / orchestrator/ (field names
-// arrive snake_case, like the usage payloads in types.ts).
+// Payload types of the orchestrator sensing commands and the tool bus —
+// keep in sync with the serde structs in src-tauri/src/transcript.rs /
+// projects.rs / orchestrator/ (field names arrive snake_case).
 
 /** One transcript entry. Tool activity is a one-line summary, never a payload. */
 export interface TranscriptMessage {
@@ -13,11 +12,11 @@ export interface TranscriptMessage {
   kind: "text" | "tool";
 }
 
-/** Result of `transcript_read` — the readable tail of one agent session. */
+/** Result of `transcript_read` — the readable tail of one codex session file. */
 export interface TranscriptView {
   /** the session's first real user message (the Ursprungsprompt), capped */
   first_user_message: string | null;
-  /** compaction summaries (Claude `type:"summary"` lines) in the read window */
+  /** compaction summaries in the read window */
   summaries: string[];
   messages: TranscriptMessage[];
   /** true when the byte cap cut the file or the tail limit dropped messages */
@@ -43,7 +42,7 @@ export interface ProjectDocs {
 /** A folder the frontend already knows, passed into `discover_projects`. */
 export interface KnownFolder {
   path: string;
-  /** where it came from: "workspace" | "profile" | "preset" | "notes" | … */
+  /** where it came from: "session" | "notes" | "worktree-repo" | … */
   source: string;
 }
 
@@ -58,24 +57,45 @@ export interface ProjectEntry {
   exists: boolean;
 }
 
-// ---- Tool bus (Phase 2) ----
+// ---- Tool bus ----
 //
 // Tool names/schemas live in ONE place: the Rust registry
 // (src-tauri/src/orchestrator/registry.rs). The TS side mirrors the NAMES
 // only (executor lookup + typing); schemas are never duplicated here.
 
-/** The V1 tool names — must match the Rust registry exactly. */
+/** The tool names — must match the Rust registry exactly (Phase 4: 24,
+ * Phase 7 adds the 7 GitHub tools → 31). */
 export const ORCHESTRATOR_TOOL_NAMES = [
   "fleet_snapshot",
-  "read_transcript",
+  "read_agent",
   "read_project_docs",
   "read_notes",
   "git_status",
   "list_projects",
-  "list_blueprints",
-  "prompt_pane",
-  "create_panes",
-  "create_workspace",
+  "spawn_agents",
+  "prompt_agent",
+  "interrupt_agent",
+  "close_agent",
+  "set_agent_config",
+  "review_agent",
+  "decide_approval",
+  "create_worktree",
+  "assign_worktree",
+  "worktree_status",
+  "cleanup_worktree",
+  "set_timer",
+  "list_timers",
+  "cancel_timer",
+  "write_plan",
+  "list_plans",
+  "read_plan",
+  "github_status",
+  "list_prs",
+  "read_pr",
+  "create_pr",
+  "review_pr",
+  "comment_pr",
+  "watch_pr",
   "remember",
 ] as const;
 
@@ -110,8 +130,7 @@ export interface OrchestratorToolDefinition {
 /**
  * Response of `orchestrator_tools`: the single-source system instructions
  * (compiled by `persona::build_instructions` — persona + memory + operative
- * core) plus the tool catalog — the OpenRouter loop consumes both, the dev
- * hook exposes the whole object.
+ * core) plus the tool catalog — the dev hook exposes the whole object.
  */
 export interface OrchestratorToolsResponse {
   instructions: string;
@@ -125,13 +144,9 @@ export interface OrchestratorToolRequest {
   args: Record<string, unknown>;
   /** BACKEND chat id of the triggering chat — null for dev-hook calls */
   chat_id?: string | null;
-}
-
-/** Pane identity echoed in tool responses. */
-export interface ToolPaneRef {
-  id: string;
-  name: string;
-  runtime: string;
+  /** project of the Conductor instance behind the call — null = unscoped
+   * (dev-hook); executors scope session resolution + fleet_snapshot on it */
+  project_id?: string | null;
 }
 
 /** `read_notes` — NoteItems reduced to content (ids dropped). */
@@ -140,64 +155,67 @@ export interface ToolNoteItem {
   done: boolean;
 }
 
-/** `prompt_pane` result. */
-export interface PromptPaneResult {
+/** One plan document's info (`conductor_plan_write` / `_list`). */
+export interface ConductorPlanInfo {
+  slug: string;
+  title: string;
+  /** absolute file path — hand this to agents */
+  path: string;
+  modified_ms: number;
+  size: number;
+}
+
+/** One plan document's content (`conductor_plan_read`). */
+export interface ConductorPlanDocument {
+  slug: string;
+  path: string;
+  content: string;
+}
+
+/** `prompt_agent` result. */
+export interface PromptAgentResult {
   delivered: true;
-  pane: ToolPaneRef;
-  /** the pane's activity right before the paste */
-  activity_at_send: "busy" | "idle" | "waiting" | null;
-  submitted: boolean;
-  /** set when the pane was busy — the text queued in the CLI's input */
-  warning?: string;
-  /** set when review mode (orchestratorAutoSubmit off) blocked the submit */
-  note?: string;
+  agent: { id: string; name: string };
+  /** how the text reached the agent: a fresh turn, or steered mid-turn */
+  mode: "turn" | "steered";
 }
 
-/** One pane request inside `create_panes`. */
-export interface CreatePaneSpec {
-  cwd: string;
-  /** create a native Vibe-Mode Codex session instead of a terminal pane */
-  native?: boolean;
-  runtime?: "claude" | "codex" | "shell";
-  profile_id?: string;
-  /** model id appended to the startup (claude: --model, codex: -m); omit = default config */
+/** One agent request inside `spawn_agents`. */
+export interface SpawnAgentSpec {
+  /** the agent's first order — self-contained */
+  task: string;
+  /** "new" | "shared:<agentName>" | "none" */
+  worktree: string;
+  /** codex model id; omit = the default */
   model?: string;
-  /** codex-only: model_reasoning_effort */
-  reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  /** reasoning effort (open string — catalog-driven); omit = medium */
+  effort?: string;
+  access?: "workspace" | "full";
   name?: string;
-  /** initial prompt, submitted once the agent CLI is ready */
-  prompt?: string;
-  /** run the pane in a fresh git worktree of the repo at cwd */
-  worktree?: boolean;
-  /** worktree branch; omitted = generated */
-  branch?: string;
-  /** place this pane next to an existing one (targeted split; ignores
-   * arrangement/workspace distribution). Not applicable to native sessions. */
-  beside?: { pane_id: string; direction?: "right" | "below" };
+  /** Phase 5: the task turn ends with a machine-readable status report
+   * (outputSchema-forced) that rides into the agent-finished turn */
+  expect_report?: boolean;
 }
 
-/** Per-pane outcome of `create_panes` — errors never abort the batch. */
-export interface CreatePaneResult {
+/** Per-agent outcome of `spawn_agents` — errors never abort the batch. */
+export interface SpawnAgentResult {
   /** set on success */
   id?: string;
   name?: string | null;
+  /** the agent's working directory (worktree path or project folder) */
   cwd?: string | null;
-  worktree?: { root: string; branch: string } | null;
-  /** true when this entry created a native Vibe session (not a terminal pane) */
-  native?: boolean;
-  /** the workspace this pane landed in (terminal panes only) */
-  workspace_id?: string;
-  workspace_name?: string;
-  /** prompt delivery note (e.g. the pane never became ready) */
+  /** worktree branch (null = works directly in the project folder) */
+  branch?: string | null;
+  /** true when the agent shares its worktree with another agent */
+  shared?: boolean;
+  /** task delivery note */
   warning?: string;
-  /** set when this pane failed (worktree creation, unknown profile, …) */
+  /** set when this agent failed to start */
   error?: string;
 }
 
-export interface CreatePanesResult {
-  /** primary target workspace (the first bucket) */
-  workspace_id: string;
-  panes: CreatePaneResult[];
-  /** honest, human-readable account of where panes landed and any overflow */
+export interface SpawnAgentsResult {
+  agents: SpawnAgentResult[];
+  /** honest, human-readable account of what was created */
   summary?: string;
 }

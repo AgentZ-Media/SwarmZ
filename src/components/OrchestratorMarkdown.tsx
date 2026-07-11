@@ -1,5 +1,5 @@
 // Tiny dependency-free markdown renderer for orchestrator assistant messages
-// (OrchestratorPanel.tsx). Deliberately a small subset — headings, lists,
+// (ChatView.tsx). Deliberately a small subset — headings, lists,
 // fenced code, inline code/bold/italic, links — rendered as React nodes (no
 // innerHTML, so model output can never inject markup). Unclosed markers in a
 // still-streaming message simply render literally until the closing half
@@ -26,10 +26,10 @@ function PathPill({ path }: { path: string }) {
   return (
     <span
       title={path}
-      className="mx-0.5 inline-flex max-w-full items-center rounded border border-border/70 bg-secondary/50 px-1 py-px align-middle font-mono text-[11px] leading-tight select-text"
+      className="mx-0.5 inline-flex max-w-full items-center rounded-xs border border-line/70 bg-pop/50 px-1 py-px align-middle font-mono text-11 leading-tight select-text"
     >
-      <span className="truncate text-foreground">{base}</span>
-      {line && <span className="shrink-0 text-faint">:{line}</span>}
+      <span className="truncate text-txt">{base}</span>
+      {line && <span className="shrink-0 text-fnt">:{line}</span>}
     </span>
   );
 }
@@ -61,7 +61,7 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
       out.push(
         <code
           key={key}
-          className="rounded-md border border-border bg-secondary px-1.5 py-px font-mono text-[12px]"
+          className="rounded-xs bg-pop px-1 py-px font-mono text-[0.9em]"
         >
           {token.slice(1, -1)}
         </code>,
@@ -83,7 +83,7 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
         <button
           key={key}
           type="button"
-          className="cursor-pointer text-ring underline-offset-2 hover:underline"
+          className="cursor-pointer text-acc underline-offset-2 hover:text-acc-bright hover:underline"
           title={url}
           onClick={() => void openUrl(url)}
         >
@@ -180,7 +180,7 @@ export function OrchestratorMarkdown({ text }: { text: string }) {
             return (
               <div
                 key={i}
-                className={`pt-1 font-semibold tracking-tight ${b.level <= 2 ? "text-[15px]" : "text-[13.5px]"}`}
+                className={`pt-1 font-semibold tracking-[-0.01em] ${b.level <= 2 ? "text-14" : "text-13"}`}
               >
                 {renderInline(b.text, `h${i}`)}
               </div>
@@ -189,7 +189,7 @@ export function OrchestratorMarkdown({ text }: { text: string }) {
             return (
               <pre
                 key={i}
-                className="overflow-x-auto rounded-lg border border-border bg-card px-3 py-2.5 font-mono text-[12px] leading-relaxed"
+                className="overflow-x-auto rounded-lg border border-line bg-card p-3 font-mono text-11"
               >
                 {b.text}
               </pre>

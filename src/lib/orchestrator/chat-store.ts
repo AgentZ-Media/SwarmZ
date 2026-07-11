@@ -1,45 +1,49 @@
-// Orchestrator chat store (Phase 4) — the chat sidebar's state, colocated
-// with the rest of the orchestrator plumbing instead of growing store.ts
-// further (same standalone-zustand pattern as lib/updates.ts / lib/limits.ts).
-// Persists in swarmz.json under `orchestratorChats` (chats + active id +
-// panel open/width), debounced like the grid snapshot, flushed by
-// flushAllPersists at quit and hydrated from store.ts hydrate(). The Codex
-// side (events, resume, delta batching) lives in controller.ts.
+// Conductor chat store (Phase 3: project-scoped) — the chat state behind the
+// Conductor stage, colocated with the rest of the orchestrator plumbing
+// instead of growing store.ts further (same standalone-zustand pattern as
+// lib/vibe/session-store.ts). Every chat belongs to exactly one PROJECT (the
+// Conductor instance it runs on); the stage shows only the active project's
+// chats and the active chat is remembered PER PROJECT (`activeByProject`).
+// Persists in swarmz.json under `orchestratorChats` (v2: chats carry
+// projectId + the active map), debounced, flushed by flushAllPersists at quit
+// and hydrated from store.ts hydrate() AFTER projects + vibe sessions — the
+// Phase-3 chat→project migration resolves against both. The Codex side
+// (events, resume, delta batching) lives in controller.ts.
 
 import { create } from "zustand";
 import { nanoid } from "nanoid";
 import { loadOrchestratorChats, saveOrchestratorChats } from "@/lib/transport";
+import { useProjects } from "@/lib/projects/store";
+import { useVibe } from "@/lib/vibe/session-store";
 import type {
   OrchestratorChat,
   OrchestratorChatMessage,
   OrchestratorPaneRef,
   OrchestratorPingRecord,
   OrchestratorTouchedPane,
-  OrchestratorWireMessage,
-  OrchestratorWireToolCall,
   PersistedOrchestratorChats,
   VibeTokenUsage,
 } from "@/types";
 // type-only: no runtime cycle (chat.ts imports the main store)
 import type { OrchestratorChatStatus } from "./chat";
-import { collapseEmptyChats, isReusableEmptyChat } from "./chat-reuse";
+import {
+  applyChatAssignments,
+  assignChatsToProjects,
+  capChats,
+  collapseEmptyChats,
+  isReusableEmptyChat,
+  type MigratableChat,
+} from "./chat-reuse";
 
 /** Per-chat message cap — oldest messages drop first (display + persistence). */
 export const MAX_CHAT_MESSAGES = 200;
-/** Total chat cap — the oldest chats are deleted first. */
+/** Total chat cap — the oldest chats are deleted first (`capChats`). Chats
+ * still awaiting their project assignment (projectId "") are EXEMPT until
+ * healed — they must never be evicted before the migration could resolve
+ * them. */
 export const MAX_CHATS = 30;
 /** Per-chat ping cap (delivered + undelivered) — oldest drop first. */
 export const MAX_PENDING_PINGS = 20;
-/**
- * OpenRouter wire-history cap (Phase 6) — oldest wire messages drop first.
- * A capped history simply loses old context, like any long chat; the model
- * never sees a `tool` result whose assistant call was cut (leading orphans
- * are trimmed after the cap).
- */
-export const MAX_WIRE_MESSAGES = 60;
-export const PANEL_DEFAULT_WIDTH = 380;
-export const PANEL_MIN_WIDTH = 300;
-export const PANEL_MAX_WIDTH = 640;
 export const DEFAULT_CHAT_TITLE = "New chat";
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
@@ -60,34 +64,17 @@ export interface OrchestratorMessagePatch {
   paneRefs?: OrchestratorPaneRef[];
 }
 
-function clampWidth(width: number): number {
-  return Math.min(PANEL_MAX_WIDTH, Math.max(PANEL_MIN_WIDTH, Math.round(width)));
-}
-
-/**
- * Apply the wire-history cap: newest MAX_WIRE_MESSAGES, then drop leading
- * `tool` results — a tool message without its preceding assistant tool_calls
- * message is invalid OpenAI wire history.
- */
-function capWire(wire: OrchestratorWireMessage[]): OrchestratorWireMessage[] {
-  const capped = wire.slice(-MAX_WIRE_MESSAGES);
-  let start = 0;
-  while (start < capped.length && capped[start].role === "tool") start++;
-  return start > 0 ? capped.slice(start) : capped;
-}
-
 // Chats stream store patches every ~80 ms — batch the (whole-file) disk
-// writes a bit wider than the grid snapshot's debounce.
+// writes a bit wider than usual.
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
 function snapshot(): PersistedOrchestratorChats {
   const s = useOrchestrator.getState();
   return {
-    version: 1,
+    // v2 = chats carry projectId + the per-project active map
+    version: 2,
     chats: s.chats,
-    activeId: s.activeChatId,
-    panelOpen: s.panelOpen,
-    panelWidth: s.panelWidth,
+    activeByProject: s.activeByProject,
   };
 }
 
@@ -113,47 +100,37 @@ export async function flushOrchestratorPersist(): Promise<void> {
 }
 
 export interface OrchestratorState {
-  /** all chats, newest first */
+  /** all chats across all projects, newest first */
   chats: OrchestratorChat[];
-  activeChatId: string | null;
-  /** the right sidebar (⌘⇧O) — persisted */
-  panelOpen: boolean;
-  /** panel width in px, clamped 300–640 — persisted */
-  panelWidth: number;
+  /** active chat per project — the stage restores per tab (persisted) */
+  activeByProject: Record<string, string>;
   /** chats with a turn in flight — set by the controller (in-memory) */
   busy: Record<string, boolean>;
   /** latest per-chat token accounting (in-memory, never persisted) — codex
    * chats get it from the `token_usage` chat event (thread/tokenUsage/updated) */
   tokenUsage: Record<string, VibeTokenUsage>;
-  /** codex app-server availability, checked on first panel open (in-memory) */
+  /** codex app-server availability, checked on first stage open (in-memory) */
   status: OrchestratorChatStatus | null;
 
-  setPanelOpen: (open: boolean) => void;
-  togglePanel: () => void;
-  setPanelWidth: (width: number) => void;
   /**
-   * Create a chat (reusing an existing empty one) and activate it. Provider
-   * + model are stamped here and stay fixed for the chat's lifetime; a
-   * reused EMPTY chat is re-stamped with the current values (it has no
-   * history yet, so it must follow the current setting). Callers go through
-   * controller.ts `createChat()`, which reads the settings.
+   * Create a chat FOR ONE PROJECT (reusing that project's empty one) and
+   * activate it there. Model + effort are stamped here as the chat's initial
+   * override; a reused EMPTY chat is re-stamped with the current values (it
+   * has no history yet, so it must follow the current setting). Callers go
+   * through controller.ts `createChat()`, which reads the settings.
    */
-  newChat: (
-    provider?: "codex" | "openrouter",
-    model?: string,
-    effort?: string,
-  ) => string;
+  newChat: (projectId: string, model?: string, effort?: string) => string;
   /**
    * Remove a chat from SwarmZ. The codex thread rollout stays on disk —
    * deliberate; it just never gets resumed again.
    */
   deleteChat: (id: string) => void;
+  /** activate a chat within ITS project (stamps `activeByProject`) */
   setActiveChat: (id: string) => void;
   setStatus: (status: OrchestratorChatStatus | null) => void;
   /**
-   * Override this chat's model / reasoning effort (persisted). A codex chat
-   * carries them into its next turn/start; an OpenRouter chat only uses
-   * `model` (effort is ignored there). `undefined` clears back to the default.
+   * Override this chat's model / reasoning effort (persisted) — carried into
+   * its next turn/start. `undefined` clears back to the default.
    */
   setChatModelEffort: (
     chatId: string,
@@ -174,15 +151,8 @@ export interface OrchestratorState {
     patch: OrchestratorMessagePatch,
   ) => void;
 
-  // Phase-6 OpenRouter wire history
-  /** append wire messages (applies the cap; persisted with the chat) */
-  appendWireMessages: (
-    chatId: string,
-    messages: OrchestratorWireMessage[],
-  ) => void;
-
-  // Phase-5 status pings
-  /** remember that this chat prompted a pane (prompt_pane / startup prompt) */
+  // status pings
+  /** remember that this chat prompted a session (prompt_agent / spawn_agents) */
   recordTouchedPane: (chatId: string, paneId: string, name: string) => void;
   /** record an undelivered ping (cap MAX_PENDING_PINGS, oldest dropped) */
   addPendingPing: (
@@ -193,47 +163,51 @@ export interface OrchestratorState {
   takePendingPings: (chatId: string) => OrchestratorPingRecord[];
 }
 
+/**
+ * The active chat of one project: the remembered one if it still exists and
+ * belongs there, else the project's newest chat, else null. The Conductor
+ * stage selects this (a primitive — never a fresh array).
+ */
+export function activeChatIdFor(
+  s: Pick<OrchestratorState, "chats" | "activeByProject">,
+  projectId: string,
+): string | null {
+  const remembered = s.activeByProject[projectId];
+  if (
+    remembered &&
+    s.chats.some((c) => c.id === remembered && c.projectId === projectId)
+  ) {
+    return remembered;
+  }
+  return s.chats.find((c) => c.projectId === projectId)?.id ?? null;
+}
+
 export const useOrchestrator = create<OrchestratorState>((set, get) => ({
   chats: [],
-  activeChatId: null,
-  panelOpen: false,
-  panelWidth: PANEL_DEFAULT_WIDTH,
+  activeByProject: {},
   busy: {},
   tokenUsage: {},
   status: null,
 
-  setPanelOpen: (open) => {
-    if (get().panelOpen === open) return;
-    set({ panelOpen: open });
-    schedulePersist();
-  },
-  togglePanel: () => get().setPanelOpen(!get().panelOpen),
-  setPanelWidth: (width) => {
-    const clamped = clampWidth(width);
-    if (get().panelWidth === clamped) return;
-    set({ panelWidth: clamped });
-    schedulePersist();
-  },
-
-  newChat: (provider = "codex", model, effort) => {
+  newChat: (projectId, model, effort) => {
     const s = get();
-    // don't stack empties — the + button reuses an untouched chat. "Untouched"
-    // means no user/assistant turn (system pings + warnings don't count, or a
-    // restart would stack a new chat behind that noise). A reusable-empty chat
-    // has no backend thread yet, so re-stamping provider/model/effort to the
-    // CURRENT setting is safe (and what the user expects after switching it).
-    const empty = s.chats.find((c) => isReusableEmptyChat(c));
+    // don't stack empties — the + button reuses THIS project's untouched
+    // chat. "Untouched" means no user/assistant turn (system pings + warnings
+    // don't count, or a restart would stack a new chat behind that noise). A
+    // reusable-empty chat has no backend thread yet, so re-stamping
+    // model/effort to the CURRENT setting is safe (and what the user expects
+    // after switching it).
+    const empty = s.chats.find(
+      (c) => c.projectId === projectId && isReusableEmptyChat(c),
+    );
     if (empty) {
-      const stamp =
-        (empty.provider ?? "codex") !== provider ||
-        empty.model !== model ||
-        empty.effort !== effort;
-      if (s.activeChatId !== empty.id || stamp) {
+      const stamp = empty.model !== model || empty.effort !== effort;
+      if (s.activeByProject[projectId] !== empty.id || stamp) {
         set({
-          activeChatId: empty.id,
+          activeByProject: { ...s.activeByProject, [projectId]: empty.id },
           chats: stamp
             ? s.chats.map((c) =>
-                c.id === empty.id ? { ...c, provider, model, effort } : c,
+                c.id === empty.id ? { ...c, model, effort } : c,
               )
             : s.chats,
         });
@@ -243,7 +217,7 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
     }
     const chat: OrchestratorChat = {
       id: nanoid(8),
-      provider,
+      projectId,
       threadId: null,
       ...(model !== undefined ? { model } : {}),
       ...(effort !== undefined ? { effort } : {}),
@@ -253,36 +227,38 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
       touchedPanes: {},
       pendingPings: [],
     };
-    // newest first — the cap drops from the end, i.e. the oldest chats
-    const chats = [chat, ...s.chats].slice(0, MAX_CHATS);
-    set({ chats, activeChatId: chat.id });
+    // newest first — the cap drops the oldest chats (unassigned ones exempt)
+    const chats = capChats([chat, ...s.chats], MAX_CHATS);
+    set({
+      chats,
+      activeByProject: { ...s.activeByProject, [projectId]: chat.id },
+    });
     schedulePersist();
     return chat.id;
   },
 
   deleteChat: (id) => {
     const s = get();
-    const idx = s.chats.findIndex((c) => c.id === id);
-    if (idx < 0) return;
+    const chat = s.chats.find((c) => c.id === id);
+    if (!chat) return;
     const chats = s.chats.filter((c) => c.id !== id);
     const { [id]: _gone, ...busy } = s.busy;
     const { [id]: _u, ...tokenUsage } = s.tokenUsage;
-    set({
-      chats,
-      busy,
-      tokenUsage,
-      activeChatId:
-        s.activeChatId === id
-          ? (chats[Math.min(idx, chats.length - 1)]?.id ?? null)
-          : s.activeChatId,
-    });
+    const activeByProject = { ...s.activeByProject };
+    if (activeByProject[chat.projectId] === id) {
+      const next = chats.find((c) => c.projectId === chat.projectId)?.id;
+      if (next) activeByProject[chat.projectId] = next;
+      else delete activeByProject[chat.projectId];
+    }
+    set({ chats, busy, tokenUsage, activeByProject });
     schedulePersist();
   },
 
   setActiveChat: (id) => {
     const s = get();
-    if (s.activeChatId === id || !s.chats.some((c) => c.id === id)) return;
-    set({ activeChatId: id });
+    const chat = s.chats.find((c) => c.id === id);
+    if (!chat || s.activeByProject[chat.projectId] === id) return;
+    set({ activeByProject: { ...s.activeByProject, [chat.projectId]: id } });
     schedulePersist();
   },
 
@@ -373,18 +349,6 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
     schedulePersist();
   },
 
-  appendWireMessages: (chatId, messages) => {
-    if (!messages.length) return;
-    const s = get();
-    const chat = s.chats.find((c) => c.id === chatId);
-    if (!chat) return; // chat deleted mid-turn — late appends are a no-op
-    const wire = capWire([...(chat.wire ?? []), ...messages]);
-    set({
-      chats: s.chats.map((c) => (c.id === chatId ? { ...c, wire } : c)),
-    });
-    schedulePersist();
-  },
-
   recordTouchedPane: (chatId, paneId, name) => {
     const s = get();
     if (!s.chats.some((c) => c.id === chatId)) return;
@@ -469,14 +433,25 @@ function sanitizeMessage(raw: unknown): OrchestratorChatMessage | null {
     case "warning":
       return { id, at, role: m.role, text };
     case "system": {
-      // status pings carry the pinged pane (jump chip + "Review")
+      // status pings carry the pinged pane (jump chip + "Review");
+      // autonomous-turn markers carry `autonomous` + the trigger kind
       const paneRefs = sanitizePaneRefs(m.paneRefs);
+      const trigger =
+        m.trigger === "agent-finished" ||
+        m.trigger === "agent-blocked" ||
+        m.trigger === "approval" ||
+        m.trigger === "timer" ||
+        m.trigger === "idle"
+          ? m.trigger
+          : undefined;
       return {
         id,
         at,
         role: "system",
         text,
         ...(paneRefs.length ? { paneRefs } : {}),
+        ...(m.autonomous === true ? { autonomous: true } : {}),
+        ...(trigger ? { trigger } : {}),
       };
     }
     case "assistant":
@@ -515,56 +490,6 @@ function sanitizeTouchedPanes(
   return out;
 }
 
-function sanitizeWireToolCalls(raw: unknown): OrchestratorWireToolCall[] {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter((c): c is OrchestratorWireToolCall => {
-    const t = c as OrchestratorWireToolCall | null;
-    return (
-      !!t &&
-      typeof t.id === "string" &&
-      typeof t.name === "string" &&
-      typeof t.arguments_json === "string"
-    );
-  });
-}
-
-/** Persisted OpenRouter wire history, entry by entry (malformed dropped). */
-function sanitizeWire(raw: unknown): OrchestratorWireMessage[] {
-  if (!Array.isArray(raw)) return [];
-  const out: OrchestratorWireMessage[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== "object") continue;
-    const m = entry as Record<string, unknown>;
-    switch (m.role) {
-      case "user":
-        if (typeof m.content === "string")
-          out.push({ role: "user", content: m.content });
-        break;
-      case "assistant": {
-        const content = typeof m.content === "string" ? m.content : null;
-        const toolCalls = sanitizeWireToolCalls(m.tool_calls);
-        out.push({
-          role: "assistant",
-          content,
-          ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
-        });
-        break;
-      }
-      case "tool":
-        if (typeof m.tool_call_id === "string" && typeof m.content === "string")
-          out.push({
-            role: "tool",
-            tool_call_id: m.tool_call_id,
-            content: m.content,
-          });
-        break;
-      default:
-        break; // system messages are never persisted; unknown roles drop
-    }
-  }
-  return capWire(out);
-}
-
 /** Persisted ping records, entry by entry (malformed entries dropped). */
 function sanitizePings(raw: unknown): OrchestratorPingRecord[] {
   if (!Array.isArray(raw)) return [];
@@ -584,11 +509,90 @@ function sanitizePings(raw: unknown): OrchestratorPingRecord[] {
 }
 
 /**
- * Load the persisted chats — called from store.ts hydrate(). Per-entry
- * graceful degradation (grid-snapshot philosophy): a malformed chat or
- * message only costs itself, never the whole restore.
+ * Re-run the project assignment for chats still carrying projectId "" (the
+ * unresolved-migration state) against the CURRENT project + session stores.
+ * Only ever assigns a real project — a "" stays "" until one exists. Called
+ * from hydrate and from a projects-store watcher, so unassigned chats heal
+ * as soon as projects become available (they are also exempt from the chat
+ * cap until then).
  */
-export async function hydrateOrchestratorChats(): Promise<void> {
+export function healUnassignedChats(): void {
+  const s = useOrchestrator.getState();
+  if (!s.chats.some((c) => c.projectId === "")) return;
+  const projects = useProjects.getState();
+  const validIds = new Set(Object.keys(projects.projects));
+  if (validIds.size === 0) return;
+  const fallback =
+    projects.activeProjectId ??
+    Object.values(projects.projects).sort(
+      (a, b) => b.lastActiveAt - a.lastActiveAt,
+    )[0]?.id ??
+    null;
+  const vibe = useVibe.getState();
+  const migratable: MigratableChat[] = s.chats
+    .filter((c) => c.projectId === "")
+    .map((c) => ({
+      id: c.id,
+      projectId: null,
+      touched: Object.fromEntries(
+        Object.entries(c.touchedPanes).map(([sid, t]) => [sid, t.lastPromptAt]),
+      ),
+    }));
+  const assignments = assignChatsToProjects(
+    migratable,
+    validIds,
+    (sessionId) => vibe.sessions[sessionId]?.session.projectId ?? null,
+    fallback,
+  );
+  let changed = false;
+  const chats = s.chats.map((c) => {
+    const assigned = assignments[c.id];
+    if (c.projectId === "" && assigned) {
+      changed = true;
+      return { ...c, projectId: assigned };
+    }
+    return c;
+  });
+  if (!changed) return;
+  useOrchestrator.setState({ chats });
+  schedulePersist();
+}
+
+let healWatcherStarted = false;
+
+/** Heal unassigned chats whenever the project store changes (rare events). */
+function startHealWatcher(): void {
+  if (healWatcherStarted) return;
+  healWatcherStarted = true;
+  useProjects.subscribe(() => healUnassignedChats());
+}
+
+/** What the surrounding hydrate() knows about the other slices. */
+export interface ChatHydrateContext {
+  /** projects AND vibe sessions hydrated without throwing — only then may
+   * the chat→project migration reassign, collapse and persist */
+  migrationReady: boolean;
+}
+
+/**
+ * Load the persisted chats — called from store.ts hydrate() AFTER projects
+ * and vibe sessions (the Phase-3 chat→project migration resolves against
+ * both stores). Per-entry graceful degradation: a malformed chat or message
+ * only costs itself, never the whole restore.
+ *
+ * Migration rule for chats without a (valid) `projectId`, in order: (1) the
+ * project of the session the chat touched most recently; (2) the last active
+ * project; (3) "" — invisible until healed. Documented in
+ * `assignChatsToProjects`. SAFETY: when the project/session hydration did
+ * not succeed (`migrationReady` false) or no projects exist, NOTHING is
+ * reassigned, collapsed or persisted — a transient load failure must never
+ * permanently rewrite chat→project assignments on disk; and an existing
+ * non-empty `projectId` is never downgraded to "" (the project record may
+ * come back).
+ */
+export async function hydrateOrchestratorChats(
+  ctx: ChatHydrateContext = { migrationReady: true },
+): Promise<void> {
   let data: PersistedOrchestratorChats | null = null;
   try {
     data = await loadOrchestratorChats();
@@ -609,20 +613,23 @@ export async function hydrateOrchestratorChats(): Promise<void> {
         .map(sanitizeMessage)
         .filter((m): m is OrchestratorChatMessage => m !== null)
         .slice(-MAX_CHAT_MESSAGES);
-      const wire = sanitizeWire(raw.wire);
+      // pre-rebuild chats may carry `provider`/`wire` (OpenRouter era) — both
+      // are dropped tolerantly here; codex is the only brain now. An old
+      // OpenRouter chat keeps its visible history but its `model` stamp is
+      // cleared (it named an OpenRouter model id, not a codex one).
+      const wasOpenRouter =
+        (raw as { provider?: unknown }).provider === "openrouter";
       chats.push({
         id: raw.id,
-        ...(raw.provider === "codex" || raw.provider === "openrouter"
-          ? { provider: raw.provider }
-          : {}),
+        // pre-Phase-3 chats carry no projectId — assigned below
+        projectId: typeof raw.projectId === "string" ? raw.projectId : "",
         threadId: typeof raw.threadId === "string" ? raw.threadId : null,
-        ...(typeof raw.model === "string" && raw.model
+        ...(typeof raw.model === "string" && raw.model && !wasOpenRouter
           ? { model: raw.model }
           : {}),
         ...(typeof raw.effort === "string" && raw.effort
           ? { effort: raw.effort }
           : {}),
-        ...(wire.length ? { wire } : {}),
         title:
           typeof raw.title === "string" && raw.title.trim()
             ? raw.title
@@ -636,46 +643,109 @@ export async function hydrateOrchestratorChats(): Promise<void> {
       /* skip this chat only */
     }
   }
-  const state = useOrchestrator.getState();
-  // a chat created before hydrate resolved survives — merge persisted after
-  const merged = state.chats.length
-    ? [
-        ...state.chats,
-        ...chats.filter((c) => !state.chats.some((x) => x.id === c.id)),
-      ].slice(0, MAX_CHATS)
-    : chats.slice(0, MAX_CHATS);
-  const mergedActive =
-    state.activeChatId ??
-    (typeof data.activeId === "string" &&
-    merged.some((c) => c.id === data.activeId)
-      ? data.activeId
-      : (merged[0]?.id ?? null));
-  // fold multiple reusable-empty chats (the reload race + old-bug pollution)
-  // into one before it hits the store — "at most one empty chat" invariant
-  const collapsed = collapseEmptyChats(merged, mergedActive);
-  useOrchestrator.setState({
-    chats: collapsed.chats,
-    activeChatId: collapsed.activeId,
-    panelOpen:
-      typeof data.panelOpen === "boolean" ? data.panelOpen : state.panelOpen,
-    panelWidth: clampWidth(
-      typeof data.panelWidth === "number" ? data.panelWidth : state.panelWidth,
-    ),
-  });
-  // persist the cleaned list so the on-disk pollution heals immediately (not
-  // only after the next interaction)
-  if (collapsed.chats.length !== merged.length) schedulePersist();
-  // Fresh start per launch: yesterday's chat context must not silently absorb
-  // today's first order — activate a new chat (createChat reuses a leftover
-  // empty one, so restarts never stack empties; old chats stay in the
-  // switcher). Skipped when a chat was already opened before hydrate resolved.
-  // Deferred import: controller statically imports this module.
-  if (!state.chats.length) {
+
+  // ---- chat → project assignment (Phase-3 migration + self-heal) ----
+  // Guarded: only with successfully hydrated projects + sessions AND at
+  // least one project record. A transient load failure or an (unexpectedly)
+  // empty project store must never force-reassign every chat to "" and
+  // persist that — the on-disk assignment survives until a clean hydrate.
+  let migrated = false;
+  const projectsState = useProjects.getState();
+  const migrationSafe =
+    ctx.migrationReady && Object.keys(projectsState.projects).length > 0;
+  if (migrationSafe) {
     try {
-      const { createChat } = await import("./controller");
-      createChat();
+      const validIds = new Set(Object.keys(projectsState.projects));
+      const fallback =
+        projectsState.activeProjectId ??
+        Object.values(projectsState.projects)
+          .sort((a, b) => b.lastActiveAt - a.lastActiveAt)[0]?.id ??
+        null;
+      const vibe = useVibe.getState();
+      const migratable: MigratableChat[] = chats.map((c) => ({
+        id: c.id,
+        projectId: c.projectId || null,
+        touched: Object.fromEntries(
+          Object.entries(c.touchedPanes).map(([sid, t]) => [
+            sid,
+            t.lastPromptAt,
+          ]),
+        ),
+      }));
+      const assignments = assignChatsToProjects(
+        migratable,
+        validIds,
+        (sessionId) => vibe.sessions[sessionId]?.session.projectId ?? null,
+        fallback,
+      );
+      // pure apply with the downgrade guard (never "" over an existing id)
+      const applied = applyChatAssignments(chats, assignments);
+      if (applied.changed) {
+        chats.splice(0, chats.length, ...applied.chats);
+        migrated = true;
+      }
     } catch {
-      /* non-fatal — the restored active chat stays selected */
+      /* keep chats hydrated even if the assignment failed */
     }
   }
+
+  const state = useOrchestrator.getState();
+  // a chat created before hydrate resolved survives — merge persisted after
+  // (the cap exempts unassigned chats until they heal)
+  const merged = capChats(
+    state.chats.length
+      ? [
+          ...state.chats,
+          ...chats.filter((c) => !state.chats.some((x) => x.id === c.id)),
+        ]
+      : chats,
+    MAX_CHATS,
+  );
+
+  // per-project active map: live entries win; then the persisted v2 map;
+  // a v1 `activeId` legacy value lands in ITS chat's project slot
+  const activeByProject: Record<string, string> = {};
+  const persistedMap =
+    data.activeByProject && typeof data.activeByProject === "object"
+      ? data.activeByProject
+      : {};
+  for (const [projectId, id] of Object.entries(persistedMap)) {
+    if (
+      typeof id === "string" &&
+      merged.some((c) => c.id === id && c.projectId === projectId)
+    )
+      activeByProject[projectId] = id;
+  }
+  if (typeof data.activeId === "string") {
+    const legacy = merged.find((c) => c.id === data.activeId);
+    if (legacy && legacy.projectId && !activeByProject[legacy.projectId])
+      activeByProject[legacy.projectId] = legacy.id;
+  }
+  for (const [projectId, id] of Object.entries(state.activeByProject)) {
+    activeByProject[projectId] = id; // pre-hydrate selections win
+  }
+
+  // fold multiple reusable-empty chats per project (the reload race +
+  // old-bug pollution) into one before it hits the store — only when the
+  // migration ran (projectIds are trustworthy this run)
+  const collapsed = migrationSafe
+    ? collapseEmptyChats(merged, activeByProject)
+    : { chats: merged, activeByProject };
+  // pre-rebuild persists may carry panelOpen/panelWidth (the removed ⌘⇧O
+  // side panel) — ignored tolerantly
+  useOrchestrator.setState({
+    chats: collapsed.chats,
+    activeByProject: collapsed.activeByProject,
+  });
+  // unassigned chats heal as soon as projects (re)appear
+  if (collapsed.chats.some((c) => c.projectId === "")) startHealWatcher();
+  // persist the migrated/cleaned list so the on-disk state heals immediately
+  // (not only after the next interaction) — never off an unsafe migration run
+  if (
+    migrationSafe &&
+    (migrated ||
+      collapsed.chats.length !== merged.length ||
+      (data.version ?? 1) < 2)
+  )
+    schedulePersist();
 }

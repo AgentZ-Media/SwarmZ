@@ -1,10 +1,9 @@
-//! Orchestrator sensing (Phase 1): read-only transcript extraction from the
-//! session jsonl files that `usage.rs` / `codex_usage.rs` already know how to
-//! locate — but returning actual message CONTENT (user prompts, assistant
-//! text, one-line tool summaries) instead of token stats. Also serves the
-//! project docs (README/AGENTS/CLAUDE.md) of a repo root. Strictly read-only;
-//! no caching — callers pull on demand, and the byte-capped tail read keeps
-//! even multi-hundred-MB session files cheap.
+//! Orchestrator sensing: read-only transcript extraction from the codex
+//! rollout jsonl files — actual message CONTENT (user prompts, assistant
+//! text) instead of token stats. Also serves the project docs
+//! (README/AGENTS/CLAUDE.md) of a repo root. Strictly read-only; no caching
+//! — callers pull on demand, and the byte-capped tail read keeps even
+//! multi-hundred-MB session files cheap.
 
 use serde::Serialize;
 use std::fs;
@@ -22,8 +21,6 @@ const HEAD_SCAN_BYTES: u64 = 256 * 1024;
 const MESSAGE_CHAR_CAP: usize = 1500;
 /// Cap for the "Ursprungsprompt" (first user message).
 const FIRST_MESSAGE_CHAR_CAP: usize = 2000;
-/// Cap for tool one-liners (`[tool: Bash — git status]`).
-const TOOL_LINE_CHAR_CAP: usize = 120;
 
 #[derive(Clone, Debug)]
 pub struct TranscriptOpts {
@@ -60,7 +57,8 @@ pub struct TranscriptMessage {
 pub struct TranscriptView {
     /// the session's first real user message (the "Ursprungsprompt"), capped
     pub first_user_message: Option<String>,
-    /// compaction summaries (Claude `type:"summary"` lines) seen in the window
+    /// compaction summaries seen in the window (unused for codex rollouts —
+    /// kept for shape stability)
     pub summaries: Vec<String>,
     pub messages: Vec<TranscriptMessage>,
     /// true when the byte cap cut the file or the tail limit dropped messages
@@ -80,12 +78,6 @@ fn truncate_chars(s: &str, max: usize) -> String {
         }
         None => s.to_string(),
     }
-}
-
-/// First non-empty line, trimmed and capped — for tool one-liners.
-fn one_line(s: &str, max: usize) -> String {
-    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-    truncate_chars(line, max)
 }
 
 /// Read up to `max_bytes` from the END of the file. When the cap cuts the
@@ -128,192 +120,6 @@ fn read_head_window(path: &Path, cap: u64) -> Vec<u8> {
         }
     }
     buf
-}
-
-// ---- Claude session jsonl (~/.claude/projects/<encoded-cwd>/<id>.jsonl) ----
-
-/// Injected/meta user content that is not something the user actually typed:
-/// slash-command wrappers, local-command output, caveat preambles, reminders.
-fn is_claude_noise_text(t: &str) -> bool {
-    let t = t.trim_start();
-    t.starts_with("Caveat:")
-        || t.starts_with("<command-name>")
-        || t.starts_with("<command-message>")
-        || t.starts_with("<local-command-stdout>")
-        || t.starts_with("<local-command-stderr>")
-        || t.starts_with("<local-command-caveat>")
-        || t.starts_with("<system-reminder>")
-}
-
-/// One-line summary of a tool_use block, e.g. `[tool: Bash — git status]`.
-fn tool_use_line(block: &serde_json::Value) -> String {
-    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-    let brief = block
-        .get("input")
-        .and_then(|input| {
-            // the most descriptive single field per common tool shape
-            const KEYS: &[&str] = &[
-                "command", "file_path", "path", "pattern", "query", "description", "prompt",
-                "url", "skill",
-            ];
-            KEYS.iter()
-                .find_map(|k| input.get(k).and_then(|v| v.as_str()))
-                .map(|s| one_line(s, TOOL_LINE_CHAR_CAP))
-        })
-        .filter(|s| !s.is_empty());
-    match brief {
-        Some(b) => format!("[tool: {name} — {b}]"),
-        None => format!("[tool: {name}]"),
-    }
-}
-
-/// One-line summary of a tool_result block — an excerpt, never the payload.
-fn tool_result_line(block: &serde_json::Value) -> String {
-    let excerpt = match block.get("content") {
-        Some(serde_json::Value::String(s)) => one_line(s, TOOL_LINE_CHAR_CAP),
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .find_map(|i| i.get("text").and_then(|t| t.as_str()))
-            .map(|s| one_line(s, TOOL_LINE_CHAR_CAP))
-            .unwrap_or_default(),
-        _ => String::new(),
-    };
-    if excerpt.is_empty() {
-        "[tool result]".to_string()
-    } else {
-        format!("[tool result: {excerpt}]")
-    }
-}
-
-/// Turn one message's `content` (string or content-block array) into
-/// transcript messages: text blocks merged into one entry, tool blocks as
-/// individual one-liners, thinking/attachment blocks skipped.
-fn push_content(
-    role: &str,
-    content: &serde_json::Value,
-    at: &Option<String>,
-    sink: &mut Vec<TranscriptMessage>,
-) {
-    let push = |sink: &mut Vec<TranscriptMessage>, text: String, kind: &str| {
-        sink.push(TranscriptMessage {
-            role: role.to_string(),
-            text,
-            at: at.clone(),
-            kind: kind.to_string(),
-        });
-    };
-    match content {
-        serde_json::Value::String(s) => {
-            if !s.trim().is_empty() && !is_claude_noise_text(s) {
-                push(sink, s.trim().to_string(), "text");
-            }
-        }
-        serde_json::Value::Array(blocks) => {
-            let mut text_buf = String::new();
-            for b in blocks {
-                match b.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => {
-                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                            if !t.trim().is_empty() && !is_claude_noise_text(t) {
-                                if !text_buf.is_empty() {
-                                    text_buf.push_str("\n\n");
-                                }
-                                text_buf.push_str(t.trim());
-                            }
-                        }
-                    }
-                    Some("tool_use") => {
-                        if !text_buf.is_empty() {
-                            push(sink, std::mem::take(&mut text_buf), "text");
-                        }
-                        push(sink, tool_use_line(b), "tool");
-                    }
-                    Some("tool_result") => {
-                        if !text_buf.is_empty() {
-                            push(sink, std::mem::take(&mut text_buf), "text");
-                        }
-                        push(sink, tool_result_line(b), "tool");
-                    }
-                    // thinking, images, attachments … — never useful as text
-                    _ => {}
-                }
-            }
-            if !text_buf.is_empty() {
-                push(sink, text_buf, "text");
-            }
-        }
-        _ => {}
-    }
-}
-
-fn parse_claude_lines(
-    bytes: &[u8],
-    sink: &mut Vec<TranscriptMessage>,
-    summaries: &mut Vec<String>,
-) {
-    for line in bytes.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
-            continue;
-        };
-        let at = v
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .map(String::from);
-        match v.get("type").and_then(|t| t.as_str()) {
-            // written at compaction — the model's own summary of what came before
-            Some("summary") => {
-                if let Some(s) = v.get("summary").and_then(|s| s.as_str()) {
-                    if !s.trim().is_empty() {
-                        summaries.push(s.to_string());
-                    }
-                }
-            }
-            Some(role @ ("user" | "assistant")) => {
-                // sidechain = subagent traffic; isMeta = injected caveat noise
-                if v.get("isSidechain").and_then(|s| s.as_bool()) == Some(true)
-                    || v.get("isMeta").and_then(|m| m.as_bool()) == Some(true)
-                {
-                    continue;
-                }
-                if let Some(content) = v.pointer("/message/content") {
-                    push_content(role, content, &at, sink);
-                }
-            }
-            // queue-operation, attachment, ai-title, last-prompt, mode, … — skip
-            _ => {}
-        }
-    }
-}
-
-/// First real user message from the file head (separate cheap read — the tail
-/// window usually doesn't contain the session start anymore).
-fn claude_first_user_message(path: &Path) -> Option<String> {
-    let bytes = read_head_window(path, HEAD_SCAN_BYTES);
-    for line in bytes.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
-            continue;
-        };
-        if v.get("type").and_then(|t| t.as_str()) != Some("user")
-            || v.get("isSidechain").and_then(|s| s.as_bool()) == Some(true)
-            || v.get("isMeta").and_then(|m| m.as_bool()) == Some(true)
-        {
-            continue;
-        }
-        let mut msgs = Vec::new();
-        if let Some(content) = v.pointer("/message/content") {
-            push_content("user", content, &None, &mut msgs);
-        }
-        if let Some(first) = msgs.into_iter().find(|m| m.kind == "text") {
-            return Some(truncate_chars(&first.text, FIRST_MESSAGE_CHAR_CAP));
-        }
-    }
-    None
 }
 
 // ---- Codex rollout jsonl (~/.codex/sessions/YYYY/MM/DD/rollout-…-<id>.jsonl) ----
@@ -449,46 +255,24 @@ pub(crate) fn codex_session_path(root: &Path, session_id: &str) -> Option<PathBu
 
 // ---- entry points ----
 
-/// Locate the session file for (cwd, session id, runtime) the same way the
-/// usage parsers do.
-fn resolve_session_path(cwd: &str, session_id: &str, runtime: &str) -> Result<PathBuf, String> {
+/// Locate the codex rollout file for a session id.
+fn resolve_session_path(session_id: &str) -> Result<PathBuf, String> {
     if session_id.trim().is_empty() {
         return Err("session id is empty".into());
     }
-    if runtime == "codex" {
-        let root = dirs::home_dir()
-            .map(|h| h.join(".codex").join("sessions"))
-            .ok_or("no home directory")?;
-        codex_session_path(&root, session_id)
-            .ok_or_else(|| format!("no Codex session file for {session_id}"))
-    } else {
-        let dir = crate::usage::claude_projects_dir()
-            .ok_or("no home directory")?
-            .join(crate::usage::encode_project_dir(cwd));
-        let p = dir.join(format!("{session_id}.jsonl"));
-        if p.is_file() {
-            Ok(p)
-        } else {
-            Err(format!("no session file at {}", p.display()))
-        }
-    }
+    let root = dirs::home_dir()
+        .map(|h| h.join(".codex").join("sessions"))
+        .ok_or("no home directory")?;
+    codex_session_path(&root, session_id)
+        .ok_or_else(|| format!("no Codex session file for {session_id}"))
 }
 
-/// Parse one session file into a `TranscriptView` (see `TranscriptOpts`).
-pub fn read_transcript_file(
-    path: &Path,
-    runtime: &str,
-    opts: &TranscriptOpts,
-) -> Result<TranscriptView, String> {
+/// Parse one codex rollout file into a `TranscriptView` (see `TranscriptOpts`).
+pub fn read_transcript_file(path: &Path, opts: &TranscriptOpts) -> Result<TranscriptView, String> {
     let (bytes, byte_truncated) = read_tail_window(path, opts.max_bytes)?;
-    let mut summaries = Vec::new();
-    let mut messages = if runtime == "codex" {
+    let mut messages = {
         let (events, items) = parse_codex_lines(&bytes);
         if events.is_empty() { items } else { events }
-    } else {
-        let mut sink = Vec::new();
-        parse_claude_lines(&bytes, &mut sink, &mut summaries);
-        sink
     };
     let tail = opts.tail_messages.max(1);
     let dropped = messages.len() > tail;
@@ -499,31 +283,22 @@ pub fn read_transcript_file(
         m.text = truncate_chars(&m.text, MESSAGE_CHAR_CAP);
     }
     let first_user_message = if opts.include_first_user_message {
-        if runtime == "codex" {
-            codex_first_user_message(path)
-        } else {
-            claude_first_user_message(path)
-        }
+        codex_first_user_message(path)
     } else {
         None
     };
     Ok(TranscriptView {
         first_user_message,
-        summaries,
+        summaries: Vec::new(),
         messages,
         truncated: byte_truncated || dropped,
     })
 }
 
-/// Command-level entry: resolve the session file, then parse it.
-pub fn read(
-    cwd: &str,
-    session_id: &str,
-    runtime: &str,
-    opts: &TranscriptOpts,
-) -> Result<TranscriptView, String> {
-    let path = resolve_session_path(cwd, session_id, runtime)?;
-    read_transcript_file(&path, runtime, opts)
+/// Command-level entry: resolve the rollout file, then parse it.
+pub fn read(session_id: &str, opts: &TranscriptOpts) -> Result<TranscriptView, String> {
+    let path = resolve_session_path(session_id)?;
+    read_transcript_file(&path, opts)
 }
 
 // ---- project docs ----
@@ -561,34 +336,74 @@ pub(crate) fn collapse_worktree_path(path: &Path) -> PathBuf {
     out
 }
 
+/// Read one doc file NO-FOLLOW and BOUNDED (audit R4): a symlinked
+/// README/AGENTS (planted by an agent to exfiltrate a host file) is refused,
+/// a FIFO/device never hangs the reader, and at most `cap + 1` bytes are
+/// pulled off disk (never the whole file). Returns (lossy content, on-disk
+/// size, was_cut).
+#[cfg(unix)]
+fn read_doc_bounded(dir: &Path, name: &str, cap: usize) -> Option<(String, u64, bool)> {
+    let handle = crate::fsx::DirHandle::open_root(dir).ok()?;
+    let file = handle.open_file(name).ok()??; // symlink/FIFO → None via Err
+    let size = file.metadata().ok()?.len();
+    let mut bytes = Vec::new();
+    (&file)
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let cut = bytes.len() > cap;
+    if cut {
+        bytes.truncate(cap);
+    }
+    Some((String::from_utf8_lossy(&bytes).into_owned(), size, cut))
+}
+
+#[cfg(not(unix))]
+fn read_doc_bounded(dir: &Path, name: &str, cap: usize) -> Option<(String, u64, bool)> {
+    let p = dir.join(name);
+    let meta = p.symlink_metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let file = fs::File::open(&p).ok()?;
+    let mut bytes = Vec::new();
+    file.take(cap as u64 + 1).read_to_end(&mut bytes).ok()?;
+    let cut = bytes.len() > cap;
+    if cut {
+        bytes.truncate(cap);
+    }
+    Some((String::from_utf8_lossy(&bytes).into_owned(), meta.len(), cut))
+}
+
 pub fn project_docs(root: &str) -> ProjectDocs {
     let root_used = collapse_worktree_path(Path::new(root.trim()));
     let mut docs = ProjectDocs {
         files: Vec::new(),
         root_used: root_used.to_string_lossy().into_owned(),
     };
+    if !root_used.is_dir() {
+        return docs;
+    }
     let mut budget = DOC_TOTAL_CAP;
     for name in DOC_FILES {
-        let p = root_used.join(name);
-        let Ok(meta) = p.metadata() else {
-            continue; // missing files are simply omitted
-        };
-        let Ok(raw) = fs::read_to_string(&p) else {
-            continue;
-        };
         let cap = DOC_FILE_CAP.min(budget);
         if cap == 0 {
             break;
         }
+        // no-follow + bounded (audit R4): missing, symlinked or non-regular
+        // files are simply omitted, oversized ones are cut at the cap
+        let Some((raw, size, byte_cut)) = read_doc_bounded(&root_used, name, cap) else {
+            continue;
+        };
         // caps are byte-ish but enforced on chars — close enough and safe
         let content = truncate_chars(&raw, cap);
-        let truncated = content.len() != raw.len();
+        let truncated = byte_cut || content.len() != raw.len();
         budget = budget.saturating_sub(content.chars().count());
         docs.files.push(ProjectDocFile {
             name: name.to_string(),
             content,
             truncated,
-            size: meta.len(),
+            size,
         });
     }
     docs
@@ -618,58 +433,47 @@ mod tests {
         p
     }
 
-    const CLAUDE_FIXTURE: &str = r#"{"type":"summary","summary":"Early exploration of the repo","leafUuid":"x"}
-{"type":"user","isSidechain":false,"timestamp":"2026-01-01T10:00:00Z","cwd":"/tmp/proj","message":{"role":"user","content":"Build the feature please"}}
-{"type":"assistant","timestamp":"2026-01-01T10:00:05Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hm"},{"type":"text","text":"Sure, starting now."},{"type":"tool_use","name":"Bash","input":{"command":"git status"}}]}}
-{"type":"user","timestamp":"2026-01-01T10:00:06Z","message":{"role":"user","content":[{"type":"tool_result","content":"On branch main\nnothing to commit"}]}}
-{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: local command output</local-command-caveat>"}}
-{"type":"user","message":{"role":"user","content":"<command-name>/clear</command-name>"}}
-{"type":"user","isSidechain":true,"message":{"role":"user","content":"sidechain prompt"}}
-{"type":"queue-operation","operation":"enqueue","content":"queued text"}
-{"type":"assistant","timestamp":"2026-01-01T10:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}
+    const CODEX_FIXTURE: &str = r#"{"timestamp":"2026-01-02T09:00:00Z","type":"session_meta","payload":{"session_id":"019fabc","cwd":"/tmp/proj"}}
+{"timestamp":"2026-01-02T09:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<permissions instructions>sandbox…</permissions instructions>"}]}}
+{"timestamp":"2026-01-02T09:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the bug"}}
+{"timestamp":"2026-01-02T09:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Looking into it.","phase":"commentary"}}
+{"timestamp":"2026-01-02T09:00:04Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}"}}
+{"timestamp":"2026-01-02T09:00:09Z","type":"event_msg","payload":{"type":"agent_message","message":"Fixed.","phase":"final_answer"}}
 "#;
 
     #[test]
-    fn claude_messages_tools_summaries_and_first_prompt() {
+    fn codex_user_and_agent_messages() {
         let dir = temp_dir();
-        let p = write_file(&dir, "s.jsonl", CLAUDE_FIXTURE);
-        let view = read_transcript_file(&p, "claude", &TranscriptOpts::default()).unwrap();
-
-        assert_eq!(view.summaries, vec!["Early exploration of the repo"]);
-        assert_eq!(
-            view.first_user_message.as_deref(),
-            Some("Build the feature please")
-        );
-        let texts: Vec<(&str, &str, &str)> = view
+        let p = write_file(&dir, "rollout-2026-01-02T09-00-00-019fabc.jsonl", CODEX_FIXTURE);
+        let view = read_transcript_file(&p, &TranscriptOpts::default()).unwrap();
+        let texts: Vec<(&str, &str)> = view
             .messages
             .iter()
-            .map(|m| (m.role.as_str(), m.kind.as_str(), m.text.as_str()))
+            .map(|m| (m.role.as_str(), m.text.as_str()))
             .collect();
         assert_eq!(
             texts,
             vec![
-                ("user", "text", "Build the feature please"),
-                ("assistant", "text", "Sure, starting now."),
-                ("assistant", "tool", "[tool: Bash — git status]"),
-                ("user", "tool", "[tool result: On branch main]"),
-                ("assistant", "text", "Done."),
+                ("user", "Fix the bug"),
+                ("assistant", "Looking into it."),
+                ("assistant", "Fixed."),
             ]
         );
-        assert!(!view.truncated);
+        assert_eq!(view.first_user_message.as_deref(), Some("Fix the bug"));
+        assert!(view.summaries.is_empty());
         assert_eq!(
             view.messages[0].at.as_deref(),
-            Some("2026-01-01T10:00:00Z")
+            Some("2026-01-02T09:00:02Z")
         );
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn claude_tail_limit_keeps_the_last_messages() {
+    fn tail_limit_keeps_the_last_messages() {
         let dir = temp_dir();
-        let p = write_file(&dir, "s.jsonl", CLAUDE_FIXTURE);
+        let p = write_file(&dir, "rollout-2026-01-02T09-00-00-019fabc.jsonl", CODEX_FIXTURE);
         let view = read_transcript_file(
             &p,
-            "claude",
             &TranscriptOpts {
                 tail_messages: 2,
                 ..Default::default()
@@ -677,14 +481,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.messages.len(), 2);
-        assert_eq!(view.messages[0].text, "[tool result: On branch main]");
-        assert_eq!(view.messages[1].text, "Done.");
+        assert_eq!(view.messages[0].text, "Looking into it.");
+        assert_eq!(view.messages[1].text, "Fixed.");
         assert!(view.truncated);
         // the first prompt still comes from the head read
-        assert_eq!(
-            view.first_user_message.as_deref(),
-            Some("Build the feature please")
-        );
+        assert_eq!(view.first_user_message.as_deref(), Some("Fix the bug"));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -692,20 +493,20 @@ mod tests {
     fn byte_cap_tails_from_the_first_complete_line() {
         let dir = temp_dir();
         let filler = "x".repeat(6000);
+        let filler_line = format!(
+            r#"{{"timestamp":"2026-01-02T09:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"{filler}"}}}}"#
+        );
         let content = format!(
             "{}\n{}\n{}\n",
-            r#"{"type":"user","message":{"role":"user","content":"FIRST message"}}"#,
-            format!(
-                r#"{{"type":"user","message":{{"role":"user","content":"{filler}"}}}}"#
-            ),
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"tail marker"}]}}"#,
+            r#"{"timestamp":"2026-01-02T09:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"FIRST message"}}"#,
+            filler_line,
+            r#"{"timestamp":"2026-01-02T09:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"tail marker"}}"#,
         );
-        let p = write_file(&dir, "s.jsonl", &content);
+        let p = write_file(&dir, "rollout-2026-01-02T09-00-00-019feee.jsonl", &content);
         // 4096-byte window lands inside the filler line → only the complete
         // last line is parsed; the whole file is never read
         let view = read_transcript_file(
             &p,
-            "claude",
             &TranscriptOpts {
                 max_bytes: 4096,
                 ..Default::default()
@@ -725,10 +526,10 @@ mod tests {
         let dir = temp_dir();
         let long = "ä".repeat(3000); // multi-byte chars: truncation must not panic
         let content = format!(
-            r#"{{"type":"user","message":{{"role":"user","content":"{long}"}}}}"#
+            r#"{{"timestamp":"2026-01-02T09:00:00Z","type":"event_msg","payload":{{"type":"user_message","message":"{long}"}}}}"#
         );
-        let p = write_file(&dir, "s.jsonl", &format!("{content}\n"));
-        let view = read_transcript_file(&p, "claude", &TranscriptOpts::default()).unwrap();
+        let p = write_file(&dir, "rollout-2026-01-02T09-00-00-019fddd.jsonl", &format!("{content}\n"));
+        let view = read_transcript_file(&p, &TranscriptOpts::default()).unwrap();
         assert_eq!(view.messages.len(), 1);
         assert_eq!(view.messages[0].text.chars().count(), 1501);
         assert!(view.messages[0].text.ends_with('…'));
@@ -737,37 +538,6 @@ mod tests {
             view.first_user_message.as_ref().unwrap().chars().count(),
             2001
         );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    const CODEX_FIXTURE: &str = r#"{"timestamp":"2026-01-02T09:00:00Z","type":"session_meta","payload":{"session_id":"019fabc","cwd":"/tmp/proj"}}
-{"timestamp":"2026-01-02T09:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<permissions instructions>sandbox…</permissions instructions>"}]}}
-{"timestamp":"2026-01-02T09:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the bug"}}
-{"timestamp":"2026-01-02T09:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Looking into it.","phase":"commentary"}}
-{"timestamp":"2026-01-02T09:00:04Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}"}}
-{"timestamp":"2026-01-02T09:00:09Z","type":"event_msg","payload":{"type":"agent_message","message":"Fixed.","phase":"final_answer"}}
-"#;
-
-    #[test]
-    fn codex_user_and_agent_messages() {
-        let dir = temp_dir();
-        let p = write_file(&dir, "rollout-2026-01-02T09-00-00-019fabc.jsonl", CODEX_FIXTURE);
-        let view = read_transcript_file(&p, "codex", &TranscriptOpts::default()).unwrap();
-        let texts: Vec<(&str, &str)> = view
-            .messages
-            .iter()
-            .map(|m| (m.role.as_str(), m.text.as_str()))
-            .collect();
-        assert_eq!(
-            texts,
-            vec![
-                ("user", "Fix the bug"),
-                ("assistant", "Looking into it."),
-                ("assistant", "Fixed."),
-            ]
-        );
-        assert_eq!(view.first_user_message.as_deref(), Some("Fix the bug"));
-        assert!(view.summaries.is_empty());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -780,7 +550,7 @@ mod tests {
 {"timestamp":"2026-01-02T09:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Real answer"}]}}
 "##;
         let p = write_file(&dir, "rollout-2026-01-02T09-00-00-019fdef.jsonl", content);
-        let view = read_transcript_file(&p, "codex", &TranscriptOpts::default()).unwrap();
+        let view = read_transcript_file(&p, &TranscriptOpts::default()).unwrap();
         let texts: Vec<(&str, &str)> = view
             .messages
             .iter()
@@ -825,5 +595,40 @@ mod tests {
         assert_eq!(docs.files[1].size, 10_000);
         assert!(docs.files[1].content.chars().count() <= DOC_FILE_CAP + 1);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Audit R4 (frozen): project docs are read NO-FOLLOW and bounded — a
+    /// symlinked README (host-file exfiltration) is omitted, a FIFO with a
+    /// doc name never hangs the reader, and an oversized file is cut at the
+    /// cap instead of being slurped whole.
+    #[cfg(unix)]
+    #[test]
+    fn project_docs_never_follow_symlinks_or_read_fifos() {
+        let dir = temp_dir();
+        let outside = temp_dir();
+        fs::write(outside.join("secret.txt"), "HOST SECRET").unwrap();
+        // README is a symlink to a host file → omitted, never leaked
+        std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("README.md")).unwrap();
+        // AGENTS.md is a FIFO → omitted without hanging
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let fifo = dir.join("AGENTS.md");
+            let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        }
+        // CLAUDE.md is a regular, oversized file → served, cut at the cap
+        fs::write(dir.join("CLAUDE.md"), "c".repeat(DOC_FILE_CAP * 3)).unwrap();
+
+        let docs = project_docs(&dir.to_string_lossy());
+        assert_eq!(docs.files.len(), 1, "only the regular file is served");
+        assert_eq!(docs.files[0].name, "CLAUDE.md");
+        assert!(docs.files[0].truncated);
+        assert!(docs.files[0].content.len() <= DOC_FILE_CAP + 4);
+        assert!(
+            !docs.files.iter().any(|f| f.content.contains("HOST SECRET")),
+            "a symlinked doc must never leak host content"
+        );
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
     }
 }

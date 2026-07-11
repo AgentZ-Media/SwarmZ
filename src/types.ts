@@ -1,11 +1,6 @@
-export type AgentStatus = "starting" | "running" | "attention" | "exited";
-export type AgentRuntime = "claude" | "codex" | "shell";
-
-/**
- * Agent working state. Claude reports this through terminal escape sequences;
- * Codex reports it through rollout events.
- */
-export type ClaudeActivity = "busy" | "idle" | "waiting";
+// SwarmZ domain types — Codex-only. The app drives native `codex app-server`
+// sessions (Vibe) plus one orchestrator; there are no terminals, panes or
+// grid workspaces anymore (removed in the codex-only rebuild, Phase 1).
 
 export interface ModelUsage {
   model: string;
@@ -18,72 +13,14 @@ export interface ModelUsage {
   cost_usd: number;
 }
 
-export interface SessionUsage {
-  runtime?: AgentRuntime;
-  activity?: ClaudeActivity;
-  session_id: string;
-  cwd: string | null;
-  primary_model: string | null;
-  service_tier: string | null;
-  title?: string | null;
-  git_branch: string | null;
-  last_activity: string | null;
-  /** current context occupancy = full prompt of the latest main-chain turn */
-  context_tokens: number;
-  /** context window of the model that served that turn (200k, or 1m variants) */
-  context_limit: number;
-  message_count: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_tokens: number;
-  cache_read_tokens: number;
-  reasoning_output_tokens?: number;
-  cost_usd: number;
-  by_model: ModelUsage[];
-  codex_limits?: CodexRateLimits | null;
-  /** subagents (Task tool) spawned by this session, each with its own context */
-  subagents?: SubagentUsage[];
-}
-
-export interface CodexRateLimitWindow extends RateLimitWindow {
-  window_minutes: number | null;
-}
-
-export interface CodexRateLimits {
-  primary: CodexRateLimitWindow | null;
-  secondary: CodexRateLimitWindow | null;
-  plan_type: string | null;
-}
-
 /**
- * One subagent (Task tool) run, parsed from its own jsonl in
- * `<project>/<session>/subagents/`. Has its own context window.
- */
-export interface SubagentUsage {
-  agent_id: string;
-  /** agent type from `attributionAgent`, e.g. "Explore" / "general-purpose" */
-  agent_type: string | null;
-  model: string | null;
-  context_tokens: number;
-  context_limit: number;
-  message_count: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_tokens: number;
-  cache_read_tokens: number;
-  cost_usd: number;
-  last_activity: string | null;
-  /** the subagent file was modified within the last few seconds */
-  running: boolean;
-}
-
-/**
- * Persisted snapshot of one tracked agent session launched inside SwarmZ.
+ * Persisted snapshot of one tracked Codex session launched inside SwarmZ.
  * Survives app restarts so global usage stats cover all-time activity,
- * independent of the ~/.claude JSONL files still existing.
+ * independent of the ~/.codex JSONL files still existing. (Entries from the
+ * pre-rebuild era may carry other `runtime` values — tolerated on read.)
  */
 export interface UsageHistoryEntry {
-  runtime?: AgentRuntime;
+  runtime?: string;
   session_id: string;
   agent_name: string;
   cwd: string | null;
@@ -99,20 +36,7 @@ export interface UsageHistoryEntry {
   by_model: ModelUsage[];
 }
 
-export interface UsageTotals {
-  runtime?: AgentRuntime;
-  total_cost_usd: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_tokens: number;
-  cache_read_tokens: number;
-  reasoning_output_tokens?: number;
-  message_count: number;
-  session_count: number;
-  by_model: ModelUsage[];
-}
-
-/** One rate-limit window of the Claude subscription (5h session, 7d week, …). */
+/** One rate-limit window of the Codex subscription (5h session, 7d week, …). */
 export interface RateLimitWindow {
   /** percent used, 0–100 */
   utilization: number | null;
@@ -120,24 +44,21 @@ export interface RateLimitWindow {
   resets_at: string | null;
 }
 
-/**
- * Usage limits of the Claude subscription logged in on this machine,
- * fetched from the Anthropic OAuth usage endpoint with Claude Code's
- * own credentials (Keychain / ~/.claude/.credentials.json).
- */
-export interface SubscriptionLimits {
-  five_hour: RateLimitWindow | null;
-  seven_day: RateLimitWindow | null;
-  seven_day_sonnet: RateLimitWindow | null;
-  seven_day_opus: RateLimitWindow | null;
+export interface CodexRateLimitWindow extends RateLimitWindow {
+  window_minutes: number | null;
+}
+
+export interface CodexRateLimits {
+  primary: CodexRateLimitWindow | null;
+  secondary: CodexRateLimitWindow | null;
+  plan_type: string | null;
 }
 
 /**
  * Account-level Codex rate limits: the newest `rate_limits` event found
- * across ALL of `~/.codex/sessions` (`codex_account_limits` in Rust) —
- * account-scoped like the Claude subscription limits, independent of any
- * open pane. `limits: null` = no data ever seen (Codex never ran / logged
- * out); `as_of_ms` dates the source event so stale data can be annotated.
+ * across ALL of `~/.codex/sessions` (`codex_account_limits` in Rust).
+ * `limits: null` = no data ever seen (Codex never ran / logged out);
+ * `as_of_ms` dates the source event so stale data can be annotated.
  */
 export interface CodexAccountLimits {
   limits: CodexRateLimits | null;
@@ -145,8 +66,9 @@ export interface CodexAccountLimits {
 }
 
 /**
- * Read-only git snapshot of an agent's working directory, polled every few
- * seconds. Produced by `git_info` (Rust), which shells out to the git binary.
+ * Read-only git snapshot of a directory, produced by `git_info` (Rust),
+ * which shells out to the git binary. Used by the orchestrator's git_status
+ * tool and the worktree flows.
  */
 export interface GitInfo {
   /** repo root folder name */
@@ -163,13 +85,39 @@ export interface GitInfo {
   remote_url: string | null;
 }
 
+/**
+ * What is still running when the user tries to quit (Quit-Guard v2). The
+ * dialog lists it; the guard raises only when something would genuinely be
+ * interrupted (busy sessions, busy Conductors, a Conductor timer mid-fire,
+ * in-flight gh writes, detached reviews or worktree git ops) — pending
+ * timers are shown as info (they persist and re-fire next launch).
+ */
+export interface QuitBlockers {
+  /** busy vibe session ids (a running turn would be interrupted) */
+  sessionIds: string[];
+  /** project names whose Conductor has a turn in flight */
+  conductorProjects: string[];
+  /** pending Conductor timers (info only — they survive a restart) */
+  pendingTimers: number;
+  /**
+   * Conductor timers MID-FIRE (durable `firedAt` claim stamped, delivery not
+   * yet finished) — quitting now drops them on the next hydrate
+   * (at-most-once), so unlike pending timers they are a HARD blocker.
+   */
+  claimedTimers: number;
+  /** gh/git write ops in flight (a push / PR mutation — interrupting is bad);
+   * -1 = the counter query FAILED (unknown state → confirm, fail closed) */
+  ghWrites: number;
+  /** detached codex reviews in flight (manual / review_agent / auto-review —
+   * they hold no busy flag but quitting kills them mid-run) */
+  reviews: number;
+  /** git worktree add/remove operations in flight */
+  worktreeOps: number;
+}
+
 // ---- Git worktrees ----
 
-/**
- * Marks an agent as living in a SwarmZ-managed git worktree (the agent's cwd
- * IS the worktree folder under `<root>/.worktrees/`). Drives the pane badge,
- * the split prefill and the close-time cleanup.
- */
+/** Marks a SwarmZ-managed git worktree (folder under `<root>/.worktrees/`). */
 export interface WorktreeMeta {
   /** main repo root the worktree belongs to */
   root: string;
@@ -180,14 +128,14 @@ export interface WorktreeMeta {
 export interface WorktreeInfo {
   /** main repo root the worktree belongs to */
   root: string;
-  /** absolute path of the new worktree (the agent's cwd) */
+  /** absolute path of the new worktree */
   path: string;
   branch: string;
   /** untracked/ignored files copied over by the environment transfer */
   copied: number;
 }
 
-/** Would closing this worktree lose work? Produced by `worktree_status` (Rust). */
+/** Would removing this worktree lose work? Produced by `worktree_status` (Rust). */
 export interface WorktreeStatus {
   /** false when the folder vanished (deleted by hand) — nothing left to lose */
   exists: boolean;
@@ -195,6 +143,11 @@ export interface WorktreeStatus {
   dirty: boolean;
   /** commits reachable only from this branch — deleting it would lose them */
   ahead: number;
+  /**
+   * the ahead count could NOT be computed (git error/timeout) — deletion
+   * gates must treat this as "may hold work" (fail closed), never as 0
+   */
+  ahead_unknown: boolean;
   branch: string | null;
 }
 
@@ -207,6 +160,8 @@ export interface WorktreeEntry {
   branch: string;
   dirty: boolean;
   ahead: number;
+  /** the ahead count could not be computed — treat as "may hold work" */
+  ahead_unknown: boolean;
   /** registered with git but the folder is gone (prunable) */
   missing: boolean;
 }
@@ -222,58 +177,53 @@ export interface WorktreeScan {
   scanned: string[];
 }
 
-/** Small app-wide preferences, persisted across restarts. Edited in the Settings dialog. */
-/** The two app-wide views (title-bar switch, ⌘⇧V) — grid = the tiling
- * terminal wall, vibe = the native Codex session view. */
-export type UiMode = "grid" | "vibe";
+// ---- Projects ----
 
+/**
+ * One project tab: a folder the swarm works in. Sessions belong to exactly
+ * one project (`VibeSession.projectId`); Phase 3 gives every project its own
+ * Conductor. Persisted under the store key `projects`.
+ */
+export interface Project {
+  id: string;
+  /** canonical absolute folder path (symlinks resolved) — the dedupe key */
+  dir: string;
+  /** display name — folder basename, deduped with a numeric suffix ("api 2") */
+  name: string;
+  /** tab position among the open projects, ascending */
+  order: number;
+  /** last time this project was the active tab, epoch ms */
+  lastActiveAt: number;
+  createdAt: number;
+  /**
+   * Epoch ms the tab was closed — null/absent = open (shown in the tab bar).
+   * Closing a project NEVER touches its sessions; the entity stays persisted
+   * so reopening the same folder brings them back under the same id.
+   */
+  closedAt?: number | null;
+}
+
+/** Persisted shape of the projects (store key `projects`). */
+export interface PersistedProjects {
+  /** shape version — bump when the persisted shape changes (missing = 1) */
+  version?: number;
+  projects: Project[];
+  /** the active project tab — persisted so a restart lands where you left */
+  activeId: string | null;
+}
+
+// ---- Settings ----
+
+/** Small app-wide preferences, persisted across restarts. Edited in the Settings dialog. */
 export interface AppSettings {
-  /** which top-level view the app opens in (grid tiling wall vs vibe sessions) */
-  uiMode?: UiMode;
-  /** last working directory an agent was launched in — prefilled in the New Agent dialog */
+  /** last project directory a session was launched in — prefilled in the New Session dialog */
   lastCwd?: string;
-  /** download updates in the background as soon as they're found (native only; installing still needs a restart) */
+  /** download updates in the background as soon as they're found (installing still needs a restart) */
   autoUpdate?: boolean;
-  /** default terminal font size for panes without a per-pane zoom override */
-  defaultFontSize?: number;
-  /** startup command the New Agent dialog opens with; unset = built-in default, "" = plain shell */
-  defaultStartup?: string;
-  /** runtime preselected for new agent panes; unset = Codex */
-  defaultRuntime?: AgentRuntime;
-  /** absolute path used instead of `claude` at the start of startup commands */
-  claudePath?: string;
-  /** absolute path used instead of `codex` at the start of startup commands */
+  /** absolute path used instead of `codex` when spawning the app-server */
   codexPath?: string;
-  /** absolute path to the git binary used for the read-only pane git status */
+  /** absolute path to the git binary used for git status / worktrees */
   gitPath?: string;
-  /** restore the last grid on launch and resume each tracked pane's session (default off) */
-  restoreAgents?: boolean;
-  /** voice dictation hotkey behavior: hold ⌘⇧M like push-to-talk, or press to start/stop (default "hold") */
-  dictationHotkeyMode?: "hold" | "toggle";
-  /** submit the transcript with Enter right after pasting it (default off) */
-  dictationAutoSubmit?: boolean;
-  /** polish transcripts with an LLM after transcription (default off) */
-  dictationCleanup?: boolean;
-  /** OpenRouter model for the cleanup pass; unset = DEFAULT_CLEANUP_MODEL */
-  dictationCleanupModel?: string;
-  /** system prompt of the cleanup pass; unset = DEFAULT_CLEANUP_PROMPT (must never translate) */
-  dictationCleanupPrompt?: string;
-  /** OpenRouter speech-to-text model; unset = DEFAULT_STT_MODEL */
-  dictationSttModel?: string;
-  /**
-   * preferred recording device (getUserMedia deviceId); unset = system
-   * default. Applied as an "ideal" constraint, so an unplugged device falls
-   * back to the default instead of erroring
-   */
-  dictationMicId?: string;
-  /** human label of the preferred mic — persisted so Settings can show the selection without opening the mic to re-enumerate */
-  dictationMicLabel?: string;
-  /**
-   * transcription engine: "openrouter" = cloud via API key (default),
-   * "local" = on-device Parakeet model (no internet, needs the ~670 MB
-   * model downloaded in Settings)
-   */
-  dictationEngine?: "openrouter" | "local";
   /**
    * repo roots that ever had a SwarmZ worktree — scanned for the title-bar
    * worktree panel (so orphans survive restarts); roots with no worktrees
@@ -281,34 +231,12 @@ export interface AppSettings {
    */
   worktreeRepos?: string[];
   /**
-   * orchestrator brain for NEW chats: "codex" = the codex app-server
-   * (ChatGPT login), "openrouter" = a tool loop over the OpenRouter API
-   * (key from the Voice section). A chat keeps the provider it was created
-   * with; switching this only affects new chats. Unset = codex.
-   */
-  orchestratorProvider?: "codex" | "openrouter";
-  /** OpenRouter model id for orchestrator chats; unset = DEFAULT_ORCHESTRATOR_MODEL */
-  orchestratorModel?: string;
-  /**
-   * Default model + reasoning effort NEW codex orchestrator chats are stamped
-   * with (a per-chat override the model picker can then change). Unset = the
-   * user's plain codex default. Distinct from `orchestratorModel`, which is the
-   * OpenRouter default.
+   * Default model + reasoning effort NEW orchestrator chats are stamped
+   * with (a per-chat override the model picker can then change). Unset =
+   * the user's plain codex default.
    */
   orchestratorCodexModel?: string;
   orchestratorCodexEffort?: string;
-  /**
-   * let the orchestrator press Enter on prompts it types into panes
-   * (default on). Off = review mode: prompt_pane and create_panes startup
-   * prompts paste but never submit — the user submits manually.
-   */
-  orchestratorAutoSubmit?: boolean;
-  /**
-   * what prompt_pane does on a busy pane: "deliver" queues the text in the
-   * CLI's input with a warning to the model (default), "refuse" errors so
-   * the model waits instead
-   */
-  orchestratorBusyPolicy?: "deliver" | "refuse";
   /** default scan roots for the orchestrator's list_projects when the model passes none */
   orchestratorScanRoots?: string[];
   /**
@@ -318,6 +246,60 @@ export interface AppSettings {
    * name/role/tone/principles reach the backend; emoji/accent are UI-only.
    */
   orchestratorPersona?: OrchestratorPersona;
+  /**
+   * Phase 5 auto-review: when a conductor-tasked agent finishes a lane that
+   * changed code, a detached codex review runs automatically BEFORE the
+   * Conductor's agent-finished turn — the findings ride into that turn, so
+   * the Conductor reports reviewed work. Off by default (reviews cost turns).
+   */
+  autoReviewFinishedLanes?: boolean;
+  /**
+   * Phase 8 auto-compaction: when a session/Conductor chat nears its context
+   * window (≥85%), `thread/compact/start` runs BEFORE the next turn to shrink
+   * the model-visible history (the UI transcript is never touched). Only when
+   * idle, and at most once per cooldown. ON by default; set false to rely on
+   * the manual compact button (and codex' own auto-compaction) only.
+   */
+  autoCompact?: boolean;
+  /**
+   * Motion off-switch (DESIGN.md): stamps `data-motion="off"` on the root
+   * element, collapsing every nonessential animation (sweeps, pulses,
+   * carets, entrances). Off by default — motion on.
+   */
+  reduceMotion?: boolean;
+  /** absolute path to the `gh` binary (GitHub CLI) — empty = auto-resolve */
+  ghPath?: string;
+  /**
+   * Phase 7 — the GitHub integration MASTER toggle (default OFF). ON enables:
+   * the Conductor's github tools, the PR watcher, the Deck PR indicator and
+   * the routine-classification of the two sanctioned agent-run gh writes
+   * (`gh pr comment` / `gh pr review` — mirrored into Rust). The read-only
+   * GitHub panel works regardless (local gh state only, no OAuth ever).
+   */
+  githubIntegration?: boolean;
+  /**
+   * When ON (and the integration is on), a NEWLY OPENED PR detected by the
+   * watcher wakes the Conductor with an autonomous review turn. Default off.
+   */
+  githubAutoReviewPrs?: boolean;
+  /**
+   * When ON (and the integration is on), the Conductor's agent-finished turn
+   * for a lane on a branch WITHOUT an open PR carries a "propose a PR"
+   * suggestion line. Default off.
+   */
+  githubSuggestPrOnFinish?: boolean;
+  /** PR watcher poll interval in seconds (default 120, floor 30). */
+  githubWatchIntervalSec?: number;
+  /**
+   * Opt-in (default OFF) that lets the Conductor perform OUTWARD-FACING GitHub
+   * writes (open a PR, comment, post a review) DURING AN AUTONOMOUS turn — a
+   * fleet event drove it, not a user message. Off = those writes are refused
+   * in autonomous turns and the Conductor must PROPOSE them to the user
+   * instead; human-triggered turns (the user asked directly) always allow them
+   * under the master toggle. The safety cap against a prompt-injected
+   * autonomous cascade pushing/posting/approving on the user's repo.
+   */
+  autonomousGithubWrites?: boolean;
 }
 
 /**
@@ -339,217 +321,6 @@ export interface OrchestratorPersona {
   accent?: string;
 }
 
-// ---- OpenRouter voice dictation ----
-
-/**
- * State of the OpenRouter API key in the macOS Keychain. `valid: null` means
- * "present but unverifiable right now" (offline/5xx) — dictation stays
- * enabled then; only an explicit 401/403 rejection turns it off.
- */
-export interface OpenrouterKeyStatus {
-  present: boolean;
-  valid: boolean | null;
-}
-
-/** One entry of OpenRouter's public model catalog (cleanup-model picker). */
-export interface OpenrouterModel {
-  id: string;
-  name: string;
-}
-
-/**
- * State of the local speech-to-text model (Parakeet TDT 0.6b v3 int8) on
- * disk and in RAM. Fetched at launch and after download/remove.
- */
-export interface LocalSttStatus {
-  installed: boolean;
-  downloading: boolean;
-  /** model currently resident in RAM (~2 GB while loaded) */
-  loaded: boolean;
-  /** full download size in bytes (~670 MB) */
-  totalBytes: number;
-}
-
-/** Result of transcribing one audio segment. */
-export interface TranscriptionResult {
-  text: string;
-  /** duration of the input audio in seconds (what OpenRouter bills) */
-  seconds: number;
-  /** cost of the request in USD */
-  cost: number;
-}
-
-/** A voice dictation in flight, keyed to the pty it will paste into (in-memory). */
-export interface DictationState {
-  /** agent pane or floating terminal receiving the transcript */
-  targetId: string;
-  phase: "recording" | "transcribing" | "error";
-  /** epoch ms recording started — drives the elapsed readout in the pill */
-  startedAt: number;
-  error?: string;
-}
-
-/**
- * A named container with its own tiling grid — the top-level organization
- * unit (title-bar tabs, ⌘1–9). Deliberately NOT bound to a project: one
- * workspace can be a repo, a feature with several worktrees, or a mixed
- * monitoring wall. Name/order/defaultCwd persist across restarts; the agents
- * inside are in-memory like everywhere else.
- */
-export interface Workspace {
-  id: string;
-  name: string;
-  /** true once the user named it — auto-naming from the first project folder stops */
-  renamed?: boolean;
-  /** prefilled working directory for new agents in this workspace */
-  defaultCwd?: string;
-}
-
-/** Shape persisted for workspaces (tabs survive restarts). */
-export interface PersistedWorkspaces {
-  workspaces: Workspace[];
-  activeId: string | null;
-}
-
-/** Restore-relevant slice of an Agent, snapshotted into the persisted grid. */
-export interface PersistedAgent {
-  id: string;
-  runtime?: AgentRuntime;
-  name: string;
-  renamed?: boolean;
-  workspaceId: string;
-  cwd?: string;
-  /** original startup command — `--resume` is injected at spawn, never stored */
-  startup: string;
-  color: string;
-  profileId?: string;
-  fontSize?: number;
-  /** agent session to resume when this pane is restored */
-  sessionId?: string;
-  /** set when the pane lives in a SwarmZ-managed git worktree */
-  worktree?: WorktreeMeta;
-}
-
-/**
- * Continuously persisted snapshot of the live grid: every agent pane plus the
- * tiling trees referencing them. Restored on launch (settings.restoreAgents)
- * by respawning each pane with runtime-specific resume. Floating terminals are
- * plain shells without a session — they are not captured.
- */
-export interface PersistedGrid {
-  /** snapshot shape version — bump when the persisted shape changes so a
-   * future reader can migrate instead of guessing (missing = 1) */
-  version?: number;
-  agents: PersistedAgent[];
-  /** tiling tree per workspace id — pane nodes reference agent ids above */
-  layouts: Record<string, LayoutNode | null>;
-  activePaneIds?: Record<string, string | null>;
-}
-
-export interface Profile {
-  id: string;
-  name: string;
-  runtime?: AgentRuntime;
-  /** command typed into the shell on spawn, e.g. `claude --dangerously-skip-permissions` */
-  startup: string;
-  defaultCwd?: string;
-  color: string;
-}
-
-// ---- Workspace presets ----
-
-/** One pane template inside a workspace preset. */
-export interface PresetPaneNode {
-  type: "pane";
-  id: string;
-  runtime?: AgentRuntime;
-  /** fixed working directory; unset = inherit the folder asked for at load time */
-  cwd?: string;
-  /** startup command; unset = the configured default startup command, "" = plain shell */
-  startup?: string;
-  /** agent name; unset = auto ("Agent N" + captured terminal titles) */
-  name?: string;
-  profileId?: string;
-  color?: string;
-}
-
-export interface PresetSplitNode {
-  type: "split";
-  direction: "row" | "column";
-  /** flex-grow weights, one per child (same semantics as SplitNode) */
-  sizes: number[];
-  children: PresetLayoutNode[];
-}
-
-export type PresetLayoutNode = PresetPaneNode | PresetSplitNode;
-
-/**
- * A reusable workspace blueprint: a tiling layout whose leaves are agent
- * templates. Loaded from the empty-workspace screen — every pane spawns as a
- * fresh agent. Persisted (store key `workspacePresets`); seeded with a few
- * standard grids on first launch.
- */
-export interface WorkspacePreset {
-  id: string;
-  name: string;
-  layout: PresetLayoutNode;
-}
-
-export interface Agent {
-  id: string;
-  runtime?: AgentRuntime;
-  name: string;
-  /** workspace this agent's pane lives in */
-  workspaceId: string;
-  cwd?: string;
-  startup: string;
-  color: string;
-  status: AgentStatus;
-  attention: boolean;
-  createdAt: number;
-  profileId?: string;
-  usage?: SessionUsage;
-  /** latched once this agent's own session file is discovered */
-  sessionId?: string;
-  /**
-   * agent session this restored pane should reopen — applied at PTY spawn,
-   * kept off `startup` so splits/persistence see the clean command
-   */
-  resume?: string;
-  /** last terminal title captured from the PTY (for runtimes that emit one) */
-  title?: string;
-  /** true once the user named the agent themselves — captured titles stop renaming it */
-  renamed?: boolean;
-  /** agent working state, if reported (see ClaudeActivity) */
-  activity?: ClaudeActivity;
-  /**
-   * epoch ms of the first Claude "busy" report. Claude session discovery is
-   * gated on it: a pane that never did anything must not latch (and later
-   * resume) a sibling session from the same folder.
-   */
-  firstBusyAt?: number;
-  /**
-   * epoch ms of the last busy → idle/waiting transition — drives the
-   * ephemeral "✓ finished" moment in the pane header (fades after ~5 min).
-   * In-memory only, never persisted.
-   */
-  lastBusyEndAt?: number;
-  /**
-   * epoch ms the pane entered needs-you via BELL attention while its
-   * activity wasn't "waiting" (OSC waiting stamps `lastBusyEndAt` instead) —
-   * gives the triage ordering (Deck queue, fleet Tab cycle) a waiting-since
-   * for bell-only panes. Stamped in `setAttention(true)`, cleared when the
-   * attention clears. In-memory only, never persisted.
-   */
-  waitingSince?: number;
-  /** per-pane terminal font size override (⌘+/⌘− zoom); unset = default */
-  fontSize?: number;
-  /** live git snapshot of the cwd; null = checked and not inside a repo */
-  git?: GitInfo | null;
-  /** set when the pane lives in a SwarmZ-managed git worktree (cwd = worktree path) */
-  worktree?: WorktreeMeta;
-}
-
 // ---- Quick notes ----
 
 /** One line in a quick-notes list — a checkable item or a plain text note. */
@@ -563,29 +334,41 @@ export interface NoteItem {
 }
 
 /**
- * All quick notes: a global list plus per-project lists keyed by repo root
- * (worktree agents resolve to their main repo, never the .worktrees path).
+ * All quick notes: a global list plus per-project lists keyed by repo root.
  */
 export interface QuickNotesData {
   global: NoteItem[];
   folders: Record<string, NoteItem[]>;
 }
 
-// ---- Orchestrator chat sidebar ----
+// ---- Orchestrator chat ----
 
-/** A pane referenced by an orchestrator tool call — rendered as a jump chip. */
+/**
+ * What woke the Conductor for an autonomous turn (Phase 5 loop). Stamped on
+ * the turn's system marker message (`autonomous: true` + `trigger`) so the
+ * UI can render autonomous turns distinctly from user-triggered ones.
+ */
+export type AutonomousTriggerKind =
+  | "agent-finished"
+  | "agent-blocked"
+  | "approval"
+  | "timer"
+  | "idle"
+  | "pr-changed";
+
+/** A session referenced by an orchestrator tool call — rendered as a jump chip. */
 export interface OrchestratorPaneRef {
-  /** agent id (chips hide themselves once the pane is gone) */
+  /** session id (chips hide themselves once the session is gone) */
   id: string;
-  /** pane name captured at reference time (fallback when the agent closed) */
+  /** session name captured at reference time (fallback when it closed) */
   name: string;
 }
 
 /**
- * One message in an orchestrator chat. `system` carries the Phase-5 status
- * pings ("«api» finished") — its `paneRefs` render the jump chip and the
- * "Review" button. Assistant messages carry a transient `streaming` flag
- * while deltas arrive — cleared on finalize and on hydrate.
+ * One message in an orchestrator chat. `system` carries the status pings
+ * ("«api» finished") — its `paneRefs` render the jump chip and the "Review"
+ * button. Assistant messages carry a transient `streaming` flag while deltas
+ * arrive — cleared on finalize and on hydrate.
  */
 export type OrchestratorChatMessage =
   | { id: string; at: number; role: "user"; text: string }
@@ -599,7 +382,7 @@ export type OrchestratorChatMessage =
       argsSummary: string;
       /** undefined while the call runs; patched from tool_done */
       ok?: boolean;
-      /** panes this call touched/created — the UI's "→ pane" jump chips */
+      /** sessions this call touched/created — the UI's jump chips */
       paneRefs?: OrchestratorPaneRef[];
     }
   | { id: string; at: number; role: "warning"; text: string }
@@ -608,119 +391,127 @@ export type OrchestratorChatMessage =
       at: number;
       role: "system";
       text: string;
-      /** the pinged pane — jump chip + "Review" target (Phase 5) */
+      /** the pinged session — jump chip + "Review" target */
       paneRefs?: OrchestratorPaneRef[];
+      /** true = this marker precedes an AUTONOMOUS Conductor turn (Phase 5) */
+      autonomous?: boolean;
+      /** what woke the Conductor — set together with `autonomous` */
+      trigger?: AutonomousTriggerKind;
     };
 
-/** A pane this chat prompted (prompt_pane / create_panes startup prompt). */
+/** A session this chat prompted (prompt_agent / spawn_agents startup task). */
 export interface OrchestratorTouchedPane {
-  /** pane name at prompt time (fallback once the pane is gone) */
+  /** session name at prompt time (fallback once it is gone) */
   name: string;
-  /** last orchestrator prompt delivery into this pane, epoch ms */
+  /** last orchestrator prompt delivery into this session, epoch ms */
   lastPromptAt: number;
 }
 
 /**
- * One "pane finished" status ping (Phase 5). Recorded per chat when a
- * touched pane transitions busy → idle/waiting; `delivered` flips once the
- * ping was injected into the wire text of an outgoing turn.
+ * One "session finished" status ping. Recorded per chat when a touched
+ * session transitions busy → idle/waiting; `delivered` flips once the ping
+ * was injected into the wire text of an outgoing turn.
  */
 export interface OrchestratorPingRecord {
   paneId: string;
   paneName: string;
-  /** the activity the pane landed on */
+  /** the activity the session landed on */
   activity: "idle" | "waiting";
   at: number;
   delivered: boolean;
 }
 
-/** One streamed tool call of the OpenRouter loop (OpenAI wire format). */
-export interface OrchestratorWireToolCall {
-  id: string;
-  name: string;
-  /** raw JSON string of the arguments, exactly as streamed */
-  arguments_json: string;
-}
-
 /**
- * One OpenAI-format wire message of an OpenRouter chat's model context
- * (Phase 6). Persisted per chat, capped — a capped history simply loses old
- * context like any long chat. The system message is NOT persisted; it is
- * rebuilt fresh each turn (instructions + current fleet-status line).
- */
-export type OrchestratorWireMessage =
-  | { role: "user"; content: string }
-  | {
-      role: "assistant";
-      content: string | null;
-      tool_calls?: OrchestratorWireToolCall[];
-    }
-  | { role: "tool"; tool_call_id: string; content: string };
-
-/**
- * One orchestrator chat (right sidebar, ⌘⇧O). `provider` is stamped at
- * creation from the settings and never changes (missing = codex, for chats
- * from pre-Phase-6 builds). Codex chats: `threadId` is the app-server thread
- * behind it — persisted so the chat reconnects across app restarts
- * (chatResume); null until the first message was sent. OpenRouter chats:
- * `model` + `wire` (the OpenAI-format model context) take that role.
- * `touchedPanes`/`pendingPings` are the Phase-5 status-ping state — persisted
- * so pings survive restarts.
+ * One Conductor chat. `threadId` is the app-server thread behind it —
+ * persisted so the chat reconnects across app restarts (chatResume); null
+ * until the first message was sent. `touchedPanes`/`pendingPings` are the
+ * status-ping state — persisted so pings survive restarts. Since Phase 3
+ * every chat belongs to exactly one project (`projectId` — the Conductor
+ * instance it runs on); pre-Phase-3 chats hydrate through a migration that
+ * derives the project from the sessions the chat touched.
  */
 export interface OrchestratorChat {
   id: string;
-  /** the brain behind this chat — fixed for the chat's lifetime */
-  provider?: "codex" | "openrouter";
+  /** owning project (`Project.id`) — the Conductor stage scopes on this */
+  projectId: string;
   threadId: string | null;
-  /**
-   * Provider model: the OpenRouter model id (openrouter chats, captured at
-   * creation) OR the codex model override (codex chats — a per-turn override,
-   * editable mid-chat via the model picker). Unset codex = the user's default.
-   */
+  /** codex model override (a per-turn override, editable mid-chat). Unset = the user's default. */
   model?: string;
-  /** codex reasoning-effort override (codex chats only), e.g. "high". Unset = default. */
+  /** codex reasoning-effort override, e.g. "high". Unset = default. */
   effort?: string;
-  /** OpenRouter wire history, capped (openrouter chats only) */
-  wire?: OrchestratorWireMessage[];
   title: string;
   createdAt: number;
   messages: OrchestratorChatMessage[];
-  /** panes this chat prompted, keyed by pane id */
+  /** sessions this chat prompted, keyed by session id */
   touchedPanes: Record<string, OrchestratorTouchedPane>;
   /** ping history, oldest first, capped (delivered + undelivered) */
   pendingPings: OrchestratorPingRecord[];
 }
 
-/** Persisted shape of the orchestrator sidebar (store key `orchestratorChats`). */
+/** Persisted shape of the orchestrator chats (store key `orchestratorChats`).
+ * Version 2 = chats carry `projectId` + the per-project active map. Pre-rebuild
+ * persists may additionally carry `panelOpen`/`panelWidth` (the removed ⌘⇧O
+ * side panel) — ignored tolerantly on hydrate. */
 export interface PersistedOrchestratorChats {
   /** shape version — bump when the persisted shape changes (missing = 1) */
   version?: number;
   chats: OrchestratorChat[];
-  activeId: string | null;
-  panelOpen?: boolean;
-  panelWidth?: number;
+  /** v1 leftover: the single global active chat (migrated into the map) */
+  activeId?: string | null;
+  /** active chat per project — the Conductor stage restores per-tab (v2) */
+  activeByProject?: Record<string, string>;
 }
 
-// ---- Vibe Mode: native Codex sessions ----
+// ---- Vibe: native Codex sessions ----
 
 /** How much a Vibe session's Codex agent may touch the machine. */
 export type VibeAccess = "workspace" | "full";
+
+/** Who created a session: the human (dialog/palette) or the Conductor. */
+export type VibeSpawnedBy = "user" | "conductor";
+
+/**
+ * The git worktree a session's agent works in. Phase 2 only carries the
+ * field (plus the WorktreePanel "open in session" flow, which knows all
+ * three values); Phase 4's worktree tools fill it for conductor-spawned
+ * agents. `shared` = other agents work in the same worktree.
+ */
+export interface VibeSessionWorktree {
+  /** main repo root the worktree belongs to */
+  root: string;
+  branch: string;
+  shared: boolean;
+}
 
 /**
  * One Vibe session (a native Codex agent driven over the app-server). `id` is
  * assigned frontend-side and keys the backend session too; `threadId` is the
  * codex thread behind it — persisted so the session reconnects across restarts
  * (vibe_session_resume), null until the first turn. `access` maps to the
- * sandbox/approval policy in Rust.
+ * sandbox/approval policy in Rust. Since schema v2 every session belongs to
+ * exactly one project (`projectId`); pre-v2 persists hydrate through the
+ * migration that derives/creates projects from their `projectDir`s.
  */
 export interface VibeSession {
   id: string;
+  /** display name — renamable; starts as the generated agent name */
   name: string;
-  /** the project directory the session runs in (thread cwd) */
+  /** owning project tab (`Project.id`) — the rail scopes on this */
+  projectId: string;
+  /**
+   * The generated agent identity (names.ts pool), collision-free per project
+   * and immutable — Phase 4 derives branch names from it (`swarm/maya-…`).
+   * Migrated sessions carry their old display name here.
+   */
+  agentName: string;
+  spawnedBy: VibeSpawnedBy;
+  /** the worktree the agent works in — null = directly in the project dir */
+  worktree: VibeSessionWorktree | null;
+  /** the directory the session runs in (thread cwd; a worktree path when `worktree` is set) */
   projectDir: string;
   /** codex model id (unset = the user's codex default) */
   model?: string;
-  /** reasoning effort (codex only), e.g. "low" | "medium" | "high" */
+  /** reasoning effort, e.g. "low" | "medium" | "high" */
   effort?: string;
   access: VibeAccess;
   /** app-server thread id — survives restarts; null until the first turn */
@@ -757,7 +548,19 @@ export interface VibePlanStep {
  * raw request (itemId links a fileChange approval to its fileChange item).
  */
 export type VibeItem =
-  | { id: string; at: number; kind: "user"; text: string }
+  | {
+      id: string;
+      at: number;
+      kind: "user";
+      text: string;
+      /**
+       * The Conductor injected this prompt (prompt_agent / spawn_agents),
+       * rather than the human typing it. Lets the feed mark it "via Conductor"
+       * so autonomously-issued orders are distinguishable from your own.
+       * Undefined = a human message (or a pre-existing item).
+       */
+      via?: "conductor";
+    }
   | {
       id: string;
       at: number;
@@ -766,6 +569,14 @@ export type VibeItem =
       /** transient while deltas arrive — never restored on hydrate */
       streaming?: boolean;
       phase?: string | null;
+      /**
+       * This message is the schema-forced final report of a COMPLETED
+       * `expect_report` turn (Phase 5 `outputSchema`) — stamped by the vibe
+       * controller at turn completion, persisted with the transcript. The UI
+       * renders it as a report card instead of raw JSON (ItemFeed), but only
+       * when the text still parses as a valid AgentReport.
+       */
+      report?: boolean;
     }
   | {
       id: string;
@@ -799,10 +610,85 @@ export type VibeItem =
       kind: "approval";
       approvalKind: "command" | "fileChange";
       status: VibeApprovalStatus;
+      /**
+       * Conductor routing class (classified in Rust, conservative):
+       * "routine" = the Conductor may decide it via decide_approval,
+       * "destructive" = hard human-only. Missing (pre-Phase-4 items) =
+       * treated as destructive.
+       */
+      escalation?: "routine" | "destructive";
+      /**
+       * Who decided a resolved approval — the Conductor (via the strict
+       * `decide_approval` path) or the human (the takeover / inline card).
+       * Undefined = still pending, or a pre-existing item resolved before this
+       * field existed. Drives the "approved by Conductor" attribution so the
+       * user can see, at a glance, which approvals they did NOT give themselves.
+       */
+      decidedBy?: "conductor" | "human";
       /** the raw request params (itemId, reason, command, cwd, …) */
       payload: Record<string, unknown>;
     }
-  | { id: string; at: number; kind: "warning"; text: string };
+  | { id: string; at: number; kind: "warning"; text: string }
+  /** a neutral, non-error notice (e.g. a context-compaction divider) */
+  | { id: string; at: number; kind: "notice"; text: string };
+
+// ---- Conductor timers ----
+
+/**
+ * One Conductor follow-up timer (the `set_timer` tool). Project-scoped;
+ * persisted (store key `conductorTimers`) so timers survive app restarts —
+ * they only FIRE while the app runs, missed ones fire on the next launch.
+ * Firing delivers an autonomous Conductor turn in the timer's project with
+ * `note` as context (lib/orchestrator/timers.ts).
+ */
+export interface ConductorTimer {
+  id: string;
+  /** owning project (`Project.id`) — fires into that project's Conductor */
+  projectId: string;
+  /** what future-you should do — the fired turn's context */
+  note: string;
+  /** fire time, epoch ms */
+  at: number;
+  createdAt: number;
+  /**
+   * Durable at-most-once claim: stamped (and flushed) IMMEDIATELY BEFORE the
+   * autonomous turn dispatches. A persisted timer carrying `firedAt` on the
+   * next hydrate may already have delivered (crash between dispatch and
+   * removal) — it is dropped instead of double-delivered. Cleared again when
+   * a dispatch reports retry (not delivered).
+   */
+  firedAt?: number;
+}
+
+/** Persisted shape of the Conductor timers (store key `conductorTimers`). */
+export interface PersistedConductorTimers {
+  /** shape version — bump when the persisted shape changes (missing = 1) */
+  version?: number;
+  timers: ConductorTimer[];
+}
+
+// ---- Autonomy budget (Phase 5) ----
+
+/**
+ * One project's persisted autonomy-budget state (lib/orchestrator/autonomy.ts).
+ * Persisted so an app relaunch/HMR can never mint a fresh autonomous-turn
+ * allowance or silently un-latch a tripped circuit breaker — only a real
+ * human message re-arms it.
+ */
+export interface PersistedAutonomyBudget {
+  /** autonomous-turn timestamps inside the rolling window */
+  firedAt: number[];
+  /** autonomous turns since the last human message */
+  consecutive: number;
+  /** breaker latched — survives restarts until a human message */
+  tripped: boolean;
+}
+
+/** Persisted shape of the autonomy budgets (store key `autonomyBudgets`). */
+export interface PersistedAutonomyBudgets {
+  version: 1;
+  projects: Record<string, PersistedAutonomyBudget>;
+}
 
 /** Per-turn token accounting (thread/tokenUsage/updated). */
 export interface VibeTokenUsage {
@@ -821,102 +707,17 @@ export interface PersistedVibeSession {
   items: VibeItem[];
 }
 
-/** Persisted shape of the Vibe sidebar (store key `vibeSessions`). */
+/**
+ * Persisted shape of the Vibe sessions (store key `vibeSessions`).
+ * Version 2 = sessions carry `projectId`/`agentName`/`spawnedBy`/`worktree`;
+ * version 1 / missing hydrates through the project migration (projects are
+ * derived from the sessions' `projectDir`s).
+ */
 export interface PersistedVibeSessions {
   /** shape version — bump when the persisted shape changes (missing = 1) */
   version?: number;
   sessions: PersistedVibeSession[];
   activeId: string | null;
+  /** remembered session selection per project — restored on tab switch */
+  activeIdByProject?: Record<string, string>;
 }
-
-// ---- Floating terminals & quick commands ----
-
-/** One saved quick command. Stored per project folder, keyed by cwd. */
-export interface CommandPreset {
-  id: string;
-  label: string;
-  command: string;
-}
-
-/**
- * Everything the user customized about quick commands in one project folder:
- * saved presets and auto-detected commands they removed. A preset whose label
- * or command matches a detected command overrides it.
- */
-export interface FolderCommands {
-  presets: CommandPreset[];
-  /** detected commands hidden by the user, matched by command string */
-  hidden: string[];
-}
-
-/**
- * One user-defined prompt/command snippet, inserted (pasted, not run) into
- * the active agent pane via the insert picker (⌘⇧K). `text` may contain
- * `{{…}}` placeholders, substituted at insert time (see lib/command-vars.ts).
- */
-export interface CustomCommand {
-  id: string;
-  label: string;
-  text: string;
-}
-
-/** All custom commands: global ones plus per-project-folder lists (keyed by presetKey(cwd)). */
-export interface CustomCommandsData {
-  global: CustomCommand[];
-  folders: Record<string, CustomCommand[]>;
-}
-
-/**
- * A runnable command auto-detected from project files in a folder —
- * package.json scripts (package-manager aware via the lockfile), Cargo.toml,
- * Makefile and justfile targets. Produced by `project_commands` (Rust) /
- * `/api/project-commands` (web) — keep both implementations in sync.
- */
-export interface DetectedCommand {
-  label: string;
-  command: string;
-  /** where it was found: "package.json" | "cargo" | "make" | "just" */
-  source: string;
-}
-
-/**
- * A small PiP-style shell terminal floating above the grid (in-memory).
- * Owned by an agent pane; detaching (when the pane closes while a process is
- * still running) keeps the PTY alive with `agentId: null`.
- */
-export interface FloatingTerminal {
-  id: string;
-  /** owning agent; null once detached */
-  agentId: string | null;
-  cwd?: string;
-  /** display name — the last command run, or "Terminal" */
-  name: string;
-  status: "running" | "exited";
-  /** collapsed to just the title bar (PTY keeps running) */
-  minimized: boolean;
-  /** window rect in px relative to the grid area; x/y null until first layout */
-  x: number | null;
-  y: number | null;
-  w: number;
-  h: number;
-  /** stacking order — raised on click; render order stays stable (xterm canvas) */
-  z: number;
-}
-
-// ---- Tiling layout tree ----
-export interface PaneNode {
-  type: "pane";
-  id: string;
-  agentId: string;
-}
-
-export interface SplitNode {
-  type: "split";
-  id: string;
-  direction: "row" | "column"; // row = side-by-side, column = stacked
-  /** flex-grow weights, one per child, summing is not required */
-  sizes: number[];
-  children: LayoutNode[];
-}
-
-export type LayoutNode = PaneNode | SplitNode;
