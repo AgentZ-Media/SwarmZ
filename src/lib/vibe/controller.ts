@@ -1303,6 +1303,9 @@ export async function respondApproval(
     await invokeRespondApproval(sessionId, approvalId, decision, false);
   } catch (err) {
     warn(sessionId, `Couldn't answer the approval: ${errorText(err)}`);
+    // revert the optimistic mark — Rust never recorded the decision, the
+    // agent is still waiting (the strict path below commits only on confirm)
+    useVibe.getState().setApprovalStatus(sessionId, approvalId, "pending");
   }
 }
 

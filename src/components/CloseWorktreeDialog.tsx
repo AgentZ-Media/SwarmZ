@@ -69,11 +69,11 @@ export function CloseWorktreeDialog() {
           <Button variant="ghost" size="sm" onClick={() => resolve("cancel")}>
             Cancel
           </Button>
-          <Button variant="danger" size="sm" onClick={() => resolve("delete")}>
-            Delete worktree
-          </Button>
           <Button variant="secondary" size="sm" onClick={() => resolve("keep")}>
             Keep worktree
+          </Button>
+          <Button variant="danger" size="sm" onClick={() => resolve("delete")}>
+            Delete worktree
           </Button>
         </div>
       </DialogContent>

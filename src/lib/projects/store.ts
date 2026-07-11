@@ -288,24 +288,28 @@ export const useProjects = create<ProjectsState>((set, get) => ({
       set({ hydrated: true });
       return;
     }
-    const projects: Record<string, Project> = {};
+    // null-prototype map + own-property checks: a persisted id like
+    // "__proto__" must neither pollute the map nor pass the active lookup
+    const hasOwn = (o: object, k: string) =>
+      Object.prototype.hasOwnProperty.call(o, k);
+    const projects: Record<string, Project> = Object.create(null);
     const order: string[] = [];
     for (const raw of Array.isArray(data.projects) ? data.projects : []) {
       const p = sanitizeProject(raw);
-      if (!p || projects[p.id]) continue;
+      if (!p || hasOwn(projects, p.id)) continue;
       projects[p.id] = p;
       order.push(p.id);
     }
     const state = get();
     // a project opened before hydrate resolved wins (kept on top of persisted)
     for (const id of state.order) {
-      if (!projects[id] && state.projects[id]) {
+      if (!hasOwn(projects, id) && state.projects[id]) {
         projects[id] = state.projects[id];
         order.push(id);
       }
     }
     const persistedActive =
-      typeof data.activeId === "string" && projects[data.activeId]
+      typeof data.activeId === "string" && hasOwn(projects, data.activeId)
         ? data.activeId
         : null;
     const active = state.activeProjectId ?? persistedActive;
@@ -313,7 +317,7 @@ export const useProjects = create<ProjectsState>((set, get) => ({
       projects,
       order,
       activeProjectId:
-        active && projects[active] && !projects[active].closedAt
+        active && hasOwn(projects, active) && !projects[active].closedAt
           ? active
           : fallbackActive(projects),
       hydrated: true,

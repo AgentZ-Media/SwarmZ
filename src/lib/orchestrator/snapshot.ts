@@ -47,10 +47,18 @@ export interface FleetSession {
   createdAt: number;
 }
 
+/** Approval payload text is UNTRUSTED (agent-originated): flatten to one
+ * line, cap AFTER normalization, and quote as a delimited JSON literal so
+ * newlines or instruction-like content can never fabricate a wire line. */
+function safeBriefValue(value: string): string {
+  const flattened = value.replace(/\s+/g, " ").trim().slice(0, 160);
+  return JSON.stringify(flattened);
+}
+
 /** One-line summary of an approval request payload (pure). */
 export function approvalBriefSummary(payload: Record<string, unknown>): string {
   const command = typeof payload.command === "string" ? payload.command : "";
-  if (command) return command.slice(0, 160);
+  if (command) return `command=${safeBriefValue(command)}`;
   const changes = Array.isArray(payload.changes) ? payload.changes : [];
   const paths = changes
     .map((c) =>
@@ -59,9 +67,9 @@ export function approvalBriefSummary(payload: Record<string, unknown>): string {
         : null,
     )
     .filter((p): p is string => !!p);
-  if (paths.length) return `file change: ${paths.join(", ")}`.slice(0, 160);
+  if (paths.length) return `paths=${safeBriefValue(paths.join(", "))}`;
   const reason = typeof payload.reason === "string" ? payload.reason : "";
-  return (reason || "unknown request").slice(0, 160);
+  return `reason=${safeBriefValue(reason || "unknown request")}`;
 }
 
 /** All PENDING approvals of one session entry, oldest first (pure). */

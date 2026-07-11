@@ -119,7 +119,11 @@ export function Toasts() {
 
   if (toasts.length === 0) return null;
   return (
-    <div className="pointer-events-none fixed right-3.5 top-[60px] z-[70] flex flex-col gap-2">
+    <div
+      role="status"
+      aria-live="polite"
+      className="pointer-events-none fixed right-3.5 top-[60px] z-[70] flex flex-col gap-2"
+    >
       {toasts.map((t) => (
         <ToastCard key={t.id} toast={t} onDismiss={() => dismiss(t.id)} />
       ))}
@@ -144,7 +148,7 @@ function ToastCard({
         if (live) focusSession(toast.sessionId);
       }}
       className={cn(
-        "animate-ztoast pointer-events-auto flex items-center gap-2.5 rounded-lg border bg-pop px-3 py-2.5 text-left shadow-toast",
+        "animate-ztoast pointer-events-auto flex items-center gap-2.5 rounded-xl border bg-pop px-3 py-2.5 text-left shadow-toast",
         style.border,
       )}
     >

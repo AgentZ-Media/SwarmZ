@@ -103,13 +103,17 @@ export function CommandPalette({
                   value="open project folder tab"
                   onSelect={() =>
                     run(() => {
-                      void pickDirectory().then(async (dir) => {
-                        if (!dir) return;
-                        const id = await useProjects
-                          .getState()
-                          .openProject(dir);
-                        activateProject(id);
-                      });
+                      void pickDirectory()
+                        .then(async (dir) => {
+                          if (!dir) return;
+                          const id = await useProjects
+                            .getState()
+                            .openProject(dir);
+                          activateProject(id);
+                        })
+                        .catch((e) => {
+                          console.error("Failed to open project:", e);
+                        });
                     })
                   }
                 >

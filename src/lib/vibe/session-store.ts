@@ -585,13 +585,19 @@ function sanitizeSession(raw: unknown): VibeSession | null {
   if (!raw || typeof raw !== "object") return null;
   const s = raw as Record<string, unknown>;
   if (typeof s.id !== "string" || typeof s.projectDir !== "string") return null;
+  // ids become dynamic object-map keys — a persisted "__proto__"/
+  // "constructor"/"prototype" id could pollute those maps
+  if (isDangerousKey(s.id)) return null;
   const access: VibeAccess = s.access === "full" ? "full" : "workspace";
   const name =
     typeof s.name === "string" && s.name.trim() ? s.name : "Vibe session";
   return {
     id: s.id,
     name,
-    projectId: typeof s.projectId === "string" ? s.projectId : "",
+    projectId:
+      typeof s.projectId === "string" && !isDangerousKey(s.projectId)
+        ? s.projectId
+        : "",
     // migrated (pre-v2) sessions carry their old display name as identity
     agentName:
       typeof s.agentName === "string" && s.agentName.trim()
@@ -635,10 +641,16 @@ function sanitizePlanSteps(raw: unknown): VibePlanStep[] {
 }
 
 /** One persisted item, hardened field by field. Unknown kinds are dropped. */
+/** Persisted ids become dynamic object-map keys — reject the identifiers
+ * that would mutate a plain object's prototype (CWE-1321). */
+function isDangerousKey(id: string): boolean {
+  return id === "__proto__" || id === "constructor" || id === "prototype";
+}
+
 function sanitizeItem(raw: unknown): VibeItem | null {
   if (!raw || typeof raw !== "object") return null;
   const m = raw as Record<string, unknown>;
-  if (typeof m.id !== "string") return null;
+  if (typeof m.id !== "string" || isDangerousKey(m.id)) return null;
   const id = m.id;
   const at = typeof m.at === "number" ? m.at : Date.now();
   const text = typeof m.text === "string" ? m.text : "";
@@ -766,13 +778,13 @@ export async function hydrateVibeSessions(): Promise<void> {
     useVibe.setState({ hydrated: true });
     return;
   }
-  const sessions: Record<string, VibeSessionEntry> = {};
+  const sessions: Record<string, VibeSessionEntry> = Object.create(null);
   const order: string[] = [];
   for (const raw of Array.isArray(data.sessions) ? data.sessions : []) {
     try {
       const session = sanitizeSession((raw as PersistedVibeSession)?.session);
       if (!session || sessions[session.id]) continue;
-      const items: Record<string, VibeItem> = {};
+      const items: Record<string, VibeItem> = Object.create(null);
       const itemOrder: string[] = [];
       const rawItems = Array.isArray((raw as PersistedVibeSession).items)
         ? (raw as PersistedVibeSession).items
@@ -824,7 +836,12 @@ export async function hydrateVibeSessions(): Promise<void> {
 
   const state = useVibe.getState();
   // a session created before hydrate resolved wins; append persisted after
-  const mergedSessions: Record<string, VibeSessionEntry> = { ...sessions };
+  // (null-prototype map — dynamic keys must not be able to hit a setter on
+  // Object.prototype; ids are additionally rejected in the sanitizers)
+  const mergedSessions: Record<string, VibeSessionEntry> = Object.assign(
+    Object.create(null),
+    sessions,
+  );
   for (const id of Object.keys(state.sessions))
     mergedSessions[id] = state.sessions[id];
   const mergedOrder = capPerProject(
@@ -845,7 +862,7 @@ export async function hydrateVibeSessions(): Promise<void> {
   if (evictedOnHydrate.length) notifyEvicted(evictedOnHydrate);
   // per-project selection map: only entries whose session survived AND still
   // belongs to that project; live (pre-hydrate) picks win
-  const activeIdByProject: Record<string, string> = {};
+  const activeIdByProject: Record<string, string> = Object.create(null);
   const rawMap =
     data.activeIdByProject && typeof data.activeIdByProject === "object"
       ? data.activeIdByProject

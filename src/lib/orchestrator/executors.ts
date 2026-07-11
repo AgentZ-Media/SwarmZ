@@ -587,6 +587,8 @@ async function spawnOneAgent(
           gitBin: gitBin(),
         });
         rolledBack = true;
+        // re-scan so a now-empty repo root is pruned from the registry again
+        void useSwarm.getState().refreshWorktrees();
       } catch {
         /* rollback failed — name the path below so nothing orphans silently */
       }
@@ -875,9 +877,12 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         results[i] = result;
         if (task) tasks.push({ index: i, ...task });
       } catch (e) {
+        // the failure path stores the model-supplied name too — sanitize it
+        // like the success path before it can reach any wire/UI surface
+        const rawName = specs[i]?.name;
         results[i] = {
           error: e instanceof Error ? e.message : String(e),
-          name: typeof specs[i]?.name === "string" ? specs[i].name : null,
+          name: typeof rawName === "string" ? sanitizeAgentName(rawName) : null,
         };
       }
     }

@@ -261,11 +261,15 @@ fn read_title(dir: &DirHandle, name: &str) -> Option<String> {
 }
 
 /// Short stable hash suffix for slug collisions of DIFFERENT titles.
+/// FNV-1a (fixed algorithm): the suffix persists in filenames, so it must
+/// stay reproducible across Rust releases — `DefaultHasher` is not.
 fn hash8(s: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:08x}", h.finish() & 0xffff_ffff)
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    format!("{:08x}", h & 0xffff_ffff)
 }
 
 fn modified_ms(meta: &fs::Metadata) -> u64 {

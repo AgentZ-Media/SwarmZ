@@ -20,6 +20,7 @@ import {
   decayedSignal,
   hasPendingApproval,
   VIBE_CTX_WARN,
+  VIBE_FINISHED_WINDOW_MS,
 } from "@/lib/vibe/ui";
 import { recentCodexModels } from "@/lib/orchestrator/models";
 import { splitUnifiedDiff } from "@/lib/vibe/diff";
@@ -171,10 +172,13 @@ function useStageState(sessionId: string): "working" | "needs" | "finished" | "i
   const lastBusyEndAt = useVibe((s) => s.sessions[sessionId]?.lastBusyEndAt ?? null);
   const [, setTick] = useState(0);
   useEffect(() => {
-    // only the time-decayed state needs re-evaluation without store events
+    // only the time-decayed state needs re-evaluation without store events;
+    // one shot at the end of the finished window — no interval past the decay
     if (busy || needs || lastBusyEndAt === null) return;
-    const t = setInterval(() => setTick((n) => n + 1), 30_000);
-    return () => clearInterval(t);
+    const remaining = lastBusyEndAt + VIBE_FINISHED_WINDOW_MS - Date.now();
+    if (remaining <= 0) return;
+    const t = setTimeout(() => setTick((n) => n + 1), remaining);
+    return () => clearTimeout(t);
   }, [busy, needs, lastBusyEndAt]);
   const signal = decayedSignal(busy, needs, lastBusyEndAt, Date.now());
   return signal === "needsYou" ? "needs" : signal;
@@ -241,6 +245,12 @@ function StageHeader({
       ) : (
         <button
           onDoubleClick={() => setEditing(true)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setEditing(true);
+            }
+          }}
           className="group/name focus-ring flex shrink-0 items-center gap-1.5 rounded-xs"
           title="Double-click to rename"
         >

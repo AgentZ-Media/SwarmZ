@@ -176,6 +176,9 @@ export function NewVibeSessionDialog() {
             gitBin: useSwarm.getState().settings.gitPath?.trim() || undefined,
           });
           msg += " (the freshly created worktree was rolled back)";
+          // re-scan so a now-empty repo root is pruned from the registry
+          // again instead of lingering until the next scan
+          void useSwarm.getState().refreshWorktrees();
         } catch {
           msg += ` — and the fresh worktree could not be rolled back; clean it up via the worktree panel: ${createdWorktree.path}`;
         }

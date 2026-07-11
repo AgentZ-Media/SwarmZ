@@ -143,7 +143,7 @@ exactly `{"answer":"4","confidence":1}`), `additionalContext`, `clientUserMessag
 
 ### Captured event order for one file-writing turn (workspace-write + on-request)
 
-```
+```text
 thread/started → mcpServer/startupStatus/updated (×N, per configured MCP server)
 → thread/settings/updated → thread/status/changed {active}
 → turn/started

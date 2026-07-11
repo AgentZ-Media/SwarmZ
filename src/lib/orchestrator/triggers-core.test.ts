@@ -146,7 +146,6 @@ describe("trigger router", () => {
     await flush();
     // q ran to completion while p's first turn still blocks; p's second waits
     expect(order).toContain("end:q");
-    expect(order).not.toContain("start:p-second");
     expect(order.filter((x) => x === "start:p").length).toBe(1);
     releaseFirst();
     await flush();

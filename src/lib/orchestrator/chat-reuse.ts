@@ -108,21 +108,6 @@ export interface MigratableChat {
 }
 
 /**
- * Assign every chat to a project (the Phase-3 hydrate migration). The rule,
- * in order:
- *
- * 1. a chat whose `projectId` names an existing project keeps it;
- * 2. otherwise the chat goes to the project of the session it touched MOST
- *    RECENTLY (via `sessionProject`, the live session store — sessions
- *    already carry projectIds since schema v2);
- * 3. otherwise it goes to `fallbackProjectId` (the last active project at
- *    hydrate time);
- * 4. with no fallback either (no projects exist at all) it keeps "" — it
- *    stays invisible until the store self-heals on a later hydrate.
- *
- * Pure: the session→project resolver and the fallback are injected.
- */
-/**
  * Apply a migration's assignments to a chat list — with the DOWNGRADE GUARD:
  * an existing non-empty `projectId` is never overwritten with "" (the project
  * record may be missing only transiently; wiping the link would be permanent
@@ -147,6 +132,21 @@ export function applyChatAssignments<
   return changed ? { chats: next, changed } : { chats, changed };
 }
 
+/**
+ * Assign every chat to a project (the Phase-3 hydrate migration). The rule,
+ * in order:
+ *
+ * 1. a chat whose `projectId` names an existing project keeps it;
+ * 2. otherwise the chat goes to the project of the session it touched MOST
+ *    RECENTLY (via `sessionProject`, the live session store — sessions
+ *    already carry projectIds since schema v2);
+ * 3. otherwise it goes to `fallbackProjectId` (the last active project at
+ *    hydrate time);
+ * 4. with no fallback either (no projects exist at all) it keeps "" — it
+ *    stays invisible until the store self-heals on a later hydrate.
+ *
+ * Pure: the session→project resolver and the fallback are injected.
+ */
 export function assignChatsToProjects(
   chats: MigratableChat[],
   validProjectIds: ReadonlySet<string>,

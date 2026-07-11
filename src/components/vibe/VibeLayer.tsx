@@ -17,6 +17,18 @@ import {
   NewVibeSessionDialog,
 } from "./NewVibeSessionDialog";
 
+// stable references — recreating these per render could tear down and
+// re-initialize the whole worker pool on every focus/unfocus transition
+const POOL_OPTIONS = {
+  workerFactory: () => new DiffsWorker(),
+  poolSize: DIFF_POOL_SIZE,
+};
+const HIGHLIGHTER_OPTIONS = {
+  theme: SWARMZ_DIFF_THEME,
+  preferredHighlighter: "shiki-js" as const,
+  langs: [...DIFF_PRELOAD_LANGS],
+};
+
 /**
  * The app's one and only view (Vibe v3): the Conductor SIDEBAR on the left
  * (collapsible ⌘B, resizable) and the fleet on the right — the agent-card
@@ -43,15 +55,8 @@ export function VibeLayer() {
 
   return (
     <WorkerPoolContextProvider
-      poolOptions={{
-        workerFactory: () => new DiffsWorker(),
-        poolSize: DIFF_POOL_SIZE,
-      }}
-      highlighterOptions={{
-        theme: SWARMZ_DIFF_THEME,
-        preferredHighlighter: "shiki-js",
-        langs: [...DIFF_PRELOAD_LANGS],
-      }}
+      poolOptions={POOL_OPTIONS}
+      highlighterOptions={HIGHLIGHTER_OPTIONS}
     >
       <div className="flex h-full w-full min-h-0 bg-bg">
         <ConductorSidebar />

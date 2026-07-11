@@ -98,8 +98,17 @@ export default function App() {
     );
   }, [reduceMotion]);
 
-  // native notification when a session raises a pending approval (needs-you)
+  // native notification when a session raises a pending approval (needs-you);
+  // seeded from the current state so hydrated pre-existing approvals never
+  // re-notify on launch (same lesson as Toasts' lastSeenRef)
   useEffect(() => {
+    const seed = new Set<string>();
+    const initial = useVibe.getState();
+    for (const id of initial.order) {
+      const entry = initial.sessions[id];
+      if (entry && hasPendingApproval(entry)) seed.add(id);
+    }
+    prevPending.current = seed;
     const unsub = useVibe.subscribe((state) => {
       const nowPending = new Set<string>();
       for (const id of state.order) {
