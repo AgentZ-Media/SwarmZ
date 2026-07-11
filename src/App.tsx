@@ -3,6 +3,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { TitleBar } from "./components/TitleBar";
 import { VibeLayer } from "./components/vibe/VibeLayer";
 import { Deck } from "./components/Deck";
+import { Toasts } from "./components/Toasts";
 import { CommandPalette } from "./components/CommandPalette";
 import { QuitConfirmDialog } from "./components/QuitConfirmDialog";
 import { CloseWorktreeDialog } from "./components/CloseWorktreeDialog";
@@ -77,6 +78,16 @@ export default function App() {
     };
   }, [hydrate]);
 
+  // the motion off-switch (Settings → Appearance): data-motion="off" on the
+  // root collapses every nonessential animation (styles.css)
+  const reduceMotion = useSwarm((s) => !!s.settings.reduceMotion);
+  useEffect(() => {
+    document.documentElement.setAttribute(
+      "data-motion",
+      reduceMotion ? "off" : "on",
+    );
+  }, [reduceMotion]);
+
   // native notification when a session raises a pending approval (needs-you)
   useEffect(() => {
     const unsub = useVibe.subscribe((state) => {
@@ -98,6 +109,31 @@ export default function App() {
   // keyboard shortcuts
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // ⎋ — collapse the focused agent back to the fleet grid (wide first).
+      // Guards: dialogs own their Escape (Radix + the approval takeover call
+      // preventDefault before this window listener runs), and typing surfaces
+      // keep Escape for themselves.
+      if (e.key === "Escape" && !e.metaKey && !e.ctrlKey) {
+        if (e.defaultPrevented) return;
+        if (document.querySelector('[role="dialog"]')) return;
+        const t = e.target as HTMLElement | null;
+        if (
+          t &&
+          (t.tagName === "INPUT" ||
+            t.tagName === "TEXTAREA" ||
+            t.isContentEditable)
+        )
+          return;
+        const ui = useVibeUi.getState();
+        if (ui.wide) {
+          e.preventDefault();
+          ui.setWide(false);
+        } else if (ui.stageMode === "session") {
+          e.preventDefault();
+          ui.backToFleet();
+        }
+        return;
+      }
       if (!(e.metaKey || e.ctrlKey)) return;
       const k = e.key.toLowerCase();
       const s = useSwarm.getState();
@@ -131,10 +167,14 @@ export default function App() {
         // new native Codex session
         e.preventDefault();
         useVibeUi.getState().setNewSessionOpen(true);
-      } else if (k === "o" && e.shiftKey) {
-        // ⌘⇧O — the orchestrator surface: the Conductor stage
+      } else if (k === "b") {
+        // ⌘B — toggle the Conductor sidebar
         e.preventDefault();
-        useVibeUi.getState().setStageMode("conductor");
+        useVibeUi.getState().toggleConductor();
+      } else if (k === "o" && e.shiftKey) {
+        // ⌘⇧O — the orchestrator surface: show the Conductor sidebar + fleet
+        e.preventDefault();
+        useVibeUi.getState().showConductor();
       } else if (k === "a" && e.shiftKey) {
         // jump to the oldest session waiting on the human
         e.preventDefault();
@@ -160,17 +200,18 @@ export default function App() {
 
   return (
     <TooltipProvider delayDuration={300}>
-      <div className="flex h-screen w-screen flex-col overflow-hidden bg-background">
+      <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg">
         <TitleBar onOpenSettings={() => setSettingsOpen(true)} />
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="relative min-h-0 min-w-0 flex-1">
             <VibeLayer />
           </div>
-          {/* the Deck: triage queue, event ticker, meters, orch status */}
+          {/* the Deck: fleet counters, event ticker, meters, conductor dot */}
           <Deck />
         </main>
       </div>
 
+      <Toasts />
       <QuitConfirmDialog />
       <CloseWorktreeDialog />
       <CommandPalette onOpenSettings={() => setSettingsOpen(true)} />

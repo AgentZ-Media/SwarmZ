@@ -53,6 +53,27 @@ export function oldestPendingApprovalAt(entry: VibeSessionEntry): number | null 
 }
 
 /**
+ * The signal-triad derivation from primitives — the ONE decay rule shared by
+ * the fleet grid, the Deck counters and the stage header (their selectors
+ * stay pure/primitive; `now` comes from the caller's render tick, never from
+ * a getSnapshot). Needs-you (a pending approval) wins over busy — a paused
+ * turn waiting on the human is the thing to surface; "finished" decays to
+ * "idle" once `now` leaves the window.
+ */
+export function decayedSignal(
+  busy: boolean,
+  needsYou: boolean,
+  lastBusyEndAt: number | null,
+  now: number,
+): VibeSignal {
+  if (needsYou) return "needsYou";
+  if (busy) return "working";
+  if (lastBusyEndAt !== null && now - lastBusyEndAt < VIBE_FINISHED_WINDOW_MS)
+    return "finished";
+  return "idle";
+}
+
+/**
  * One session's signal-triad state. Needs-you (a pending approval) wins over
  * busy — a paused turn waiting on the human is the thing to surface.
  */
@@ -61,14 +82,7 @@ export function vibeSignal(
   busy: boolean,
   now: number,
 ): VibeSignal {
-  if (hasPendingApproval(entry)) return "needsYou";
-  if (busy) return "working";
-  if (
-    entry.lastBusyEndAt !== null &&
-    now - entry.lastBusyEndAt < VIBE_FINISHED_WINDOW_MS
-  )
-    return "finished";
-  return "idle";
+  return decayedSignal(busy, hasPendingApproval(entry), entry.lastBusyEndAt, now);
 }
 
 /** Compact age for status lines: "now" / "4m" / "2h". */

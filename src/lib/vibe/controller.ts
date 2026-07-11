@@ -34,6 +34,7 @@ import type {
 } from "@/types";
 import { useVibe, type NewVibeSession } from "./session-store";
 import { pickAgentName } from "./names";
+import { reportItemIdOf } from "./report-item";
 import { useVibeUi } from "./ui-store";
 
 /** Trailing-edge delta flush — word-level deltas never write per event. */
@@ -358,6 +359,44 @@ export interface LastTurnOutcome {
 
 const lastTurnOutcomes = new Map<string, LastTurnOutcome>();
 
+/**
+ * Sessions whose CURRENT turn carries an `outputSchema` (an `expect_report`
+ * turn) — its final assistant message is the schema-forced status report.
+ * Marked BEFORE the send goes out (a very fast completion must never beat
+ * the registration), bound to the acked turn id after, and consumed at
+ * `turn_completed` to stamp `report: true` on the final assistant item (the
+ * UI then renders a report card instead of raw JSON). Independent of the
+ * orchestrator's one-shot report-expectation registry (report.ts), which the
+ * autonomous finish trigger consumes for the WIRE — this marker only drives
+ * the transcript presentation. In-memory: a restart mid-turn degrades to the
+ * plain-text rendering, same as the orchestrator's free-text path.
+ */
+const schemaTurns = new Map<string, { turnId: string | null }>();
+
+/** Stamp the completed schema turn's final assistant message as the report
+ * (consume the marker). Only a genuinely COMPLETED turn stamps — the schema
+ * forces the final message only when the turn runs to its end. */
+function stampReportItem(sessionId: string, completed: boolean) {
+  const marker = schemaTurns.get(sessionId);
+  if (!marker) return;
+  const store = useVibe.getState();
+  const currentTurnId = store.sessions[sessionId]?.turnId ?? null;
+  // a bound marker only matches ITS turn — a definite mismatch means the
+  // completion belongs to another turn (stale event); leave the marker
+  if (
+    marker.turnId !== null &&
+    currentTurnId !== null &&
+    marker.turnId !== currentTurnId
+  )
+    return;
+  schemaTurns.delete(sessionId);
+  if (!completed) return;
+  const entry = store.sessions[sessionId];
+  if (!entry) return;
+  const itemId = reportItemIdOf(entry.order, entry.items);
+  if (itemId) store.patchItem(sessionId, itemId, { report: true });
+}
+
 /** The session's last turn outcome (null = no turn ended this app run). */
 export function lastTurnOutcomeOf(sessionId: string): LastTurnOutcome | null {
   return lastTurnOutcomes.get(sessionId) ?? null;
@@ -475,6 +514,10 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
     }
     case "turn_completed": {
       finalizeStream(sessionId);
+      // stamp the schema turn's report BEFORE the turn id clears (the marker
+      // is bound to it) and BEFORE the busy flip (the orchestrator's watcher
+      // renders the transcript synchronously on the busy→idle tick)
+      stampReportItem(sessionId, data.status !== "interrupted");
       // outcome BEFORE the busy flip — the activity watcher reads it during
       // the synchronous busy→idle subscription tick ("interrupted" is a
       // deliberate stop, never an autonomous-loop "finished" event)
@@ -489,6 +532,7 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
     }
     case "turn_failed": {
       finalizeStream(sessionId);
+      stampReportItem(sessionId, false); // consume the marker, never stamp
       warn(sessionId, `Turn failed: ${str(data.error) || "unknown error"}`);
       recordTurnOutcome(sessionId, "failed");
       store.setBusy(sessionId, false);
@@ -502,6 +546,7 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
     }
     case "process_exited": {
       finalizeStream(sessionId);
+      schemaTurns.delete(sessionId); // the schema turn died with the process
       warn(sessionId, str(data.message) || "the session process exited");
       recordTurnOutcome(sessionId, "exited");
       store.setBusy(sessionId, false);
@@ -782,13 +827,21 @@ async function deliverTurn(
   const store = useVibe.getState();
   store.setBusy(sessionId, true);
   resetStream(sessionId);
+  // schema turn: mark BEFORE the send (a racing completion event must find
+  // the marker), bind to the acked turn id after
+  if (opts?.outputSchema) schemaTurns.set(sessionId, { turnId: null });
   try {
     await resumeSession(sessionId);
     const res = await invokeSend(sessionId, trimmed, opts?.outputSchema);
     // send returns after the turn/start ack — busy stays true until the turn
     // completion event clears it
+    if (opts?.outputSchema) {
+      const marker = schemaTurns.get(sessionId);
+      if (marker && res.turn_id) marker.turnId = res.turn_id;
+    }
     return { turnId: res.turn_id ?? null };
   } catch (err) {
+    if (opts?.outputSchema) schemaTurns.delete(sessionId);
     useVibe.getState().setBusy(sessionId, false);
     warn(sessionId, `Send failed: ${errorText(err)}`);
     throw err instanceof Error ? err : new Error(errorText(err));
@@ -1066,6 +1119,7 @@ export async function closeSession(sessionId: string): Promise<void> {
   resetStream(sessionId);
   streams.delete(sessionId);
   lastTurnOutcomes.delete(sessionId);
+  schemaTurns.delete(sessionId);
   useVibe.getState().dropSession(sessionId);
 }
 

@@ -141,7 +141,7 @@ export function UsageDashboard() {
   return (
     <>
       <div
-        className="fixed inset-0 z-30 bg-black/40"
+        className="animate-zoverlay fixed inset-0 z-30 bg-[rgba(5,5,8,0.55)] backdrop-blur-[2px]"
         onClick={() => setOpen(false)}
       />
       <div
@@ -149,19 +149,19 @@ export function UsageDashboard() {
         role="dialog"
         aria-label="Usage"
         tabIndex={-1}
-        className="animate-slide-in-right fixed right-0 top-0 z-40 flex h-full w-[420px] flex-col border-l border-border bg-background shadow-[-24px_0_48px_-24px_rgba(0,0,0,0.6)] outline-none"
+        className="animate-ztoast fixed right-0 top-0 z-40 flex h-full w-[420px] flex-col border-l border-line2 bg-panel shadow-modal outline-none"
       >
-        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+        <div className="flex items-center justify-between border-b border-line px-4 py-3">
           <div>
-            <h2 className="text-sm font-semibold tracking-tight">Usage</h2>
-            <p className="text-[11px] text-faint">
+            <h2 className="text-14 font-semibold tracking-[-0.01em]">Usage</h2>
+            <p className="text-11 text-fnt">
               All time · recorded Codex history (new entries return with the
               Phase-2 session accounting)
             </p>
           </div>
           <button
             onClick={() => setOpen(false)}
-            className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-faint hover:bg-accent hover:text-foreground"
+            className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt"
           >
             <X size={16} />
           </button>
@@ -194,12 +194,12 @@ export function UsageDashboard() {
 
             {/* per-model breakdown */}
             <div>
-              <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-faint">
+              <div className="mb-2 font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
                 By model
               </div>
               <div className="space-y-2">
                 {agg.byModel.length === 0 && (
-                  <p className="text-xs text-faint">No activity yet.</p>
+                  <p className="text-12 text-fnt">No activity yet.</p>
                 )}
                 {agg.byModel.map((m) => {
                   const accent = modelAccent(m.model);
@@ -211,10 +211,10 @@ export function UsageDashboard() {
                   return (
                     <div
                       key={m.model}
-                      className="rounded-lg border border-border bg-card p-2.5"
+                      className="rounded-lg border border-line bg-card p-2.5"
                     >
                       <div className="flex items-center justify-between gap-2">
-                        <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-foreground">
+                        <span className="flex min-w-0 items-center gap-1.5 text-12 font-medium text-txt">
                           <span
                             className="h-2 w-2 shrink-0 rounded-full"
                             style={{ backgroundColor: accent }}
@@ -223,11 +223,11 @@ export function UsageDashboard() {
                             {prettyModel(m.model)}
                           </span>
                         </span>
-                        <span className="shrink-0 font-mono text-xs tabular-nums text-foreground">
+                        <span className="shrink-0 font-mono text-12 tabular-nums text-txt">
                           {formatUsd(m.cost_usd)}
                         </span>
                       </div>
-                      <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-secondary">
+                      <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-pop">
                         <div
                           className="h-full rounded-full"
                           style={{
@@ -236,7 +236,7 @@ export function UsageDashboard() {
                           }}
                         />
                       </div>
-                      <div className="mt-1.5 flex justify-between font-mono text-[10px] text-faint">
+                      <div className="mt-1.5 flex justify-between font-mono text-10 tabular-nums text-fnt">
                         <span>{formatTokens(tokens)} tokens</span>
                         <span>{formatTokens(m.message_count)} msgs</span>
                       </div>
@@ -274,7 +274,7 @@ function HistoryList({
   return (
     <div>
       <div className="mb-2 flex items-center justify-between">
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-faint">
+        <span className="font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
           Recent sessions
         </span>
         {entries.length > 0 && (
@@ -294,10 +294,10 @@ function HistoryList({
             }}
             onPointerLeave={disarm}
             className={cn(
-              "focus-ring flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] transition-colors",
+              "focus-ring flex items-center gap-1 rounded-md px-1.5 py-0.5 text-10 transition-colors",
               armed
-                ? "bg-destructive/15 text-destructive"
-                : "text-faint hover:bg-accent hover:text-foreground",
+                ? "bg-err/15 text-err"
+                : "text-fnt hover:bg-card hover:text-txt",
             )}
             title={
               armed ? "Click again to reset" : "Reset all-time usage statistics"
@@ -309,7 +309,7 @@ function HistoryList({
       </div>
       <div className="space-y-1.5">
         {entries.length === 0 && (
-          <p className="text-xs text-faint">No recorded sessions yet.</p>
+          <p className="text-12 text-fnt">No recorded sessions yet.</p>
         )}
         {recent.map((e) => {
           const tok =
@@ -320,26 +320,26 @@ function HistoryList({
           return (
             <div
               key={`${e.runtime ?? "codex"}:${e.session_id}`}
-              className="flex items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1.5"
+              className="flex items-center gap-2 rounded-md border border-line bg-card px-2.5 py-1.5"
             >
-              <History size={11} className="shrink-0 text-faint" />
-              <span className="flex-1 truncate text-xs" title={e.cwd ?? undefined}>
+              <History size={11} className="shrink-0 text-fnt" />
+              <span className="flex-1 truncate text-12" title={e.cwd ?? undefined}>
                 {e.agent_name}
               </span>
-              <span className="shrink-0 whitespace-nowrap font-mono text-[10px] tabular-nums text-faint">
+              <span className="shrink-0 whitespace-nowrap font-mono text-10 tabular-nums text-fnt">
                 {formatDay(e.last_updated)}
               </span>
-              <span className="shrink-0 whitespace-nowrap font-mono text-[10px] tabular-nums text-muted-foreground">
+              <span className="shrink-0 whitespace-nowrap font-mono text-10 tabular-nums text-mut">
                 {formatTokens(tok)}
               </span>
-              <span className="min-w-12 shrink-0 whitespace-nowrap text-right font-mono text-[10px] tabular-nums text-foreground">
+              <span className="min-w-12 shrink-0 whitespace-nowrap text-right font-mono text-10 tabular-nums text-txt">
                 {e.cost_usd > 0 ? formatUsd(e.cost_usd) : "—"}
               </span>
             </div>
           );
         })}
         {entries.length > recent.length && (
-          <p className="pt-1 text-center text-[10px] text-faint">
+          <p className="pt-1 text-center text-10 text-fnt">
             + {entries.length - recent.length} older session
             {entries.length - recent.length === 1 ? "" : "s"}
           </p>

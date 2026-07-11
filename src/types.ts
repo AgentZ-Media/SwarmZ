@@ -223,6 +223,12 @@ export interface AppSettings {
    * the Conductor reports reviewed work. Off by default (reviews cost turns).
    */
   autoReviewFinishedLanes?: boolean;
+  /**
+   * Motion off-switch (DESIGN.md): stamps `data-motion="off"` on the root
+   * element, collapsing every nonessential animation (sweeps, pulses,
+   * carets, entrances). Off by default — motion on.
+   */
+  reduceMotion?: boolean;
 }
 
 /**
@@ -479,6 +485,14 @@ export type VibeItem =
       /** transient while deltas arrive — never restored on hydrate */
       streaming?: boolean;
       phase?: string | null;
+      /**
+       * This message is the schema-forced final report of a COMPLETED
+       * `expect_report` turn (Phase 5 `outputSchema`) — stamped by the vibe
+       * controller at turn completion, persisted with the transcript. The UI
+       * renders it as a report card instead of raw JSON (ItemFeed), but only
+       * when the text still parses as a valid AgentReport.
+       */
+      report?: boolean;
     }
   | {
       id: string;

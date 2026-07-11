@@ -1,20 +1,16 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
-  Bot,
   ChevronDown,
   ExternalLink,
-  FolderCog,
   FolderOpen,
-  Info,
   Plus,
   RefreshCw,
   RotateCcw,
   Trash2,
-  type LucideIcon,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { Button } from "./ui/button";
-import { Input } from "./ui/input";
+import { Input, Label } from "./ui/input";
 import { Switch } from "./ui/switch";
 import { Textarea } from "./ui/textarea";
 import { useSwarm } from "@/store";
@@ -43,15 +39,10 @@ const pathIsFile = (path: string) => invoke<boolean>("path_is_file", { path });
 const REPO_URL = "https://github.com/AgentZ-Media/SwarmZ";
 const AGENTZ_URL = "https://linktr.ee/deragentz";
 
-type SectionId = "orchestrator" | "updates" | "paths" | "about";
-
-const SECTIONS: { id: SectionId; label: string; icon: LucideIcon }[] = [
-  { id: "orchestrator", label: "Orchestrator", icon: Bot },
-  { id: "updates", label: "Updates", icon: RefreshCw },
-  { id: "paths", label: "Paths", icon: FolderCog },
-  { id: "about", label: "About", icon: Info },
-];
-
+/**
+ * Settings v2 — one scrolling column of mono-labeled sections:
+ * Conductor · Autonomy · Appearance · Memory · Paths · Updates · About.
+ */
 export function SettingsDialog({
   open,
   onOpenChange,
@@ -59,41 +50,24 @@ export function SettingsDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const [section, setSection] = useState<SectionId>("orchestrator");
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className="max-w-2xl overflow-hidden p-0"
+        className="max-w-xl overflow-hidden p-0"
         aria-describedby={undefined}
       >
-        <div className="grid h-[480px] max-h-[80vh] grid-cols-[176px_1fr]">
-          <nav className="flex flex-col gap-1 border-r border-border bg-card p-3">
-            <DialogTitle className="px-2.5 pb-2 pt-0.5 text-sm">
-              Settings
-            </DialogTitle>
-            {SECTIONS.map(({ id, label, icon: Ic }) => (
-              <button
-                key={id}
-                onClick={() => setSection(id)}
-                className={cn(
-                  "flex h-8 items-center gap-2 rounded-md px-2.5 text-[13px] transition-colors",
-                  section === id
-                    ? "bg-secondary text-foreground"
-                    : "text-muted-foreground hover:bg-accent hover:text-foreground",
-                )}
-              >
-                <Ic size={14} className={section === id ? "" : "text-faint"} />
-                {label}
-              </button>
-            ))}
-          </nav>
-
-          <div className="min-h-0 overflow-y-auto p-5">
-            {section === "orchestrator" && <OrchestratorSection />}
-            {section === "updates" && <UpdatesSection />}
-            {section === "paths" && <PathsSection />}
-            {section === "about" && <AboutSection />}
+        <div className="flex h-[560px] max-h-[80vh] flex-col">
+          <div className="shrink-0 border-b border-line px-6 pb-3 pt-5">
+            <DialogTitle>Settings</DialogTitle>
+          </div>
+          <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 py-5">
+            <ConductorSection />
+            <AutonomySection />
+            <AppearanceSection />
+            <MemorySection />
+            <PathsSection />
+            <UpdatesSection />
+            <AboutSection />
           </div>
         </div>
       </DialogContent>
@@ -103,14 +77,24 @@ export function SettingsDialog({
 
 // ---- shared section building blocks ----
 
-function SectionHeader({ title, sub }: { title: string; sub: string }) {
+/** A settings section: mono uppercase micro-label (+ optional sub) above rows. */
+function Section({
+  label,
+  sub,
+  children,
+}: {
+  label: string;
+  sub?: string;
+  children: ReactNode;
+}) {
   return (
-    <div className="mb-2">
-      <h3 className="text-sm font-semibold tracking-tight text-foreground">
-        {title}
-      </h3>
-      <p className="mt-0.5 text-xs text-muted-foreground">{sub}</p>
-    </div>
+    <section>
+      <div className="font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
+        {label}
+      </div>
+      {sub && <p className="mt-1 text-11 leading-relaxed text-fnt">{sub}</p>}
+      <div className="mt-2">{children}</div>
+    </section>
   );
 }
 
@@ -125,13 +109,11 @@ function Row({
   children?: ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 border-t border-border py-3">
+    <div className="flex items-center justify-between gap-4 border-t border-line py-3">
       <div className="min-w-0 flex-1">
-        <div className="text-[13px] font-medium text-foreground">{label}</div>
+        <div className="text-13 font-medium text-txt">{label}</div>
         {help && (
-          <div className="mt-0.5 text-[11px] leading-relaxed text-faint">
-            {help}
-          </div>
+          <div className="mt-0.5 text-11 leading-relaxed text-fnt">{help}</div>
         )}
       </div>
       {children && (
@@ -152,19 +134,50 @@ function StackedRow({
   children: ReactNode;
 }) {
   return (
-    <div className="border-t border-border py-3">
-      <div className="text-[13px] font-medium text-foreground">{label}</div>
+    <div className="border-t border-line py-3">
+      <div className="text-13 font-medium text-txt">{label}</div>
       <div className="mt-2">{children}</div>
       {help && (
-        <div className="mt-1.5 text-[11px] leading-relaxed text-faint">
-          {help}
-        </div>
+        <div className="mt-1.5 text-11 leading-relaxed text-fnt">{help}</div>
       )}
     </div>
   );
 }
 
-// ---- Orchestrator ----
+/** Card row: title + subtext on the left, a Switch on the right. */
+function ToggleCard({
+  title,
+  sub,
+  checked,
+  onChange,
+}: {
+  title: string;
+  sub: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-4 rounded-lg border border-line bg-card p-3">
+      <div className="min-w-0">
+        <div className="text-13 font-medium text-txt">{title}</div>
+        <div className="mt-0.5 text-11 leading-relaxed text-fnt">{sub}</div>
+      </div>
+      <Switch checked={checked} onCheckedChange={onChange} label={title} />
+    </div>
+  );
+}
+
+/** Read-only informational row — explains behavior, offers no control. */
+function InfoRow({ title, text }: { title: string; text: string }) {
+  return (
+    <div className="px-3 py-1">
+      <div className="text-13 font-medium text-txt">{title}</div>
+      <div className="mt-0.5 text-11 leading-relaxed text-fnt">{text}</div>
+    </div>
+  );
+}
+
+// ---- Conductor ----
 
 /**
  * Codex defaults NEW orchestrator chats are stamped with (a per-chat override
@@ -196,123 +209,41 @@ function CodexDefaultsRows() {
       >
         <button
           title="Default model & reasoning effort for new chats"
-          className="focus-ring flex items-center gap-1 rounded-full border border-border bg-secondary px-2.5 py-1 font-mono text-[11px] text-muted-foreground transition-colors hover:border-ring/50 hover:text-foreground"
+          className="focus-ring flex items-center gap-1 rounded-full border border-line bg-pop px-2.5 py-1 font-mono text-11 text-mut transition-colors hover:border-acc/55 hover:text-txt"
         >
           <span className="max-w-40 truncate">
             {model ? prettyModel(model) : "Default"}
           </span>
-          {effort && <span className="text-faint">· {effort}</span>}
-          <ChevronDown size={11} className="text-faint" />
+          {effort && <span className="text-fnt">· {effort}</span>}
+          <ChevronDown size={11} className="text-fnt" />
         </button>
       </ModelEffortPicker>
     </Row>
   );
 }
 
-function OrchestratorSection() {
-  const settings = useSwarm((s) => s.settings);
-  const updateSettings = useSwarm((s) => s.updateSettings);
-
-  const scanRoots = settings.orchestratorScanRoots ?? [];
-
+function ConductorSection() {
   if (!IS_TAURI) {
     return (
-      <>
-        <SectionHeader
-          title="Orchestrator"
-          sub="The AI team lead behind the Conductor stage (⌘⇧O)."
-        />
-        <p className="border-t border-border py-3 text-xs leading-relaxed text-muted-foreground">
-          The orchestrator ships with the native macOS app.
+      <Section
+        label="Conductor"
+        sub="The AI team lead behind the Conductor stage (⌘⇧O)."
+      >
+        <p className="border-t border-line py-3 text-12 leading-relaxed text-mut">
+          The Conductor ships with the native macOS app.
         </p>
-      </>
+      </Section>
     );
   }
 
   return (
-    <>
-      <SectionHeader
-        title="Orchestrator"
-        sub="The AI team lead behind the Conductor stage (⌘⇧O) — runs on your ChatGPT subscription via the codex CLI."
-      />
-
+    <Section
+      label="Conductor"
+      sub="The AI team lead behind the Conductor stage (⌘⇧O) — runs on your ChatGPT subscription via the codex CLI."
+    >
       <CodexDefaultsRows />
-
-      <Row
-        label="Auto-review finished lanes"
-        help="When an agent the Conductor tasked finishes work that changed code, a detached codex review runs automatically and its findings ride into the Conductor's report — you hear about reviewed work, not just finished work. Costs an extra review turn per lane."
-      >
-        <Switch
-          checked={!!settings.autoReviewFinishedLanes}
-          onCheckedChange={(v) =>
-            updateSettings({ autoReviewFinishedLanes: v })
-          }
-        />
-      </Row>
-
-      <StackedRow
-        label="Project scan folders"
-        help="Extra folders (e.g. ~/Code) the orchestrator's project discovery shallow-scans for git repos when the model doesn't name its own — on top of your Codex session history and folders the app already knows."
-      >
-        <div className="flex flex-col gap-1.5">
-          {scanRoots.map((root) => (
-            <div
-              key={root}
-              className="flex items-center gap-2 rounded-md border border-border bg-secondary/40 px-2 py-1"
-            >
-              <FolderOpen
-                size={12}
-                className="shrink-0 text-muted-foreground"
-              />
-              <span
-                className="min-w-0 flex-1 truncate font-mono text-[10px] text-foreground"
-                title={root}
-              >
-                {shortPath(root)}
-              </span>
-              <Button
-                size="xs"
-                variant="ghost"
-                title="Remove folder"
-                className="hover:text-destructive"
-                onClick={() =>
-                  updateSettings({
-                    orchestratorScanRoots: scanRoots.filter((r) => r !== root),
-                  })
-                }
-              >
-                <Trash2 size={11} />
-              </Button>
-            </div>
-          ))}
-          {scanRoots.length === 0 && (
-            <p className="px-1 text-[11px] text-faint">
-              No folders yet — discovery then relies on session history and
-              known folders alone.
-            </p>
-          )}
-          <div>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                void pickDirectory().then((dir) => {
-                  if (dir && !scanRoots.includes(dir))
-                    updateSettings({
-                      orchestratorScanRoots: [...scanRoots, dir],
-                    });
-                });
-              }}
-            >
-              <Plus size={13} /> Add folder…
-            </Button>
-          </div>
-        </div>
-      </StackedRow>
-
       <PersonaControls />
-      <MemoryControls />
-    </>
+    </Section>
   );
 }
 
@@ -361,17 +292,17 @@ function PersonaControls() {
               key={preset.id}
               onClick={() => applyPreset(preset)}
               className={cn(
-                "focus-ring flex flex-col gap-0.5 rounded-lg border px-2.5 py-2 text-left",
+                "focus-ring flex flex-col gap-0.5 rounded-lg border px-2.5 py-2 text-left transition-colors",
                 activePresetId === preset.id
-                  ? "border-ring/60 ring-1 ring-ring/30"
-                  : "border-border hover:border-input",
+                  ? "border-acc/60 ring-1 ring-acc/30"
+                  : "border-line hover:border-line2",
               )}
             >
-              <span className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+              <span className="flex items-center gap-1.5 text-12 font-semibold text-txt">
                 <span>{preset.emoji}</span>
                 {preset.name}
               </span>
-              <span className="text-[10px] leading-snug text-faint">
+              <span className="text-10 leading-snug text-fnt">
                 {preset.blurb}
               </span>
             </button>
@@ -382,45 +313,45 @@ function PersonaControls() {
           <Input
             value={persona.emoji ?? ""}
             onChange={(e) => patch({ emoji: e.target.value.slice(0, 4) })}
-            className="w-14 text-center text-sm"
+            className="w-14 text-center"
             placeholder="🎼"
             aria-label="Persona emoji"
           />
           <Input
             value={persona.name}
             onChange={(e) => patch({ name: e.target.value })}
-            className="flex-1 text-xs"
+            className="flex-1 text-12"
             placeholder="Name"
             aria-label="Persona name"
           />
         </div>
 
         <label className="flex flex-col gap-1">
-          <span className="text-[11px] font-medium text-muted-foreground">
+          <span className="font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
             Self-image
           </span>
           <Input
             value={persona.role}
             onChange={(e) => patch({ role: e.target.value })}
-            className="text-xs"
+            className="text-12"
             placeholder="the fleet's conductor — you keep the tempo, the agents play"
           />
         </label>
 
         <label className="flex flex-col gap-1">
-          <span className="text-[11px] font-medium text-muted-foreground">
+          <span className="font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
             Voice
           </span>
           <Input
             value={persona.tone}
             onChange={(e) => patch({ tone: e.target.value })}
-            className="text-xs"
+            className="text-12"
             placeholder="Calm, precise, leading."
           />
         </label>
 
         <label className="flex flex-col gap-1">
-          <span className="text-[11px] font-medium text-muted-foreground">
+          <span className="font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
             Principles (one per line)
           </span>
           <Textarea
@@ -434,7 +365,7 @@ function PersonaControls() {
               })
             }
             rows={3}
-            className="resize-none text-xs"
+            className="resize-none text-12"
             placeholder={"Clarity over chatter.\nYou delegate, you don't do the work yourself."}
           />
         </label>
@@ -443,7 +374,7 @@ function PersonaControls() {
           <div>
             <Button
               size="sm"
-              variant="outline"
+              variant="ghost"
               onClick={() => updateSettings({ orchestratorPersona: undefined })}
             >
               <RotateCcw size={12} /> Reset to {DEFAULT_PERSONA.name}
@@ -455,6 +386,56 @@ function PersonaControls() {
   );
 }
 
+// ---- Autonomy ----
+
+function AutonomySection() {
+  const autoReview = useSwarm((s) => !!s.settings.autoReviewFinishedLanes);
+  const updateSettings = useSwarm((s) => s.updateSettings);
+
+  if (!IS_TAURI) return null;
+
+  return (
+    <Section label="Autonomy">
+      <div className="flex flex-col gap-2">
+        <ToggleCard
+          title="Auto-review finished lanes"
+          sub="When an agent the Conductor tasked finishes work that changed code, a detached codex review runs automatically and its findings ride into the Conductor's report — you hear about reviewed work, not just finished work. Costs an extra review turn per lane."
+          checked={autoReview}
+          onChange={(v) => updateSettings({ autoReviewFinishedLanes: v })}
+        />
+        <InfoRow
+          title="Autonomy budget"
+          text="Autonomous turns are budget-capped — max 5 consecutive without your message, 20 per hour per project. A tripped breaker re-arms on your next message."
+        />
+        <InfoRow
+          title="Approval policy"
+          text="Routine (read-only/test) approvals can be decided by the Conductor; anything destructive always waits for you."
+        />
+      </div>
+    </Section>
+  );
+}
+
+// ---- Appearance ----
+
+function AppearanceSection() {
+  const reduceMotion = useSwarm((s) => !!s.settings.reduceMotion);
+  const updateSettings = useSwarm((s) => s.updateSettings);
+
+  return (
+    <Section label="Appearance">
+      <ToggleCard
+        title="Reduce motion"
+        sub="Collapses sweeps, pulses and entrance animations."
+        checked={reduceMotion}
+        onChange={(v) => updateSettings({ reduceMotion: v })}
+      />
+    </Section>
+  );
+}
+
+// ---- Memory ----
+
 /**
  * Curated-memory management (Phase 3: scoped): a global list plus one list
  * per project — the toggle switches between Global and the ACTIVE project.
@@ -463,7 +444,7 @@ function PersonaControls() {
  * tool (transparent chip in the chat) — the files themselves are editable
  * directly at the shown path.
  */
-function MemoryControls() {
+function MemorySection() {
   const activeProjectId = useProjects((s) => s.activeProjectId);
   const activeProjectName = useProjects((s) =>
     s.activeProjectId ? (s.projects[s.activeProjectId]?.name ?? "") : "",
@@ -523,35 +504,34 @@ function MemoryControls() {
 
   const count = entries?.length ?? 0;
 
+  if (!IS_TAURI) return null;
+
   return (
-    <StackedRow
-      label="Memory"
-      help={
-        <>
-          Durable facts the orchestrator chose to remember (preferences,
-          corrections, recurring workflows) — injected into every new session.
-          Global facts reach every project's Conductor; project facts only its
-          own. The orchestrator writes these itself via its{" "}
-          <code>remember</code> tool; here you can review and prune them.
-          {path && (
-            <>
-              {" "}
-              File: <span className="font-mono text-[10px]">{path}</span>
-            </>
-          )}
-        </>
-      }
-    >
-      <div className="flex flex-col gap-1.5">
+    <Section label="Memory">
+      <p className="text-11 leading-relaxed text-fnt">
+        Durable facts the orchestrator chose to remember (preferences,
+        corrections, recurring workflows) — injected into every new session.
+        Global facts reach every project's Conductor; project facts only its
+        own. The orchestrator writes these itself via its{" "}
+        <code className="font-mono">remember</code> tool; here you can review
+        and prune them.
+        {path && (
+          <>
+            {" "}
+            File: <span className="font-mono text-10">{path}</span>
+          </>
+        )}
+      </p>
+      <div className="mt-2 flex flex-col gap-1.5">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-1">
             <button
               onClick={() => setScope("global")}
               className={cn(
-                "focus-ring rounded-md border px-2 py-0.5 font-mono text-[10px]",
+                "focus-ring rounded-md border px-2 py-0.5 font-mono text-10 transition-colors",
                 effectiveScope === "global"
-                  ? "border-ring/60 text-foreground"
-                  : "border-border text-muted-foreground hover:text-foreground",
+                  ? "border-acc/60 text-txt"
+                  : "border-line text-mut hover:text-txt",
               )}
             >
               Global
@@ -565,44 +545,44 @@ function MemoryControls() {
                   : "Open a project to see its memory"
               }
               className={cn(
-                "focus-ring max-w-40 truncate rounded-md border px-2 py-0.5 font-mono text-[10px] disabled:opacity-40",
+                "focus-ring max-w-40 truncate rounded-md border px-2 py-0.5 font-mono text-10 transition-colors disabled:opacity-40",
                 effectiveScope === "project"
-                  ? "border-ring/60 text-foreground"
-                  : "border-border text-muted-foreground hover:text-foreground",
+                  ? "border-acc/60 text-txt"
+                  : "border-line text-mut hover:text-txt",
               )}
             >
               {activeProjectName || "Project"}
             </button>
           </div>
-          <span className="font-mono text-[10px] text-faint">
+          <span className="font-mono text-10 tabular-nums text-fnt">
             {count}/20 entries
           </span>
         </div>
         {entries === null ? (
-          <p className="px-1 text-[11px] text-faint">Loading…</p>
+          <p className="px-1 text-11 text-fnt">Loading…</p>
         ) : entries.length === 0 ? (
-          <p className="px-1 text-[11px] text-faint">
+          <p className="px-1 text-11 text-fnt">
             No memories yet — the orchestrator adds them as you work.
           </p>
         ) : (
           entries.map((entry, i) => (
             <div
               key={`${i}-${entry.text}`}
-              className="flex items-start gap-2 rounded-md border border-border bg-secondary/40 px-2 py-1.5"
+              className="flex items-start gap-2 rounded-md border border-line bg-card px-2 py-1.5"
             >
               {entry.date && (
-                <span className="shrink-0 font-mono text-[10px] text-faint tabular-nums">
+                <span className="shrink-0 font-mono text-10 tabular-nums text-fnt">
                   {entry.date}
                 </span>
               )}
-              <span className="min-w-0 flex-1 text-[11px] leading-snug text-foreground">
+              <span className="min-w-0 flex-1 text-11 leading-snug text-txt">
                 {entry.text}
               </span>
               <Button
                 size="xs"
                 variant="ghost"
                 title="Forget this entry"
-                className="hover:text-destructive"
+                className="hover:text-err"
                 disabled={deleting}
                 onClick={() => del(i)}
               >
@@ -612,101 +592,7 @@ function MemoryControls() {
           ))
         )}
       </div>
-    </StackedRow>
-  );
-}
-
-// ---- Updates ----
-
-function UpdatesSection() {
-  const settings = useSwarm((s) => s.settings);
-  const updateSettings = useSwarm((s) => s.updateSettings);
-  const stage = useUpdates((s) => s.stage);
-  const version = useUpdates((s) => s.version);
-  const progress = useUpdates((s) => s.progress);
-  const manualCheck = useUpdates((s) => s.manualCheck);
-  const checkNow = useUpdates((s) => s.checkNow);
-  const downloadAndInstall = useUpdates((s) => s.downloadAndInstall);
-  const restart = useUpdates((s) => s.restart);
-
-  if (!IS_TAURI) {
-    return (
-      <>
-        <SectionHeader
-          title="Updates"
-          sub="Keep SwarmZ up to date from GitHub Releases."
-        />
-        <p className="border-t border-border py-3 text-xs leading-relaxed text-muted-foreground">
-          In-app updates ship with the native macOS app.
-        </p>
-      </>
-    );
-  }
-
-  const status =
-    stage === "available"
-      ? `Update ${version ?? ""} available`
-      : stage === "downloading"
-        ? `Downloading… ${progress}%`
-        : stage === "ready"
-          ? "Update downloaded — restart to apply"
-          : stage === "error"
-            ? "Update failed"
-            : manualCheck === "uptodate"
-              ? "You're up to date"
-              : `SwarmZ v${__APP_VERSION__}`;
-
-  return (
-    <>
-      <SectionHeader
-        title="Updates"
-        sub="Keep SwarmZ up to date from GitHub Releases."
-      />
-
-      <Row
-        label="Automatic updates"
-        help="Download new versions in the background as soon as they're found. Installing still happens on the next restart."
-      >
-        <Switch
-          checked={!!settings.autoUpdate}
-          onCheckedChange={(v) => updateSettings({ autoUpdate: v })}
-          label="Automatic updates"
-        />
-      </Row>
-
-      <Row label="Check for updates" help={status}>
-        {stage === "available" && (
-          <Button size="sm" onClick={() => void downloadAndInstall()}>
-            Download
-          </Button>
-        )}
-        {stage === "ready" && (
-          <Button size="sm" onClick={() => void restart()}>
-            Restart now
-          </Button>
-        )}
-        <Button
-          size="sm"
-          variant="outline"
-          // Once an update is found, downloaded or installing, checking again is
-          // pointless — and in the "ready"/"downloading" states poll() is a
-          // no-op anyway, so an enabled button would just feel like a freeze.
-          disabled={
-            manualCheck === "checking" ||
-            stage === "available" ||
-            stage === "downloading" ||
-            stage === "ready"
-          }
-          onClick={() => void checkNow()}
-        >
-          <RefreshCw
-            size={13}
-            className={manualCheck === "checking" ? "animate-spin" : ""}
-          />
-          {manualCheck === "checking" ? "Checking…" : "Check now"}
-        </Button>
-      </Row>
-    </>
+    </Section>
   );
 }
 
@@ -756,18 +642,16 @@ function BinaryPathInput({
         onChange={(e) => setText(e.target.value)}
         onBlur={commit}
         onKeyDown={(e) => e.key === "Enter" && commit()}
-        className="font-mono text-xs"
+        className="font-mono text-12"
         placeholder={placeholder}
         spellCheck={false}
       />
       {status === "missing" && (
-        <p className="mt-1 text-[11px] text-destructive">
+        <p className="mt-1 text-11 text-err">
           No file at this path — fix it or clear the field.
         </p>
       )}
-      {status === "ok" && (
-        <p className="mt-1 text-[11px] text-success">Found.</p>
-      )}
+      {status === "ok" && <p className="mt-1 text-11 text-ok">Found.</p>}
     </div>
   );
 }
@@ -776,42 +660,194 @@ function PathsSection() {
   const settings = useSwarm((s) => s.settings);
   const updateSettings = useSwarm((s) => s.updateSettings);
 
+  const scanRoots = settings.orchestratorScanRoots ?? [];
+
   return (
-    <>
-      <SectionHeader
-        title="Paths"
-        sub="Override binaries when they aren't on the PATH the app sees. Leave empty for the defaults."
-      />
-
-      <StackedRow
-        label="Codex binary"
-        help={
-          <>
+    <Section
+      label="Paths"
+      sub="Override binaries when they aren't on the PATH the app sees. Leave empty for the defaults."
+    >
+      <div className="flex flex-col gap-4 pt-1">
+        <div>
+          <Label>Codex binary</Label>
+          <BinaryPathInput
+            value={settings.codexPath ?? ""}
+            placeholder="codex — resolved by your login shell"
+            onCommit={(v) => updateSettings({ codexPath: v })}
+          />
+          <p className="mt-1.5 text-11 leading-relaxed text-fnt">
             Absolute path to the{" "}
-            <code className="font-mono text-muted-foreground">codex</code>{" "}
-            binary used to spawn the app-server behind sessions and the
-            orchestrator.
-          </>
-        }
-      >
-        <BinaryPathInput
-          value={settings.codexPath ?? ""}
-          placeholder="codex — resolved by your login shell"
-          onCommit={(v) => updateSettings({ codexPath: v })}
-        />
-      </StackedRow>
+            <code className="font-mono text-mut">codex</code> binary used to
+            spawn the app-server behind sessions and the orchestrator.
+          </p>
+        </div>
 
-      <StackedRow
-        label="Git binary"
-        help="Used for the read-only git status and the worktree management."
+        <div>
+          <Label>Git binary</Label>
+          <BinaryPathInput
+            value={settings.gitPath ?? ""}
+            placeholder="/usr/bin/git"
+            onCommit={(v) => updateSettings({ gitPath: v })}
+          />
+          <p className="mt-1.5 text-11 leading-relaxed text-fnt">
+            Used for the read-only git status and the worktree management.
+          </p>
+        </div>
+
+        {IS_TAURI && (
+          <div>
+            <Label>Project scan folders</Label>
+            <div className="flex flex-col gap-1.5">
+              {scanRoots.map((root) => (
+                <div
+                  key={root}
+                  className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1"
+                >
+                  <FolderOpen size={12} className="shrink-0 text-mut" />
+                  <span
+                    className="min-w-0 flex-1 truncate font-mono text-10 text-txt"
+                    title={root}
+                  >
+                    {shortPath(root)}
+                  </span>
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    title="Remove folder"
+                    className="hover:text-err"
+                    onClick={() =>
+                      updateSettings({
+                        orchestratorScanRoots: scanRoots.filter(
+                          (r) => r !== root,
+                        ),
+                      })
+                    }
+                  >
+                    <Trash2 size={11} />
+                  </Button>
+                </div>
+              ))}
+              {scanRoots.length === 0 && (
+                <p className="px-1 text-11 text-fnt">
+                  No folders yet — discovery then relies on session history and
+                  known folders alone.
+                </p>
+              )}
+              <div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    void pickDirectory().then((dir) => {
+                      if (dir && !scanRoots.includes(dir))
+                        updateSettings({
+                          orchestratorScanRoots: [...scanRoots, dir],
+                        });
+                    });
+                  }}
+                >
+                  <Plus size={13} /> Add folder…
+                </Button>
+              </div>
+            </div>
+            <p className="mt-1.5 text-11 leading-relaxed text-fnt">
+              Extra folders (e.g. ~/Code) the orchestrator's project discovery
+              shallow-scans for git repos when the model doesn't name its own —
+              on top of your Codex session history and folders the app already
+              knows.
+            </p>
+          </div>
+        )}
+      </div>
+    </Section>
+  );
+}
+
+// ---- Updates ----
+
+function UpdatesSection() {
+  const settings = useSwarm((s) => s.settings);
+  const updateSettings = useSwarm((s) => s.updateSettings);
+  const stage = useUpdates((s) => s.stage);
+  const version = useUpdates((s) => s.version);
+  const progress = useUpdates((s) => s.progress);
+  const manualCheck = useUpdates((s) => s.manualCheck);
+  const checkNow = useUpdates((s) => s.checkNow);
+  const downloadAndInstall = useUpdates((s) => s.downloadAndInstall);
+  const restart = useUpdates((s) => s.restart);
+
+  if (!IS_TAURI) {
+    return (
+      <Section
+        label="Updates"
+        sub="Keep SwarmZ up to date from GitHub Releases."
       >
-        <BinaryPathInput
-          value={settings.gitPath ?? ""}
-          placeholder="/usr/bin/git"
-          onCommit={(v) => updateSettings({ gitPath: v })}
+        <p className="border-t border-line py-3 text-12 leading-relaxed text-mut">
+          In-app updates ship with the native macOS app.
+        </p>
+      </Section>
+    );
+  }
+
+  const status =
+    stage === "available"
+      ? `Update ${version ?? ""} available`
+      : stage === "downloading"
+        ? `Downloading… ${progress}%`
+        : stage === "ready"
+          ? "Update downloaded — restart to apply"
+          : stage === "error"
+            ? "Update failed"
+            : manualCheck === "uptodate"
+              ? "You're up to date"
+              : `SwarmZ v${__APP_VERSION__}`;
+
+  return (
+    <Section label="Updates" sub="Keep SwarmZ up to date from GitHub Releases.">
+      <Row
+        label="Automatic updates"
+        help="Download new versions in the background as soon as they're found. Installing still happens on the next restart."
+      >
+        <Switch
+          checked={!!settings.autoUpdate}
+          onCheckedChange={(v) => updateSettings({ autoUpdate: v })}
+          label="Automatic updates"
         />
-      </StackedRow>
-    </>
+      </Row>
+
+      <Row label="Check for updates" help={status}>
+        {stage === "available" && (
+          <Button size="sm" onClick={() => void downloadAndInstall()}>
+            Download
+          </Button>
+        )}
+        {stage === "ready" && (
+          <Button size="sm" onClick={() => void restart()}>
+            Restart now
+          </Button>
+        )}
+        <Button
+          size="sm"
+          variant="outline"
+          // Once an update is found, downloaded or installing, checking again is
+          // pointless — and in the "ready"/"downloading" states poll() is a
+          // no-op anyway, so an enabled button would just feel like a freeze.
+          disabled={
+            manualCheck === "checking" ||
+            stage === "available" ||
+            stage === "downloading" ||
+            stage === "ready"
+          }
+          onClick={() => void checkNow()}
+        >
+          <RefreshCw
+            size={13}
+            className={manualCheck === "checking" ? "animate-spin" : ""}
+          />
+          {manualCheck === "checking" ? "Checking…" : "Check now"}
+        </Button>
+      </Row>
+    </Section>
   );
 }
 
@@ -831,7 +867,7 @@ function LinkRow({
   return (
     <Row label={label} help={help}>
       <button
-        className="flex items-center gap-1.5 font-mono text-xs text-ring hover:underline"
+        className="focus-ring flex items-center gap-1.5 font-mono text-12 text-acc hover:underline"
         onClick={() => void openUrl(url)}
       >
         {text}
@@ -843,21 +879,19 @@ function LinkRow({
 
 function AboutSection() {
   return (
-    <>
-      <div className="mb-4 flex items-center gap-3">
-        <img src="/favicon.png" alt="" className="h-12 w-12" draggable={false} />
-        <div>
-          <div className="text-sm font-semibold tracking-tight text-foreground">
-            SwarmZ{" "}
-            <span className="ml-1 font-mono text-xs font-normal text-muted-foreground">
-              v{__APP_VERSION__}
-            </span>
-          </div>
-          <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-            Run and monitor a swarm of native Codex agents — live sessions,
-            approvals, tokens &amp; cost. 100% local.
-          </p>
+    <Section label="About">
+      <div className="mb-3 pt-1">
+        <div className="flex items-center gap-2 text-14 font-bold tracking-[-0.01em] text-txt">
+          <span className="hex-mark hex-mark-flat inline-block h-5 w-5" />
+          SwarmZ
+          <span className="font-mono text-12 font-normal text-mut">
+            v{__APP_VERSION__}
+          </span>
         </div>
+        <p className="mt-1 text-12 leading-relaxed text-mut">
+          Run and monitor a swarm of native Codex agents — live sessions,
+          approvals, tokens &amp; cost. 100% local.
+        </p>
       </div>
 
       <LinkRow
@@ -871,6 +905,6 @@ function AboutSection() {
         text="linktr.ee/deragentz"
         url={AGENTZ_URL}
       />
-    </>
+    </Section>
   );
 }

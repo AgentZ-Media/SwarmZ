@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart3,
-  Bot,
   Download,
   FolderOpen,
+  PanelLeft,
   Plus,
+  Search,
   Settings,
   StickyNote,
   X,
@@ -14,11 +15,15 @@ import { useProjects, openProjectIds } from "@/lib/projects/store";
 import { useVibe } from "@/lib/vibe/session-store";
 import { hasPendingApproval } from "@/lib/vibe/ui";
 import { useVibeUi } from "@/lib/vibe/ui-store";
-import { activateProject, requestCloseProject } from "@/lib/vibe/controller";
+import {
+  activateProject,
+  focusSession,
+  requestCloseProject,
+} from "@/lib/vibe/controller";
+import { vibeTriageEntries } from "@/lib/vibe/triage";
 import { discoverProjects } from "@/lib/orchestrator/native";
 import { useUpdates } from "@/lib/updates";
 import { WorktreesButton } from "./WorktreePanel";
-import { Button } from "./ui/button";
 import { Tip } from "./ui/tooltip";
 import {
   DropdownMenu,
@@ -32,12 +37,18 @@ import { cn, shortPath } from "@/lib/utils";
 import { IS_TAURI, pickDirectory } from "@/lib/transport";
 import type { ProjectEntry } from "@/lib/orchestrator/types";
 
+/** Shared 32px icon-button treatment for the title-bar actions. */
+const BAR_BTN =
+  "no-drag focus-ring flex h-8 w-8 items-center justify-center rounded-md text-mut hover:bg-card hover:text-txt";
+
 export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const setDashboardOpen = useSwarm((s) => s.setDashboardOpen);
   const dashboardOpen = useSwarm((s) => s.dashboardOpen);
   const notesOpen = useSwarm((s) => s.notesOpen);
   const setNotesOpen = useSwarm((s) => s.setNotesOpen);
-  const stageMode = useVibeUi((s) => s.stageMode);
+  const setPaletteOpen = useSwarm((s) => s.setPaletteOpen);
+  const conductorOpen = useVibeUi((s) => s.conductorOpen);
+  const toggleConductor = useVibeUi((s) => s.toggleConductor);
 
   return (
     <header
@@ -48,81 +59,117 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
       // out explicitly via data-tauri-drag-region="false". WKWebView ignores
       // -webkit-app-region, so this attribute — not the CSS — drags on macOS.
       data-tauri-drag-region="deep"
-      className="flex h-11 shrink-0 items-center gap-2 border-b border-border bg-background pr-3"
+      className="flex h-12 shrink-0 items-center gap-2 border-b border-line bg-panel pr-4"
       style={{ paddingLeft: IS_TAURI ? 80 : 16 }}
     >
-      <img
-        src="/favicon.png"
-        alt="SwarmZ"
-        draggable={false}
-        className="pointer-events-none h-7 w-7 shrink-0"
-      />
+      {/* Conductor sidebar toggle (⌘B) */}
+      <Tip label={conductorOpen ? "Collapse the Conductor (⌘B)" : "Open the Conductor (⌘B)"}>
+        <button onClick={toggleConductor} className={BAR_BTN}>
+          <PanelLeft
+            size={16}
+            className={cn(!conductorOpen && "opacity-40")}
+          />
+        </button>
+      </Tip>
+
+      {/* brand mark + wordmark */}
+      <div className="flex shrink-0 items-center gap-2">
+        <span aria-hidden className="hex-mark hex-mark-flat flex h-6 w-6 items-center justify-center">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="#fff">
+            <polygon points="13 2 4 14 11 14 9.5 22 20 10 13 10" />
+          </svg>
+        </span>
+        <span className="text-14 font-bold tracking-[-0.01em] text-txt">
+          SwarmZ
+        </span>
+        <span aria-hidden className="font-mono text-12 text-fnt">
+          /
+        </span>
+      </div>
 
       <ProjectTabs />
 
-      <div className="ml-auto flex shrink-0 items-center gap-2">
+      <div className="ml-auto flex shrink-0 items-center gap-1">
+        <NeedsYouPill />
+
         {IS_TAURI && <UpdatePill />}
 
+        <Tip label="Search or jump (⌘K)">
+          <button
+            onClick={() => setPaletteOpen(true)}
+            className="no-drag focus-ring flex h-8 items-center gap-1.5 rounded-md px-2.5 text-mut hover:bg-card hover:text-txt"
+          >
+            <Search size={15} />
+            <span className="font-mono text-11">⌘K</span>
+          </button>
+        </Tip>
+
         <Tip label="Usage dashboard">
-          <Button
-            size="icon"
-            variant={dashboardOpen ? "secondary" : "ghost"}
-            className="no-drag"
+          <button
             onClick={() => setDashboardOpen(!dashboardOpen)}
+            className={cn(BAR_BTN, dashboardOpen && "bg-card text-txt")}
           >
             <BarChart3 size={15} />
-          </Button>
+          </button>
         </Tip>
 
         <Tip label="Quick notes (⌘N)">
-          <Button
-            size="icon"
-            variant={notesOpen ? "secondary" : "ghost"}
-            className="no-drag"
+          <button
             onClick={() => setNotesOpen(!notesOpen)}
+            className={cn(BAR_BTN, notesOpen && "bg-card text-txt")}
           >
             <StickyNote size={15} />
-          </Button>
-        </Tip>
-
-        <Tip label="Conductor (⌘⇧O)">
-          <Button
-            size="icon"
-            variant={stageMode === "conductor" ? "secondary" : "ghost"}
-            className="no-drag"
-            onClick={() => useVibeUi.getState().setStageMode("conductor")}
-          >
-            <Bot size={15} />
-          </Button>
+          </button>
         </Tip>
 
         {/* appears only once at least one git worktree exists */}
         <WorktreesButton />
 
-        <Tip label="Settings">
-          <Button
-            size="icon"
-            variant="ghost"
-            className="no-drag"
-            onClick={onOpenSettings}
-          >
+        <Tip label="Settings (⌘,)">
+          <button onClick={onOpenSettings} className={BAR_BTN}>
             <Settings size={15} />
-          </Button>
+          </button>
         </Tip>
 
-        <Button
-          size="sm"
-          className="no-drag"
+        <button
           onClick={() => useVibeUi.getState().setNewSessionOpen(true)}
+          className="no-drag focus-ring ml-1 flex h-8 items-center gap-1.5 rounded-md bg-acc px-3 text-12 font-semibold text-white hover:brightness-110"
         >
-          <Plus size={14} /> New Session
-        </Button>
+          <Plus size={13} strokeWidth={2.8} /> New agent
+        </button>
       </div>
     </header>
   );
 }
 
-// ---- Project tabs (interim look — the Phase-6 design restyles them) ----
+/**
+ * The needs-you pill — amber, only while at least one agent waits on the
+ * human. Click = jump to the oldest waiting session (same routing as ⌘⇧A).
+ */
+function NeedsYouPill() {
+  // primitive count — vibeTriageEntries builds fresh arrays, so only its
+  // length may leave the selector (AGENTS.md)
+  const count = useVibe((s) => vibeTriageEntries(s).length);
+  if (count === 0) return null;
+  const jump = () => {
+    const entries = vibeTriageEntries(useVibe.getState());
+    if (entries.length) focusSession(entries[0].id);
+  };
+  return (
+    <button
+      onClick={jump}
+      title="Jump to the next agent that needs you (⌘⇧A)"
+      className="no-drag focus-ring mr-1 flex h-8 items-center gap-1.5 rounded-md border border-attn/30 bg-attn/10 px-3 font-mono text-12 font-semibold text-attn hover:bg-attn/15"
+    >
+      <span aria-hidden className="animate-zattn">
+        ⚑
+      </span>
+      {count} need{count === 1 ? "s" : ""} you
+    </button>
+  );
+}
+
+// ---- Project tabs ----
 
 /**
  * One tab per OPEN project. Click = activate (⌘1–9), double-click = rename,
@@ -244,15 +291,15 @@ function ProjectTab({
     window.addEventListener("mouseup", onUp);
   };
 
-  // busy is quiet — a static muted dot; needs-you is the ⚑n badge. Alive but
-  // idle is deliberately NEUTRAL (faint), not green: green stays reserved for
-  // "just finished" / success states (DESIGN.md).
-  const dotColor =
+  // busy is quiet — the accent live-dot marks a project with running agents;
+  // alive but idle stays NEUTRAL (fnt); an empty project fades further.
+  // Needs-you is the ⚑n badge, never the dot.
+  const dotCls =
     stats.busy > 0
-      ? "var(--muted-foreground)"
+      ? "bg-acc animate-zpulse"
       : stats.total > 0
-        ? "var(--faint)"
-        : "color-mix(in srgb, var(--faint) 40%, transparent)";
+        ? "bg-fnt"
+        : "bg-fnt/40";
 
   // The tab is a DIV with two real button siblings (activate + close) — a
   // close X nested inside the tab <button> would be unreachable by keyboard
@@ -269,18 +316,15 @@ function ProjectTab({
         if (e.button === 1) requestCloseProject(id);
       }}
       className={cn(
-        "no-drag group/tab flex h-7 max-w-44 shrink-0 items-center rounded-md border pr-1 transition-colors",
+        "no-drag group/tab flex h-8 max-w-44 shrink-0 items-center rounded-md border pr-1 transition-colors",
         active
-          ? "border-border bg-card text-foreground"
-          : "border-transparent text-muted-foreground hover:bg-accent hover:text-foreground",
+          ? "border-line bg-card text-txt"
+          : "border-transparent text-mut hover:bg-card/60 hover:text-txt",
       )}
     >
       {editing ? (
-        <span className="flex h-full items-center gap-1.5 pl-2">
-          <span
-            className="h-1.5 w-1.5 shrink-0 rounded-full"
-            style={{ backgroundColor: dotColor }}
-          />
+        <span className="flex h-full items-center gap-1.5 pl-2.5">
+          <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", dotCls)} />
           <input
             autoFocus
             defaultValue={name}
@@ -295,7 +339,7 @@ function ProjectTab({
               if (e.key === "Escape") setEditing(false);
             }}
             onMouseDown={(e) => e.stopPropagation()}
-            className="h-5 w-24 rounded bg-secondary px-1 text-xs text-foreground outline-none select-text"
+            className="h-5 w-24 select-text rounded-xs bg-pop px-1 text-12 text-txt outline-none"
           />
         </span>
       ) : (
@@ -308,22 +352,19 @@ function ProjectTab({
             (index <= 8 ? `${name} — ⌘${index + 1}` : name) +
             `\n${shortPath(dir)}`
           }
-          className="focus-ring flex h-full min-w-0 items-center gap-1.5 rounded-md pl-2 pr-0.5"
+          className="focus-ring flex h-full min-w-0 items-center gap-1.5 rounded-md pl-2.5 pr-0.5"
         >
-          <span
-            className="h-1.5 w-1.5 shrink-0 rounded-full"
-            style={{ backgroundColor: dotColor }}
-          />
-          <span className="min-w-0 truncate text-xs font-medium">{name}</span>
+          <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", dotCls)} />
+          <span className="min-w-0 truncate text-12 font-medium">{name}</span>
           {stats.total > 0 && (
-            <span className="font-mono text-[10px] tabular-nums text-faint">
+            <span className="font-mono text-10 tabular-nums text-fnt">
               {stats.busy > 0 ? `${stats.busy}/${stats.total}` : stats.total}
             </span>
           )}
           {stats.attn > 0 && (
             <span
-              className="font-mono text-[10px] font-semibold tabular-nums text-attn"
-              title={`${stats.attn} session${stats.attn > 1 ? "s" : ""} need${stats.attn > 1 ? "" : "s"} your input`}
+              className="font-mono text-10 font-semibold tabular-nums text-attn"
+              title={`${stats.attn} agent${stats.attn > 1 ? "s" : ""} need${stats.attn > 1 ? "" : "s"} your input`}
             >
               ⚑{stats.attn}
             </span>
@@ -340,7 +381,7 @@ function ProjectTab({
         }}
         onMouseDown={(e) => e.stopPropagation()}
         title="Close project tab (sessions are kept)"
-        className="focus-ring pointer-events-none flex h-4 w-4 shrink-0 items-center justify-center rounded text-faint opacity-0 hover:bg-destructive/15 hover:text-destructive focus-visible:opacity-100 group-hover/tab:pointer-events-auto group-hover/tab:opacity-100"
+        className="focus-ring pointer-events-none flex h-4 w-4 shrink-0 items-center justify-center rounded-xs text-fnt opacity-0 hover:bg-err/15 hover:text-err focus-visible:opacity-100 group-hover/tab:pointer-events-auto group-hover/tab:opacity-100"
       >
         <X size={10} />
       </button>
@@ -389,15 +430,15 @@ function AddProjectButton({ openCount }: { openCount: number }) {
     <DropdownMenu open={open} onOpenChange={setOpen}>
       <Tip label="Open project">
         <DropdownMenuTrigger asChild>
-          <button className="no-drag focus-ring flex h-7 shrink-0 items-center gap-1 rounded-md px-1.5 text-faint hover:bg-accent hover:text-foreground">
+          <button className="no-drag focus-ring flex h-8 shrink-0 items-center gap-1 rounded-md px-1.5 text-fnt hover:bg-card hover:text-txt">
             <Plus size={14} />
-            {openCount === 0 && <span className="text-xs">Open project</span>}
+            {openCount === 0 && <span className="text-12">Open project</span>}
           </button>
         </DropdownMenuTrigger>
       </Tip>
       <DropdownMenuContent align="start" className="w-80">
         <DropdownMenuItem onSelect={() => void pick()}>
-          <FolderOpen size={13} className="shrink-0 text-muted-foreground" />
+          <FolderOpen size={13} className="shrink-0 text-mut" />
           Open folder…
         </DropdownMenuItem>
         {recents.length > 0 && (
@@ -406,8 +447,8 @@ function AddProjectButton({ openCount }: { openCount: number }) {
             <DropdownMenuLabel>Recent</DropdownMenuLabel>
             {recents.map((p) => (
               <DropdownMenuItem key={p.path} onSelect={() => void openDir(p.path)}>
-                <span className="min-w-0 flex-1 truncate text-xs">{p.name}</span>
-                <span className="max-w-[55%] shrink-0 truncate font-mono text-[10px] text-faint">
+                <span className="min-w-0 flex-1 truncate text-12">{p.name}</span>
+                <span className="max-w-[55%] shrink-0 truncate font-mono text-10 text-fnt">
                   {shortPath(p.path)}
                 </span>
               </DropdownMenuItem>
@@ -442,7 +483,7 @@ function UpdatePill() {
 
   return (
     <button
-      className="no-drag focus-ring flex h-7 items-center gap-1.5 rounded-md border border-ring/50 bg-ring/10 px-2.5 text-[11px] font-medium text-foreground hover:bg-ring/20 disabled:opacity-70"
+      className="no-drag focus-ring flex h-8 items-center gap-1.5 rounded-md border border-acc/50 bg-acc/10 px-2.5 text-11 font-medium text-txt hover:bg-acc/20 disabled:opacity-70"
       disabled={stage === "downloading"}
       onClick={() => (stage === "ready" ? restart() : downloadAndInstall())}
       title={
@@ -451,7 +492,7 @@ function UpdatePill() {
           : "Download and install the update"
       }
     >
-      <Download size={12} className="text-ring" />
+      <Download size={12} className="text-acc" />
       <span className="font-mono tabular-nums">{label}</span>
     </button>
   );

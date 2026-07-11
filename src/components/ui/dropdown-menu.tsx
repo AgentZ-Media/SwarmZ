@@ -14,7 +14,7 @@ export const DropdownMenuContent = React.forwardRef<
       ref={ref}
       sideOffset={sideOffset}
       className={cn(
-        "z-50 min-w-[11rem] overflow-hidden rounded-lg border border-border bg-popover p-1 shadow-xl data-[state=open]:animate-in",
+        "z-50 min-w-[11rem] overflow-hidden rounded-xl border border-line2 bg-pop p-1 shadow-pop data-[state=open]:animate-zfadeup",
         className,
       )}
       {...props}
@@ -32,10 +32,10 @@ export const DropdownMenuItem = React.forwardRef<
   <DropdownPrimitive.Item
     ref={ref}
     className={cn(
-      "relative flex cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-sm outline-none transition-colors data-[highlighted]:bg-accent [&_svg]:size-3.5 [&_svg]:text-muted-foreground",
+      "relative flex cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-13 outline-none transition-colors data-[highlighted]:bg-line [&_svg]:size-3.5 [&_svg]:text-mut",
       danger
-        ? "text-destructive data-[highlighted]:bg-destructive/10 [&_svg]:text-destructive"
-        : "text-foreground",
+        ? "text-err data-[highlighted]:bg-err/10 [&_svg]:text-err"
+        : "text-txt",
       className,
     )}
     {...props}
@@ -44,7 +44,7 @@ export const DropdownMenuItem = React.forwardRef<
 DropdownMenuItem.displayName = "DropdownMenuItem";
 
 export const DropdownMenuSeparator = () => (
-  <DropdownPrimitive.Separator className="my-1 h-px bg-border" />
+  <DropdownPrimitive.Separator className="my-1 h-px bg-line" />
 );
 
 export const DropdownMenuSub = DropdownPrimitive.Sub;
@@ -56,7 +56,7 @@ export const DropdownMenuSubTrigger = React.forwardRef<
   <DropdownPrimitive.SubTrigger
     ref={ref}
     className={cn(
-      "relative flex cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-accent data-[state=open]:bg-accent [&_svg]:size-3.5 [&_svg]:text-muted-foreground",
+      "relative flex cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-13 text-txt outline-none transition-colors data-[highlighted]:bg-line data-[state=open]:bg-line [&_svg]:size-3.5 [&_svg]:text-mut",
       className,
     )}
     {...props}
@@ -73,7 +73,7 @@ export const DropdownMenuSubContent = React.forwardRef<
       ref={ref}
       sideOffset={sideOffset}
       className={cn(
-        "z-50 min-w-[11rem] overflow-hidden rounded-lg border border-border bg-popover p-1 shadow-xl data-[state=open]:animate-in",
+        "z-50 min-w-[11rem] overflow-hidden rounded-xl border border-line2 bg-pop p-1 shadow-pop data-[state=open]:animate-zfadeup",
         className,
       )}
       {...props}
@@ -88,7 +88,7 @@ export const DropdownMenuLabel = ({
 }: React.HTMLAttributes<HTMLDivElement>) => (
   <div
     className={cn(
-      "px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-faint",
+      "px-2 py-1 font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt",
       className,
     )}
     {...props}

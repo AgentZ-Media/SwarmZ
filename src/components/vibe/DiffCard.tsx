@@ -1,19 +1,19 @@
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { ChevronRight } from "lucide-react";
-import { DiffView, DiffModeEnum, DiffFile } from "@git-diff-view/react";
+import { FileDiff } from "@pierre/diffs/react";
 import {
   capDiff,
   changeKind,
   changeKindLabel,
   changeStats,
-  changeToDiffData,
-  diffHash,
-  parsedFileToDiffData,
   type ChangeKind,
-  type DiffData,
   type ParsedFile,
 } from "@/lib/vibe/diff";
-import { requestDiffBundle } from "@/lib/vibe/diff-highlight";
+import {
+  changeToPatchText,
+  DIFF_OPTIONS,
+  toFileDiff,
+} from "@/lib/vibe/diff-pierre";
 import { cn } from "@/lib/utils";
 import type { VibeFileChange } from "@/types";
 
@@ -27,71 +27,34 @@ const FILE_COLLAPSE = 3;
 const BODY_MAX = "max-h-[460px]";
 
 // ---------------------------------------------------------------------------
-// DiffBody — the @git-diff-view wrapper. Plain first (no highlight, parsed on
-// this thread but cheap), then swaps to an off-thread-highlighted DiffFile once
-// the worker resolves. Height stays stable across the swap (same line count),
-// so the async replace never reflows the feed. `highlight={false}` is the fully
-// functional path — the worker is a pure enhancement.
+// DiffBody — the @pierre/diffs wrapper. `<FileDiff>` renders plain text
+// immediately and swaps in worker-highlighted tokens per line (same line
+// count, fixed line-height), so the async token swap never changes the row's
+// height — the virtua feed stays reflow-free (identity-preservation
+// invariant). Inner virtualization is off (DIFF_OPTIONS): the transcript's
+// VList owns row heights; tall diffs scroll inside BODY_MAX instead.
+// An unparseable patch falls back to a plain <pre> of the raw text.
 // ---------------------------------------------------------------------------
 
-const DiffBody = memo(function DiffBody({
-  diffKey,
-  data,
-  highlight,
-}: {
-  diffKey: string;
-  data: DiffData;
-  highlight: boolean;
-}) {
-  const [file, setFile] = useState<DiffFile | null>(null);
-
-  useEffect(() => {
-    if (!highlight) {
-      setFile(null);
-      return;
-    }
-    let cancelled = false;
-    requestDiffBundle(diffKey, data, "unified")
-      .then((bundle) => {
-        if (cancelled) return;
-        const f = DiffFile.createInstance({
-          oldFile: data.oldFile,
-          newFile: data.newFile,
-          hunks: data.hunks,
-        });
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        f._mergeFullBundle(bundle as any);
-        setFile(f);
-      })
-      .catch(() => {
-        /* stay on the plain path */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [diffKey, highlight, data]);
-
-  const common = {
-    diffViewMode: DiffModeEnum.Unified,
-    diffViewTheme: "dark" as const,
-    diffViewFontSize: 11,
-    diffViewWrap: false,
-  };
-
+const DiffBody = memo(function DiffBody({ patchText }: { patchText: string }) {
+  const meta = useMemo(() => toFileDiff(patchText), [patchText]);
+  if (!meta) {
+    return (
+      <pre className="max-h-64 select-text overflow-auto px-3 py-2 font-mono text-11 leading-[1.7] text-mut">
+        {patchText}
+      </pre>
+    );
+  }
   return (
     <div className={cn("vibe-diff overflow-auto", BODY_MAX)}>
-      {file ? (
-        <DiffView diffFile={file} diffViewHighlight {...common} />
-      ) : (
-        <DiffView data={data} diffViewHighlight={false} {...common} />
-      )}
+      <FileDiff fileDiff={meta} options={DIFF_OPTIONS} />
     </div>
   );
 });
 
 function TruncatedBanner() {
   return (
-    <div className="border-t border-border px-3 py-1 font-mono text-[9.5px] text-warning">
+    <div className="border-t border-line px-3 py-1 font-mono text-10 text-warn">
       [truncated] — file too large to render in full
     </div>
   );
@@ -99,7 +62,7 @@ function TruncatedBanner() {
 
 // ---------------------------------------------------------------------------
 // FileRow — one collapsible file inside a fileChange card or the turn panel.
-// Highlighting is lazy: only an OPEN row asks the worker (plain until then).
+// The diff mounts lazily: only an OPEN row parses + asks the worker pool.
 // ---------------------------------------------------------------------------
 
 const FileRow = memo(function FileRow({
@@ -107,7 +70,7 @@ const FileRow = memo(function FileRow({
   kind,
   add,
   del,
-  data,
+  patchText,
   truncated,
   defaultOpen,
 }: {
@@ -115,40 +78,41 @@ const FileRow = memo(function FileRow({
   kind: ChangeKind;
   add: number;
   del: number;
-  data: DiffData;
+  patchText: string;
   truncated: boolean;
   defaultOpen: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
-  // the diff string identity drives the highlight cache key
-  const diffKey = useMemo(() => diffHash(data.hunks.join("\n")), [data]);
 
   return (
-    <div className="border-t border-border first:border-t-0">
+    <div className="border-t border-line first:border-t-0">
       <button
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-[10.5px] hover:bg-accent"
+        className="focus-ring flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-11 hover:bg-pop"
       >
         <ChevronRight
           size={11}
-          className={cn("shrink-0 text-faint transition-transform", open && "rotate-90")}
+          className={cn(
+            "shrink-0 text-fnt transition-transform",
+            open && "rotate-90",
+          )}
         />
-        <span className="shrink-0 rounded border border-border px-1 text-[9px] uppercase tracking-wide text-faint">
+        <span className="shrink-0 rounded-xs border border-line px-1 text-10 uppercase tracking-wide text-fnt">
           {changeKindLabel(kind)}
         </span>
-        <span className="min-w-0 flex-1 truncate text-muted-foreground select-text">
+        <span className="min-w-0 flex-1 select-text truncate text-mut">
           {path}
         </span>
         {(add > 0 || del > 0) && (
           <span className="shrink-0 tabular-nums">
-            <span className="text-diff-add">+{add}</span>{" "}
-            <span className="text-diff-del">−{del}</span>
+            <span className="text-add">+{add}</span>{" "}
+            <span className="text-del">−{del}</span>
           </span>
         )}
       </button>
       {open && (
         <>
-          <DiffBody diffKey={diffKey} data={data} highlight />
+          <DiffBody patchText={patchText} />
           {truncated && <TruncatedBanner />}
         </>
       )}
@@ -157,9 +121,9 @@ const FileRow = memo(function FileRow({
 });
 
 // ---------------------------------------------------------------------------
-// FileChangeCard — replaces the old flat fileChange row. Header aggregate +
-// one collapsible FileRow per file. Large sets (many files or big diffs) mount
-// collapsed; small single edits auto-open.
+// FileChangeCard — header aggregate + one collapsible FileRow per file.
+// Large sets (many files or big diffs) mount collapsed; small single edits
+// auto-open.
 // ---------------------------------------------------------------------------
 
 interface PreparedFile {
@@ -167,7 +131,7 @@ interface PreparedFile {
   kind: ChangeKind;
   add: number;
   del: number;
-  data: DiffData;
+  patchText: string;
   truncated: boolean;
   size: number;
 }
@@ -185,7 +149,7 @@ function prepareChanges(changes: VibeFileChange[]): PreparedFile[] {
       kind,
       add,
       del,
-      data: changeToDiffData(source),
+      patchText: changeToPatchText(source),
       truncated: capped.truncated,
       size: add + del,
     };
@@ -212,18 +176,21 @@ export const FileChangeCard = memo(function FileChangeCard({
     files.length > FILE_COLLAPSE || totals.add + totals.del > LINE_COLLAPSE * 2;
 
   return (
-    <div className="max-w-[86%] overflow-hidden rounded-lg border border-border bg-card">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 font-mono text-[10px] text-muted-foreground">
-        <span className="text-foreground">
+    <div className="max-w-[92%] overflow-hidden rounded-lg border border-line bg-card">
+      <div className="flex items-center gap-2 border-b border-line px-3 py-1.5 font-mono text-11">
+        <span aria-hidden className="text-acc">
+          Δ
+        </span>
+        <span className="text-txt">
           {files.length} file{files.length === 1 ? "" : "s"} changed
         </span>
         {(totals.add > 0 || totals.del > 0) && (
-          <span className="tabular-nums">
-            <span className="text-diff-add">+{totals.add}</span>{" "}
-            <span className="text-diff-del">−{totals.del}</span>
+          <span className="tabular-nums text-fnt">
+            <span className="text-add">+{totals.add}</span>{" "}
+            <span className="text-del">−{totals.del}</span>
           </span>
         )}
-        {status && <span className="ml-auto text-faint">{status}</span>}
+        {status && <span className="ml-auto text-fnt">{status}</span>}
       </div>
       <div className="flex flex-col">
         {files.map((f) => (
@@ -233,7 +200,7 @@ export const FileChangeCard = memo(function FileChangeCard({
             kind={f.kind}
             add={f.add}
             del={f.del}
-            data={f.data}
+            patchText={f.patchText}
             truncated={f.truncated}
             defaultOpen={!cardLarge && f.size <= LINE_COLLAPSE}
           />
@@ -260,9 +227,6 @@ export const TurnDiffFiles = memo(function TurnDiffFiles({
     <div className="flex flex-col">
       {files.map((f) => {
         const capped = capDiff(f.diff, BYTE_CAP);
-        const data = parsedFileToDiffData(
-          capped.truncated ? { ...f, diff: capped.text } : f,
-        );
         return (
           <FileRow
             key={f.path}
@@ -270,7 +234,7 @@ export const TurnDiffFiles = memo(function TurnDiffFiles({
             kind={f.kind}
             add={f.add}
             del={f.del}
-            data={data}
+            patchText={capped.text}
             truncated={capped.truncated}
             defaultOpen={!cardLarge && f.add + f.del <= LINE_COLLAPSE}
           />
@@ -281,15 +245,15 @@ export const TurnDiffFiles = memo(function TurnDiffFiles({
 });
 
 // ---------------------------------------------------------------------------
-// CompactDiffPreview — a plain (no highlight), height-capped preview for the
-// approval takeover: shows the first file's diff without spinning the worker.
+// CompactDiffPreview — a height-capped preview for the approval takeover:
+// the first file's diff, straight through the same engine (the pool has
+// usually highlighted it already — LRU by content hash).
 // ---------------------------------------------------------------------------
 
-export function CompactDiffPreview({ data }: { data: DiffData }) {
-  const diffKey = useMemo(() => diffHash(data.hunks.join("\n")), [data]);
+export function CompactDiffPreview({ patchText }: { patchText: string }) {
   return (
-    <div className="overflow-hidden rounded-md border border-border">
-      <DiffBody diffKey={diffKey} data={data} highlight={false} />
+    <div className="overflow-hidden rounded-md border border-line">
+      <DiffBody patchText={patchText} />
     </div>
   );
 }

@@ -1,4 +1,3 @@
-import { Loader2 } from "lucide-react";
 import { useSwarm } from "@/store";
 import { resolveQuitConfirm } from "@/lib/quit";
 import { useVibe } from "@/lib/vibe/session-store";
@@ -48,12 +47,16 @@ export function QuitConfirmDialog() {
           {listed.map((a) => (
             <li
               key={a.id}
-              className="flex items-center gap-2 rounded-md border border-border bg-secondary/40 px-2 py-1.5 font-mono text-[11px] text-foreground"
+              className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt"
             >
-              <Loader2 size={12} className="shrink-0 animate-spin text-warning" />
+              <span className="shrink-0 font-mono leading-none text-err">
+                ■
+              </span>
               <span className="truncate">{a.name}</span>
               {a.cwd && (
-                <span className="ml-auto truncate pl-2 text-faint">{a.cwd}</span>
+                <span className="ml-auto truncate pl-2 font-mono text-10 text-fnt">
+                  {a.cwd}
+                </span>
               )}
             </li>
           ))}
@@ -61,7 +64,7 @@ export function QuitConfirmDialog() {
 
         <div className="flex justify-end gap-2">
           <Button
-            variant="outline"
+            variant="secondary"
             size="sm"
             onClick={() => resolveQuitConfirm(false)}
           >

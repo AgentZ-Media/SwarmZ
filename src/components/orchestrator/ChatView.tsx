@@ -1,6 +1,6 @@
 // Shared orchestrator chat rendering — the message list, message rows,
 // tool/system chips, session jump chips and the chat switcher. Rendered by
-// the Conductor stage (the app's one orchestrator surface).
+// the Conductor sidebar (the app's one orchestrator surface).
 
 import {
   Fragment,
@@ -13,7 +13,6 @@ import {
 } from "react";
 import {
   BookOpen,
-  Bot,
   Brain,
   Check,
   ChevronDown,
@@ -72,15 +71,6 @@ type ToolMessage = Extract<OrchestratorChatMessage, { role: "tool" }>;
 
 const EMPTY_MESSAGES: OrchestratorChatMessage[] = [];
 
-/** Tiny brain indicator — every chat runs on codex. */
-export function ProviderBadge() {
-  return (
-    <div className="truncate pb-1 text-center font-mono text-[9px] tracking-wide text-faint">
-      codex
-    </div>
-  );
-}
-
 export function MessageList({ chatId }: { chatId: string }) {
   const messages = useOrchestrator(
     (s) => s.chats.find((c) => c.id === chatId)?.messages ?? EMPTY_MESSAGES,
@@ -119,10 +109,9 @@ export function MessageList({ chatId }: { chatId: string }) {
     <div
       ref={ref}
       onScroll={onScroll}
-      className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-4 py-4"
+      className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-4 py-5"
     >
-      <div className={cn("mx-auto flex w-full flex-col gap-4", CHAT_MAX_W)}>
-        <ProviderBadge />
+      <div className={cn("mx-auto flex w-full flex-col gap-3", CHAT_MAX_W)}>
         {groups.map((g) => {
           const at = g.kind === "message" ? g.msg.at : g.tools[0].at;
           const showT = lastAt === 0 || at - lastAt > 5 * 60_000;
@@ -140,8 +129,8 @@ export function MessageList({ chatId }: { chatId: string }) {
           );
         })}
         {showThinking && (
-          <div className="font-mono text-[11px] leading-relaxed text-faint">
-            <span className="streaming-caret">…</span>
+          <div className="ml-6 font-mono text-12 leading-relaxed text-fnt">
+            <span className="animate-zcaret">…</span>
           </div>
         )}
       </div>
@@ -160,7 +149,7 @@ function TimeDivider({ at }: { at: number }) {
     ? ""
     : `${d.toLocaleDateString(undefined, { weekday: "short" })} `;
   return (
-    <div className="py-0.5 text-center font-mono text-[9px] uppercase tracking-wider text-faint">
+    <div className="py-0.5 text-center font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
       {day}
       {time}
     </div>
@@ -180,18 +169,25 @@ const MessageRow = memo(function MessageRow({
     case "user":
       return (
         <div className="flex justify-end">
-          <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl border border-border bg-secondary px-3.5 py-2 text-[13.5px] leading-relaxed text-foreground select-text">
+          <div className="max-w-[85%] select-text whitespace-pre-wrap break-words rounded-xl rounded-br-[4px] border border-line2 bg-pop px-3.5 py-2.5 text-13 leading-relaxed text-txt">
             {msg.text}
           </div>
         </div>
       );
     case "assistant":
+      // the Conductor speaks under its orb (reference: 15px hex orb + prose)
       return (
-        <div className="break-words text-[13.5px] leading-relaxed text-foreground/90 select-text">
-          <OrchestratorMarkdown text={msg.text} />
-          {msg.streaming && (
-            <span className="streaming-caret ml-0.5 inline-block h-3.5 w-[6px] translate-y-[2px] rounded-[1px] bg-foreground/60" />
-          )}
+        <div className="animate-zfadeup flex gap-2">
+          <span
+            aria-hidden
+            className="hex-mark hex-mark-orb mt-[3px] h-[15px] w-[15px] shrink-0"
+          />
+          <div className="min-w-0 select-text break-words text-13 leading-relaxed text-txt/90">
+            <OrchestratorMarkdown text={msg.text} />
+            {msg.streaming && (
+              <span className="animate-zcaret ml-0.5 inline-block h-[13px] w-[6px] translate-y-[2px] rounded-[1px] bg-acc-hot" />
+            )}
+          </div>
         </div>
       );
     case "tool":
@@ -237,11 +233,13 @@ function SystemRow({
       })}
     >
       {msg.autonomous && (
-        // Phase 5: autonomous-turn markers carry `autonomous` + the trigger
-        // kind — the interim chip; Phase 6 designs the real treatment
+        // Phase 5: an autonomous-turn marker — the Conductor woke itself
+        // (finish/approval/timer/idle trigger), no human sent this. Accent-
+        // washed chip, deliberately NOT a user bubble; the trigger kind
+        // rides in the tooltip.
         <span
-          title={`Autonomous turn (trigger: ${msg.trigger ?? "event"})`}
-          className="shrink-0 rounded border border-border bg-secondary/50 px-1.5 py-px font-mono text-[10px] text-muted-foreground"
+          title={`Autonomous turn — the Conductor acted on its own (trigger: ${msg.trigger ?? "event"})`}
+          className="shrink-0 rounded-sm border border-acc/40 bg-acc/10 px-1.5 py-px font-mono text-10 font-medium text-acc"
         >
           ⚡ autonomous
         </span>
@@ -257,7 +255,7 @@ function SystemRow({
             )
           }
           title={`Summarize what "${pane.name}" produced`}
-          className="focus-ring flex shrink-0 items-center rounded border border-border bg-secondary/50 px-1.5 py-px font-mono text-[10px] text-muted-foreground transition-colors hover:border-ring/60 hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+          className="focus-ring flex shrink-0 items-center rounded-sm border border-line px-2 py-px font-mono text-11 text-acc transition-colors hover:border-acc/55 hover:bg-acc/10 disabled:pointer-events-none disabled:opacity-40"
         >
           Review
         </button>
@@ -280,24 +278,24 @@ function StatusIcon({ status }: { status: QuietStatus }) {
   switch (status) {
     case "running":
       return (
-        <span className="streaming-caret shrink-0 font-mono text-faint">…</span>
+        <span className="animate-zcaret shrink-0 font-mono text-fnt">…</span>
       );
     case "ok":
-      return <Check size={12} className="shrink-0 text-success" />;
+      return <Check size={12} className="shrink-0 text-ok" />;
     case "failed":
-      return <TriangleAlert size={12} className="shrink-0 text-warning" />;
+      return <TriangleAlert size={12} className="shrink-0 text-warn" />;
     case "waiting":
       return (
         <span
           aria-hidden
-          className="shrink-0 font-mono text-[11px] font-semibold leading-none text-attn"
+          className="animate-zattn shrink-0 font-mono text-11 font-semibold leading-none text-attn"
         >
           ⚑
         </span>
       );
     case "info":
       return (
-        <span aria-hidden className="shrink-0 font-mono text-faint">
+        <span aria-hidden className="shrink-0 font-mono text-fnt">
           ·
         </span>
       );
@@ -305,7 +303,8 @@ function StatusIcon({ status }: { status: QuietStatus }) {
 }
 
 /** A calm one-line row: status glyph + human text (+ optional tooltip) + any
- * trailing chips/buttons. The shared shape for single steps, pings, warnings. */
+ * trailing chips/buttons. The shared shape for single steps, pings, warnings.
+ * Indented under the assistant orb column (ml-6) so prose keeps the lead. */
 function QuietLine({
   status,
   text,
@@ -321,13 +320,13 @@ function QuietLine({
   children?: ReactNode;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[12px] leading-5 select-text">
+    <div className="ml-6 flex select-text flex-wrap items-center gap-x-1.5 gap-y-1 text-12 leading-5">
       <StatusIcon status={status} />
       <span
         title={tooltip}
         className={cn(
           "min-w-0 break-words",
-          tone === "warning" ? "text-warning" : "text-muted-foreground",
+          tone === "warning" ? "text-warn" : "text-mut",
         )}
       >
         {text}
@@ -427,27 +426,27 @@ function ActivityGroup({ tools }: { tools: ToolMessage[] }) {
   const refs = unionRefs(tools);
 
   return (
-    <div className="text-[12px] leading-5">
+    <div className="ml-6 text-12 leading-5">
       <button
         onClick={() => setOpen((o) => !o)}
-        className="focus-ring group flex w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-left hover:bg-accent/40"
+        className="focus-ring group flex w-full items-center gap-1.5 rounded-sm px-1 py-0.5 text-left hover:bg-card"
       >
         <ChevronRight
-          size={12}
+          size={11}
           className={cn(
-            "shrink-0 text-faint transition-transform",
+            "shrink-0 text-fnt transition-transform",
             open && "rotate-90",
           )}
         />
-        <span className="font-mono text-muted-foreground">
+        <span className="font-mono text-11 text-mut">
           {running ? "Working" : "Worked"} · {activityCountLabel(tools.length)}
         </span>
         {running ? (
-          <span className="streaming-caret font-mono text-faint">…</span>
+          <span className="animate-zcaret font-mono text-fnt">…</span>
         ) : failed.length ? (
-          <TriangleAlert size={11} className="shrink-0 text-warning" />
+          <TriangleAlert size={11} className="shrink-0 text-warn" />
         ) : (
-          <Check size={12} className="shrink-0 text-success" />
+          <Check size={12} className="shrink-0 text-ok" />
         )}
       </button>
 
@@ -470,7 +469,7 @@ function ActivityGroup({ tools }: { tools: ToolMessage[] }) {
       )}
 
       {open && (
-        <div className="ml-[10px] mt-1 flex flex-col gap-0.5 border-l border-border/50 pl-2.5">
+        <div className="ml-[13px] mt-1.5 flex flex-col gap-1 border-l border-line2 pl-3">
           {tools.map((t) => (
             <StepRow key={t.id} tool={t} withChips />
           ))}
@@ -492,23 +491,20 @@ function StepRow({
   const running = tool.ok === undefined;
   return (
     <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
-      <Icon size={13} className="shrink-0 text-faint" />
+      <Icon size={12} className="shrink-0 text-fnt" />
       <span
         title={tool.argsSummary ? `${tool.tool} — ${tool.argsSummary}` : tool.tool}
-        className={cn(
-          "min-w-0 truncate",
-          failed ? "text-warning" : "text-muted-foreground",
-        )}
+        className={cn("min-w-0 truncate", failed ? "text-warn" : "text-mut")}
       >
         {stepLabel(tool)}
       </span>
       {withChips && tool.paneRefs?.map((p) => <PaneChip key={p.id} pane={p} />)}
       {running ? (
-        <span className="streaming-caret text-faint">…</span>
+        <span className="animate-zcaret text-fnt">…</span>
       ) : failed ? (
-        <TriangleAlert size={10} className="shrink-0 text-warning" />
+        <TriangleAlert size={10} className="shrink-0 text-warn" />
       ) : (
-        <Check size={11} className="shrink-0 text-faint" />
+        <Check size={11} className="shrink-0 text-ok" />
       )}
     </div>
   );
@@ -516,17 +512,26 @@ function StepRow({
 
 /**
  * "→ name" jump chip: a native session (focusSession selects it). Resolves
- * live and hides once the target is gone.
+ * live and hides once the target is gone. Carries the session's live status
+ * dot (accent while working, amber while it needs the human).
  */
 function PaneChip({ pane }: { pane: OrchestratorPaneRef }) {
   const name = useVibe((s) => s.sessions[pane.id]?.session.name);
+  const busy = useVibe((s) => !!s.busy[pane.id]);
   if (!name) return null;
   return (
     <button
       onClick={() => focusSession(pane.id)}
-      title={`Jump to session "${name}"`}
-      className="focus-ring flex shrink-0 items-center rounded border border-border bg-secondary/50 px-1.5 py-px font-mono text-[10px] text-muted-foreground transition-colors hover:border-ring/60 hover:text-foreground"
+      title={`Jump to agent "${name}"`}
+      className="focus-ring flex shrink-0 items-center gap-1.5 rounded-sm border border-line bg-card px-2 py-px font-mono text-11 text-mut transition-colors hover:border-acc/55 hover:text-txt"
     >
+      <span
+        aria-hidden
+        className={cn(
+          "h-[5px] w-[5px] rounded-full",
+          busy ? "bg-acc" : "bg-fnt",
+        )}
+      />
       → {name}
     </button>
   );
@@ -535,18 +540,19 @@ function PaneChip({ pane }: { pane: OrchestratorPaneRef }) {
 function EmptyChat() {
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center px-6">
-      <div className="max-w-60 text-center">
-        <Bot size={18} className="mx-auto text-faint" />
-        <p className="mt-2.5 text-xs leading-relaxed text-muted-foreground">
-          Talk to the orchestrator about your fleet.
+      <div className="max-w-64 text-center">
+        <span
+          aria-hidden
+          className="hex-mark hex-mark-orb mx-auto block h-7 w-7 opacity-80"
+        />
+        <p className="mt-3 text-12 leading-normal text-mut">
+          Give the Conductor a goal — it decomposes the work, staffs agents
+          and reports back.
         </p>
-        <p className="mt-1 text-[11px] leading-relaxed text-faint">
-          It can inspect sessions and transcripts, check git status, prompt
-          agents, and spin up new sessions.
+        <p className="mt-1.5 text-11 leading-normal text-fnt">
+          It reads transcripts and git, spawns and steers agents, manages
+          worktrees, sets follow-up timers and decides routine approvals.
         </p>
-        <div className="mt-2.5">
-          <ProviderBadge />
-        </div>
       </div>
     </div>
   );
@@ -569,7 +575,7 @@ export function ChatMeta({ chatId }: { chatId: string }) {
   const label = model ? prettyModel(model) : "default model";
 
   return (
-    <div className="flex shrink-0 items-center gap-1.5">
+    <div className="flex shrink-0 items-center gap-0.5">
       <ModelEffortPicker
         model={model}
         effort={effort}
@@ -579,11 +585,11 @@ export function ChatMeta({ chatId }: { chatId: string }) {
       >
         <button
           title="Model & reasoning effort — applies from the next turn"
-          className="focus-ring flex items-center gap-1 rounded-full border border-border bg-secondary px-2 py-0.5 font-mono text-[9px] text-muted-foreground transition-colors hover:border-ring/50 hover:text-foreground"
+          className="focus-ring flex items-center gap-1 rounded-sm px-2 py-1 font-mono text-11 text-fnt transition-colors hover:bg-card hover:text-mut"
         >
           <span className="max-w-28 truncate">{label}</span>
-          {effort && <span className="text-faint">· {effort}</span>}
-          <ChevronDown size={9} className="text-faint" />
+          {effort && <span>· {effort}</span>}
+          <ChevronDown size={9} />
         </button>
       </ModelEffortPicker>
       <ChatContextGauge chatId={chatId} />
@@ -602,7 +608,7 @@ function ChatContextGauge({ chatId }: { chatId: string }) {
   return (
     <Tip
       label={
-        <span className="font-mono text-[11px]">
+        <span className="font-mono text-11">
           Context · {total.toLocaleString()} / {window.toLocaleString()} tokens
         </span>
       }
@@ -610,8 +616,8 @@ function ChatContextGauge({ chatId }: { chatId: string }) {
       <span
         tabIndex={0}
         className={cn(
-          "focus-ring shrink-0 rounded-full border border-border bg-secondary px-2 py-0.5 font-mono text-[9px] tabular-nums",
-          warn ? "text-warning" : "text-muted-foreground",
+          "focus-ring shrink-0 rounded-sm px-2 py-1 font-mono text-11 tabular-nums",
+          warn ? "text-warn" : "text-fnt",
         )}
       >
         ctx {Math.round(pct * 100)}%
@@ -644,39 +650,39 @@ export function ChatSwitcher({ projectId }: { projectId: string | null }) {
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <button className="focus-ring flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
+        <button className="focus-ring flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-11 text-mut transition-colors hover:bg-card hover:text-txt">
           <span className="min-w-0 truncate">
             {active?.title ?? DEFAULT_CHAT_TITLE}
           </span>
           {chats.length > 1 && (
-            <span className="shrink-0 font-mono text-[10px] tabular-nums text-faint">
+            <span className="shrink-0 font-mono text-10 tabular-nums text-fnt">
               {chats.length}
             </span>
           )}
-          <ChevronDown size={11} className="shrink-0 text-faint" />
+          <ChevronDown size={11} className="shrink-0 text-fnt" />
         </button>
       </PopoverTrigger>
       <PopoverContent align="start" className="max-h-72 w-64 overflow-y-auto">
         {chats.map((c) => (
           <div
             key={c.id}
-            className="group/chat flex items-center gap-1 rounded-md pr-1 hover:bg-accent"
+            className="group/chat flex items-center gap-1 rounded-md pr-1 hover:bg-line"
           >
             <button
               onClick={() => {
                 setActiveChat(c.id);
                 setOpen(false);
               }}
-              className="focus-ring flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-xs text-foreground"
+              className="focus-ring flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-12 text-txt"
             >
               <span
                 className={cn(
                   "h-1.5 w-1.5 shrink-0 rounded-full",
                   busy[c.id]
-                    ? "bg-warning"
+                    ? "animate-zpulse bg-acc"
                     : c.id === activeChatId
-                      ? "bg-ring"
-                      : "bg-faint/50",
+                      ? "bg-acc"
+                      : "bg-fnt/50",
                 )}
               />
               <span className="min-w-0 flex-1 truncate">{c.title}</span>
@@ -684,7 +690,7 @@ export function ChatSwitcher({ projectId }: { projectId: string | null }) {
             <button
               onClick={() => removeChat(c.id)}
               title="Delete chat"
-              className="focus-ring flex h-4 w-4 shrink-0 items-center justify-center rounded text-faint opacity-0 hover:bg-destructive/15 hover:text-destructive focus-visible:opacity-100 group-hover/chat:opacity-100"
+              className="focus-ring flex h-4 w-4 shrink-0 items-center justify-center rounded-xs text-fnt opacity-0 hover:bg-err/15 hover:text-err focus-visible:opacity-100 group-hover/chat:opacity-100"
             >
               <X size={11} />
             </button>

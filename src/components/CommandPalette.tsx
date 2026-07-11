@@ -1,16 +1,7 @@
 import { useEffect, useState } from "react";
 import { Command } from "cmdk";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
-import {
-  BarChart3,
-  Bell,
-  Bot,
-  FolderOpen,
-  Plus,
-  Search,
-  Settings,
-  StickyNote,
-} from "lucide-react";
+import { Search } from "lucide-react";
 import { useSwarm } from "@/store";
 import { useVibe, type VibeSessionEntry } from "@/lib/vibe/session-store";
 import { activateProject, focusSession } from "@/lib/vibe/controller";
@@ -58,29 +49,29 @@ export function CommandPalette({
   return (
     <DialogPrimitive.Root open={open} onOpenChange={setOpen}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50 data-[state=open]:animate-overlay-in" />
+        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-[rgba(5,5,8,0.55)] backdrop-blur-[2px] data-[state=open]:animate-zoverlay" />
         <DialogPrimitive.Content
-          className="fixed left-1/2 top-[18%] z-50 w-full max-w-lg -translate-x-1/2 overflow-hidden rounded-xl border border-border bg-popover shadow-[0_16px_48px_-12px_rgba(0,0,0,0.7)] data-[state=open]:animate-in"
+          className="fixed left-1/2 top-[16%] z-50 w-full max-w-[560px] -translate-x-1/2 overflow-hidden rounded-2xl border border-line2 bg-pop shadow-modal data-[state=open]:animate-zfadeup"
           onCloseAutoFocus={(e) => e.preventDefault()}
         >
           <DialogPrimitive.Title className="sr-only">
             Command palette
           </DialogPrimitive.Title>
           <Command label="Command palette" loop>
-            <div className="flex items-center gap-2 border-b border-border px-3">
-              <Search size={14} className="shrink-0 text-faint" />
+            <div className="flex items-center gap-2 border-b border-line px-3">
+              <Search size={14} className="shrink-0 text-fnt" />
               <Command.Input
                 value={search}
                 onValueChange={setSearch}
                 placeholder="Jump to a session or action…"
-                className="h-11 w-full bg-transparent text-sm text-foreground outline-none placeholder:text-faint"
+                className="h-11 w-full bg-transparent text-14 text-txt outline-none placeholder:text-fnt"
               />
-              <kbd className="rounded border border-border bg-secondary px-1.5 py-0.5 font-mono text-[10px] text-faint">
+              <kbd className="rounded-xs border border-line2 px-1 font-mono text-10 text-fnt">
                 esc
               </kbd>
             </div>
             <Command.List className="max-h-80 overflow-y-auto p-1.5">
-              <Command.Empty className="px-3 py-6 text-center text-sm text-faint">
+              <Command.Empty className="px-3 py-6 text-center text-13 text-fnt">
                 Nothing found.
               </Command.Empty>
 
@@ -95,16 +86,13 @@ export function CommandPalette({
                       onSelect={() => run(() => activateProject(id))}
                     >
                       <span
-                        className="h-1.5 w-1.5 shrink-0 rounded-full"
-                        style={{
-                          backgroundColor:
-                            activeProjectId === id
-                              ? "var(--ring)"
-                              : "var(--faint)",
-                        }}
+                        className={cn(
+                          "h-1.5 w-1.5 shrink-0 rounded-full",
+                          activeProjectId === id ? "bg-acc" : "bg-fnt",
+                        )}
                       />
-                      <span className="truncate text-foreground">{p.name}</span>
-                      <span className="ml-auto min-w-0 truncate pl-3 font-mono text-[10px] text-faint">
+                      <span className="truncate text-txt">{p.name}</span>
+                      <span className="ml-auto min-w-0 truncate pl-3 font-mono text-10 text-fnt">
                         {shortPath(p.dir)}
                       </span>
                       {i <= 8 && <Shortcut>⌘{i + 1}</Shortcut>}
@@ -125,8 +113,8 @@ export function CommandPalette({
                     })
                   }
                 >
-                  <FolderOpen size={13} className="shrink-0 text-faint" />
-                  Open project…
+                  <ActionDot />
+                  <span className="truncate text-txt">Open project…</span>
                 </PaletteItem>
               </PaletteGroup>
 
@@ -142,8 +130,8 @@ export function CommandPalette({
                       onSelect={() => run(() => focusSession(id))}
                     >
                       <SessionDot entry={entry} />
-                      <span className="truncate text-foreground">{s.name}</span>
-                      <span className="ml-auto min-w-0 truncate pl-3 font-mono text-[10px] text-faint">
+                      <span className="truncate text-txt">{s.name}</span>
+                      <span className="ml-auto min-w-0 truncate pl-3 font-mono text-10 text-fnt">
                         {shortPath(s.projectDir)}
                       </span>
                     </PaletteItem>
@@ -158,18 +146,18 @@ export function CommandPalette({
                     run(() => useVibeUi.getState().setNewSessionOpen(true))
                   }
                 >
-                  <Plus size={13} className="shrink-0 text-faint" />
-                  New session
+                  <ActionDot />
+                  <span className="truncate text-txt">New session</span>
                   <Shortcut>⌘T</Shortcut>
                 </PaletteItem>
                 <PaletteItem
                   value="focus conductor orchestrator chat"
                   onSelect={() =>
-                    run(() => useVibeUi.getState().setStageMode("conductor"))
+                    run(() => useVibeUi.getState().showConductor())
                   }
                 >
-                  <Bot size={13} className="shrink-0 text-faint" />
-                  Focus Conductor
+                  <ActionDot />
+                  <span className="truncate text-txt">Focus Conductor</span>
                   <Shortcut>⌘⇧O</Shortcut>
                 </PaletteItem>
                 <PaletteItem
@@ -181,10 +169,12 @@ export function CommandPalette({
                     })
                   }
                 >
-                  <Bell size={13} className="shrink-0 text-faint" />
-                  Jump to session waiting for input
+                  <ActionDot />
+                  <span className="truncate text-txt">
+                    Jump to session waiting for input
+                  </span>
                   {waiting > 0 && (
-                    <span className="ml-1.5 rounded bg-ring/15 px-1 font-mono text-[10px] tabular-nums text-ring">
+                    <span className="ml-1.5 rounded-xs bg-acc/15 px-1 font-mono text-10 tabular-nums text-acc">
                       {waiting}
                     </span>
                   )}
@@ -194,8 +184,8 @@ export function CommandPalette({
                   value="quick notes checklist"
                   onSelect={() => run(() => useSwarm.getState().setNotesOpen(true))}
                 >
-                  <StickyNote size={13} className="shrink-0 text-faint" />
-                  Quick notes
+                  <ActionDot />
+                  <span className="truncate text-txt">Quick notes</span>
                   <Shortcut>⌘N</Shortcut>
                 </PaletteItem>
                 <PaletteItem
@@ -204,15 +194,15 @@ export function CommandPalette({
                     run(() => useSwarm.getState().setDashboardOpen(true))
                   }
                 >
-                  <BarChart3 size={13} className="shrink-0 text-faint" />
-                  Usage dashboard
+                  <ActionDot />
+                  <span className="truncate text-txt">Usage dashboard</span>
                 </PaletteItem>
                 <PaletteItem
                   value="settings preferences"
                   onSelect={() => run(onOpenSettings)}
                 >
-                  <Settings size={13} className="shrink-0 text-faint" />
-                  Settings
+                  <ActionDot />
+                  <span className="truncate text-txt">Settings</span>
                   <Shortcut>⌘,</Shortcut>
                 </PaletteItem>
               </PaletteGroup>
@@ -234,7 +224,7 @@ export function PaletteGroup({
   return (
     <Command.Group
       heading={heading}
-      className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider [&_[cmdk-group-heading]]:text-faint"
+      className="[&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:font-mono [&_[cmdk-group-heading]]:text-10 [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-[.08em] [&_[cmdk-group-heading]]:text-fnt"
     >
       {children}
     </Command.Group>
@@ -257,8 +247,8 @@ export function PaletteItem({
       value={value}
       onSelect={onSelect}
       className={cn(
-        "flex cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground",
-        "data-[selected=true]:bg-accent data-[selected=true]:text-foreground",
+        "flex cursor-default select-none items-center gap-2 rounded-md px-3 py-1.5 text-13 text-mut",
+        "data-[selected=true]:bg-line data-[selected=true]:text-txt",
         className,
       )}
     >
@@ -269,10 +259,15 @@ export function PaletteItem({
 
 export function Shortcut({ children }: { children: React.ReactNode }) {
   return (
-    <kbd className="ml-auto pl-3 font-mono text-[10px] tabular-nums text-faint">
+    <kbd className="ml-auto pl-3 font-mono text-10 tabular-nums text-fnt">
       {children}
     </kbd>
   );
+}
+
+/** Action rows carry the accent dot — "this takes you somewhere". */
+function ActionDot() {
+  return <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-acc" />;
 }
 
 /** Status dot matching the signal triad, condensed: amber dot + ⚑ for
@@ -280,19 +275,16 @@ export function Shortcut({ children }: { children: React.ReactNode }) {
 function SessionDot({ entry }: { entry: VibeSessionEntry }) {
   const busy = useVibe((s) => !!s.busy[entry.session.id]);
   const needsYou = hasPendingApproval(entry);
-  const color = needsYou
-    ? "var(--attn)"
-    : busy
-      ? "var(--muted-foreground)"
-      : "var(--faint)";
   return (
     <>
       <span
-        className="h-1.5 w-1.5 shrink-0 rounded-full"
-        style={{ backgroundColor: color }}
+        className={cn(
+          "h-1.5 w-1.5 shrink-0 rounded-full",
+          needsYou ? "bg-attn" : busy ? "bg-mut" : "bg-fnt",
+        )}
       />
       {needsYou && (
-        <span className="shrink-0 font-mono text-[10px] font-semibold leading-none text-attn">
+        <span className="shrink-0 font-mono text-10 font-semibold leading-none text-attn">
           ⚑
         </span>
       )}

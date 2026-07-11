@@ -146,8 +146,15 @@ impl Client {
             let base = std::env::var("PATH").unwrap_or_default();
             cmd.env("PATH", format!("{}:{}", dir.display(), base));
         }
+        // SwarmZ processes run WITHOUT the user's global MCP servers (see
+        // `mcp_disable_args`) — the user's config.toml is only READ, never
+        // modified. The read is tiny but still file I/O → spawn_blocking.
+        let mcp_off = tokio::task::spawn_blocking(mcp_disable_args)
+            .await
+            .map_err(|e| e.to_string())?;
         let mut child = cmd
             .arg("app-server")
+            .args(&mcp_off)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -442,6 +449,86 @@ async fn resolved_program() -> Result<String, String> {
 
 fn invalidate_resolved_program() {
     RESOLVER.lock().resolved = None;
+}
+
+// ---------------------------------------------------------------------------
+// MCP opt-out — SwarmZ children never boot the user's global MCP servers
+// ---------------------------------------------------------------------------
+//
+// Every `codex app-server` child inherits the user's `~/.codex/config.toml`,
+// including its `[mcp_servers.*]` entries (the ChatGPT desktop app installs a
+// heavyweight `node_repl` with `startup_timeout_sec = 120`). Those servers
+// boot PER THREAD on the first turn; live on 0.144.1 that boot both delays
+// the turn and trips the codex tool router (`timeout_ms must be at least
+// 10000` → the Conductor's first dynamic tool call gets "cancelled before
+// receiving a response"). SwarmZ agents don't use those servers, so every
+// spawn disables them for THIS PROCESS ONLY.
+//
+// Live-verified mechanism (0.144.1, see docs/ARCHITECTURE.md):
+//   · `-c mcp_servers={}` does NOT work — `-c` table overrides MERGE into the
+//     config table instead of replacing it (probed: a dummy entry is added,
+//     the user's servers keep booting). Same for a per-thread
+//     `thread/start {config: {mcp_servers: {}}}`.
+//   · `-c mcp_servers.<name>.enabled=false` DOES work per server → we
+//     enumerate the names by READING the user's config.toml (never writing
+//     it) and emit one disable per entry.
+//   · `--disable apps` (= `-c features.apps=false`) turns off the built-in
+//     `codex_apps` MCP server that otherwise boots per thread regardless of
+//     config.
+
+/// The user's codex config file (`$CODEX_HOME/config.toml`, default
+/// `~/.codex/config.toml`) — read-only.
+fn codex_config_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
+    Some(home.join("config.toml"))
+}
+
+/// Only names expressible as a bare TOML key segment ride in a `-c` dotted
+/// path. Codex constrains MCP server names to this charset anyway; anything
+/// else is skipped (and logged) rather than guessed at.
+fn is_bare_toml_key(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The per-spawn CLI args that disable MCP servers for one `codex
+/// app-server` child (pure — unit-tested; `config_text` is the user's
+/// config.toml, empty/unparseable degrades to just the `apps` opt-out).
+pub(crate) fn mcp_disable_args_from(config_text: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec!["--disable".into(), "apps".into()];
+    let parsed: toml::Table = match config_text.parse() {
+        Ok(v) => v,
+        Err(_) => return args, // codex itself will complain about its config
+    };
+    let Some(servers) = parsed.get("mcp_servers").and_then(|v| v.as_table()) else {
+        return args;
+    };
+    for name in servers.keys() {
+        if is_bare_toml_key(name) {
+            args.push("-c".into());
+            args.push(format!("mcp_servers.{name}.enabled=false"));
+        } else {
+            eprintln!(
+                "[codex host] mcp server name {name:?} is not a bare TOML key — cannot disable it for this process"
+            );
+        }
+    }
+    args
+}
+
+/// Read the user's config.toml (READ-ONLY) and build the disable args.
+/// Missing file = no user servers = just the `apps` opt-out. Recomputed per
+/// spawn so config edits apply to the next process.
+fn mcp_disable_args() -> Vec<String> {
+    let text = codex_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    mcp_disable_args_from(&text)
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +944,53 @@ mod tests {
     }
 
     #[test]
+    fn mcp_disable_args_enumerate_the_users_servers() {
+        // shape of the user's real config (ChatGPT desktop app entries)
+        let config = r#"
+model = "gpt-5.6-sol"
+
+[mcp_servers.node_repl]
+command = "/Applications/ChatGPT.app/…/node_repl"
+startup_timeout_sec = 120
+
+[mcp_servers.node_repl.env]
+CODEX_HOME = "/Users/x/.codex"
+
+[mcp_servers.computer-use]
+command = "…"
+enabled = false
+"#;
+        let args = mcp_disable_args_from(config);
+        assert_eq!(args[0..2], ["--disable".to_string(), "apps".to_string()]);
+        assert!(args
+            .chunks(2)
+            .any(|c| c == ["-c", "mcp_servers.node_repl.enabled=false"]));
+        // already-disabled entries get the (harmless) explicit disable too
+        assert!(args
+            .chunks(2)
+            .any(|c| c == ["-c", "mcp_servers.computer-use.enabled=false"]));
+        assert_eq!(args.len(), 6);
+    }
+
+    #[test]
+    fn mcp_disable_args_handle_edge_configs() {
+        // no config / no mcp_servers table → just the built-in apps opt-out
+        for text in ["", "model = \"o3\"", "not [ valid toml"] {
+            assert_eq!(
+                mcp_disable_args_from(text),
+                vec!["--disable".to_string(), "apps".to_string()],
+                "{text:?}"
+            );
+        }
+        // inline-table form counts too
+        let args = mcp_disable_args_from(r#"mcp_servers = { foo = { command = "x" } }"#);
+        assert!(args.chunks(2).any(|c| c == ["-c", "mcp_servers.foo.enabled=false"]));
+        // a name that can't ride a bare dotted -c path is skipped, never guessed
+        let args = mcp_disable_args_from("[mcp_servers.\"we ird\"]\ncommand = \"x\"\n");
+        assert_eq!(args, vec!["--disable".to_string(), "apps".to_string()]);
+    }
+
+    #[test]
     fn unknown_thread_errors_are_classified() {
         for msg in [
             // verbatim live answer from codex (0.142.5 spike, re-verified on 0.144.1)
@@ -1200,5 +1334,160 @@ mod tests {
                 s.label
             );
         }
+    }
+
+    // ---- MCP-disable spike (Phase 6 live-fix) ----
+    //
+    // Live proof against the REAL installed codex CLI that a SwarmZ-spawned
+    // app-server (a) boots NO MCP servers — neither the user's global
+    // `[mcp_servers.*]` entries nor the built-in `codex_apps` — and (b) runs
+    // a FIRST dynamic tool call cleanly on the first attempt (the bug this
+    // fixes: the inherited node_repl boot raced the Conductor's first
+    // spawn_agents call into `timeout_ms must be at least 10000` + "dynamic
+    // tool call was cancelled before receiving a response"). Requires codex
+    // + login + a config.toml with MCP servers to be meaningful; run with:
+    //   cargo test mcp_disable_spike -- --ignored --nocapture
+
+    #[tokio::test]
+    #[ignore]
+    async fn mcp_disable_spike() {
+        let cwd = std::env::temp_dir().join("swarmz-mcp-disable-spike");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // context: what the user's config would boot WITHOUT the fix
+        let disable_args = mcp_disable_args();
+        println!("disable args: {disable_args:?}");
+
+        let host = ProcessHost::new();
+        let (conn, generation) = host.ensure().await.expect("spawn app-server");
+        println!("process up (generation {generation}, {})", conn.version());
+
+        // one dynamic tool, exactly the Conductor's spec shape (adapter.rs)
+        let started = conn
+            .request(
+                "thread/start",
+                json!({
+                    "cwd": cwd.to_string_lossy(),
+                    "sandbox": "read-only",
+                    "approvalPolicy": "never",
+                    "ephemeral": true,
+                    "developerInstructions":
+                        "You are a test agent with one dynamic tool. Use it exactly as asked.",
+                    "dynamicTools": [{
+                        "type": "function",
+                        "name": "ping",
+                        "description": "Answers with pong. Call it whenever asked.",
+                        "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+                    }],
+                }),
+                THREAD_TIMEOUT_MS,
+            )
+            .await
+            .expect("thread/start");
+        let thread_id = started
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .expect("thread id")
+            .to_string();
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+        conn.register_thread(&thread_id, sink_tx);
+
+        // the FIRST turn asks for the tool immediately — without the fix this
+        // is the turn that raced the user's MCP boot
+        let t_turn = std::time::Instant::now();
+        conn.request(
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text":
+                    "Call the ping tool once (empty arguments), then reply with exactly the text it returned." }],
+            }),
+            RPC_TIMEOUT_MS,
+        )
+        .await
+        .expect("turn/start");
+
+        let mut mcp_boots: Vec<String> = Vec::new();
+        let mut tool_calls = 0usize;
+        let mut first_tool_call_ms: Option<u128> = None;
+        let mut final_message = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+        let turn_status = loop {
+            let ev = tokio::time::timeout_at(deadline, sink_rx.recv())
+                .await
+                .expect("mcp spike timed out")
+                .expect("event sink closed");
+            match ev {
+                ThreadEvent::Request { method, params, responder } => match method.as_str() {
+                    "item/tool/call" => {
+                        tool_calls += 1;
+                        first_tool_call_ms.get_or_insert(t_turn.elapsed().as_millis());
+                        println!(
+                            "[{:>6} ms] item/tool/call #{tool_calls}: {}",
+                            t_turn.elapsed().as_millis(),
+                            params.get("tool").and_then(|v| v.as_str()).unwrap_or("?"),
+                        );
+                        responder.ok(&json!({
+                            "success": true,
+                            "contentItems": [{ "type": "inputText", "text": "pong" }],
+                        }));
+                    }
+                    other => {
+                        println!("unexpected server request {other} — refusing");
+                        responder.error(-32601, "not supported by the spike");
+                    }
+                },
+                ThreadEvent::Notification { method, params } => match method.as_str() {
+                    "mcpServer/startupStatus/updated" => {
+                        let line = format!(
+                            "{}: {}",
+                            params.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                            params.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+                        );
+                        println!("MCP STARTUP (must not happen): {line}");
+                        mcp_boots.push(line);
+                    }
+                    "item/completed" => {
+                        let item = params.get("item").cloned().unwrap_or(Value::Null);
+                        if item.get("type").and_then(|v| v.as_str()) == Some("agentMessage") {
+                            final_message = item
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                        }
+                    }
+                    "turn/completed" => {
+                        break params
+                            .pointer("/turn/status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                    }
+                    _ => {}
+                },
+                ThreadEvent::Exited => panic!("app-server exited mid-spike"),
+            }
+        };
+
+        println!("\n==== mcp disable spike summary ====");
+        println!("turn status: {turn_status}");
+        println!("mcp servers booted: {}", mcp_boots.len());
+        println!("dynamic tool calls: {tool_calls} (first after {first_tool_call_ms:?} ms)");
+        println!("final message: {final_message:?}");
+
+        assert_eq!(turn_status, "completed", "the FIRST turn must complete cleanly");
+        assert!(
+            mcp_boots.is_empty(),
+            "a SwarmZ-spawned app-server must boot NO MCP servers, got: {mcp_boots:?}"
+        );
+        assert!(
+            tool_calls >= 1,
+            "the first dynamic tool call must arrive on the first attempt"
+        );
+        assert!(
+            final_message.to_lowercase().contains("pong"),
+            "the tool result must round-trip into the reply: {final_message:?}"
+        );
     }
 }

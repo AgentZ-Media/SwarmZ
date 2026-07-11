@@ -18,7 +18,7 @@ export function Badge({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-border bg-secondary/50 px-2 py-0.5 text-[10px] font-medium leading-none text-muted-foreground",
+        "inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-line bg-pop/50 px-2 py-0.5 text-10 font-medium leading-none text-mut",
         className,
       )}
       style={
@@ -55,7 +55,7 @@ export const ScrollArea = React.forwardRef<
       orientation="vertical"
       className="flex touch-none select-none p-0.5 transition-colors"
     >
-      <ScrollAreaPrimitive.Thumb className="relative flex-1 rounded-full bg-input" />
+      <ScrollAreaPrimitive.Thumb className="relative flex-1 rounded-full bg-line2" />
     </ScrollAreaPrimitive.Scrollbar>
   </ScrollAreaPrimitive.Root>
 ));
@@ -73,18 +73,18 @@ export function Stat({
   accent?: string;
 }) {
   return (
-    <div className="min-w-0 rounded-lg border border-border bg-card p-3">
-      <div className="truncate text-[10px] font-medium uppercase tracking-wider text-faint">
+    <div className="min-w-0 rounded-lg border border-line bg-card p-3">
+      <div className="truncate font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
         {label}
       </div>
       <div
-        className="mt-1 truncate font-mono text-lg font-semibold tabular-nums tracking-tight"
+        className="mt-1 truncate font-mono text-16 font-semibold tabular-nums tracking-[-0.01em]"
         style={accent ? { color: accent } : undefined}
       >
         {value}
       </div>
       {sub && (
-        <div className="mt-0.5 truncate text-xs text-muted-foreground">
+        <div className="mt-0.5 truncate text-12 text-mut">
           {sub}
         </div>
       )}

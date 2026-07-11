@@ -18,6 +18,11 @@ export default defineConfig(async () => ({
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),
   },
+  // the @pierre/diffs highlight worker is ESM (code-split imports) — Vite's
+  // default iife worker format can't bundle it
+  worker: {
+    format: "es" as const,
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

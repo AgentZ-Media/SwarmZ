@@ -77,17 +77,17 @@ export function WorktreesButton() {
       </Tip>
       <DropdownMenuContent align="end" className="w-96">
         {safeCount > 0 && (
-          <div className="mb-1 flex items-center justify-between gap-3 rounded-md bg-secondary/35 px-2 py-1.5">
+          <div className="mb-1 flex items-center justify-between gap-3 rounded-lg border border-line bg-card px-2 py-1.5">
             <div className="min-w-0">
-              <div className="text-xs text-foreground">Safe cleanup ready</div>
-              <div className="truncate text-[10px] text-faint">
+              <div className="text-12 text-txt">Safe cleanup ready</div>
+              <div className="truncate text-10 text-fnt">
                 {safeCount} clean unattached worktree{safeCount === 1 ? "" : "s"}
               </div>
             </div>
             <Button
               size="sm"
               variant="secondary"
-              className="h-7 shrink-0 px-2 text-[11px]"
+              className="h-7 shrink-0 px-2 text-11"
               onClick={() => void cleanupSafeWorktrees()}
             >
               <CheckCircle2 size={13} />
@@ -96,7 +96,7 @@ export function WorktreesButton() {
           </div>
         )}
         {groups.length === 0 ? (
-          <p className="px-2 py-1.5 text-[11px] text-faint">
+          <p className="px-2 py-1.5 text-11 text-fnt">
             No worktrees found.
           </p>
         ) : (
@@ -173,15 +173,15 @@ function WorktreeRow({
   };
 
   return (
-    <div className="group/wt flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-accent">
+    <div className="group/wt flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-line">
       <span
         className="h-1.5 w-1.5 shrink-0 rounded-full"
         style={{
           backgroundColor: entry.missing
-            ? "var(--faint)"
+            ? "var(--fnt)"
             : openSessionId
-              ? "var(--success)"
-              : "var(--muted-foreground)",
+              ? "var(--ok)"
+              : "var(--mut)",
         }}
         title={
           entry.missing
@@ -192,26 +192,26 @@ function WorktreeRow({
         }
       />
       <div className="min-w-0 flex-1">
-        <div className="truncate font-mono text-[11px] text-foreground">
+        <div className="truncate font-mono text-11 text-txt">
           {entry.branch}
         </div>
-        <div className="flex items-center gap-1.5 font-mono text-[10px] text-faint">
+        <div className="flex items-center gap-1.5 font-mono text-10 text-fnt">
           {entry.missing ? (
             <span>folder missing</span>
           ) : (
             <>
               {entry.dirty && (
-                <span className="rounded bg-warning/15 px-1 text-warning">
+                <span className="rounded bg-warn/15 px-1 text-warn">
                   uncommitted
                 </span>
               )}
               {entry.ahead > 0 && (
-                <span className="rounded bg-secondary px-1">
+                <span className="rounded bg-line px-1 tabular-nums">
                   ↑{entry.ahead} local-only
                 </span>
               )}
               {entry.ahead_unknown && (
-                <span className="rounded bg-warning/15 px-1 text-warning">
+                <span className="rounded bg-warn/15 px-1 text-warn">
                   state unknown
                 </span>
               )}
@@ -228,7 +228,7 @@ function WorktreeRow({
           <Tip label={openSessionId ? "Jump to session" : "Open in a new session"}>
             <button
               onClick={onOpen}
-              className="flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-secondary hover:text-foreground"
+              className="focus-ring flex h-6 w-6 items-center justify-center rounded-md text-fnt hover:bg-line2 hover:text-txt"
             >
               <Plus size={13} />
             </button>
@@ -238,7 +238,7 @@ function WorktreeRow({
           <Tip label="Reveal in Finder">
             <button
               onClick={() => void revealItemInDir(entry.path)}
-              className="flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-secondary hover:text-foreground"
+              className="focus-ring flex h-6 w-6 items-center justify-center rounded-md text-fnt hover:bg-line2 hover:text-txt"
             >
               <FolderOpen size={13} />
             </button>
@@ -261,10 +261,10 @@ function WorktreeRow({
             onClick={onDelete}
             disabled={!!openSessionId || deleting}
             className={cn(
-              "flex h-6 w-6 items-center justify-center rounded-md transition-colors disabled:pointer-events-none disabled:opacity-30",
+              "focus-ring flex h-6 w-6 items-center justify-center rounded-md transition-colors disabled:pointer-events-none disabled:opacity-30",
               armed
-                ? "bg-destructive/15 text-destructive"
-                : "text-faint hover:bg-destructive/15 hover:text-destructive",
+                ? "bg-err text-white"
+                : "text-fnt hover:bg-err/15 hover:text-err",
             )}
           >
             {risky ? <Trash2 size={13} /> : <CheckCircle2 size={13} />}

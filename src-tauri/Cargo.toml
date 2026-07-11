@@ -39,6 +39,10 @@ walkdir = "2"
 tokio = { version = "1", features = ["time", "sync", "process", "io-util", "rt"] }
 # O_NOFOLLOW opens for the plan documents (plans.rs no-follow confinement)
 libc = "0.2"
+# read-only parse of the user's ~/.codex/config.toml to enumerate their MCP
+# servers — SwarmZ disables them per spawned app-server (codex/host.rs;
+# already in the tree via tauri)
+toml = "0.9"
 
 [dev-dependencies]
 # async unit tests for the orchestrator bus (#[tokio::test])

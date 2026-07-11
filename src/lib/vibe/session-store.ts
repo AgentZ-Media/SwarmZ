@@ -614,6 +614,8 @@ function sanitizeItem(raw: unknown): VibeItem | null {
         kind: "assistant",
         text,
         ...(typeof m.phase === "string" ? { phase: m.phase } : {}),
+        // the report stamp survives restarts — the card keeps rendering
+        ...(m.report === true ? { report: true } : {}),
       };
     case "command":
       return {

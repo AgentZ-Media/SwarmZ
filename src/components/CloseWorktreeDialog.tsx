@@ -1,4 +1,3 @@
-import { FolderGit2 } from "lucide-react";
 import { useSwarm } from "@/store";
 import { Button } from "./ui/button";
 import {
@@ -44,26 +43,36 @@ export function CloseWorktreeDialog() {
           </DialogDescription>
         </DialogHeader>
 
-        <div className="mb-4 flex items-center gap-2 rounded-md border border-border bg-secondary/40 px-2 py-1.5 font-mono text-[11px] text-foreground">
-          <FolderGit2 size={12} className="shrink-0 text-faint" />
-          <span className="truncate">
-            {status?.branch ?? confirm?.meta.branch}
-          </span>
+        <div className="mb-4 space-y-1">
+          <div className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt">
+            <span className="shrink-0 font-mono leading-none text-mut">⎇</span>
+            <span className="truncate font-mono">
+              {status?.branch ?? confirm?.meta.branch}
+            </span>
+          </div>
+          {status?.dirty && (
+            <div className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-mut">
+              <span className="shrink-0 font-mono leading-none text-mut">
+                Δ
+              </span>
+              <span className="truncate">uncommitted changes</span>
+            </div>
+          )}
         </div>
 
-        <p className="mb-4 text-xs text-muted-foreground">
+        <p className="mb-4 text-12 text-mut">
           Keep it to come back later (it stays available in the worktree panel),
           or delete the worktree and its branch for good.
         </p>
 
         <div className="flex justify-end gap-2">
-          <Button variant="outline" size="sm" onClick={() => resolve("cancel")}>
+          <Button variant="ghost" size="sm" onClick={() => resolve("cancel")}>
             Cancel
           </Button>
           <Button variant="danger" size="sm" onClick={() => resolve("delete")}>
             Delete worktree
           </Button>
-          <Button size="sm" onClick={() => resolve("keep")}>
+          <Button variant="secondary" size="sm" onClick={() => resolve("keep")}>
             Keep worktree
           </Button>
         </div>

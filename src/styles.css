@@ -1,76 +1,186 @@
 @import "tailwindcss";
-@import "@fontsource-variable/inter";
-@import "@fontsource-variable/jetbrains-mono";
-/* Vibe-Mode diff rendering — structure + a bundled hljs token theme, scoped to
-   the lib's own `.diff-tailwindcss-wrapper`. Its block colours are re-themed to
-   the SwarmZ tokens further down (see "Vibe diff view"). */
-@import "@git-diff-view/react/styles/diff-view-pure.css";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+/* Diff rendering is @pierre/diffs (Phase 6 stage 2): the engine injects its
+   structural CSS into its own shadow root — no stylesheet import needed. Our
+   theming happens purely through the `--diffs-*` custom properties in the
+   "Diff view" section at the bottom of this file (custom properties inherit
+   through the shadow boundary). */
 
-/* ----------------------------------------------------------------------------
-   SwarmZ design system — dark only.
+/* ============================================================================
+   SwarmZ design system — "Vibe v3". Dark only.
 
-   Near-monochrome: hierarchy comes from luminance, not hue. The single accent
-   (--ring, a muted blue) is reserved for focus, active state and data viz.
-   Token names follow the shadcn/ui convention so `shadcn add <component>`
-   produces correctly themed components out of the box. See DESIGN.md.
----------------------------------------------------------------------------- */
+   The accent #f0567c is the leitmotif: it marks ACTIVE / FOCUS / the
+   Conductor — "where I am". Amber --attn marks "where I'm needed", green
+   --ok marks "finished", --err/--warn stay for failures/warnings. Surfaces
+   climb a four-step ladder (bg → panel → card → pop); text descends a
+   three-step ladder (txt → mut → fnt). See DESIGN.md for the full system.
+
+   TWO NAMING LAYERS live side by side during the Phase-6 migration:
+
+   1. Vibe v3 primitives (--acc, --bg/--panel/--pop, --line/--line2,
+      --txt/--mut/--fnt, --attn/--ok/--warn/--err, --add/--del) — the
+      canonical system. New/migrated components use THESE via `bg-panel`,
+      `border-line`, `text-mut`, `bg-acc`, `text-ok`, …
+
+   2. shadcn-compat aliases (--background, --card, --border, --ring, …) —
+      every legacy name is remapped onto the Vibe v3 values so unmigrated
+      components keep compiling AND already render in the new palette.
+      Deprecated: stage 2 migrates components off them.
+
+      shadcn name          → Vibe v3 value
+      --background         → --bg      #09090c
+      --foreground         → --txt     #e9eaee
+      --card               → (surface) #121217   (same concept, new value)
+      --popover            → --pop     #191920
+      --primary            → --txt on --bg (light-on-dark stays: the
+                             "Allow"-style hard-confirm button)
+      --secondary          → --pop     (inputs, kbd chips, user bubbles)
+      --muted              → --pop / --mut (foreground)
+      --accent             → --line    (hover wash — NOT the color accent;
+                             the color accent is --acc)
+      --destructive        → --err     #e5544d
+      --border             → --line    #1e1e26
+      --input              → --line2   #2b2b35
+      --ring               → --acc     #f0567c  ("where I am" — focus/active
+                             was blue, is now the accent)
+      --faint              → --fnt     #62646f
+      --success            → --ok      #46c07a
+      --warning            → --warn    #d6a243
+      --attn               → --attn    #f0a13a  (unchanged meaning)
+      --diff-add/--diff-del→ --add/--del (unchanged values)
+      --chart-1..5         → accent ramp (bright → deep, 5 = neutral)
+============================================================================ */
+
 :root {
-  --background: #0c0c0e;
-  --foreground: #ededef;
+  /* -------- accent — the leitmotif ---------------------------------------
+     One hue, a systematic scale. --acc is the anchor; the functional stops
+     are what the UI actually uses (they follow the reference design's
+     color-mix recipes and re-derive automatically if --acc changes). */
+  --acc: #f0567c;
+  --acc-hot: color-mix(in srgb, var(--acc) 80%, #ffffff); /* sweep/caret/orb highlight */
+  --acc-bright: color-mix(in srgb, var(--acc) 70%, #ffffff); /* link hover */
+  --acc-deep: color-mix(in srgb, var(--acc) 55%, #401020); /* brand-gradient end */
+  --acc-dim: color-mix(in srgb, var(--acc) 50%, #000000); /* orb shadow side */
+  /* numeric scale (100 = lightest) for ramps/data viz */
+  --acc-100: color-mix(in srgb, var(--acc) 35%, #ffffff);
+  --acc-200: color-mix(in srgb, var(--acc) 55%, #ffffff);
+  --acc-300: color-mix(in srgb, var(--acc) 75%, #ffffff);
+  --acc-400: color-mix(in srgb, var(--acc) 90%, #ffffff);
+  --acc-500: var(--acc);
+  --acc-600: color-mix(in srgb, var(--acc) 85%, #401020);
+  --acc-700: color-mix(in srgb, var(--acc) 65%, #401020);
+  --acc-800: color-mix(in srgb, var(--acc) 45%, #2b1220);
+  --acc-900: color-mix(in srgb, var(--acc) 30%, #1a0a12);
 
-  --card: #111114;
-  --card-foreground: #ededef;
+  /* -------- surface ladder (bg < panel < card < pop) ---------------------- */
+  --bg: #09090c; /* app canvas */
+  --panel: #0d0d11; /* title bar, deck, sidebars */
+  --card-surface: #121217; /* cards, inputs, feed blocks */
+  --pop: #191920; /* menus, dialogs, bubbles — highest */
 
-  --popover: #17171a;
-  --popover-foreground: #ededef;
+  /* -------- lines --------------------------------------------------------- */
+  --line: #1e1e26; /* default border */
+  --line2: #2b2b35; /* stronger border: inputs, hover, dialog edges */
 
-  /* primary action = light-on-dark, the premium monochrome move */
-  --primary: #ededef;
-  --primary-foreground: #131316;
+  /* -------- text ladder ---------------------------------------------------- */
+  --txt: #e9eaee; /* primary text */
+  --mut: #9da0ab; /* secondary text */
+  --fnt: #62646f; /* tertiary/faint: meta, placeholders, section labels */
 
-  --secondary: #1a1a1e;
-  --secondary-foreground: #ededef;
+  /* -------- semantics ------------------------------------------------------ */
+  --attn: #f0a13a; /* "needs you" — approvals, waiting; never decorative */
+  --ok: #46c07a; /* finished / passing */
+  --warn: #d6a243; /* genuine warnings: limits, context pressure */
+  --err: #e5544d; /* failures, destructive actions */
 
-  --muted: #1a1a1e;
-  --muted-foreground: #9b9ba3;
+  /* -------- diff (code deltas, distinct from process status) -------------- */
+  --add: #3fb950;
+  --del: #f85149;
 
-  /* hover / highlighted-row wash */
-  --accent: #202025;
-  --accent-foreground: #ededef;
+  /* ==========================================================================
+     shadcn-compat aliases (deprecated — see mapping table above)
+     ========================================================================== */
+  --background: var(--bg);
+  --foreground: var(--txt);
 
-  --destructive: #e5544d;
-  --destructive-foreground: #ededef;
+  --card: var(--card-surface);
+  --card-foreground: var(--txt);
 
-  --border: #232328;
-  --input: #2e2e34;
-  --ring: #5b8def;
+  --popover: var(--pop);
+  --popover-foreground: var(--txt);
 
-  /* SwarmZ extensions (not part of shadcn core) */
-  --faint: #62626a;
-  --success: #4cae6e;
-  --warning: #d6a243;
-  /* "where I'm needed" — waiting/attention signals ONLY, never decorative.
-     Soft tints via alpha utilities: bg-attn/10 (header wash), border-attn/30,
-     border-attn/60 (pane outline). --warning stays for genuine warnings
-     (limit meters); --ring stays for focus/selection. See DESIGN.md. */
-  --attn: #f0a13a;
+  /* hard-confirm action = light-on-dark (the reference "Allow" button) */
+  --primary: var(--txt);
+  --primary-foreground: var(--bg);
 
-  /* Diff add/remove — semantic diff colours, distinct from --success/
-     --destructive (those are process status; these are code deltas). Dark-tuned
-     so the +/- washes sit quietly on the --card surface. See DESIGN.md. */
-  --diff-add: #3fb950;
-  --diff-del: #f85149;
+  --secondary: var(--pop);
+  --secondary-foreground: var(--txt);
 
-  --chart-1: #8ab4f8;
-  --chart-2: #5b8def;
-  --chart-3: #4477d4;
-  --chart-4: #335c9e;
-  --chart-5: #62626a;
+  --muted: var(--pop);
+  --muted-foreground: var(--mut);
 
+  /* hover / highlighted-row wash — NOT the color accent (that's --acc) */
+  --accent: var(--line);
+  --accent-foreground: var(--txt);
+
+  --destructive: var(--err);
+  --destructive-foreground: var(--txt);
+
+  --border: var(--line);
+  --input: var(--line2);
+  --ring: var(--acc);
+
+  --faint: var(--fnt);
+  --success: var(--ok);
+  --warning: var(--warn);
+  --diff-add: var(--add);
+  --diff-del: var(--del);
+
+  /* data viz — accent ramp, bright = most capable; 5 = neutral */
+  --chart-1: var(--acc-200);
+  --chart-2: var(--acc-500);
+  --chart-3: var(--acc-700);
+  --chart-4: var(--acc-800);
+  --chart-5: var(--fnt);
+
+  /* legacy shadcn radius var (rounded-lg base before the scale below) */
   --radius: 0.625rem;
 }
 
 @theme inline {
+  /* -------- Vibe v3 color tokens → bg-acc, bg-panel, border-line,
+     text-txt/text-mut/text-fnt, text-ok, bg-attn/10, text-add … ------------ */
+  --color-acc: var(--acc);
+  --color-acc-hot: var(--acc-hot);
+  --color-acc-bright: var(--acc-bright);
+  --color-acc-deep: var(--acc-deep);
+  --color-acc-dim: var(--acc-dim);
+  --color-acc-100: var(--acc-100);
+  --color-acc-200: var(--acc-200);
+  --color-acc-300: var(--acc-300);
+  --color-acc-400: var(--acc-400);
+  --color-acc-500: var(--acc-500);
+  --color-acc-600: var(--acc-600);
+  --color-acc-700: var(--acc-700);
+  --color-acc-800: var(--acc-800);
+  --color-acc-900: var(--acc-900);
+
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-pop: var(--pop);
+  --color-line: var(--line);
+  --color-line2: var(--line2);
+  --color-txt: var(--txt);
+  --color-mut: var(--mut);
+  --color-fnt: var(--fnt);
+  --color-ok: var(--ok);
+  --color-err: var(--err);
+  --color-warn: var(--warn);
+  --color-add: var(--add);
+  --color-del: var(--del);
+
+  /* -------- shadcn-compat color tokens (deprecated) ------------------------ */
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -104,19 +214,198 @@
   --color-chart-4: var(--chart-4);
   --color-chart-5: var(--chart-5);
 
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
+  /* -------- radius scale (4/6/8/10/12/16) ----------------------------------
+     rounded-xs chips-in-chips · rounded-sm chips/inline pills · rounded-md
+     buttons/inputs · rounded-lg feed cards · rounded-xl cards/composer ·
+     rounded-2xl dialogs */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+  --radius-2xl: 16px;
 
-  --font-sans: "Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI",
+  /* -------- typography ------------------------------------------------------
+     Geist for UI copy, Geist Mono for numbers/code/labels/meta. The type
+     scale is pixel-named (text-10 … text-16) — six sizes, nothing else:
+       text-10  section labels (uppercase, tracking-wide), tiny meta
+       text-11  mono meta, chips, deck, tickers
+       text-12  secondary copy, mini-feed lines, settings subtext
+       text-13  body copy (= body default), composer, chat
+       text-14  headings-in-place (pane titles, palette input)
+       text-16  dialog titles
+     Weights: 400 body · 500 labels/emphasized UI · 600 headings/names ·
+     700 brand/CTAs/mono-strong. */
+  --font-sans: "Geist Variable", -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
-  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace,
-    SFMono-Regular, Menlo, monospace;
+  --font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, Menlo,
+    monospace;
+
+  --text-10: 10px;
+  --text-10--line-height: 1.5;
+  --text-11: 11px;
+  --text-11--line-height: 1.5;
+  --text-12: 12px;
+  --text-12--line-height: 1.5;
+  --text-13: 13px;
+  --text-13--line-height: 1.6;
+  --text-14: 14px;
+  --text-14--line-height: 1.5;
+  --text-16: 16px;
+  --text-16--line-height: 1.4;
+
+  /* -------- elevation -------------------------------------------------------
+     Depth = surface ladder + one shadow per layer. Hover-lift for cards,
+     pop for anchored popovers/toasts, modal for centered dialogs. */
+  --shadow-card: 0 8px 24px rgb(0 0 0 / 0.3);
+  --shadow-pop: 0 12px 40px rgb(0 0 0 / 0.5);
+  --shadow-toast: 0 12px 32px rgb(0 0 0 / 0.5);
+  --shadow-modal: 0 24px 80px rgb(0 0 0 / 0.6);
+
+  /* -------- motion -----------------------------------------------------------
+     One easing family: ease-out for fades, "swift" spring-ish curve for
+     entrances. Durations: 120–220 ms events, 1–2.6 s ambient loops. */
+  --ease-swift: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --animate-zsweep: zsweep 2.6s ease-in-out infinite;
+  --animate-zpulse: zpulse 2s ease-in-out infinite;
+  --animate-zattn: zattn 2s ease-in-out infinite;
+  --animate-zcaret: zcaret 1s ease-in-out infinite;
+  --animate-zfadeup: zfadeup 0.18s ease-out;
+  --animate-zdialog: zdialog 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-zoverlay: zoverlay 0.15s ease-out;
+  --animate-zglow: zglow 2.4s ease-in-out infinite;
+  --animate-ztoast: ztoast 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-zeq: zeq 1s ease-in-out infinite;
 }
 
+/* ----------------------------------------------------------------------------
+   Keyframes — the complete Vibe v3 motion vocabulary. Available both as
+   Tailwind utilities (animate-zsweep, …) and for hand-rolled `animation:`
+   values. Events flash once; the only sanctioned loops are zsweep (busy
+   hairline), zcaret (streaming), zattn (waiting glyph), zpulse/zglow
+   (Conductor orb) and zeq (deck equalizer).
+---------------------------------------------------------------------------- */
+@keyframes zsweep {
+  /* busy hairline: a 40%-wide light band sweeping a working header */
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(350%);
+  }
+}
+@keyframes zpulse {
+  /* accent status dot: soft breathing + expanding ring */
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--acc) 45%, transparent);
+  }
+  50% {
+    opacity: 0.75;
+    box-shadow: 0 0 0 4px transparent;
+  }
+}
+@keyframes zattn {
+  /* waiting flag: slow attention blink */
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+@keyframes zcaret {
+  /* streaming caret / running ellipsis */
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.12;
+  }
+}
+@keyframes zfadeup {
+  /* message/card entrance */
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes zdialog {
+  /* centered dialog entrance (requires translate(-50%,-50%) positioning) */
+  from {
+    opacity: 0;
+    transform: translate(-50%, -48%) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+@keyframes zoverlay {
+  /* backdrop fade */
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes zglow {
+  /* Conductor orb working-glow */
+  0%,
+  100% {
+    box-shadow: 0 0 12px color-mix(in srgb, var(--acc) 35%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 24px color-mix(in srgb, var(--acc) 60%, transparent);
+  }
+}
+@keyframes ztoast {
+  /* toast entrance from the right */
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@keyframes zeq {
+  /* deck equalizer bars (transform-origin: bottom on the bar) */
+  0%,
+  100% {
+    transform: scaleY(0.25);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+/* one-shot event flash when a pane ENTERS "needs you" — retriggered by a
+   React key (transition counter), never loops. Inset, because the pane root
+   is overflow-hidden and would clip an outward glow. */
+@keyframes arrive-flash {
+  0% {
+    box-shadow: inset 0 0 0 6px color-mix(in srgb, var(--attn) 45%, transparent);
+  }
+  100% {
+    box-shadow: inset 0 0 0 1px transparent;
+  }
+}
+
+/* ----------------------------------------------------------------------------
+   Base
+---------------------------------------------------------------------------- */
 * {
-  border-color: var(--border);
+  border-color: var(--line);
 }
 
 html,
@@ -127,36 +416,62 @@ body,
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
+  background: var(--bg);
+  color: var(--txt);
   font-family: var(--font-sans);
-  font-feature-settings: "cv05", "cv11", "ss01";
+  font-size: 13px; /* text-13 — the body size of the scale */
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
   overflow: hidden;
   user-select: none;
 }
 
+a {
+  color: var(--acc);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--acc-bright);
+}
+
+textarea,
+input,
+button,
+select {
+  font-family: inherit;
+}
+
+::placeholder {
+  color: var(--fnt);
+  opacity: 1;
+}
+
 ::selection {
-  background: color-mix(in srgb, var(--ring) 30%, transparent);
+  background: color-mix(in srgb, var(--acc) 32%, transparent);
 }
 
 ::-webkit-scrollbar {
-  width: 9px;
-  height: 9px;
+  width: 10px;
+  height: 10px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--input);
+  background: var(--line2);
   border-radius: 999px;
   border: 2px solid transparent;
   background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--faint);
+  background: var(--fnt);
   background-clip: content-box;
 }
+
+/* ----------------------------------------------------------------------------
+   Utilities & component classes
+---------------------------------------------------------------------------- */
 
 /* horizontal tab strip: scrollable on overflow, but never shows a bar */
 .no-scrollbar {
@@ -166,7 +481,8 @@ body {
   display: none;
 }
 
-/* draggable macOS titlebar region */
+/* draggable macOS titlebar region — kept for non-macOS webviews; on macOS the
+   real mechanism is data-tauri-drag-region="deep" (see AGENTS.md) */
 .drag-region {
   -webkit-app-region: drag;
 }
@@ -179,11 +495,29 @@ body {
    every hand-rolled <button>/focusable span; mouse clicks stay ring-free. */
 .focus-ring:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ring) 40%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--acc) 40%, transparent);
+}
+
+/* the SwarmZ mark: hexagon (clip) + bolt. `.hex-mark` clips any element to
+   the brand hexagon; pair with `.hex-mark-flat` (title-bar mark, buttons) or
+   `.hex-mark-orb` (the Conductor orb — add animate-zpulse/zglow while busy). */
+.hex-mark {
+  clip-path: polygon(25% 3%, 75% 3%, 98% 50%, 75% 97%, 25% 97%, 2% 50%);
+}
+.hex-mark-flat {
+  background: linear-gradient(135deg, var(--acc), var(--acc-deep));
+}
+.hex-mark-orb {
+  background: radial-gradient(
+    circle at 35% 30%,
+    var(--acc-hot),
+    var(--acc) 60%,
+    var(--acc-dim)
+  );
 }
 
 /* busy is quiet: a barely-there hairline sweeping under a working pane's
-   header — the only looping state animation in the app (see DESIGN.md) */
+   header — accent-tinted light, the sanctioned looping state animation */
 .activity-line {
   position: absolute;
   left: 0;
@@ -200,154 +534,100 @@ body {
   bottom: 0;
   left: 0;
   width: 40%;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    rgb(255 255 255 / 0.25),
-    transparent
-  );
-  animation: activity-sweep 2.6s ease-in-out infinite;
+  background: linear-gradient(90deg, transparent, var(--acc-hot), transparent);
+  animation: zsweep 2.6s ease-in-out infinite;
 }
-/* same sweep, pinned to the TOP edge — used on the Vibe rail cards, whose
-   header sits at the top (the pane variant sweeps under a bottom border) */
+/* same sweep, pinned to the TOP edge — used on cards whose header sits at
+   the top (the pane variant sweeps under a bottom border) */
 .activity-line-top {
   top: 0;
   bottom: auto;
 }
-@keyframes activity-sweep {
-  from {
-    transform: translateX(-100%);
-  }
-  to {
-    transform: translateX(350%);
-  }
-}
 
-/* one-shot event flash when a pane ENTERS "needs you" — retriggered by a
-   React key (transition counter), never loops. Inset, because the pane root
-   is overflow-hidden and would clip an outward glow. */
-@keyframes arrive-flash {
-  0% {
-    box-shadow: inset 0 0 0 6px color-mix(in srgb, var(--attn) 45%, transparent);
-  }
-  100% {
-    box-shadow: inset 0 0 0 1px transparent;
-  }
-}
 .arrive-flash {
   animation: arrive-flash 0.3s ease-out 1;
 }
 
-@keyframes fade-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-.animate-in {
-  animation: fade-in 0.18s ease-out;
+/* the fleet grid's ambient dot pattern (reference: 22px radial txt-4.5% dots) */
+.dot-grid {
+  background-image: radial-gradient(
+    color-mix(in srgb, var(--txt) 4.5%, transparent) 1px,
+    transparent 1px
+  );
+  background-size: 22px 22px;
 }
 
-/* focus-mode backdrop: pure opacity fade, no translate */
-@keyframes overlay-fade {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-.animate-overlay-in {
-  animation: overlay-fade 0.15s ease-out;
+/* the soft accent halo above the Conductor sidebar header (decorative) */
+.conductor-glow {
+  background: radial-gradient(
+    ellipse at center,
+    color-mix(in srgb, var(--acc) 7%, transparent),
+    transparent 70%
+  );
 }
 
-@keyframes dialog-in {
-  from {
-    opacity: 0;
-    transform: translate(-50%, -50%) scale(0.97);
-  }
-  to {
-    opacity: 1;
-    transform: translate(-50%, -50%) scale(1);
-  }
-}
-.animate-dialog-in {
-  animation: dialog-in 0.16s cubic-bezier(0.16, 1, 0.3, 1);
-}
+/* (the legacy animation aliases .animate-in/.animate-dialog-in/… are gone —
+   stage 2 migrated every component onto the animate-z* utilities) */
 
-/* orchestrator chat: pulsing caret/ellipsis while a response streams */
-@keyframes caret-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.15;
-  }
-}
-.streaming-caret {
-  animation: caret-pulse 1s ease-in-out infinite;
-}
+/* ----------------------------------------------------------------------------
+   Diff view (@pierre/diffs) — the SwarmZ diff theme, two halves:
 
-@keyframes slide-in-right {
-  from {
-    opacity: 0;
-    transform: translateX(24px);
-  }
-  to {
-    opacity: 1;
-    transform: translateX(0);
-  }
+   1. Syntax tokens: the registered Shiki css-variables theme "swarmz"
+      (lib/vibe/diff-pierre.ts) resolves every token color from a
+      `--diffs-token-*` / `--diffs-foreground` custom property. Defined on
+      :root so they inherit into the engine's shadow root — restrained
+      palette off the SwarmZ tokens (accent for keywords/constants, ok-green
+      strings, warm functions, faint comments).
+
+   2. Structure: pierre's own stylesheet (shadow-injected) derives washes and
+      gutters from `--diffs-*-override` variables — pinned here to the
+      SwarmZ +/- tokens and surface ladder, scoped to `.vibe-diff`.
+---------------------------------------------------------------------------- */
+:root {
+  --diffs-foreground: var(--txt);
+  --diffs-background: transparent;
+  --diffs-token-comment: var(--fnt);
+  --diffs-token-keyword: var(--acc-300);
+  --diffs-token-string: color-mix(in srgb, var(--ok) 55%, var(--txt));
+  --diffs-token-string-expression: color-mix(in srgb, var(--ok) 55%, var(--txt));
+  --diffs-token-constant: var(--acc-200);
+  --diffs-token-function: color-mix(in srgb, var(--warn) 55%, var(--txt));
+  --diffs-token-parameter: var(--mut);
+  --diffs-token-punctuation: var(--mut);
+  --diffs-token-link: var(--acc);
 }
-.animate-slide-in-right {
-  animation: slide-in-right 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+.vibe-diff {
+  /* dark-only app → light-dark() inside the engine must resolve dark */
+  color-scheme: dark;
+  --diffs-dark-bg: var(--card-surface);
+  --diffs-dark: var(--txt);
+  --diffs-font-family: var(--font-mono);
+  --diffs-header-font-family: var(--font-sans);
+  --diffs-font-size: 11px;
+  --diffs-line-height: 1.7;
+  --diffs-fg-number-override: var(--fnt);
+  --diffs-bg-context-override: transparent;
+  --diffs-bg-separator-override: var(--line);
+  --diffs-bg-addition-override: color-mix(in srgb, var(--add) 11%, transparent);
+  --diffs-bg-addition-emphasis-override: color-mix(in srgb, var(--add) 26%, transparent);
+  --diffs-bg-deletion-override: color-mix(in srgb, var(--del) 11%, transparent);
+  --diffs-bg-deletion-emphasis-override: color-mix(in srgb, var(--del) 26%, transparent);
+  --diffs-addition-color-override: var(--add);
+  --diffs-deletion-color-override: var(--del);
 }
 
 /* ----------------------------------------------------------------------------
-   Vibe diff view — re-theme @git-diff-view's block colours to the SwarmZ
-   tokens (the lib ships structure + a GitHub-ish hljs syntax theme; we keep the
-   syntax token colours, but recolour the +/- washes, borders and line-number
-   gutters to our palette so a diff card reads as part of the app, not GitHub).
-   Everything is scoped to the lib's own wrapper — no global bleed.
+   Motion off-switches (DESIGN.md): events flash once, states are static.
+   Users who ask the OS for reduced motion — or set the in-app toggle
+   (data-motion="off" on the root) — get NO nonessential animation: sweeps,
+   pulses, carets and entrances collapse to their end state.
 ---------------------------------------------------------------------------- */
-.diff-tailwindcss-wrapper[data-theme="dark"] .diff-style-root {
-  --diff-border--: var(--border);
-  --diff-plain-content--: transparent;
-  --diff-expand-content--: var(--card);
-  --diff-plain-lineNumber--: transparent;
-  --diff-expand-lineNumber--: var(--card);
-  --diff-plain-lineNumber-color--: var(--faint);
-  --diff-expand-lineNumber-color--: var(--faint);
-  --diff-empty-content--: color-mix(in srgb, var(--background) 60%, transparent);
-  --diff-add-content--: color-mix(in srgb, var(--diff-add) 12%, transparent);
-  --diff-add-content-highlight--: color-mix(in srgb, var(--diff-add) 26%, transparent);
-  --diff-add-lineNumber--: color-mix(in srgb, var(--diff-add) 18%, transparent);
-  --diff-del-content--: color-mix(in srgb, var(--diff-del) 12%, transparent);
-  --diff-del-content-highlight--: color-mix(in srgb, var(--diff-del) 26%, transparent);
-  --diff-del-lineNumber--: color-mix(in srgb, var(--diff-del) 18%, transparent);
-  --diff-hunk-content--: color-mix(in srgb, var(--ring) 8%, transparent);
-  --diff-hunk-lineNumber--: color-mix(in srgb, var(--ring) 12%, transparent);
-  --diff-hunk-content-color--: var(--faint);
-  --diff-hunk-lineNumber-hover--: var(--ring);
+[data-motion="off"] *,
+[data-motion="off"] *::before,
+[data-motion="off"] *::after {
+  animation: none !important;
+  transition: none !important;
 }
-/* the lib's default body colour is white; our surface wants the muted token */
-.diff-tailwindcss-wrapper[data-theme="dark"] .diff-style-root {
-  color: var(--muted-foreground);
-}
-/* the diff table is mono + compact to match the rest of the transcript */
-.vibe-diff .diff-tailwindcss-wrapper {
-  font-family: var(--font-mono);
-  background: transparent;
-}
-
-/* Motion doctrine (DESIGN.md): events flash once, states are static. Users
-   who ask the OS for reduced motion get NO nonessential animation at all —
-   the activity sweep, arrive flash, pings/pulses, streaming caret and every
-   entrance animation collapse to their end state (one ~instant iteration). */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
