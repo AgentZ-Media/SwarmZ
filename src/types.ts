@@ -85,6 +85,36 @@ export interface GitInfo {
   remote_url: string | null;
 }
 
+/**
+ * What is still running when the user tries to quit (Quit-Guard v2). The
+ * dialog lists it; the guard raises only when something would genuinely be
+ * interrupted (busy sessions, busy Conductors, a Conductor timer mid-fire,
+ * in-flight gh writes, detached reviews or worktree git ops) — pending
+ * timers are shown as info (they persist and re-fire next launch).
+ */
+export interface QuitBlockers {
+  /** busy vibe session ids (a running turn would be interrupted) */
+  sessionIds: string[];
+  /** project names whose Conductor has a turn in flight */
+  conductorProjects: string[];
+  /** pending Conductor timers (info only — they survive a restart) */
+  pendingTimers: number;
+  /**
+   * Conductor timers MID-FIRE (durable `firedAt` claim stamped, delivery not
+   * yet finished) — quitting now drops them on the next hydrate
+   * (at-most-once), so unlike pending timers they are a HARD blocker.
+   */
+  claimedTimers: number;
+  /** gh/git write ops in flight (a push / PR mutation — interrupting is bad);
+   * -1 = the counter query FAILED (unknown state → confirm, fail closed) */
+  ghWrites: number;
+  /** detached codex reviews in flight (manual / review_agent / auto-review —
+   * they hold no busy flag but quitting kills them mid-run) */
+  reviews: number;
+  /** git worktree add/remove operations in flight */
+  worktreeOps: number;
+}
+
 // ---- Git worktrees ----
 
 /** Marks a SwarmZ-managed git worktree (folder under `<root>/.worktrees/`). */
@@ -223,6 +253,14 @@ export interface AppSettings {
    * the Conductor reports reviewed work. Off by default (reviews cost turns).
    */
   autoReviewFinishedLanes?: boolean;
+  /**
+   * Phase 8 auto-compaction: when a session/Conductor chat nears its context
+   * window (≥85%), `thread/compact/start` runs BEFORE the next turn to shrink
+   * the model-visible history (the UI transcript is never touched). Only when
+   * idle, and at most once per cooldown. ON by default; set false to rely on
+   * the manual compact button (and codex' own auto-compaction) only.
+   */
+  autoCompact?: boolean;
   /**
    * Motion off-switch (DESIGN.md): stamps `data-motion="off"` on the root
    * element, collapsing every nonessential animation (sweeps, pulses,
@@ -560,7 +598,9 @@ export type VibeItem =
       /** the raw request params (itemId, reason, command, cwd, …) */
       payload: Record<string, unknown>;
     }
-  | { id: string; at: number; kind: "warning"; text: string };
+  | { id: string; at: number; kind: "warning"; text: string }
+  /** a neutral, non-error notice (e.g. a context-compaction divider) */
+  | { id: string; at: number; kind: "notice"; text: string };
 
 // ---- Conductor timers ----
 

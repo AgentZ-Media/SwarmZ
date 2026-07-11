@@ -3,6 +3,7 @@
 // Pure module on purpose: the store imports it, so it must not import the store.
 
 import { invoke } from "@tauri-apps/api/core";
+import { beginInflight } from "@/lib/inflight";
 import type { WorktreeInfo, WorktreeScan, WorktreeStatus } from "@/types";
 
 // ---- random branch names ----
@@ -57,18 +58,24 @@ export function generateBranchName(repoName: string): string {
  * main checkout (.env, local configs, …) is copied over, minus the
  * heavyweight cache/build dirs. Rejects with a readable git error message.
  */
-export function addWorktree(args: {
+export async function addWorktree(args: {
   cwd: string;
   branch: string;
   copyEnv: boolean;
   gitBin?: string;
 }): Promise<WorktreeInfo> {
-  return invoke<WorktreeInfo>("worktree_add", {
-    cwd: args.cwd,
-    branch: args.branch,
-    copyEnv: args.copyEnv,
-    bin: args.gitBin,
-  });
+  // a git write outside any busy flag — visible to the quit guard
+  const endInflight = beginInflight("worktree");
+  try {
+    return await invoke<WorktreeInfo>("worktree_add", {
+      cwd: args.cwd,
+      branch: args.branch,
+      copyEnv: args.copyEnv,
+      bin: args.gitBin,
+    });
+  } finally {
+    endInflight();
+  }
 }
 
 /** Would closing this worktree lose work? (dirty files / local-only commits) */
@@ -86,20 +93,26 @@ export function worktreeStatus(
  * work that appeared after the caller's check still refuses. `force: true`
  * is for explicitly user-confirmed deletions only.
  */
-export function removeWorktree(args: {
+export async function removeWorktree(args: {
   root: string;
   path: string;
   branch: string;
   force: boolean;
   gitBin?: string;
 }): Promise<void> {
-  return invoke<void>("worktree_remove", {
-    root: args.root,
-    path: args.path,
-    branch: args.branch,
-    force: args.force,
-    bin: args.gitBin,
-  });
+  // a git write outside any busy flag — visible to the quit guard
+  const endInflight = beginInflight("worktree");
+  try {
+    await invoke<void>("worktree_remove", {
+      root: args.root,
+      path: args.path,
+      branch: args.branch,
+      force: args.force,
+      bin: args.gitBin,
+    });
+  } finally {
+    endInflight();
+  }
 }
 
 /** All SwarmZ worktrees of the given repo roots, with live status, plus

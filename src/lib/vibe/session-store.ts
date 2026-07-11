@@ -605,6 +605,7 @@ function sanitizeItem(raw: unknown): VibeItem | null {
   switch (m.kind) {
     case "user":
     case "warning":
+    case "notice": // compaction dividers survive restarts
       return { id, at, kind: m.kind, text };
     case "assistant":
       // never restore `streaming` — a quit mid-stream must not leave a caret

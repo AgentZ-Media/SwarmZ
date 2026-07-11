@@ -32,6 +32,8 @@ import type {
   VibeSpawnedBy,
   VibeTokenUsage,
 } from "@/types";
+import { shouldAutoCompact } from "@/lib/compact";
+import { beginInflight } from "@/lib/inflight";
 import { useVibe, type NewVibeSession } from "./session-store";
 import { pickAgentName } from "./names";
 import { reportItemIdOf } from "./report-item";
@@ -54,6 +56,7 @@ export type VibeSessionEventKind =
   | "approval_request"
   | "turn_completed"
   | "turn_failed"
+  | "compacted"
   | "warning"
   | "process_exited";
 
@@ -121,6 +124,12 @@ function invokeSend(
 
 function invokeInterrupt(sessionId: string): Promise<void> {
   return invoke("vibe_session_interrupt", { sessionId });
+}
+
+/** Blocks until the compaction turn genuinely completed (Rust waits on the
+ * turn's terminal event — a following send never races the compaction). */
+function invokeCompact(sessionId: string): Promise<{ status: string }> {
+  return invoke("vibe_session_compact", { sessionId });
 }
 
 function invokeRespondApproval(
@@ -333,6 +342,50 @@ function warn(sessionId: string, text: string) {
   });
 }
 
+function notice(sessionId: string, text: string) {
+  useVibe.getState().upsertItem(sessionId, {
+    id: `notice-${nanoid(8)}`,
+    at: Date.now(),
+    kind: "notice",
+    text,
+  });
+}
+
+/**
+ * Sessions with a SwarmZ-initiated `thread/compact/start` in flight. Its
+ * turn/completed must NOT read as an agent finish (no Deck ticker, no
+ * autonomous-loop trigger) — the outcome is recorded as "compacted" instead.
+ * Only turns WE start count; codex' own auto-compaction (inside a work turn)
+ * never enters this set, so a real finish is never suppressed.
+ *
+ * The marker doubles as the per-session compaction SERIALIZATION claim:
+ * `compactSession` refuses while it is set (a manual and an automatic
+ * compaction can never share — and clear — one bit), and it is consumed
+ * EXACTLY by the compaction's terminal event (`consumeCompactionMarker`,
+ * which also resolves the settle handshake below).
+ */
+const compactingSessions = new Set<string>();
+
+/** Settle handshake: resolvers waiting for the webview to have PROCESSED the
+ * compaction's terminal event (busy flip included) — see `compactSession`. */
+const compactionWaiters = new Map<string, () => void>();
+
+/** Consume the compaction marker (terminal-event side): returns whether this
+ * terminal event belonged to a SwarmZ-initiated compaction, and releases any
+ * settle waiter. */
+function consumeCompactionMarker(sessionId: string): boolean {
+  const wasCompaction = compactingSessions.delete(sessionId);
+  const waiter = compactionWaiters.get(sessionId);
+  if (waiter) {
+    compactionWaiters.delete(sessionId);
+    waiter();
+  }
+  return wasCompaction;
+}
+
+/** When a session was last AUTO-compacted (cooldown; manual ignores it). */
+const lastAutoCompactAt = new Map<string, number>();
+
 /** Mirror a session lifecycle moment into the shared Deck ticker. */
 function pushSessionEvent(sessionId: string, kind: FleetEventKind) {
   const entry = useVibe.getState().sessions[sessionId];
@@ -353,7 +406,7 @@ function pushSessionEvent(sessionId: string, kind: FleetEventKind) {
  * (null when codex never handed one out).
  */
 export interface LastTurnOutcome {
-  outcome: "completed" | "interrupted" | "failed" | "exited";
+  outcome: "completed" | "interrupted" | "failed" | "exited" | "compacted";
   turnId: string | null;
 }
 
@@ -512,32 +565,47 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
       pushSessionEvent(sessionId, "waiting");
       break;
     }
+    case "compacted": {
+      // the model-visible context was summarized (thread/compact/start) — the
+      // transcript above stays; drop a subtle divider so the user sees it
+      notice(sessionId, "Context compacted — earlier history summarized for the model.");
+      break;
+    }
     case "turn_completed": {
       finalizeStream(sessionId);
+      // a SwarmZ-initiated compaction's turn is not an agent finish
+      const wasCompaction = consumeCompactionMarker(sessionId);
       // stamp the schema turn's report BEFORE the turn id clears (the marker
       // is bound to it) and BEFORE the busy flip (the orchestrator's watcher
       // renders the transcript synchronously on the busy→idle tick)
       stampReportItem(sessionId, data.status !== "interrupted");
       // outcome BEFORE the busy flip — the activity watcher reads it during
-      // the synchronous busy→idle subscription tick ("interrupted" is a
-      // deliberate stop, never an autonomous-loop "finished" event)
+      // the synchronous busy→idle subscription tick ("interrupted"/"compacted"
+      // are deliberate, never autonomous-loop "finished" events)
       recordTurnOutcome(
         sessionId,
-        data.status === "interrupted" ? "interrupted" : "completed",
+        wasCompaction
+          ? "compacted"
+          : data.status === "interrupted"
+            ? "interrupted"
+            : "completed",
       );
       store.setBusy(sessionId, false);
       store.setTurnId(sessionId, null);
-      pushSessionEvent(sessionId, "finished");
+      if (!wasCompaction) pushSessionEvent(sessionId, "finished");
       break;
     }
     case "turn_failed": {
       finalizeStream(sessionId);
+      const wasCompaction = consumeCompactionMarker(sessionId);
       stampReportItem(sessionId, false); // consume the marker, never stamp
       warn(sessionId, `Turn failed: ${str(data.error) || "unknown error"}`);
-      recordTurnOutcome(sessionId, "failed");
+      // a failed compaction is deliberate work, not an agent finish → don't
+      // wake the autonomous loop with a "turn FAILED" trigger
+      recordTurnOutcome(sessionId, wasCompaction ? "compacted" : "failed");
       store.setBusy(sessionId, false);
       store.setTurnId(sessionId, null);
-      pushSessionEvent(sessionId, "exited");
+      if (!wasCompaction) pushSessionEvent(sessionId, "exited");
       break;
     }
     case "warning": {
@@ -546,9 +614,10 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
     }
     case "process_exited": {
       finalizeStream(sessionId);
+      const wasCompaction = consumeCompactionMarker(sessionId);
       schemaTurns.delete(sessionId); // the schema turn died with the process
       warn(sessionId, str(data.message) || "the session process exited");
-      recordTurnOutcome(sessionId, "exited");
+      recordTurnOutcome(sessionId, wasCompaction ? "compacted" : "exited");
       store.setBusy(sessionId, false);
       store.setTurnId(sessionId, null);
       break;
@@ -791,17 +860,40 @@ export async function sendMessageStrict(
   const store = useVibe.getState();
   if (!store.sessions[sessionId])
     throw new Error(`unknown vibe session "${sessionId}"`);
-  if (store.busy[sessionId])
+  // the SYNCHRONOUS delivery claim: `deliverTurn` awaits (auto-compaction)
+  // BEFORE it flips the busy flag, so the busy check alone would let two
+  // same-tick sends both pass, both append their user item, and the losing
+  // Rust send would then clear the winner's busy flag. The claim is taken
+  // here — before the append and before any await — and held until the
+  // delivery settled (busy then owns the one-turn guard again).
+  if (store.busy[sessionId] || deliveryClaims.has(sessionId))
     throw new Error("session is busy — one turn at a time");
+  if (compactingSessions.has(sessionId))
+    throw new Error(
+      "the session is compacting its context — wait for the compaction to finish",
+    );
   ensureEvents();
-  store.upsertItem(sessionId, {
-    id: `user-${nanoid(8)}`,
-    at: Date.now(),
-    kind: "user",
-    text: trimmed,
-  });
-  return deliverTurn(sessionId, trimmed, opts);
+  deliveryClaims.add(sessionId);
+  try {
+    store.upsertItem(sessionId, {
+      id: `user-${nanoid(8)}`,
+      at: Date.now(),
+      kind: "user",
+      text: trimmed,
+    });
+    return await deliverTurn(sessionId, trimmed, opts);
+  } finally {
+    deliveryClaims.delete(sessionId);
+  }
 }
+
+/**
+ * Sessions with a `sendMessageStrict` delivery in flight that has not yet
+ * claimed the busy flag (the pre-claim window spans the auto-compaction
+ * await). Checked synchronously next to the busy flag — one turn at a time
+ * holds across the whole delivery.
+ */
+const deliveryClaims = new Set<string>();
 
 /** Per-turn options of the strict send path. */
 export interface SendTurnOpts {
@@ -824,6 +916,9 @@ async function deliverTurn(
   trimmed: string,
   opts?: SendTurnOpts,
 ): Promise<{ turnId: string | null }> {
+  // near the context window? compact first (idle, conservative — see
+  // maybeAutoCompactBeforeTurn). Runs BEFORE we claim busy for this turn.
+  await maybeAutoCompactBeforeTurn(sessionId);
   const store = useVibe.getState();
   store.setBusy(sessionId, true);
   resetStream(sessionId);
@@ -915,6 +1010,13 @@ export async function steerMessageStrict(
   const store = useVibe.getState();
   if (!store.sessions[sessionId])
     throw new Error(`unknown vibe session "${sessionId}"`);
+  // a compaction's turn must never be steered — the instruction would be
+  // absorbed by the summarization turn and lost. STRICT: reject; the caller
+  // (prompt_agent) retries once the short compaction is over.
+  if (compactingSessions.has(sessionId))
+    throw new Error(
+      "the session is compacting its context — retry in a moment",
+    );
   if (!store.busy[sessionId]) {
     const res = await sendMessageStrict(sessionId, freshText, opts);
     return { mode: "queued", turnId: res.turnId };
@@ -995,8 +1097,15 @@ export async function reviewSession(
   const session = useVibe.getState().sessions[sessionId]?.session;
   if (!session) throw new Error(`unknown vibe session "${sessionId}"`);
   ensureEvents();
-  await resumeSession(sessionId);
-  return invokeReview(sessionId, target);
+  // a detached review holds NO session/conductor busy flag — surface it to
+  // the quit guard so quitting can't silently kill minutes of review work
+  const endInflight = beginInflight("review");
+  try {
+    await resumeSession(sessionId);
+    return await invokeReview(sessionId, target);
+  } finally {
+    endInflight();
+  }
 }
 
 /**
@@ -1020,6 +1129,112 @@ export async function sendMessage(
 export function interrupt(sessionId: string): void {
   if (!liveBackends.has(sessionId)) return;
   void invokeInterrupt(sessionId).catch(() => {});
+}
+
+/** How long `compactSession` waits, AFTER the blocking Rust RPC returned,
+ * for the webview to process the compaction's terminal event. The events are
+ * emitted before the RPC resolves, so this is a formality — generous anyway. */
+const COMPACT_SETTLE_TIMEOUT_MS = 5_000;
+
+/**
+ * Compact the session's thread (thread/compact/start): summarize the
+ * model-visible history so the next turn runs on a smaller context. The
+ * VISIBLE transcript stays; a "compacted" event drops a divider. The
+ * compaction runs as a real turn and RESOLVES ONLY AFTER IT GENUINELY ENDED:
+ * Rust blocks until the turn's terminal event (mirroring `chat_compact`), and
+ * a settle handshake then waits until the webview processed that event too —
+ * so a send fired right after never races the compaction's busy flip in
+ * either direction. Compactions are SERIALIZED per session (a second call
+ * while one runs rejects — manual and auto can never share the marker), and
+ * the marker is tagged so the compaction never reads as an agent finish.
+ * STRICT: a busy/unknown session or a backend error rejects. `resumeSession`
+ * first so a not-yet-live backend can compact.
+ */
+export async function compactSession(
+  sessionId: string,
+  opts?: {
+    /** set by the auto-compaction inside `deliverTurn`, which legitimately
+     * runs UNDER the session's own delivery claim */
+    fromDelivery?: boolean;
+  },
+): Promise<void> {
+  const store = useVibe.getState();
+  if (!store.sessions[sessionId])
+    throw new Error(`unknown vibe session "${sessionId}"`);
+  if (compactingSessions.has(sessionId))
+    throw new Error("a compaction is already running in this session");
+  if (store.busy[sessionId])
+    throw new Error("session is busy — interrupt the turn or wait before compacting");
+  // a send mid-delivery (claim held, busy not yet flipped) would race the
+  // compaction into Rust's one-turn guard — refuse early. The auto-compact
+  // path is exempt: it runs inside that very claim.
+  if (!opts?.fromDelivery && deliveryClaims.has(sessionId))
+    throw new Error("a message is being delivered — try again in a moment");
+  ensureEvents();
+  // claim the marker BEFORE the first await — two same-tick compactions
+  // (manual + auto) must never both pass the checks and share one bit
+  compactingSessions.add(sessionId);
+  const settled = new Promise<void>((resolve) => {
+    compactionWaiters.set(sessionId, resolve);
+  });
+  try {
+    await resumeSession(sessionId);
+    await invokeCompact(sessionId); // blocks until the turn genuinely ended
+    // settle handshake: the terminal event was emitted before the RPC
+    // resolved — wait (bounded) until the webview processed it, so the
+    // busy-flip and the "compacted" outcome are recorded before we return
+    if (compactingSessions.has(sessionId)) {
+      await Promise.race([
+        settled,
+        new Promise<void>((resolve) =>
+          setTimeout(resolve, COMPACT_SETTLE_TIMEOUT_MS),
+        ),
+      ]);
+    }
+  } catch (err) {
+    warn(sessionId, `Couldn't compact the context: ${errorText(err)}`);
+    throw err instanceof Error ? err : new Error(errorText(err));
+  } finally {
+    // normally consumed by the terminal event. A still-busy session means
+    // the compaction turn is STILL running (the bounded Rust wait timed out)
+    // — keep the marker so its eventual terminal event still reads as a
+    // compaction, never as an agent finish. Otherwise clean up so a stale
+    // marker can never leak into a later turn's completion.
+    if (!useVibe.getState().busy[sessionId]) consumeCompactionMarker(sessionId);
+  }
+}
+
+/**
+ * Before a fresh turn: auto-compact when the session's context footprint
+ * crossed the threshold (Settings `autoCompact`, default on). Conservative —
+ * only when idle + live + past the threshold + past the cooldown (see
+ * `shouldAutoCompact`). Best-effort: a compaction failure never blocks the
+ * send (the turn just runs on the fuller context). Awaits completion so the
+ * following turn genuinely runs on the compacted context.
+ */
+async function maybeAutoCompactBeforeTurn(sessionId: string): Promise<void> {
+  if (!liveBackends.has(sessionId)) return; // no live context to compact yet
+  const store = useVibe.getState();
+  const entry = store.sessions[sessionId];
+  if (!entry) return;
+  const enabled = useSwarm.getState().settings.autoCompact !== false;
+  if (
+    !shouldAutoCompact({
+      usage: entry.tokenUsage ?? null,
+      enabled,
+      busy: !!store.busy[sessionId],
+      lastCompactAt: lastAutoCompactAt.get(sessionId),
+      now: Date.now(),
+    })
+  ) {
+    return;
+  }
+  lastAutoCompactAt.set(sessionId, Date.now());
+  try {
+    await compactSession(sessionId, { fromDelivery: true });
+  } catch {
+    /* surfaced as a warning item; the turn proceeds on the fuller context */
+  }
 }
 
 const DECISION_STATUS: Record<VibeApprovalDecision, VibeApprovalStatus> = {

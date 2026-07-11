@@ -103,6 +103,31 @@ export function totalTokens(
   return sum;
 }
 
+/**
+ * The CURRENT context footprint of a turn's token bucket, in tokens. Codex'
+ * `totalTokens` field IS that footprint (input — which already carries the
+ * whole prior context — plus output); summing every field of the bucket
+ * (as `totalTokens()` does) double-counts it, so this prefers the explicit
+ * field and falls back to `inputTokens + outputTokens` when it is absent.
+ * Used by the context gauges and the compaction threshold so both reflect
+ * the real footprint.
+ */
+export function contextTokens(
+  bucket: Record<string, number> | null | undefined,
+): number {
+  if (!bucket) return 0;
+  const explicit = bucket.totalTokens;
+  if (typeof explicit === "number" && explicit > 0) return explicit;
+  // fallback for buckets without the explicit field: input + output ONLY —
+  // `cachedInputTokens` / `reasoningOutputTokens` are SUBSETS of those, so
+  // summing every field (totalTokens()) reads false-high on partial/old
+  // buckets and would trip the gauge + auto-compaction threshold early
+  const input = typeof bucket.inputTokens === "number" ? bucket.inputTokens : 0;
+  const output =
+    typeof bucket.outputTokens === "number" ? bucket.outputTokens : 0;
+  return input + output;
+}
+
 /** A human command string from an approval's raw request payload. */
 export function approvalCommand(payload: Record<string, unknown>): string {
   const c = payload.command;

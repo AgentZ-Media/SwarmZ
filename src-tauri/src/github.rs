@@ -78,13 +78,38 @@ pub fn integration_enabled() -> bool {
     INTEGRATION_ENABLED.load(Ordering::SeqCst)
 }
 
+/// In-flight gh/git WRITE ops (pr_create/comment/review) — a `git push` or a
+/// PR mutation mid-flight. The quit guard reads this so quitting mid-write
+/// warns instead of killing a push (`gh_writes` in the QuitConfirm dialog).
+static WRITES_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of gh write ops currently running (for the quit guard).
+pub fn writes_in_flight() -> usize {
+    WRITES_IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+/// The guard a write op holds for its whole duration: the WRITE_GATE read lock
+/// (draining a disable) PLUS the in-flight counter (the quit guard). Both
+/// release together on drop.
+struct WriteGuard {
+    _read: RwLockReadGuard<'static, ()>,
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        WRITES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Check the gate and return the guard the write op must HOLD until it is
 /// done — the flag check happens under the read lock, so it stays consistent
-/// with a concurrent draining disable.
-fn require_integration() -> Result<RwLockReadGuard<'static, ()>, String> {
+/// with a concurrent draining disable. Also books the in-flight counter.
+fn require_integration() -> Result<WriteGuard, String> {
     let guard = WRITE_GATE.read();
     if integration_enabled() {
-        Ok(guard)
+        WRITES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        Ok(WriteGuard { _read: guard })
     } else {
         Err("GitHub integration is disabled (Settings → GitHub) — write actions refuse".into())
     }

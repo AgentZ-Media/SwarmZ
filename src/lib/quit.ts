@@ -1,18 +1,52 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { IS_TAURI } from "./transport";
 import { flushAllPersists, useSwarm } from "@/store";
 import { vibeBusyIds } from "./vibe/controller";
+import { busyConductorProjectNames } from "./orchestrator/controller";
+import { useConductorTimers } from "./orchestrator/timers";
+import { inflightCount } from "./inflight";
+import { hasHardBlocker } from "./quit-core";
+import type { QuitBlockers } from "@/types";
 
 // set once the user confirmed quitting — lets the re-issued close() pass the guard
 let confirmed = false;
 
+/** gh/git write ops currently in flight (Rust counter; -1 = the query
+ * FAILED — unknown state must confirm, never silently pass, fail closed). */
+async function ghWritesInFlight(): Promise<number> {
+  try {
+    return (await invoke<number>("github_writes_in_flight")) || 0;
+  } catch {
+    return -1;
+  }
+}
+
+/** Gather everything that would be interrupted by quitting right now. */
+async function gatherBlockers(): Promise<QuitBlockers> {
+  const timers = useConductorTimers.getState().timers;
+  return {
+    sessionIds: vibeBusyIds(),
+    conductorProjects: busyConductorProjectNames(),
+    pendingTimers: timers.length,
+    // mid-fire (durable claim stamped, delivery not finished): quitting now
+    // would drop the timer on the next hydrate — a HARD blocker
+    claimedTimers: timers.filter((t) => t.firedAt !== undefined).length,
+    ghWrites: await ghWritesInFlight(),
+    reviews: inflightCount("review"),
+    worktreeOps: inflightCount("worktree"),
+  };
+}
+
 async function closeOrConfirm(win: { close: () => Promise<void> }) {
-  // a Vibe session with a turn in flight loses the run — warn first
-  const blockers = vibeBusyIds();
-  if (blockers.length > 0 && !confirmed) {
-    useSwarm.getState().setQuitConfirm(blockers);
-    return;
+  // anything that would lose work if we quit now → warn first
+  if (!confirmed) {
+    const blockers = await gatherBlockers();
+    if (hasHardBlocker(blockers)) {
+      useSwarm.getState().setQuitConfirm(blockers);
+      return;
+    }
   }
   // every debounced persist must hit disk before the webview goes away;
   // the re-issued close() passes the guard via `confirmed` (window-state

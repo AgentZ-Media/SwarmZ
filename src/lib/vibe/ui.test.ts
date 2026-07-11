@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  contextTokens,
   decayedSignal,
   shortAge,
   totalTokens,
@@ -89,5 +90,35 @@ describe("shortAge / totalTokens (sanity)", () => {
   it("sums numeric buckets only", () => {
     expect(totalTokens({ inputTokens: 2, outputTokens: 3 })).toBe(5);
     expect(totalTokens(null)).toBe(0);
+  });
+});
+
+describe("contextTokens", () => {
+  it("prefers the explicit codex totalTokens field", () => {
+    expect(
+      contextTokens({
+        totalTokens: 50,
+        inputTokens: 49,
+        cachedInputTokens: 20,
+        outputTokens: 1,
+      }),
+    ).toBe(50);
+  });
+
+  it("falls back to input + output ONLY — cached/reasoning are subsets and summing them reads false-high", () => {
+    expect(
+      contextTokens({
+        inputTokens: 40,
+        cachedInputTokens: 30,
+        outputTokens: 10,
+        reasoningOutputTokens: 5,
+      }),
+    ).toBe(50);
+  });
+
+  it("unknown fields mean 0 (never compact on unknown data)", () => {
+    expect(contextTokens({ cachedInputTokens: 30 })).toBe(0);
+    expect(contextTokens(null)).toBe(0);
+    expect(contextTokens(undefined)).toBe(0);
   });
 });

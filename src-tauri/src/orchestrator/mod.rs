@@ -26,7 +26,9 @@ mod registry;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 
-pub use appserver::{chat_interrupt, chat_resume, chat_send, chat_start, chat_status, list_models};
+pub use appserver::{
+    chat_compact, chat_interrupt, chat_resume, chat_send, chat_start, chat_status, list_models,
+};
 pub use memory::{
     append as memory_append, read_entries as memory_read, remove as memory_remove, AppendResult,
     MemoryEntry, MemoryScope,

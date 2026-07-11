@@ -270,6 +270,13 @@ async fn github_set_integration(enabled: bool) -> Result<(), String> {
         .map_err(|e| format!("github_set_integration failed: {e}"))
 }
 
+/// Number of gh/git WRITE ops currently in flight (a `git push` or PR
+/// mutation) — the quit guard reads this so quitting mid-write warns.
+#[tauri::command]
+fn github_writes_in_flight() -> usize {
+    github::writes_in_flight()
+}
+
 /// Declaratively (re)configure the PR watcher: poll the given repos every
 /// `interval_secs`, emit `github://pr-changed` on real changes. An empty
 /// list stops polling.
@@ -502,6 +509,17 @@ async fn orchestrator_chat_interrupt(chat_id: String) -> Result<(), String> {
     orchestrator::chat_interrupt(&chat_id).await
 }
 
+/// Compact the chat's thread (thread/compact/start) — summarizes the
+/// model-visible history without touching the UI transcript. Blocks until the
+/// compaction turn completes.
+#[tauri::command]
+async fn orchestrator_chat_compact(
+    app: AppHandle,
+    chat_id: String,
+) -> Result<serde_json::Value, String> {
+    orchestrator::chat_compact(&app, &chat_id).await
+}
+
 /// Reopen a persisted app-server thread as a chat (thread/resume on its
 /// project's instance).
 #[tauri::command]
@@ -600,6 +618,15 @@ async fn vibe_session_send(
 #[tauri::command]
 async fn vibe_session_interrupt(session_id: String) -> Result<(), String> {
     codex::sessions::session_interrupt(&session_id).await
+}
+
+/// Compact the session's thread (thread/compact/start) — summarizes the
+/// model-visible history without touching the UI transcript. BLOCKS until
+/// the compaction turn completed (busy clears before this resolves, so a
+/// send fired right after never races the compaction).
+#[tauri::command]
+async fn vibe_session_compact(session_id: String) -> Result<serde_json::Value, String> {
+    codex::sessions::session_compact(&session_id).await
 }
 
 /// Answer a pending approval — `decision` ∈ accept | acceptForSession |
@@ -746,6 +773,7 @@ pub fn run() {
             gh_pr_comment,
             gh_pr_review,
             github_set_integration,
+            github_writes_in_flight,
             github_watch_configure,
             transcript_read,
             project_docs,
@@ -759,6 +787,7 @@ pub fn run() {
             orchestrator_chat_start,
             orchestrator_chat_send,
             orchestrator_chat_interrupt,
+            orchestrator_chat_compact,
             orchestrator_chat_resume,
             orchestrator_chat_status,
             codex_list_models,
@@ -766,6 +795,7 @@ pub fn run() {
             vibe_session_resume,
             vibe_session_send,
             vibe_session_interrupt,
+            vibe_session_compact,
             vibe_session_respond_approval,
             vibe_session_set_access,
             vibe_session_set_model_effort,

@@ -248,6 +248,21 @@ library — only through these variables.
 - **The autonomous marker**: `⚡ autonomous` chip on autonomous-turn system
   messages — `border-acc/40 bg-acc/10 text-acc font-mono text-10`, never a
   user bubble; the trigger kind lives in the tooltip.
+- **Report card** (`expect_report` finals in the ItemFeed): `rounded-lg border
+  bg-card` with a mono `text-11` header — `▸ in progress` (`--fnt`) / `✓ done`
+  (`--ok`) / `⚑ needs you` (the attn wash `border-attn/55` + header
+  `bg-attn/10 text-attn`, like the approval card), `tests pass|FAIL` right-
+  aligned (`--ok`/`--err`). Summary is `text-13`/1.6 body; a `needs_human`
+  question is an amber block; `files_changed` are mono `text-11 text-mut` lines
+  (capped, "+N more"). It follows the signal logic exactly — attn only when the
+  agent actually needs the human, never for a plain finish.
+- **PR badges** (GitHubPanel / PR rows) — the signal triad on GitHub state:
+  checks `bg-ok/15 text-ok` pass / `bg-err/15 text-err` fail / `bg-warn/15
+  text-warn` pending; review decision `--ok` approved / `--err` changes-
+  requested / neutral line-outlined pending; draft + conflicts as neutral
+  line-outlined `text-fnt` chips. All `rounded-sm font-mono text-10`. The gh
+  auth chip is a `rounded-full border-line bg-card` pill with an `--ok`/`--warn`
+  dot.
 
 ## Keyboard & focus
 
@@ -271,8 +286,9 @@ library — only through these variables.
   font-mono`, triage counts, ticker, meters, Conductor dot). The deck never
   grows.
 - The Conductor sidebar is *furniture*: a persistent flex sibling on
-  `--panel`, no backdrop, resizable. Drawers (Quick Notes, Usage) are *modal
-  overlays*: backdrop + `animate-ztoast`-family slide, Escape closes.
+  `--panel`, no backdrop, resizable. Drawers (Quick Notes, Usage, the GitHub panel) are
+  *modal overlays*: `animate-zoverlay` backdrop + `animate-ztoast`-family
+  slide (the GitHub panel slides from the right on `--panel`), Escape closes.
 - Chat is human-readable, not a dev log: reading-width column (~720 px),
   body `text-13`/1.6, tool/meta lines recede to `text-11 font-mono text-mut`
   and fold into collapsible activity blocks; agent jump chips are first-class.

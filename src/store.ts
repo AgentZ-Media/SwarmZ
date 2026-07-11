@@ -25,6 +25,7 @@ import type {
   AppSettings,
   NoteItem,
   QuickNotesData,
+  QuitBlockers,
   UsageHistoryEntry,
   WorktreeEntry,
   WorktreeMeta,
@@ -76,29 +77,77 @@ function schedulePersistHistory() {
 
 let persistAutonomyTimer: ReturnType<typeof setTimeout> | null = null;
 
+/** Autonomy-budget writes are SERIALIZED on this chain: a quit-flush must
+ * never return while a debounce write is still in flight (the flush could
+ * otherwise finish before it and a racing writer restore a stale breaker/
+ * budget), and two overlapping saves must never invert on disk. Snapshots
+ * are taken at write time, so the last chained write always carries the
+ * freshest state. Never rejects. */
+let autonomyWriteChain: Promise<void> = Promise.resolve();
+
+function writeAutonomyBudgetsNow(): Promise<void> {
+  autonomyWriteChain = autonomyWriteChain
+    .then(() => saveAutonomyBudgets(serializeAutonomyBudgets()))
+    .catch(() => {
+      /* never block quitting on a failed write */
+    });
+  return autonomyWriteChain;
+}
+
 function scheduleAutonomyPersist() {
   if (persistAutonomyTimer) return;
   persistAutonomyTimer = setTimeout(() => {
     persistAutonomyTimer = null;
-    void saveAutonomyBudgets(serializeAutonomyBudgets());
+    void writeAutonomyBudgetsNow();
   }, 300);
 }
 
-/** Write a pending autonomy-budget debounce NOW (flushAllPersists). */
+/** Flush the autonomy-budget slice (flushAllPersists): a PENDING debounce
+ * writes now; otherwise only JOIN any in-flight write — never mint a fresh
+ * one (a run whose budget hydrate failed and that never booked a turn must
+ * not clobber the persisted breaker with an empty snapshot at quit). */
 async function flushAutonomyPersist(): Promise<void> {
-  if (!persistAutonomyTimer) return;
-  clearTimeout(persistAutonomyTimer);
-  persistAutonomyTimer = null;
-  try {
-    await saveAutonomyBudgets(serializeAutonomyBudgets());
-  } catch {
-    /* never block quitting on a failed write */
+  if (persistAutonomyTimer) {
+    clearTimeout(persistAutonomyTimer);
+    persistAutonomyTimer = null;
+    await writeAutonomyBudgetsNow();
+    return;
   }
+  await autonomyWriteChain;
 }
 
 // Registered at module init — every budget mutation (reserve/release/trip/
 // human re-arm) marks the slice dirty so a relaunch sees the same state.
 registerAutonomyPersist(scheduleAutonomyPersist);
+
+// ---- settings + quick-notes persistence ----
+//
+// Both save on every mutation (no debounce), but the writes are SERIALIZED
+// on per-slice chains so `flushAllPersists` can JOIN them at quit — a quit
+// right after a change must not race the webview teardown against an
+// in-flight write. The chains snapshot at write time (latest state wins) and
+// never write on their own at quit, so a failed hydrate can never be
+// clobbered by an empty quit-save.
+
+let settingsWriteChain: Promise<void> = Promise.resolve();
+function persistSettings(): Promise<void> {
+  settingsWriteChain = settingsWriteChain
+    .then(() => saveSettings(useSwarm.getState().settings))
+    .catch(() => {
+      /* never block quitting on a failed write */
+    });
+  return settingsWriteChain;
+}
+
+let quickNotesWriteChain: Promise<void> = Promise.resolve();
+function persistQuickNotes(): Promise<void> {
+  quickNotesWriteChain = quickNotesWriteChain
+    .then(() => saveQuickNotes(useSwarm.getState().quickNotes))
+    .catch(() => {
+      /* never block quitting on a failed write */
+    });
+  return quickNotesWriteChain;
+}
 
 /**
  * Write every debounced slice NOW — quit must not lose any debounce window.
@@ -110,27 +159,31 @@ export async function flushAllPersists(): Promise<void> {
     persistHistoryTimer = null;
   }
   const s = useSwarm.getState();
-  try {
-    await Promise.all([
-      saveUsageHistory(
-        Object.values(s.usageHistory)
-          .sort((a, b) => b.last_updated - a.last_updated)
-          .slice(0, MAX_HISTORY_ENTRIES),
-      ),
-      // the orchestrator chats keep their own debounced slice
-      flushOrchestratorPersist(),
-      // the vibe sessions keep their own debounced slice
-      flushVibePersist(),
-      // the project tabs keep their own debounced slice
-      flushProjectsPersist(),
-      // the conductor timers keep their own debounced slice
-      flushConductorTimersPersist(),
-      // the autonomy budgets keep their own debounced slice
-      flushAutonomyPersist(),
-    ]);
-  } catch {
-    /* never block quitting on a failed write */
-  }
+  // allSettled, not all: one failed write must never abandon the others
+  // mid-flight (quit would proceed while they still race the teardown)
+  await Promise.allSettled([
+    saveUsageHistory(
+      Object.values(s.usageHistory)
+        .sort((a, b) => b.last_updated - a.last_updated)
+        .slice(0, MAX_HISTORY_ENTRIES),
+    ),
+    // settings + quick notes persist on every mutation — join their write
+    // chains so a quit right after a change still lands the latest snapshot
+    // (the chains never mint a write of their own, so a failed hydrate is
+    // never clobbered by an empty quit-save)
+    settingsWriteChain,
+    quickNotesWriteChain,
+    // the orchestrator chats keep their own debounced slice
+    flushOrchestratorPersist(),
+    // the vibe sessions keep their own debounced slice
+    flushVibePersist(),
+    // the project tabs keep their own debounced slice
+    flushProjectsPersist(),
+    // the conductor timers keep their own debounced slice
+    flushConductorTimersPersist(),
+    // the autonomy budgets keep their own debounced slice
+    flushAutonomyPersist(),
+  ]);
 }
 
 function usageHistoryKey(runtime: string | undefined, sessionId: string): string {
@@ -166,8 +219,8 @@ export interface SwarmState {
   githubOpen: boolean;
   /** command palette (⌘K) */
   paletteOpen: boolean;
-  /** pending app-quit while these sessions are still working (see lib/quit.ts) */
-  quitConfirm: string[] | null;
+  /** pending app-quit while work is still running (see lib/quit.ts) */
+  quitConfirm: QuitBlockers | null;
   /** SwarmZ worktrees on disk (title-bar panel + icon visibility) — refreshed on demand (in-memory) */
   worktrees: WorktreeEntry[];
   /**
@@ -185,8 +238,8 @@ export interface SwarmState {
   /** merge + persist app preferences (Settings dialog) */
   updateSettings: (patch: Partial<AppSettings>) => void;
 
-  /** open/close the quit warning (busy session ids; null = dismissed) */
-  setQuitConfirm: (sessionIds: string[] | null) => void;
+  /** open/close the quit warning (running-work blockers; null = dismissed) */
+  setQuitConfirm: (blockers: QuitBlockers | null) => void;
 
   // usage history
   /** mirror one session's usage into the persistent all-time history */
@@ -344,10 +397,10 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   updateSettings: (patch) => {
     const settings = { ...get().settings, ...patch };
     set({ settings });
-    void saveSettings(settings);
+    void persistSettings();
   },
 
-  setQuitConfirm: (sessionIds) => set({ quitConfirm: sessionIds }),
+  setQuitConfirm: (blockers) => set({ quitConfirm: blockers }),
 
   recordUsageHistory: (entry) => {
     const state = get();
@@ -535,7 +588,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       { id: nanoid(8), text: trimmed, done: false },
     ]);
     set({ quickNotes });
-    void saveQuickNotes(quickNotes);
+    void persistQuickNotes();
   },
 
   updateNote: (folderKey, id, patch) => {
@@ -550,7 +603,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       list.map((n) => (n.id === id ? { ...n, ...patch, id } : n)),
     );
     set({ quickNotes });
-    void saveQuickNotes(quickNotes);
+    void persistQuickNotes();
   },
 
   deleteNote: (folderKey, id) => {
@@ -562,7 +615,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     if (next.length === list.length) return;
     const quickNotes = withNoteList(state.quickNotes, folderKey, next);
     set({ quickNotes });
-    void saveQuickNotes(quickNotes);
+    void persistQuickNotes();
   },
 
   moveNote: (folderKey, id, toIndex) => {
@@ -579,7 +632,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     next.splice(to, 0, item);
     const quickNotes = withNoteList(state.quickNotes, folderKey, next);
     set({ quickNotes });
-    void saveQuickNotes(quickNotes);
+    void persistQuickNotes();
   },
 
   clearDoneNotes: (folderKey) => {
@@ -591,7 +644,7 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     if (next.length === list.length) return;
     const quickNotes = withNoteList(state.quickNotes, folderKey, next);
     set({ quickNotes });
-    void saveQuickNotes(quickNotes);
+    void persistQuickNotes();
   },
 
   setDashboardOpen: (open) => set({ dashboardOpen: open }),

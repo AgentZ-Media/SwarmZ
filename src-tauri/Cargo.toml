@@ -1,6 +1,6 @@
 [package]
 name = "swarmz"
-version = "0.5.0"
+version = "1.0.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -47,6 +47,9 @@ toml = "0.9"
 [dev-dependencies]
 # async unit tests for the orchestrator bus (#[tokio::test])
 tokio = { version = "1", features = ["time", "sync", "rt", "macros"] }
+# mock AppHandle for registry-level live spikes (phase8_session_compact_spike
+# drives the REAL session_start/compact/send commands without a window)
+tauri = { version = "2", features = ["test"] }
 
 [profile.release]
 codegen-units = 1

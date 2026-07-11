@@ -35,7 +35,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::host::{self, Connection, EventSink, ProcessHost, Responder, ThreadEvent};
 
@@ -135,6 +135,10 @@ struct SessionState {
     /// PLUS its server-side routing class — "human-only" must never live only
     /// in frontend state (the strict Conductor response path checks it here)
     pending_approvals: HashMap<String, PendingApproval>,
+    /// a `session_compact` waiting for its compaction turn to end — resolved
+    /// by the shared turn/completed bookkeeping (status, error) or dropped on
+    /// process exit. Only ever Some while `busy` is held by the compaction.
+    compact_done: Option<oneshot::Sender<(String, Option<String>)>>,
     /// this session's event sink (re-registered on the fresh connection after
     /// a respawn — routes die with the process)
     sink: EventSink,
@@ -819,8 +823,19 @@ fn map_notification(method: &str, params: &Value) -> Option<(&'static str, Value
                     json!({ "item_id": item.get("id"), "text": text, "phase": item.get("phase") }),
                 ));
             }
+            // A context compaction (from thread/compact/start): the model's
+            // context was summarized. The VISIBLE transcript stays untouched
+            // (this item is not rendered as history) — the frontend just drops
+            // a subtle divider so the user knows it happened.
+            if item.get("type").and_then(|v| v.as_str()) == Some("contextCompaction") {
+                return Some(("compacted", json!({})));
+            }
             Some(("item_completed", json!({ "item": normalize_item(item) })))
         }
+        // A dedicated compaction notification exists in the schema but did not
+        // fire on 0.142.5/0.144.1 (the contextCompaction ITEM above is the
+        // reliable signal); mapped anyway for forward-compatibility.
+        "thread/compacted" => Some(("compacted", json!({}))),
         "turn/diff/updated" => Some((
             "turn_diff",
             json!({ "diff": params.get("diff").and_then(|v| v.as_str()).unwrap_or("") }),
@@ -994,9 +1009,31 @@ fn handle_notification(app: &AppHandle, session_id: &str, method: &str, params: 
             }
         }
         "turn/completed" => {
-            if let Some(st) = SESSIONS.lock().get_mut(session_id) {
-                st.current_turn_id = None;
-                st.busy = false;
+            let compact_done = {
+                let mut sessions = SESSIONS.lock();
+                match sessions.get_mut(session_id) {
+                    Some(st) => {
+                        st.current_turn_id = None;
+                        st.busy = false;
+                        st.compact_done.take()
+                    }
+                    None => None,
+                }
+            };
+            // a blocked `session_compact` waits on this turn — resolve it
+            // AFTER the busy flag cleared (so the RPC returning implies the
+            // Rust-side slot is genuinely free for the next send)
+            if let Some(tx) = compact_done {
+                let status = params
+                    .pointer("/turn/status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("completed")
+                    .to_string();
+                let error = params
+                    .pointer("/turn/error/message")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let _ = tx.send((status, error));
             }
         }
         _ => {}
@@ -1009,10 +1046,24 @@ fn handle_notification(app: &AppHandle, session_id: &str, method: &str, params: 
 /// The private process died: clear turn/busy state, drop dead approval
 /// responders, tell the UI. The next `send` respawns and resumes.
 fn handle_exit(app: &AppHandle, session_id: &str) {
-    if let Some(st) = SESSIONS.lock().get_mut(session_id) {
-        st.current_turn_id = None;
-        st.busy = false;
-        st.pending_approvals.clear(); // the blocked RPCs died with the process
+    let compact_done = {
+        let mut sessions = SESSIONS.lock();
+        match sessions.get_mut(session_id) {
+            Some(st) => {
+                st.current_turn_id = None;
+                st.busy = false;
+                st.pending_approvals.clear(); // the blocked RPCs died with the process
+                st.compact_done.take()
+            }
+            None => None,
+        }
+    };
+    if let Some(tx) = compact_done {
+        // a blocked `session_compact` must not hang until its timeout
+        let _ = tx.send((
+            "exited".into(),
+            Some("the session process exited during compaction".into()),
+        ));
     }
     emit_session_event(
         app,
@@ -1120,6 +1171,7 @@ fn register_session(
             busy: false,
             access_override_pending: false,
             pending_approvals: HashMap::new(),
+            compact_done: None,
             sink: tx,
             approval_counter: 0,
         },
@@ -1384,6 +1436,116 @@ pub async fn session_interrupt(session_id: &str) -> Result<(), String> {
     )
     .await
     .map(|_| ())
+}
+
+/// How long a session compaction turn may run before we stop waiting on it.
+const COMPACT_TIMEOUT_MS: u64 = 300_000;
+
+/// Compact the session's thread (`thread/compact/start`, live-verified on
+/// 0.144.1): codex summarizes the model-visible history into a compaction
+/// item and continues from the summary — the on-disk rollout and the SwarmZ
+/// UI transcript are untouched, only the context the model carries into the
+/// next turn shrinks. Runs as a real (short) turn: it claims the one-turn
+/// slot synchronously (a busy session refuses — interrupt or wait first) and
+/// BLOCKS until the compaction's turn/completed arrived (mirrors
+/// `chat_compact` — a following `session_send` must never race the still-
+/// running compaction turn into "a turn is already running"). The busy flag
+/// itself is still driven by the turn events, and it clears BEFORE the
+/// waiting RPC resolves. Transparently resumes after a private-process
+/// respawn, like `send`.
+pub async fn session_compact(session_id: &str) -> Result<Value, String> {
+    let (done_tx, done_rx) = oneshot::channel();
+    let (host, sink, thread_id, gen_stored, profile) = {
+        let mut sessions = SESSIONS.lock();
+        let st = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
+        if st.busy {
+            return Err(
+                "a turn is already running in this session — interrupt it or wait before compacting"
+                    .into(),
+            );
+        }
+        let thread_id = st.thread_id.clone().ok_or("this session has no thread yet")?;
+        st.busy = true;
+        st.compact_done = Some(done_tx);
+        (
+            st.host.clone(),
+            st.sink.clone(),
+            thread_id,
+            st.generation,
+            st.profile.clone(),
+        )
+    };
+    let release = |sid: &str| {
+        if let Some(st) = SESSIONS.lock().get_mut(sid) {
+            st.busy = false;
+            st.compact_done = None;
+        }
+    };
+    let (conn, generation) = match host.ensure().await {
+        Ok(v) => v,
+        Err(e) => {
+            release(session_id);
+            return Err(e);
+        }
+    };
+    // the private process was respawned since this session's route was set →
+    // resume the thread so compaction operates on the right context
+    if gen_stored != generation {
+        if let Err(e) =
+            host::resume_thread(&conn, thread_resume_params(&thread_id, &profile)).await
+        {
+            release(session_id);
+            return Err(format!("resuming the session before compaction failed: {}", e.message()));
+        }
+        conn.register_thread(&thread_id, sink.clone());
+        if let Some(st) = SESSIONS.lock().get_mut(session_id) {
+            st.generation = generation;
+        }
+    }
+    if let Err(e) = conn
+        .request(
+            "thread/compact/start",
+            json!({ "threadId": thread_id }),
+            host::RPC_TIMEOUT_MS,
+        )
+        .await
+    {
+        release(session_id);
+        return Err(format!("thread/compact/start failed: {e}"));
+    }
+    // BLOCK until the compaction turn genuinely ended — turn/completed clears
+    // busy and resolves `compact_done` (process exit resolves it too), so a
+    // send fired right after this RPC returns finds the slot free.
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(COMPACT_TIMEOUT_MS),
+        done_rx,
+    )
+    .await
+    {
+        Ok(Ok((status, error))) => {
+            if status == "completed" {
+                Ok(json!({ "status": status }))
+            } else {
+                Err(error.unwrap_or_else(|| format!("compaction ended as \"{status}\"")))
+            }
+        }
+        // sender dropped without a message: the session was closed mid-compaction
+        Ok(Err(_)) => Err("compaction aborted: the session was closed".into()),
+        Err(_) => {
+            // stop waiting, but leave the busy flag to the turn events — the
+            // compaction turn may still be running and the one-turn guard
+            // must keep refusing sends until it genuinely ends
+            if let Some(st) = SESSIONS.lock().get_mut(session_id) {
+                st.compact_done = None;
+            }
+            Err(
+                "compaction timed out — the session stays busy until its turn ends (interrupt it to stop)"
+                    .into(),
+            )
+        }
+    }
 }
 
 /// Steer the session's RUNNING turn: inject `text` into it (turn/steer with
@@ -1903,6 +2065,21 @@ mod tests {
         assert_eq!(data["item"]["type"], "fileChange");
         assert_eq!(data["item"]["changes"][0]["kind"]["type"], "add");
         assert_eq!(data["item"]["changes"][0]["diff"], "hi\n");
+    }
+
+    #[test]
+    fn maps_context_compaction_to_compacted() {
+        // the contextCompaction ITEM (from thread/compact/start) maps to a
+        // dedicated `compacted` event, NOT item_completed — the visible
+        // transcript stays intact, the frontend just drops a divider
+        let line = r#"{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"cc_1"},"threadId":"t","turnId":"tn","completedAtMs":4}}"#;
+        let (m, p) = notif(line);
+        let (kind, _data) = map_notification(&m, &p).unwrap();
+        assert_eq!(kind, "compacted");
+        // the schema-level thread/compacted notification maps too (forward-compat)
+        let line = r#"{"method":"thread/compacted","params":{"threadId":"t"}}"#;
+        let (m, p) = notif(line);
+        assert_eq!(map_notification(&m, &p).unwrap().0, "compacted");
     }
 
     #[test]
@@ -3049,5 +3226,138 @@ mod tests {
         assert!(content.contains("phase5 spike"), "unexpected content: {content}");
         println!("[phase5] outputSchema forced a valid report — done={} summary={:?}", report["done"], report["summary"]);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // ---- Phase-8 fix spike: compact blocks, the follow-up send never races ----
+    //
+    // Live verification of the `session_compact` fix against the REAL codex
+    // CLI, on PRODUCTION session params (thread_start_params / turn_params):
+    // the fixed command blocks until the compaction's turn/completed — this
+    // spike drives exactly that sequence at the host layer and then fires the
+    // follow-up turn IMMEDIATELY (zero delay, the auto-compact-then-send
+    // path): the turn/start must be ACCEPTED (pre-fix the frontend fired it
+    // while the compaction turn still ran and the send failed with "a turn is
+    // already running") and must still carry the pre-compaction context.
+    // Ignored by default (needs codex + login + network); run with:
+    //   cargo test phase8_session_compact_block_spike -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn phase8_session_compact_block_spike() {
+        let cwd = std::env::temp_dir().join("swarmz-phase8-session-compact-spike");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let profile = SessionProfile {
+            cwd: cwd.to_string_lossy().into_owned(),
+            model: None,
+            effort: Some("low".into()),
+            access: Access::Workspace,
+        };
+        let host = ProcessHost::new();
+        let (conn, _gen) = host.ensure().await.expect("spawn app-server");
+        let started = conn
+            .request("thread/start", thread_start_params(&profile), THREAD_TIMEOUT_MS)
+            .await
+            .expect("thread/start");
+        let tid = started
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        conn.register_thread(&tid, tx);
+
+        // wait for THIS turn's terminal event — the same signal the fixed
+        // `session_compact` blocks on (turn/completed resolves compact_done)
+        async fn wait_turn_completed(
+            rx: &mut mpsc::UnboundedReceiver<ThreadEvent>,
+        ) -> (String, String) {
+            let mut final_message = String::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+            loop {
+                let ev = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("timed out waiting for turn/completed")
+                    .expect("sink closed");
+                match ev {
+                    ThreadEvent::Request { responder, .. } => {
+                        responder.ok(&json!({ "decision": "decline" }))
+                    }
+                    ThreadEvent::Notification { method, params } => {
+                        if method == "item/completed"
+                            && params.pointer("/item/type").and_then(|v| v.as_str())
+                                == Some("agentMessage")
+                        {
+                            final_message = params
+                                .pointer("/item/text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                        }
+                        if method == "turn/completed" {
+                            let status = params
+                                .pointer("/turn/status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("completed")
+                                .to_string();
+                            return (status, final_message);
+                        }
+                    }
+                    ThreadEvent::Exited => panic!("process exited mid-turn"),
+                }
+            }
+        }
+
+        // turn 1: plant the codeword (a real completed turn)
+        conn.request(
+            "turn/start",
+            turn_params(
+                &tid,
+                "Remember this codeword for later: ZIRKON-77. Reply with just 'ok'.",
+                &profile,
+                false,
+                None,
+            ),
+            RPC_TIMEOUT_MS,
+        )
+        .await
+        .expect("turn/start (plant)");
+        let (status, _) = wait_turn_completed(&mut rx).await;
+        assert_eq!(status, "completed", "the planting turn must complete");
+
+        // compact — ack, then BLOCK on turn/completed (the fixed sequence)
+        conn.request(
+            "thread/compact/start",
+            json!({ "threadId": tid }),
+            RPC_TIMEOUT_MS,
+        )
+        .await
+        .expect("thread/compact/start");
+        let (status, _) = wait_turn_completed(&mut rx).await;
+        println!("[compact-block] compaction turn ended: {status}");
+        assert_eq!(status, "completed", "the compaction turn must complete");
+
+        // FOLLOW-UP SEND, ZERO DELAY — the exact moment the pre-fix frontend
+        // fired into "a turn is already running". Must be accepted now.
+        conn.request(
+            "turn/start",
+            turn_params(
+                &tid,
+                "What was the codeword I gave you earlier? Reply with just the codeword.",
+                &profile,
+                false,
+                None,
+            ),
+            RPC_TIMEOUT_MS,
+        )
+        .await
+        .expect("the follow-up turn/start right after compaction must be accepted");
+        let (status, answer) = wait_turn_completed(&mut rx).await;
+        println!("[compact-block] follow-up turn: status={status} answer={answer:?}");
+        assert_eq!(status, "completed", "the follow-up turn must complete");
+        assert!(
+            answer.contains("ZIRKON-77"),
+            "the post-compaction turn must still know the context: {answer}"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+        println!("==== phase8 session compact-block spike: compact→send sequence clean ====");
     }
 }

@@ -391,6 +391,7 @@ function PersonaControls() {
 
 function AutonomySection() {
   const autoReview = useSwarm((s) => !!s.settings.autoReviewFinishedLanes);
+  const autoCompact = useSwarm((s) => s.settings.autoCompact !== false);
   const updateSettings = useSwarm((s) => s.updateSettings);
 
   if (!IS_TAURI) return null;
@@ -403,6 +404,12 @@ function AutonomySection() {
           sub="When an agent the Conductor tasked finishes work that changed code, a detached codex review runs automatically and its findings ride into the Conductor's report — you hear about reviewed work, not just finished work. Costs an extra review turn per lane."
           checked={autoReview}
           onChange={(v) => updateSettings({ autoReviewFinishedLanes: v })}
+        />
+        <ToggleCard
+          title="Auto-compact context"
+          sub="When a session or Conductor chat nears its context window (≥85%), it compacts automatically before the next turn — the model keeps a summarized history so it stays coherent on long runs. Your visible transcript is never touched. Only when idle. You can also compact any time via the ctx gauge."
+          checked={autoCompact}
+          onChange={(v) => updateSettings({ autoCompact: v })}
         />
         <InfoRow
           title="Autonomy budget"

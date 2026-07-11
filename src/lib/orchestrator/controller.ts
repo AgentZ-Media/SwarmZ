@@ -28,6 +28,7 @@ import type {
 } from "@/types";
 import { useSwarm } from "@/store";
 import {
+  chatCompact,
   chatInterrupt,
   chatResume,
   chatSend,
@@ -37,6 +38,7 @@ import {
   type OrchestratorChatEvent,
   type ProjectContextWire,
 } from "./chat";
+import { shouldAutoCompact } from "@/lib/compact";
 import {
   useOrchestrator,
   type OrchestratorMessagePatch,
@@ -351,12 +353,81 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
       });
       break;
     }
+    case "compacted": {
+      // the model-visible context was summarized (thread/compact/start) — the
+      // chat history above stays; a neutral system line marks it
+      store.appendMessage(chatId, {
+        role: "system",
+        text: "Context compacted — earlier history summarized for the model.",
+      });
+      break;
+    }
     case "warning": {
       const text =
         typeof data.message === "string" ? data.message : JSON.stringify(data);
       store.appendMessage(chatId, { role: "warning", text });
       break;
     }
+  }
+}
+
+/** When a chat's thread was last AUTO-compacted (cooldown; manual ignores). */
+const lastAutoCompactChatAt = new Map<string, number>();
+
+/**
+ * Compact a Conductor chat's thread (thread/compact/start): summarize the
+ * model-visible history so the next turn runs on a smaller context. The
+ * visible chat stays. Blocks until the compaction turn finishes. A busy chat
+ * or a backend error surfaces as a warning message and rejects.
+ */
+export async function compactChat(chatId: string): Promise<void> {
+  const store = useOrchestrator.getState();
+  if (!store.chats.some((c) => c.id === chatId)) return;
+  if (store.busy[chatId])
+    throw new Error("a turn is running — interrupt it or wait before compacting");
+  ensureEvents();
+  store.setBusy(chatId, true);
+  try {
+    const backendId = await ensureBackendChat(chatId);
+    await chatCompact(backendId);
+  } catch (err) {
+    useOrchestrator.getState().appendMessage(chatId, {
+      role: "warning",
+      text: `Couldn't compact the context: ${errorText(err)}`,
+    });
+    throw err instanceof Error ? err : new Error(errorText(err));
+  } finally {
+    useOrchestrator.getState().setBusy(chatId, false);
+  }
+}
+
+/**
+ * Before a chat's next turn: auto-compact when its context footprint crossed
+ * the threshold (Settings `autoCompact`, default on). Conservative (idle,
+ * past threshold, past cooldown) and best-effort — a failure never blocks the
+ * send. Awaits completion so the send genuinely runs on the compacted context.
+ */
+async function maybeAutoCompactChat(chatId: string): Promise<void> {
+  const store = useOrchestrator.getState();
+  // only once a backend chat exists (a real thread with context this run)
+  if (!backendByChat.has(chatId)) return;
+  const enabled = useSwarm.getState().settings.autoCompact !== false;
+  if (
+    !shouldAutoCompact({
+      usage: store.tokenUsage[chatId] ?? null,
+      enabled,
+      busy: !!store.busy[chatId],
+      lastCompactAt: lastAutoCompactChatAt.get(chatId),
+      now: Date.now(),
+    })
+  ) {
+    return;
+  }
+  lastAutoCompactChatAt.set(chatId, Date.now());
+  try {
+    await compactChat(chatId);
+  } catch {
+    /* surfaced as a warning; the turn proceeds on the fuller context */
   }
 }
 
@@ -488,7 +559,11 @@ function maybeEnqueueFinishTrigger(sessionId: string, projectId: string): void {
   // its one-shot report expectation is spent either way (the schema turn is
   // over)
   const ended = lastTurnOutcomeOf(sessionId);
-  if (ended?.outcome === "interrupted") {
+  // an interrupted turn is a deliberate stop; a "compacted" turn is a
+  // SwarmZ-initiated context compaction (thread/compact/start) — neither is
+  // an agent finish, so neither wakes the loop (the report expectation, if
+  // any, is spent either way)
+  if (ended?.outcome === "interrupted" || ended?.outcome === "compacted") {
     takeReportExpectation(sessionId, ended.turnId);
     return;
   }
@@ -751,8 +826,14 @@ export function startVibeSessionActivityWatcher(): () => void {
       else if (pPending === undefined && pending) {
         escalateRoutineApprovals(id, entry);
       }
-      // turn genuinely finished (busy → idle, nothing waiting)
-      else if (pBusy === true && !busy && !pending)
+      // turn genuinely finished (busy → idle, nothing waiting) — but a
+      // SwarmZ-initiated compaction turn is not a finish (no ping, no loop)
+      else if (
+        pBusy === true &&
+        !busy &&
+        !pending &&
+        lastTurnOutcomeOf(id)?.outcome !== "compacted"
+      )
         onSessionFinished(id, name, "idle");
     }
     for (const id of prevSessBusy.keys())
@@ -946,7 +1027,11 @@ async function dispatchTurn(
   const chat = store.chats.find((c) => c.id === chatId);
   if (!chat || store.busy[chatId]) return "never-started";
   ensureEvents();
-  store.setBusy(chatId, true);
+  // near the context window? compact first (idle, conservative). Its own busy
+  // flag guards the window; a fresh read of busy follows below.
+  await maybeAutoCompactChat(chatId);
+  if (useOrchestrator.getState().busy[chatId]) return "never-started";
+  useOrchestrator.getState().setBusy(chatId, true);
   const st = streamOf(chatId);
   st.turnFailed = false;
   st.turnStarted = false;
@@ -1217,6 +1302,24 @@ function approvalSummary(payload: Record<string, unknown>): string {
   if (paths.length) return clip(`file change: ${paths.join(", ")}`, 200);
   const reason = typeof payload.reason === "string" ? payload.reason : "";
   return clip(reason || "unknown request", 200);
+}
+
+/**
+ * Project names whose Conductor has a turn in flight (busy chat) — the quit
+ * guard lists these (a running Conductor turn would be interrupted on quit).
+ * Deduped by project; a chat whose project record is gone falls back to a
+ * generic label.
+ */
+export function busyConductorProjectNames(): string[] {
+  const { busy, chats } = useOrchestrator.getState();
+  const projects = useProjects.getState().projects;
+  const names = new Set<string>();
+  for (const chat of chats) {
+    if (!busy[chat.id]) continue;
+    const name = projects[chat.projectId]?.name?.trim();
+    names.add(name || "Conductor");
+  }
+  return [...names];
 }
 
 /** Stop the chat's running turn (its send resolves as "interrupted"). */

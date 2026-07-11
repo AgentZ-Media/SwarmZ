@@ -25,6 +25,7 @@ export type OrchestratorChatEventKind =
   | "token_usage"
   | "turn_completed"
   | "turn_failed"
+  | "compacted"
   | "warning";
 
 /** Payload of the `orchestrator://chat-event` stream. */
@@ -116,6 +117,13 @@ export function chatSend(
 /** Interrupt the chat's running turn (chatSend resolves as "interrupted"). */
 export function chatInterrupt(chatId: string): Promise<void> {
   return invoke("orchestrator_chat_interrupt", { chatId });
+}
+
+/** Compact the chat's thread (thread/compact/start) — summarizes the
+ * model-visible history without touching the UI transcript. Blocks until the
+ * compaction turn completes. */
+export function chatCompact(chatId: string): Promise<{ status: string }> {
+  return invoke("orchestrator_chat_compact", { chatId });
 }
 
 /** Reopen a persisted app-server thread as a chat (across app restarts) on

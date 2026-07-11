@@ -9,15 +9,16 @@ import { ChevronDown, Maximize2, Minimize2, Pencil, Square } from "lucide-react"
 import { useVibe } from "@/lib/vibe/session-store";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import {
+  compactSession,
   focusSession,
   interrupt,
   setAccess,
   setModelEffort,
 } from "@/lib/vibe/controller";
 import {
+  contextTokens,
   decayedSignal,
   hasPendingApproval,
-  totalTokens,
   VIBE_CTX_WARN,
 } from "@/lib/vibe/ui";
 import { recentCodexModels } from "@/lib/orchestrator/models";
@@ -390,10 +391,10 @@ function TurnDiffChip({
 
 function ContextGauge({ sessionId }: { sessionId: string }) {
   const usage = useVibe((s) => s.sessions[sessionId]?.tokenUsage ?? null);
-  // `last` = the latest turn's accounting = the CURRENT context footprint.
-  // `total` is cumulative across turns (every turn re-counts the whole
-  // context as input) and overshoots the window after a few turns.
-  const total = totalTokens(usage?.last);
+  const busy = useVibe((s) => !!s.busy[sessionId]);
+  // `last` = the latest turn's accounting = the CURRENT context footprint
+  // (codex' `totalTokens` field; `contextTokens` avoids double-counting).
+  const total = contextTokens(usage?.last);
   const window = usage?.modelContextWindow ?? 0;
   if (!window || total <= 0) return null;
   const pct = Math.min(total / window, 1);
@@ -403,18 +404,21 @@ function ContextGauge({ sessionId }: { sessionId: string }) {
       label={
         <span className="font-mono text-11">
           Context · {total.toLocaleString()} / {window.toLocaleString()} tokens
+          {busy ? "" : " · click to compact"}
         </span>
       }
     >
-      <span
-        tabIndex={0}
+      <button
+        disabled={busy}
+        onClick={() => void compactSession(sessionId).catch(() => {})}
         className={cn(
-          "focus-ring shrink-0 rounded-sm px-2 py-0.5 font-mono text-11 tabular-nums",
+          "focus-ring shrink-0 rounded-sm px-2 py-0.5 font-mono text-11 tabular-nums transition-colors disabled:opacity-60",
           warn ? "text-warn" : "text-fnt",
+          !busy && "hover:bg-card hover:text-txt",
         )}
       >
         ctx {Math.round(pct * 100)}%
-      </span>
+      </button>
     </Tip>
   );
 }

@@ -179,7 +179,9 @@ function setFiredAt(id: string, firedAt: number | undefined): void {
  * with a visible notice). The claim also RE-CHECKS existence — a timer
  * cancelled while queued (e.g. by cancel_timer inside the very turn it
  * waited behind) aborts instead of firing anyway. A "retry" clears the
- * stamp again (nothing ran).
+ * stamp again (nothing ran). While the stamp is set (claim → removal) the
+ * timer counts as a HARD quit blocker (`claimedTimers` in lib/quit.ts) —
+ * quitting in that window would hydrate-drop it, so the user must confirm.
  */
 async function fireTimer(timer: ConductorTimer, missed: boolean): Promise<void> {
   if (firing.has(timer.id)) return; // already mid-fire in this run

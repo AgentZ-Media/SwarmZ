@@ -122,6 +122,8 @@ function RenderItem({
       return <ApprovalRow sessionId={sessionId} item={item} />;
     case "warning":
       return <WarningRow text={item.text} />;
+    case "notice":
+      return <NoticeRow text={item.text} />;
     case "plan":
       return item.explanation ? <PlanExplanationRow text={item.explanation} /> : null;
     case "webSearch":
@@ -419,6 +421,17 @@ function WarningRow({ text }: { text: string }) {
   return (
     <div className="max-w-[88%] select-text text-12 leading-normal text-warn">
       {text}
+    </div>
+  );
+}
+
+/** A neutral centered divider (context compaction) — reads as info, not error. */
+function NoticeRow({ text }: { text: string }) {
+  return (
+    <div className="flex items-center gap-2 py-0.5 text-11 text-fnt">
+      <span className="h-px flex-1 bg-line" />
+      <span className="select-text">{text}</span>
+      <span className="h-px flex-1 bg-line" />
     </div>
   );
 }

@@ -43,7 +43,7 @@ import {
   DEFAULT_CHAT_TITLE,
   useOrchestrator,
 } from "@/lib/orchestrator/chat-store";
-import { removeChat, sendMessage } from "@/lib/orchestrator/controller";
+import { compactChat, removeChat, sendMessage } from "@/lib/orchestrator/controller";
 import {
   activityCountLabel,
   groupChatMessages,
@@ -52,7 +52,7 @@ import {
   toolActivityLabel,
 } from "@/lib/orchestrator/tool-labels";
 import { recentCodexModels } from "@/lib/orchestrator/models";
-import { VIBE_CTX_WARN, totalTokens } from "@/lib/vibe/ui";
+import { VIBE_CTX_WARN, contextTokens } from "@/lib/vibe/ui";
 import { OrchestratorMarkdown } from "../OrchestratorMarkdown";
 import { ModelEffortPicker } from "./ModelEffortPicker";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
@@ -597,10 +597,12 @@ export function ChatMeta({ chatId }: { chatId: string }) {
   );
 }
 
-/** Context gauge for an orchestrator chat (mirrors the Vibe ContextGauge). */
+/** Context gauge for an orchestrator chat (mirrors the Vibe ContextGauge) —
+ * click to compact when idle. */
 function ChatContextGauge({ chatId }: { chatId: string }) {
   const usage = useOrchestrator((s) => s.tokenUsage[chatId] ?? null);
-  const total = totalTokens(usage?.last);
+  const busy = useOrchestrator((s) => !!s.busy[chatId]);
+  const total = contextTokens(usage?.last);
   const window = usage?.modelContextWindow ?? 0;
   if (!window || total <= 0) return null;
   const pct = Math.min(total / window, 1);
@@ -610,18 +612,21 @@ function ChatContextGauge({ chatId }: { chatId: string }) {
       label={
         <span className="font-mono text-11">
           Context · {total.toLocaleString()} / {window.toLocaleString()} tokens
+          {busy ? "" : " · click to compact"}
         </span>
       }
     >
-      <span
-        tabIndex={0}
+      <button
+        disabled={busy}
+        onClick={() => void compactChat(chatId).catch(() => {})}
         className={cn(
-          "focus-ring shrink-0 rounded-sm px-2 py-1 font-mono text-11 tabular-nums",
+          "focus-ring shrink-0 rounded-sm px-2 py-1 font-mono text-11 tabular-nums transition-colors disabled:opacity-60",
           warn ? "text-warn" : "text-fnt",
+          !busy && "hover:bg-card hover:text-txt",
         )}
       >
         ctx {Math.round(pct * 100)}%
-      </span>
+      </button>
     </Tip>
   );
 }
