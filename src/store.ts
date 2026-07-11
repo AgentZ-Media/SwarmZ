@@ -52,6 +52,7 @@ import {
 } from "@/lib/orchestrator/timers";
 import {
   hydrateAutonomyBudgets,
+  latchAutonomyUnavailable,
   registerAutonomyPersist,
   serializeAutonomyBudgets,
 } from "@/lib/orchestrator/autonomy";
@@ -349,7 +350,11 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       // un-latch a tripped breaker without a human message.
       hydrateAutonomyBudgets(await loadAutonomyBudgets());
     } catch {
-      /* unreadable = empty; the caps re-establish within one window */
+      // a store READ ERROR (not a missing key — loadAutonomyBudgets throws on
+      // a genuine read failure) means we can't know which breakers were
+      // tripped: FAIL CLOSED and pause autonomy globally until a human message
+      // clears it, rather than minting a fresh allowance / un-latching a trip.
+      latchAutonomyUnavailable();
     }
     // readiness for the chat→project migration: only when projects AND
     // sessions hydrated cleanly may the chat hydrator reassign/persist — a

@@ -44,6 +44,14 @@ const FILE_HEADER: &str = "# Orchestrator memory\n\nCurated facts the orchestrat
 pub const MAX_ENTRIES: usize = 20;
 /// Max total characters across one file's entries. Overflow drops the oldest.
 pub const MAX_TOTAL_CHARS: usize = 2000;
+/// Max characters of ONE entry's text (audit R11): the total cap never drops
+/// the LAST entry, so without a per-entry bound a single giant `remember`
+/// call would ride into every future session prompt. Longer texts are
+/// rejected with a readable error (the model shortens and retries).
+pub const MAX_ENTRY_CHARS: usize = 500;
+/// Bounded file read (audit R11): a hand-bloated or foreign memory file is
+/// read at most this far — way beyond anything the caps can produce.
+const MAX_FILE_BYTES: u64 = 256 * 1024;
 
 /// Which memory file an operation targets.
 #[derive(Debug, Clone, PartialEq)]
@@ -216,12 +224,22 @@ fn parse_line(line: &str) -> Option<MemoryEntry> {
     })
 }
 
-/// Parse one file's entries (missing/unreadable file → empty, never an error).
+/// Parse one file's entries (missing/unreadable file → empty, never an
+/// error). Bounded (audit R11): at most `MAX_FILE_BYTES` are read — a
+/// bloated/foreign file can't flood memory or the prompt.
 fn read_at(path: &Path) -> Vec<MemoryEntry> {
-    match fs::read_to_string(path) {
-        Ok(s) => s.lines().filter_map(parse_line).collect(),
-        Err(_) => Vec::new(),
+    use std::io::Read;
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut bytes = Vec::new();
+    if file.take(MAX_FILE_BYTES).read_to_end(&mut bytes).is_err() {
+        return Vec::new();
     }
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(parse_line)
+        .collect()
 }
 
 /// Read every entry of one scope under its file lock (missing/unreadable file
@@ -303,6 +321,15 @@ pub fn append(
     let text = text.trim();
     if text.is_empty() {
         return Err("nothing to remember: the text is empty".into());
+    }
+    // R11: strict per-entry bound BEFORE persisting — the FIFO total cap
+    // never drops the last entry, so one giant entry would otherwise ride
+    // into every future session prompt
+    let chars = text.chars().count();
+    if chars > MAX_ENTRY_CHARS {
+        return Err(format!(
+            "memory entry too long ({chars} chars — the cap is {MAX_ENTRY_CHARS}); store one concise sentence"
+        ));
     }
     let lock = lock_for(dir, scope);
     let _guard = lock.lock();
@@ -537,6 +564,28 @@ mod tests {
         let r = append(&dir, &p, "one more", "2026-07-07").unwrap();
         assert!(r.dropped >= 1);
         assert!(r.note.contains("dropped"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Audit R11 (frozen): one giant entry is rejected up front — the total
+    /// cap never drops the last entry, so without this bound a single
+    /// injection-sized `remember` would ride into every future prompt.
+    #[test]
+    fn oversized_single_entries_are_rejected() {
+        let dir = temp_dir();
+        let err = append(&dir, &G, &"x".repeat(MAX_ENTRY_CHARS + 1), "2026-07-10").unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+        assert!(read_entries(&dir, &G).is_empty(), "nothing may have been stored");
+        // exactly at the cap still stores
+        assert!(append(&dir, &G, &"y".repeat(MAX_ENTRY_CHARS), "2026-07-10").is_ok());
+        // a hand-bloated file is read bounded, never slurped whole
+        let path = dir.join("orchestrator-memory/global.md");
+        let mut giant = String::from("# Orchestrator memory\n\n");
+        giant.push_str(&"z".repeat(2 * MAX_FILE_BYTES as usize));
+        fs::write(&path, &giant).unwrap();
+        let entries = read_entries(&dir, &G);
+        let total: usize = entries.iter().map(|e| e.text.len()).sum();
+        assert!(total <= MAX_FILE_BYTES as usize, "bounded read");
         fs::remove_dir_all(&dir).ok();
     }
 

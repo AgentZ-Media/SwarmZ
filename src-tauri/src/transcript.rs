@@ -336,34 +336,74 @@ pub(crate) fn collapse_worktree_path(path: &Path) -> PathBuf {
     out
 }
 
+/// Read one doc file NO-FOLLOW and BOUNDED (audit R4): a symlinked
+/// README/AGENTS (planted by an agent to exfiltrate a host file) is refused,
+/// a FIFO/device never hangs the reader, and at most `cap + 1` bytes are
+/// pulled off disk (never the whole file). Returns (lossy content, on-disk
+/// size, was_cut).
+#[cfg(unix)]
+fn read_doc_bounded(dir: &Path, name: &str, cap: usize) -> Option<(String, u64, bool)> {
+    let handle = crate::fsx::DirHandle::open_root(dir).ok()?;
+    let file = handle.open_file(name).ok()??; // symlink/FIFO → None via Err
+    let size = file.metadata().ok()?.len();
+    let mut bytes = Vec::new();
+    (&file)
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let cut = bytes.len() > cap;
+    if cut {
+        bytes.truncate(cap);
+    }
+    Some((String::from_utf8_lossy(&bytes).into_owned(), size, cut))
+}
+
+#[cfg(not(unix))]
+fn read_doc_bounded(dir: &Path, name: &str, cap: usize) -> Option<(String, u64, bool)> {
+    let p = dir.join(name);
+    let meta = p.symlink_metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let file = fs::File::open(&p).ok()?;
+    let mut bytes = Vec::new();
+    file.take(cap as u64 + 1).read_to_end(&mut bytes).ok()?;
+    let cut = bytes.len() > cap;
+    if cut {
+        bytes.truncate(cap);
+    }
+    Some((String::from_utf8_lossy(&bytes).into_owned(), meta.len(), cut))
+}
+
 pub fn project_docs(root: &str) -> ProjectDocs {
     let root_used = collapse_worktree_path(Path::new(root.trim()));
     let mut docs = ProjectDocs {
         files: Vec::new(),
         root_used: root_used.to_string_lossy().into_owned(),
     };
+    if !root_used.is_dir() {
+        return docs;
+    }
     let mut budget = DOC_TOTAL_CAP;
     for name in DOC_FILES {
-        let p = root_used.join(name);
-        let Ok(meta) = p.metadata() else {
-            continue; // missing files are simply omitted
-        };
-        let Ok(raw) = fs::read_to_string(&p) else {
-            continue;
-        };
         let cap = DOC_FILE_CAP.min(budget);
         if cap == 0 {
             break;
         }
+        // no-follow + bounded (audit R4): missing, symlinked or non-regular
+        // files are simply omitted, oversized ones are cut at the cap
+        let Some((raw, size, byte_cut)) = read_doc_bounded(&root_used, name, cap) else {
+            continue;
+        };
         // caps are byte-ish but enforced on chars — close enough and safe
         let content = truncate_chars(&raw, cap);
-        let truncated = content.len() != raw.len();
+        let truncated = byte_cut || content.len() != raw.len();
         budget = budget.saturating_sub(content.chars().count());
         docs.files.push(ProjectDocFile {
             name: name.to_string(),
             content,
             truncated,
-            size: meta.len(),
+            size,
         });
     }
     docs
@@ -453,12 +493,13 @@ mod tests {
     fn byte_cap_tails_from_the_first_complete_line() {
         let dir = temp_dir();
         let filler = "x".repeat(6000);
+        let filler_line = format!(
+            r#"{{"timestamp":"2026-01-02T09:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"{filler}"}}}}"#
+        );
         let content = format!(
             "{}\n{}\n{}\n",
             r#"{"timestamp":"2026-01-02T09:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"FIRST message"}}"#,
-            format!(
-                r#"{{"timestamp":"2026-01-02T09:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"{filler}"}}}}"#
-            ),
+            filler_line,
             r#"{"timestamp":"2026-01-02T09:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"tail marker"}}"#,
         );
         let p = write_file(&dir, "rollout-2026-01-02T09-00-00-019feee.jsonl", &content);
@@ -554,5 +595,40 @@ mod tests {
         assert_eq!(docs.files[1].size, 10_000);
         assert!(docs.files[1].content.chars().count() <= DOC_FILE_CAP + 1);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Audit R4 (frozen): project docs are read NO-FOLLOW and bounded — a
+    /// symlinked README (host-file exfiltration) is omitted, a FIFO with a
+    /// doc name never hangs the reader, and an oversized file is cut at the
+    /// cap instead of being slurped whole.
+    #[cfg(unix)]
+    #[test]
+    fn project_docs_never_follow_symlinks_or_read_fifos() {
+        let dir = temp_dir();
+        let outside = temp_dir();
+        fs::write(outside.join("secret.txt"), "HOST SECRET").unwrap();
+        // README is a symlink to a host file → omitted, never leaked
+        std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("README.md")).unwrap();
+        // AGENTS.md is a FIFO → omitted without hanging
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let fifo = dir.join("AGENTS.md");
+            let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        }
+        // CLAUDE.md is a regular, oversized file → served, cut at the cap
+        fs::write(dir.join("CLAUDE.md"), "c".repeat(DOC_FILE_CAP * 3)).unwrap();
+
+        let docs = project_docs(&dir.to_string_lossy());
+        assert_eq!(docs.files.len(), 1, "only the regular file is served");
+        assert_eq!(docs.files[0].name, "CLAUDE.md");
+        assert!(docs.files[0].truncated);
+        assert!(docs.files[0].content.len() <= DOC_FILE_CAP + 4);
+        assert!(
+            !docs.files.iter().any(|f| f.content.contains("HOST SECRET")),
+            "a symlinked doc must never leak host content"
+        );
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
     }
 }

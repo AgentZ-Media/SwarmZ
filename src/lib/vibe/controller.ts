@@ -34,7 +34,11 @@ import type {
 } from "@/types";
 import { shouldAutoCompact } from "@/lib/compact";
 import { beginInflight } from "@/lib/inflight";
-import { useVibe, type NewVibeSession } from "./session-store";
+import {
+  registerSessionEvictionSink,
+  useVibe,
+  type NewVibeSession,
+} from "./session-store";
 import { pickAgentName } from "./names";
 import { reportItemIdOf } from "./report-item";
 import { useVibeUi } from "./ui-store";
@@ -1318,8 +1322,23 @@ export async function setModelEffort(
   }
 }
 
-/** Close a session: end its process, drop controller state + the store entry. */
-export async function closeSession(sessionId: string): Promise<void> {
+/**
+ * Tear down one session's backend PROCESS + all controller-side per-session
+ * maps — but NOT the store entry (the caller owns that). Shared by
+ * closeSession (which drops the store entry after) and the cap-eviction sink
+ * (the store already removed the entry). The final usage mirror + map deletes
+ * run BEFORE the invokeClose await, so the accounting flushes while the store
+ * entry is still present (the eviction sink is invoked pre-removal).
+ */
+async function cleanupSessionBackend(sessionId: string): Promise<void> {
+  // flush a pending accounting mirror before the entry disappears
+  cancelUsageMirror(sessionId);
+  mirrorUsageHistory(sessionId);
+  resetStream(sessionId);
+  streams.delete(sessionId);
+  lastTurnOutcomes.delete(sessionId);
+  schemaTurns.delete(sessionId);
+  compactingSessions.delete(sessionId);
   if (liveBackends.has(sessionId)) {
     liveBackends.delete(sessionId);
     try {
@@ -1328,15 +1347,20 @@ export async function closeSession(sessionId: string): Promise<void> {
       /* best effort — the process dies with the app anyway */
     }
   }
-  // flush a pending accounting mirror before the entry disappears
-  cancelUsageMirror(sessionId);
-  mirrorUsageHistory(sessionId);
-  resetStream(sessionId);
-  streams.delete(sessionId);
-  lastTurnOutcomes.delete(sessionId);
-  schemaTurns.delete(sessionId);
+}
+
+/** Close a session: end its process, drop controller state + the store entry. */
+export async function closeSession(sessionId: string): Promise<void> {
+  await cleanupSessionBackend(sessionId);
   useVibe.getState().dropSession(sessionId);
 }
+
+// The per-project session cap EVICTS a project's oldest sessions by deleting
+// them from the store directly — route those evictions through the same
+// backend teardown so the Rust child process + controller maps never leak.
+registerSessionEvictionSink((ids) => {
+  for (const id of ids) void cleanupSessionBackend(id);
+});
 
 /**
  * Bring a session into view: switch to its PROJECT tab first (reopening a

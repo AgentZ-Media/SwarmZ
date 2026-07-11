@@ -199,13 +199,83 @@ fn approval_kind(method: &str) -> Option<&'static str> {
 // false destructive costs one human click; a false routine is unacceptable.
 // The human's approval card stays authoritative for BOTH classes.
 
-/// The ONLY heads that are routine without further argument gates — genuinely
-/// read-only commands. NO interpreters, NO `env`, NO `find`/`xargs`, nothing
-/// that writes, moves or executes other programs. `echo` is safe only because
-/// the tokenizer already rejects every redirect/substitution around it.
+/// Read-only heads that are routine ONLY after two further gates pass:
+/// the per-head flag gate (`rg` can execute programs via `--pre`/
+/// `--hostname-bin`, audit R2) and the path-operand confinement (every
+/// path-bearing operand must stay inside the session cwd, audit R3). NO
+/// interpreters, NO `env`, NO `find`/`xargs`, nothing that writes, moves or
+/// executes other programs. `echo` is safe only because the tokenizer
+/// already rejects every redirect/substitution around it.
 const ROUTINE_READ_HEADS: &[&str] = &[
     "ls", "cat", "head", "tail", "grep", "rg", "wc", "pwd", "which", "echo",
 ];
+
+/// rg flags that make ripgrep EXECUTE other programs or read through
+/// decompressors — never routine (audit R2, fail closed): `--pre <cmd>` /
+/// `--pre=<cmd>` runs an arbitrary preprocessor per file, `--pre-glob`
+/// selects which files it runs on, `--hostname-bin` runs a program for
+/// hyperlink rendering, `-z`/`--search-zip` pipes files through external
+/// decompression binaries.
+fn rg_args_safe(args: &[String]) -> bool {
+    args.iter().all(|a| {
+        if !a.starts_with('-') {
+            return true; // positionals are gated by the operand confinement
+        }
+        if a.starts_with("--") {
+            // exact or `=`-value spelling of the exec-capable flags
+            let name = a.split('=').next().unwrap_or(a);
+            !matches!(name, "--pre" | "--pre-glob" | "--hostname-bin" | "--search-zip")
+        } else {
+            // short flags may combine (`-iz`): any `z` in a short cluster is
+            // --search-zip → human
+            !a.chars().skip(1).any(|c| c == 'z')
+        }
+    })
+}
+
+/// R3 path-operand confinement (fail closed): every operand of an otherwise
+/// routine command that CAN address a filesystem path must stay inside the
+/// session's cwd. Concretely, for each token (flags' `=`-values included):
+///   - `~…` (home expansion in the real shell) → human,
+///   - any `..` path component → human (traversal is never resolved),
+///   - an ABSOLUTE path must canonicalize into the session cwd → else human.
+///
+/// Relative operands are safe by construction: they resolve against the
+/// request cwd, which `classify_approval` already confines to the session
+/// cwd. Flag tokens themselves (`-la`, `--stat`) pass untouched; a flag's
+/// separate value token is checked like any operand, so `grep -f /etc/x`
+/// or `cargo test --manifest-path /other/Cargo.toml` classify destructive.
+fn operands_confined(args: &[String], cwd: &str) -> bool {
+    args.iter().all(|tok| {
+        // for `--flag=value`, gate the VALUE; bare flags pass
+        let val: &str = if let Some(rest) = tok.strip_prefix("--") {
+            match rest.split_once('=') {
+                Some((_, v)) => v,
+                None => return true,
+            }
+        } else if tok.starts_with('-') {
+            // short flags pass — UNLESS they smuggle an attached path value
+            // (`grep -f/etc/patterns` is one token): any '/', '~' or '..'
+            // inside a short-flag token → human
+            return !tok.contains('/') && !tok.contains('~') && !tok.contains("..");
+        } else {
+            tok
+        };
+        if val.starts_with('~') {
+            return false;
+        }
+        if std::path::Path::new(val)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        if val.starts_with('/') {
+            return path_within(cwd, val);
+        }
+        true
+    })
+}
 
 /// Read-only git subcommands (argument-gated in `git_is_routine` — a
 /// subcommand alone is not enough, mutating flags flip to destructive).
@@ -370,20 +440,22 @@ fn git_is_routine(args: &[String]) -> bool {
 }
 
 /// Is this full command line routine? Pure, fail-closed, recursion-bounded.
+/// `cwd` is the session's TRUSTED working directory — every path-bearing
+/// operand of a routine candidate must stay inside it (audit R3).
 /// `gh_writes` = the GitHub integration master toggle (Phase 7): with it ON,
 /// the two sanctioned gh WRITE forms (`gh pr comment`, `gh pr review`) may be
 /// routine; with it OFF every gh write is destructive. Read-only gh commands
 /// are routine either way.
-fn command_is_routine(raw: &str, gh_writes: bool) -> bool {
+fn command_is_routine(raw: &str, cwd: &str, gh_writes: bool) -> bool {
     // secrets/system-config are never the Conductor's call, wrapped or not
     let lower = raw.to_lowercase();
     if SENSITIVE_PATTERNS.iter().any(|p| lower.contains(p)) {
         return false;
     }
-    classify_command_str(raw, 0, gh_writes)
+    classify_command_str(raw, cwd, 0, gh_writes)
 }
 
-fn classify_command_str(raw: &str, depth: u8, gh_writes: bool) -> bool {
+fn classify_command_str(raw: &str, cwd: &str, depth: u8, gh_writes: bool) -> bool {
     if depth > 2 {
         return false; // nested wrappers beyond sh -c 'sh -c …' → human
     }
@@ -395,20 +467,34 @@ fn classify_command_str(raw: &str, depth: u8, gh_writes: bool) -> bool {
     }
     // a genuine shell wrapper is unwrapped and its SCRIPT is classified
     if let Some(inner) = unwrap_shell_strict(&tokens) {
-        return classify_command_str(inner, depth + 1, gh_writes);
+        return classify_command_str(inner, cwd, depth + 1, gh_writes);
     }
     let Some(head) = normalized_head(&tokens[0]) else {
         return false;
     };
     let args = &tokens[1..];
+    // R3: every routine candidate EXCEPT gh runs the operand confinement —
+    // an absolute/`~`/`..` operand outside the session cwd retargets even a
+    // read-only head (`cat /Users/x/Documents/…` is exfiltration). gh has
+    // its own strict parser (numeric selectors only, no path flags), and its
+    // free-text `--body` values must not false-trip on a path-shaped word.
+    if head != "gh" && !operands_confined(args, cwd) {
+        return false;
+    }
     if ROUTINE_READ_HEADS.contains(&head) {
-        return true;
+        // R2: rg can execute programs via --pre/--hostname-bin/--search-zip
+        return head != "rg" || rg_args_safe(args);
     }
     match head {
         "git" => git_is_routine(args),
         // GitHub CLI (Phase 7) — tiny read allowlist + the two gated writes
         "gh" => gh_is_routine(args, gh_writes),
-        // read-only build/test commands
+        // Build/test commands stay routine WITH the two gates above:
+        // they run under codex' workspace-write sandbox (network off,
+        // writes confined to the tree), full access is human-only since
+        // audit R1, and R3 keeps their path args (--manifest-path,
+        // --outDir, …) in-tree — so the accepted agent threat model is
+        // "runs the project's own build in its own tree", nothing more.
         "cargo" => matches!(
             args.first().map(|s| s.as_str()),
             Some("test") | Some("check") | Some("clippy") | Some("build")
@@ -443,9 +529,7 @@ fn gh_parse_args<'a>(
             let spec = allowed
                 .iter()
                 .find(|(f, _)| tok == *f || tok.starts_with(&format!("{f}=")));
-            let Some((flag, takes_value)) = spec else {
-                return None;
-            };
+            let (flag, takes_value) = spec?;
             seen.push(*flag);
             if *takes_value && tok == *flag {
                 i += 1; // `--flag value` spelling: skip the value token
@@ -607,76 +691,9 @@ fn gh_is_routine(args: &[String], gh_writes: bool) -> bool {
     }
 }
 
-/// Lexically fold an ABSOLUTE path: `.` drops, any `..` component or a
-/// relative path returns None — traversal is never resolved lexically.
-fn fold_absolute(p: &std::path::Path) -> Option<std::path::PathBuf> {
-    use std::path::Component;
-    let mut out = std::path::PathBuf::new();
-    let mut seen_root = false;
-    for c in p.components() {
-        match c {
-            Component::RootDir => {
-                out.push("/");
-                seen_root = true;
-            }
-            Component::Prefix(_) | Component::ParentDir => return None,
-            Component::CurDir => {}
-            Component::Normal(n) => out.push(n),
-        }
-    }
-    if seen_root && out.as_os_str().len() > 1 {
-        Some(out)
-    } else {
-        None
-    }
-}
-
-/// Canonicalize with a missing leaf allowed: an EXISTING path (including a
-/// symlink leaf) must fully resolve; for a missing leaf the deepest existing
-/// ancestor is canonicalized (resolving symlink chains) and the missing
-/// remainder re-appended. A broken symlink anywhere, `..`, a relative path or
-/// IO doubt → None (fail closed).
-fn canonicalize_lenient(p: &std::path::Path) -> Option<std::path::PathBuf> {
-    let folded = fold_absolute(p)?;
-    // an existing leaf (file, dir or symlink) must RESOLVE — a broken symlink
-    // fails canonicalize and correctly classifies as unsafe
-    if folded.symlink_metadata().is_ok() {
-        return folded.canonicalize().ok();
-    }
-    // missing leaf: climb to the deepest existing ancestor
-    let mut rest: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = folded.as_path();
-    loop {
-        let parent = cur.parent()?;
-        rest.push(cur.file_name()?.to_os_string());
-        if parent.symlink_metadata().is_ok() {
-            let base = parent.canonicalize().ok()?;
-            let mut out = base;
-            for seg in rest.iter().rev() {
-                out.push(seg);
-            }
-            return Some(out);
-        }
-        cur = parent;
-    }
-}
-
-/// Is `target` strictly inside `root` after full symlink/`..` resolution?
-/// Any doubt (relative paths, traversal, broken links, IO errors) → false.
-fn path_within(root: &str, target: &str) -> bool {
-    let root = root.trim();
-    let target = target.trim();
-    if root.is_empty() || target.is_empty() {
-        return false;
-    }
-    let (Some(r), Some(t)) = (
-        canonicalize_lenient(std::path::Path::new(root)),
-        canonicalize_lenient(std::path::Path::new(target)),
-    ) else {
-        return false;
-    };
-    t.starts_with(&r)
-}
+// Path containment (fold/canonicalize/path_within) lives in `crate::fsx` —
+// shared with the worktree confinement (audit R3/R5).
+use crate::fsx::path_within;
 
 /// Are all of a fileChange approval's changes routine? Routine requires EVERY
 /// change to be (a) a pure create (`add` of a not-yet-existing path) or an
@@ -729,7 +746,7 @@ pub fn classify_approval(kind: &str, params: &Value, cwd: &str, gh_writes: bool)
             let cmd_ok = params
                 .get("command")
                 .and_then(|c| c.as_str())
-                .map(|c| command_is_routine(c, gh_writes))
+                .map(|c| command_is_routine(c, cwd, gh_writes))
                 .unwrap_or(false);
             // the REQUEST's cwd (when present) must sit inside the session's
             // assigned directory — a foreign cwd retargets even a read-only
@@ -805,6 +822,13 @@ fn map_notification(method: &str, params: &Value) -> Option<(&'static str, Value
         // command item's output.
         "item/commandExecution/outputDelta" => {
             let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            // R8: one runaway delta must not flood the event bridge — the
+            // store-side aggregation is tail-capped anyway (MAX_AGG_OUTPUT)
+            let delta = if delta.len() > MAX_AGG_OUTPUT {
+                cap_output(delta, MAX_AGG_OUTPUT)
+            } else {
+                delta.to_string()
+            };
             Some(("item_output_delta", json!({ "item_id": params.get("itemId"), "delta": delta })))
         }
         "item/started" => {
@@ -896,25 +920,42 @@ fn map_notification(method: &str, params: &Value) -> Option<(&'static str, Value
 // Per-session dispatcher
 // ---------------------------------------------------------------------------
 
+/// One dispatcher task PER PROCESS GENERATION (audit R6, mirroring the
+/// Conductor's fencing in appserver.rs): the channel is created fresh for
+/// each (re)spawn and the generation is baked into the task, so every
+/// handler can compare it against the session's CURRENT generation — a
+/// straggler event from a dead gen-N process can never mutate state (or
+/// reach the UI) after the session resumed onto gen N+1.
 fn spawn_session_dispatcher(
     app: AppHandle,
     session_id: String,
+    generation: u64,
     mut rx: mpsc::UnboundedReceiver<ThreadEvent>,
 ) {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             match ev {
                 ThreadEvent::Request { method, params, responder } => {
-                    handle_server_request(&app, &session_id, &method, params, responder);
+                    handle_server_request(&app, &session_id, generation, &method, params, responder);
                 }
                 ThreadEvent::Notification { method, params } => {
-                    handle_notification(&app, &session_id, &method, &params);
+                    handle_notification(&app, &session_id, generation, &method, &params);
                 }
-                ThreadEvent::Exited => handle_exit(&app, &session_id),
+                ThreadEvent::Exited => handle_exit(&app, &session_id, generation),
             }
         }
         // all senders dropped (session closed → SessionState + Connection gone)
     });
+}
+
+/// Is `generation` still the session's live process generation? Stale = the
+/// event belongs to an older, dead process — drop it (fail closed).
+fn generation_current(session_id: &str, generation: u64) -> bool {
+    SESSIONS
+        .lock()
+        .get(session_id)
+        .map(|st| st.generation == generation)
+        .unwrap_or(false)
 }
 
 /// Approvals are BLOCKING server requests: remember the Responder under a fresh
@@ -925,10 +966,17 @@ fn spawn_session_dispatcher(
 fn handle_server_request(
     app: &AppHandle,
     session_id: &str,
+    generation: u64,
     method: &str,
     params: Value,
     responder: Responder,
 ) {
+    // R6: a request from a stale generation is answered (the blocked RPC of
+    // the OLD process must not hang) but never surfaces or stores anything
+    if !generation_current(session_id, generation) {
+        responder.ok(&json!({ "decision": "cancel" }));
+        return;
+    }
     match approval_kind(method) {
         Some(kind) => {
             // the session's trusted cwd first (classification touches the
@@ -958,7 +1006,12 @@ fn handle_server_request(
                 && classify_approval(kind, &params, &cwd, false) == "destructive";
             let approval_id = {
                 let mut sessions = SESSIONS.lock();
-                let Some(st) = sessions.get_mut(session_id) else {
+                // re-check the generation UNDER the lock — the session may
+                // have respawned between classification and storage
+                let Some(st) = sessions
+                    .get_mut(session_id)
+                    .filter(|st| st.generation == generation)
+                else {
                     responder.ok(&json!({ "decision": "cancel" }));
                     return;
                 };
@@ -995,7 +1048,56 @@ fn handle_server_request(
     }
 }
 
-fn handle_notification(app: &AppHandle, session_id: &str, method: &str, params: &Value) {
+/// A blocked `session_compact`'s waiter: (turn status, optional error).
+type CompactWaiter = oneshot::Sender<(String, Option<String>)>;
+
+/// The `turn/completed` bookkeeping, generation-fenced (audit R6): clears
+/// turn/busy state and takes the compact waiter ONLY when the event's
+/// generation is still the session's live one. Returns `None` when the event
+/// was stale (nothing mutated), `Some(compact_done)` when it applied.
+fn turn_completed_bookkeeping(
+    session_id: &str,
+    generation: u64,
+) -> Option<Option<CompactWaiter>> {
+    let mut sessions = SESSIONS.lock();
+    let st = sessions
+        .get_mut(session_id)
+        .filter(|st| st.generation == generation)?;
+    st.current_turn_id = None;
+    st.busy = false;
+    Some(st.compact_done.take())
+}
+
+/// The process-exit bookkeeping, generation-fenced: a gen-N `Exited` arriving
+/// after the session already respawned onto gen N+1 must not clear the NEW
+/// turn's busy flag or drop the NEW process' approvals. Returns `None` when
+/// stale.
+fn exit_bookkeeping(
+    session_id: &str,
+    generation: u64,
+) -> Option<Option<CompactWaiter>> {
+    let mut sessions = SESSIONS.lock();
+    let st = sessions
+        .get_mut(session_id)
+        .filter(|st| st.generation == generation)?;
+    st.current_turn_id = None;
+    st.busy = false;
+    st.pending_approvals.clear(); // the blocked RPCs died with the process
+    Some(st.compact_done.take())
+}
+
+fn handle_notification(
+    app: &AppHandle,
+    session_id: &str,
+    generation: u64,
+    method: &str,
+    params: &Value,
+) {
+    // R6: an event from a dead generation neither mutates state nor reaches
+    // the UI — the new generation's own events tell the real story.
+    if !generation_current(session_id, generation) {
+        return;
+    }
     // SHARED bookkeeping first (turn id for interrupt, busy for the one-turn
     // guard) — then the pure event mapping.
     match method {
@@ -1004,26 +1106,19 @@ fn handle_notification(app: &AppHandle, session_id: &str, method: &str, params: 
                 .pointer("/turn/id")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            if let Some(st) = SESSIONS.lock().get_mut(session_id) {
+            if let Some(st) = SESSIONS
+                .lock()
+                .get_mut(session_id)
+                .filter(|st| st.generation == generation)
+            {
                 st.current_turn_id = turn_id;
             }
         }
         "turn/completed" => {
-            let compact_done = {
-                let mut sessions = SESSIONS.lock();
-                match sessions.get_mut(session_id) {
-                    Some(st) => {
-                        st.current_turn_id = None;
-                        st.busy = false;
-                        st.compact_done.take()
-                    }
-                    None => None,
-                }
-            };
             // a blocked `session_compact` waits on this turn — resolve it
             // AFTER the busy flag cleared (so the RPC returning implies the
             // Rust-side slot is genuinely free for the next send)
-            if let Some(tx) = compact_done {
+            if let Some(Some(tx)) = turn_completed_bookkeeping(session_id, generation) {
                 let status = params
                     .pointer("/turn/status")
                     .and_then(|v| v.as_str())
@@ -1044,19 +1139,12 @@ fn handle_notification(app: &AppHandle, session_id: &str, method: &str, params: 
 }
 
 /// The private process died: clear turn/busy state, drop dead approval
-/// responders, tell the UI. The next `send` respawns and resumes.
-fn handle_exit(app: &AppHandle, session_id: &str) {
-    let compact_done = {
-        let mut sessions = SESSIONS.lock();
-        match sessions.get_mut(session_id) {
-            Some(st) => {
-                st.current_turn_id = None;
-                st.busy = false;
-                st.pending_approvals.clear(); // the blocked RPCs died with the process
-                st.compact_done.take()
-            }
-            None => None,
-        }
+/// responders, tell the UI. The next `send` respawns and resumes. Generation-
+/// fenced — a stale exit (the session already lives on a newer process) is a
+/// silent no-op.
+fn handle_exit(app: &AppHandle, session_id: &str, generation: u64) {
+    let Some(compact_done) = exit_bookkeeping(session_id, generation) else {
+        return; // stale generation — the live process is untouched
     };
     if let Some(tx) = compact_done {
         // a blocked `session_compact` must not hang until its timeout
@@ -1158,8 +1246,9 @@ fn register_session(
     profile: SessionProfile,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
-    spawn_session_dispatcher(app.clone(), session_id.to_string(), rx);
-    conn.register_thread(thread_id, tx.clone());
+    spawn_session_dispatcher(app.clone(), session_id.to_string(), generation, rx);
+    // state BEFORE route (audit R6 ordering): once an event can arrive, the
+    // generation fence must already know this session
     SESSIONS.lock().insert(
         session_id.to_string(),
         SessionState {
@@ -1172,10 +1261,11 @@ fn register_session(
             access_override_pending: false,
             pending_approvals: HashMap::new(),
             compact_done: None,
-            sink: tx,
+            sink: tx.clone(),
             approval_counter: 0,
         },
     );
+    conn.register_thread(thread_id, tx);
 }
 
 /// Start a fresh Vibe session: a dedicated app-server process + thread/start
@@ -1204,14 +1294,26 @@ pub async fn session_start(
     };
     let host = Arc::new(ProcessHost::new());
     let (conn, generation) = host.ensure().await?;
-    let res = conn
+    // R7: a post-spawn failure must not leak the freshly spawned child —
+    // shut it down explicitly before erroring out
+    let res = match conn
         .request("thread/start", thread_start_params(&profile), host::THREAD_TIMEOUT_MS)
-        .await?;
-    let thread_id = res
+        .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            host.shutdown().await;
+            return Err(e);
+        }
+    };
+    let Some(thread_id) = res
         .pointer("/thread/id")
         .and_then(|v| v.as_str())
-        .ok_or("thread/start: no thread id in response")?
-        .to_string();
+        .map(str::to_string)
+    else {
+        host.shutdown().await;
+        return Err("thread/start: no thread id in response".into());
+    };
     register_session(app, session_id, host, &conn, generation, &thread_id, profile);
     Ok(json!({ "thread_id": thread_id }))
 }
@@ -1221,6 +1323,9 @@ pub async fn session_start(
 /// to a fresh thread/start — the returned `resumed:false` tells the UI its
 /// prior transcript context is gone (the displayed history stays, the model's
 /// context doesn't). `session_id`/`thread_id` come from the persisted store.
+// 8 args: the resume wire is (identity, thread, profile, override) — a
+// params struct would only rename the same eight fields (audit R13).
+#[allow(clippy::too_many_arguments)]
 pub async fn session_resume(
     app: &AppHandle,
     session_id: &str,
@@ -1246,27 +1351,40 @@ pub async fn session_resume(
     let host = Arc::new(ProcessHost::new());
     let (conn, generation) = host.ensure().await?;
 
+    // R7: like session_start, a post-spawn failure shuts the child down
+    // instead of leaking it behind the error
     let (effective_thread_id, resumed) =
         match host::resume_thread(&conn, thread_resume_params(thread_id, &profile)).await {
             Ok(_) => (thread_id.to_string(), true),
             Err(host::ResumeError::ThreadNotFound(_)) => {
                 // rollout gone — start a fresh thread under the same session id
-                let res = conn
+                let res = match conn
                     .request(
                         "thread/start",
                         thread_start_params(&profile),
                         host::THREAD_TIMEOUT_MS,
                     )
-                    .await?;
-                let tid = res
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(e) => {
+                        host.shutdown().await;
+                        return Err(e);
+                    }
+                };
+                let Some(tid) = res
                     .pointer("/thread/id")
                     .and_then(|v| v.as_str())
-                    .ok_or("thread/start after lost thread returned no id")?
-                    .to_string();
+                    .map(str::to_string)
+                else {
+                    host.shutdown().await;
+                    return Err("thread/start after lost thread returned no id".into());
+                };
                 (tid, false)
             }
             Err(host::ResumeError::Other(m)) => {
-                return Err(format!("resuming the session failed: {m}"))
+                host.shutdown().await;
+                return Err(format!("resuming the session failed: {m}"));
             }
         };
     register_session(
@@ -1294,7 +1412,7 @@ pub async fn session_send(
     output_schema: Option<Value>,
 ) -> Result<Value, String> {
     // atomically claim the turn slot + snapshot what we need for the roundtrip
-    let (host, sink, mut thread_id, gen_stored, override_pending, profile) = {
+    let (host, mut thread_id, gen_stored, override_pending, profile) = {
         let mut sessions = SESSIONS.lock();
         let st = sessions
             .get_mut(session_id)
@@ -1309,7 +1427,6 @@ pub async fn session_send(
         st.busy = true;
         (
             st.host.clone(),
-            st.sink.clone(),
             thread_id,
             st.generation,
             st.access_override_pending,
@@ -1331,7 +1448,8 @@ pub async fn session_send(
     };
 
     // the private process was respawned since this session's route was set →
-    // resume the thread (routes die with the process, re-register below)
+    // resume the thread (routes die with the process, re-register below with
+    // a FRESH generation-tagged dispatcher — audit R6)
     if gen_stored != generation {
         match host::resume_thread(&conn, thread_resume_params(&thread_id, &profile)).await {
             Ok(_) => {}
@@ -1373,10 +1491,17 @@ pub async fn session_send(
                 return Err(format!("resuming the session after a restart failed: {m}"));
             }
         }
-        conn.register_thread(&thread_id, sink.clone());
+        // fresh generation-tagged dispatcher — the old one only ever serves
+        // (and drops) the dead process' stragglers. The state's generation
+        // updates BEFORE the route registers: no event can arrive before the
+        // route exists, and once one does the fence already matches.
+        let (tx, rx) = mpsc::unbounded_channel();
+        spawn_session_dispatcher(app.clone(), session_id.to_string(), generation, rx);
         if let Some(st) = SESSIONS.lock().get_mut(session_id) {
             st.generation = generation;
+            st.sink = tx.clone();
         }
+        conn.register_thread(&thread_id, tx);
     }
 
     let params = turn_params(
@@ -1453,9 +1578,9 @@ const COMPACT_TIMEOUT_MS: u64 = 300_000;
 /// itself is still driven by the turn events, and it clears BEFORE the
 /// waiting RPC resolves. Transparently resumes after a private-process
 /// respawn, like `send`.
-pub async fn session_compact(session_id: &str) -> Result<Value, String> {
+pub async fn session_compact(app: &AppHandle, session_id: &str) -> Result<Value, String> {
     let (done_tx, done_rx) = oneshot::channel();
-    let (host, sink, thread_id, gen_stored, profile) = {
+    let (host, thread_id, gen_stored, profile) = {
         let mut sessions = SESSIONS.lock();
         let st = sessions
             .get_mut(session_id)
@@ -1471,7 +1596,6 @@ pub async fn session_compact(session_id: &str) -> Result<Value, String> {
         st.compact_done = Some(done_tx);
         (
             st.host.clone(),
-            st.sink.clone(),
             thread_id,
             st.generation,
             st.profile.clone(),
@@ -1491,7 +1615,8 @@ pub async fn session_compact(session_id: &str) -> Result<Value, String> {
         }
     };
     // the private process was respawned since this session's route was set →
-    // resume the thread so compaction operates on the right context
+    // resume the thread so compaction operates on the right context (fresh
+    // generation-tagged dispatcher, audit R6 — same as `send`)
     if gen_stored != generation {
         if let Err(e) =
             host::resume_thread(&conn, thread_resume_params(&thread_id, &profile)).await
@@ -1499,10 +1624,14 @@ pub async fn session_compact(session_id: &str) -> Result<Value, String> {
             release(session_id);
             return Err(format!("resuming the session before compaction failed: {}", e.message()));
         }
-        conn.register_thread(&thread_id, sink.clone());
+        let (tx, rx) = mpsc::unbounded_channel();
+        spawn_session_dispatcher(app.clone(), session_id.to_string(), generation, rx);
+        // generation BEFORE route — see the identical ordering note in `send`
         if let Some(st) = SESSIONS.lock().get_mut(session_id) {
             st.generation = generation;
+            st.sink = tx.clone();
         }
+        conn.register_thread(&thread_id, tx);
     }
     if let Err(e) = conn
         .request(
@@ -1615,13 +1744,15 @@ pub async fn session_set_cwd(session_id: &str, cwd: &str) -> Result<(), String> 
         return Err(format!("cwd is not an existing folder: {cwd:?}"));
     }
     let (host, thread_id) = {
-        let mut sessions = SESSIONS.lock();
+        let sessions = SESSIONS.lock();
         let st = sessions
-            .get_mut(session_id)
+            .get(session_id)
             .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
-        st.profile.cwd = cwd.to_string();
         (st.host.clone(), st.thread_id.clone())
     };
+    // R12: the profile commits ONLY after the live thread ACKED the new cwd
+    // — a failed update must not leave profile and thread split-brained
+    // (approval confinement classifies against the profile cwd).
     if let (Some(conn), Some(thread_id)) = (host.alive().await, thread_id) {
         conn.request(
             "thread/settings/update",
@@ -1629,12 +1760,13 @@ pub async fn session_set_cwd(session_id: &str, cwd: &str) -> Result<(), String> 
             host::RPC_TIMEOUT_MS,
         )
         .await
-        .map(|_| ())
-        .map_err(|e| format!("thread/settings/update (cwd) failed: {e}"))
-    } else {
-        // process not running — the profile cwd applies on the next resume
-        Ok(())
+        .map_err(|e| format!("thread/settings/update (cwd) failed: {e}"))?;
     }
+    // no live process: the profile cwd applies on the next resume
+    if let Some(st) = SESSIONS.lock().get_mut(session_id) {
+        st.profile.cwd = cwd.to_string();
+    }
+    Ok(())
 }
 
 /// How long a detached review turn may run before we give up collecting.
@@ -1881,9 +2013,12 @@ pub async fn session_set_model_effort(
 }
 
 /// Close a session: best-effort interrupt a running turn, cancel every pending
-/// approval, unregister the thread and drop the registry entry — dropping it
-/// drops the private ProcessHost, ending the child (stdin close + kill_on_drop)
-/// and, once its sink is gone, the dispatcher task.
+/// approval, unregister the thread, SHUT THE PROCESS DOWN explicitly and drop
+/// the registry entry. The explicit `host.shutdown()` (audit R7) closes the
+/// child's stdin (EOF → codex exits) and arms the force-kill watchdog — a
+/// codex ignoring the EOF is killed after the grace period instead of
+/// lingering until app quit. The frontend's cap-eviction path goes through
+/// this close, so evicted sessions can no longer accumulate child processes.
 pub async fn session_close(session_id: &str) -> Result<(), String> {
     let Some(mut st) = SESSIONS.lock().remove(session_id) else {
         return Ok(()); // already gone — idempotent
@@ -1909,7 +2044,8 @@ pub async fn session_close(session_id: &str) -> Result<(), String> {
             conn.unregister_thread(thread_id);
         }
     }
-    // `st` drops here → private ProcessHost + sink drop → child exits, dispatcher ends
+    // graceful stdin-EOF + kill watchdog — never rely on Drop alone
+    st.host.shutdown().await;
     Ok(())
 }
 
@@ -2282,6 +2418,124 @@ mod tests {
         );
         // unknown approval kinds → human
         assert_eq!(classify_no_gh("elicitation", &json!({}), "/repo/wt"), "destructive");
+    }
+
+    /// Audit R2 (frozen): rg's exec-capable flags are never routine — `--pre`
+    /// runs an arbitrary program per searched file, `--hostname-bin` runs a
+    /// program for hyperlinks, `-z`/`--search-zip` pipes through external
+    /// decompressors. Plain read-only rg stays routine.
+    #[test]
+    fn rg_exec_flags_are_destructive() {
+        for c in [
+            "rg --pre sh x",
+            "rg --pre 'sh' x",
+            "rg --pre=evil x",
+            "rg --pre=/bin/sh x",
+            "rg --pre-glob '*.md' --pre cat x",
+            "rg --pre-glob=* x",
+            "rg --hostname-bin evil TODO",
+            "rg --hostname-bin=evil TODO",
+            "rg --search-zip TODO",
+            "rg -z TODO",
+            "rg -iz TODO",
+            "rg -zn TODO src",
+            "/bin/zsh -lc 'rg --pre sh x'",
+        ] {
+            assert_eq!(classify_cmd(c), "destructive", "{c}");
+        }
+        // ordinary read-only rg usage stays routine
+        for c in [
+            "rg TODO src",
+            "rg -n 'fn main' src",
+            "rg -i --glob '*.rs' unsafe src",
+            "rg --max-count 5 TODO",
+        ] {
+            assert_eq!(classify_cmd(c), "routine", "{c}");
+        }
+    }
+
+    /// Audit R3 (frozen): path operands of routine commands are confined to
+    /// the session cwd — absolute paths outside it, `~` expansion and any
+    /// `..` traversal classify destructive, whatever the head. Relative
+    /// operands (which resolve inside the confined request cwd) stay routine.
+    #[test]
+    fn path_operands_outside_the_session_cwd_are_destructive() {
+        // a REAL directory so the containment canonicalizes positives
+        let root = std::env::temp_dir().join(format!(
+            "swarmz-r3-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let cwd = root.to_string_lossy().into_owned();
+        std::fs::write(root.join("src/a.rs"), "x").unwrap();
+        let classify = |c: &str| classify_no_gh("command", &json!({ "command": c }), &cwd);
+
+        // reads of files OUTSIDE the session tree — the exfil payloads
+        for c in [
+            "cat /Users/someone/Documents/finances.txt",
+            "head -n 5 /var/log/system.log",
+            "tail /private/etc/hosts",
+            "grep key /Users/someone/notes.md",
+            "grep -f /var/patterns src/a.rs", // pattern FILE outside the tree
+            "grep -f/var/patterns src/a.rs",  // attached short-flag value
+            "rg secret2 /Users/someone",
+            "wc -l /dev/random",
+            "ls /Users",
+            "cat ~/Documents/notes.txt",
+            "cat ../outside.txt",
+            "cat src/../../outside.txt",
+            "head --lines=5 /var/log/wifi.log",
+            // build/test with out-of-tree path args (retarget/exfil)
+            "tsc --outDir /tmp/exfil-r3",
+            "tsc --outDir=/tmp/exfil-r3",
+            "cargo test --manifest-path /other/repo/Cargo.toml",
+            "cargo build --target-dir /tmp/exfil-r3",
+            "pnpm test --dir /tmp/exfil-r3",
+            // wrapped forms confine identically
+            "/bin/zsh -lc 'cat /Users/someone/Documents/finances.txt'",
+        ] {
+            assert_eq!(classify(c), "destructive", "{c}");
+        }
+        // in-tree and relative operands stay routine
+        for c in [
+            "cat src/a.rs",
+            "head -n 50 src/a.rs",
+            "grep foo src/",
+            "rg TODO src",
+            "wc -l src/a.rs",
+            "ls -la",
+            "ls src",
+            "tsc --noEmit",
+            "tsc --outDir dist",
+            "cargo test",
+            "pnpm test",
+        ] {
+            assert_eq!(classify(c), "routine", "{c}");
+        }
+        // absolute paths INSIDE the session tree are fine
+        assert_eq!(
+            classify(&format!("cat {}/src/a.rs", cwd)),
+            "routine",
+            "in-tree absolute path"
+        );
+        // a symlink inside the tree pointing OUT resolves outside → human
+        let escape = std::env::temp_dir().join(format!("swarmz-r3-out-{}", std::process::id()));
+        std::fs::create_dir_all(&escape).unwrap();
+        std::fs::write(escape.join("target.txt"), "y").unwrap();
+        let link = root.join("src/link.txt");
+        std::fs::remove_file(&link).ok();
+        std::os::unix::fs::symlink(escape.join("target.txt"), &link).unwrap();
+        assert_eq!(
+            classify(&format!("cat {}", link.to_string_lossy())),
+            "destructive",
+            "escaping symlink operand"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&escape).ok();
     }
 
     // ---- Phase-7 security review: gh CLI classification (frozen) ----
@@ -2665,6 +2919,62 @@ mod tests {
         ));
     }
 
+    /// Audit R6 (frozen): the session-event bookkeeping is generation-fenced
+    /// — a straggler `turn/completed`/`Exited` from a dead gen-N process must
+    /// never clear the busy flag (or the approvals) of the gen-N+1 turn that
+    /// already runs.
+    #[test]
+    fn stale_generation_events_never_mutate_the_live_session() {
+        let sid = format!("r6-fence-test-{}", std::process::id());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        SESSIONS.lock().insert(
+            sid.clone(),
+            SessionState {
+                host: Arc::new(ProcessHost::new()),
+                thread_id: Some("t".into()),
+                generation: 2, // the session lives on gen 2 now
+                profile: SessionProfile {
+                    cwd: "/repo".into(),
+                    model: None,
+                    effort: None,
+                    access: Access::Workspace,
+                },
+                current_turn_id: Some("turn-gen2".into()),
+                busy: true,
+                access_override_pending: false,
+                pending_approvals: HashMap::new(),
+                compact_done: None,
+                sink: tx,
+                approval_counter: 0,
+            },
+        );
+
+        // stale gen-1 events: no mutation, reported as not-applied
+        assert!(turn_completed_bookkeeping(&sid, 1).is_none());
+        assert!(exit_bookkeeping(&sid, 1).is_none());
+        assert!(!generation_current(&sid, 1));
+        {
+            let sessions = SESSIONS.lock();
+            let st = sessions.get(&sid).unwrap();
+            assert!(st.busy, "stale events must not clear busy");
+            assert_eq!(st.current_turn_id.as_deref(), Some("turn-gen2"));
+        }
+
+        // the LIVE generation applies normally
+        assert!(generation_current(&sid, 2));
+        assert!(turn_completed_bookkeeping(&sid, 2).is_some());
+        {
+            let sessions = SESSIONS.lock();
+            let st = sessions.get(&sid).unwrap();
+            assert!(!st.busy);
+            assert!(st.current_turn_id.is_none());
+        }
+
+        // unknown sessions and stale exits are no-ops too
+        assert!(exit_bookkeeping("never-registered", 1).is_none());
+        SESSIONS.lock().remove(&sid);
+    }
+
     #[test]
     fn steer_race_errors_are_classified() {
         // verbatim live answers from codex 0.144.1 (Phase-4 probe)
@@ -2758,7 +3068,7 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn sessions_spike() {
         // (a) INTERRUPT — full access so a `sleep` runs approval-free
         {
@@ -2972,7 +3282,7 @@ mod tests {
     // default (needs codex + login + network); run with:
     //   SWARMZ_SPIKE_DIR=<scratch> cargo test phase4_worktree_spike -- --ignored --nocapture
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn phase4_worktree_spike() {
         use std::path::PathBuf;
         let base = std::env::var("SWARMZ_SPIKE_DIR")
@@ -3118,7 +3428,7 @@ mod tests {
     // (needs codex + login + network); run with:
     //   SWARMZ_SPIKE_DIR=<scratch> cargo test phase5_output_schema_spike -- --ignored --nocapture
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn phase5_output_schema_spike() {
         use std::path::PathBuf;
         let base = std::env::var("SWARMZ_SPIKE_DIR")
@@ -3241,7 +3551,7 @@ mod tests {
     // Ignored by default (needs codex + login + network); run with:
     //   cargo test phase8_session_compact_block_spike -- --ignored --nocapture
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn phase8_session_compact_block_spike() {
         let cwd = std::env::temp_dir().join("swarmz-phase8-session-compact-spike");
         std::fs::create_dir_all(&cwd).unwrap();

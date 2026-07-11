@@ -1,5 +1,6 @@
 mod codex;
 mod codex_usage;
+mod fsx;
 mod git;
 mod github;
 mod orchestrator;
@@ -9,46 +10,11 @@ mod storefile;
 mod transcript;
 mod worktree;
 
-use codex_usage::{SessionUsage, UsageTotals};
 use tauri::{AppHandle, Emitter, Manager};
 
-// Usage commands run off the main thread: the per-file cache makes them
-// cheap in steady state, but the first call after launch parses the backlog
-// under ~/.codex/sessions.
-#[tauri::command]
-async fn usage_for_dir(cwd: String) -> Option<SessionUsage> {
-    tauri::async_runtime::spawn_blocking(move || codex_usage::usage_for_dir(&cwd))
-        .await
-        .ok()
-        .flatten()
-}
-
-#[tauri::command]
-async fn usage_for_session(
-    cwd: String,
-    since: f64,
-    session: Option<String>,
-    exclude: Option<Vec<String>>,
-) -> Option<SessionUsage> {
-    tauri::async_runtime::spawn_blocking(move || {
-        codex_usage::usage_for_session(
-            &cwd,
-            since as u64,
-            session.as_deref(),
-            exclude.as_deref().unwrap_or(&[]),
-        )
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-#[tauri::command]
-async fn usage_totals() -> Result<UsageTotals, String> {
-    tauri::async_runtime::spawn_blocking(codex_usage::usage_totals)
-        .await
-        .map_err(|e| e.to_string())
-}
+// The pre-rebuild per-session usage commands (usage_for_dir/_session/_totals)
+// are GONE (audit R13): session accounting mirrors codex `token_usage`
+// events frontend-side, so they had no caller left.
 
 /// Account-level Codex rate limits: the newest `rate_limits` event across all
 /// of `~/.codex/sessions` (bounded tail reads, newest file first — see
@@ -120,8 +86,11 @@ async fn worktree_status(path: String, bin: Option<String>) -> Result<worktree::
 
 /// `force: false` is the gated path — the removal re-checks dirty/ahead
 /// inside worktree::remove and runs `git worktree remove` WITHOUT --force
-/// (git refuses late-appearing work). Omitted/`true` = the user-confirmed
-/// force path.
+/// (git refuses late-appearing work). `true` = the user-confirmed force
+/// path; an OMITTED flag defaults to the GATED path (audit R5 — force must
+/// always be an explicit, deliberate claim). The path is confined to
+/// `<root>/.worktrees` and the branch is derived from git inside
+/// `worktree::remove`.
 #[tauri::command]
 async fn worktree_remove(
     root: String,
@@ -131,7 +100,7 @@ async fn worktree_remove(
     bin: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        worktree::remove(&root, &path, &branch, force.unwrap_or(true), bin.as_deref())
+        worktree::remove(&root, &path, &branch, force.unwrap_or(false), bin.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -302,9 +271,17 @@ async fn transcript_read(
     // file reads (possibly a seek into a huge jsonl) — off the core threads
     tauri::async_runtime::spawn_blocking(move || {
         let defaults = transcript::TranscriptOpts::default();
+        // audit R12: caller-supplied window sizes are CLAMPED — a huge
+        // max_bytes/tail request must not turn the tail read into a slurp
+        const MAX_TAIL_MESSAGES: usize = 500;
+        const MAX_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
         let opts = transcript::TranscriptOpts {
-            tail_messages: tail_messages.unwrap_or(defaults.tail_messages),
-            max_bytes: max_bytes.unwrap_or(defaults.max_bytes),
+            tail_messages: tail_messages
+                .unwrap_or(defaults.tail_messages)
+                .clamp(1, MAX_TAIL_MESSAGES),
+            max_bytes: max_bytes
+                .unwrap_or(defaults.max_bytes)
+                .clamp(4_096, MAX_WINDOW_BYTES),
             include_first_user_message: include_first_user_message
                 .unwrap_or(defaults.include_first_user_message),
         };
@@ -452,12 +429,19 @@ async fn orchestrator_memory_remove(
 /// Run one tool through the roundtrip bus (Rust → webview executor → Rust).
 /// Async: it awaits the webview's response (or the tool's timeout) — no
 /// blocking work happens on this side.
+///
+/// DEV-ONLY (audit R13): this is the `window.__orch` dev hook's unscoped
+/// surface — release builds refuse it (the Conductor's real tool calls go
+/// through the app-server adapter, never through this command).
 #[tauri::command]
 async fn orchestrator_run_tool(
     app: AppHandle,
     tool: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    if !cfg!(debug_assertions) {
+        return Err("orchestrator_run_tool is a dev-only hook and disabled in release builds".into());
+    }
     // dev-hook surface — no chat/project context (executors skip
     // touched-session tracking and resolve sessions unscoped)
     orchestrator::run_tool(&app, &tool, args, None, None).await
@@ -576,6 +560,8 @@ async fn vibe_session_start(
 
 /// Reopen a persisted session across an app restart (thread/resume, with a
 /// fresh-start fallback when the rollout is gone). Returns `{thread_id, resumed}`.
+// 8 args mirror the session_resume wire 1:1 (audit R13).
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn vibe_session_resume(
     app: AppHandle,
@@ -625,8 +611,11 @@ async fn vibe_session_interrupt(session_id: String) -> Result<(), String> {
 /// the compaction turn completed (busy clears before this resolves, so a
 /// send fired right after never races the compaction).
 #[tauri::command]
-async fn vibe_session_compact(session_id: String) -> Result<serde_json::Value, String> {
-    codex::sessions::session_compact(&session_id).await
+async fn vibe_session_compact(
+    app: AppHandle,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    codex::sessions::session_compact(&app, &session_id).await
 }
 
 /// Answer a pending approval — `decision` ∈ accept | acceptForSession |
@@ -754,9 +743,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            usage_for_dir,
-            usage_for_session,
-            usage_totals,
             codex_account_limits,
             path_is_file,
             canonicalize_path,

@@ -1297,9 +1297,9 @@ mod tests {
     /// default (needs codex + login + network — CI stays green); run with:
     ///   cargo test appserver_spike -- --ignored --nocapture
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn appserver_spike() {
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events_rx) = mpsc::channel(4_096);
         // resolve exactly like production — doubles as a regression test for
         // the built app's minimal GUI PATH (run with PATH=/usr/bin:/bin …)
         let program = crate::codex::host::resolve_codex_program(None).expect("resolve codex binary");
@@ -1532,7 +1532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn conductor_instances_spike() {
         let base = std::env::temp_dir().join("swarmz-conductor-spike");
         let dir_a = base.join("project-a");
@@ -1651,7 +1651,7 @@ mod tests {
     // Ignored by default; run with:
     //   SWARMZ_SPIKE_DIR=<scratch> cargo test phase5_autonomy_loop_spike -- --ignored --nocapture
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn phase5_autonomy_loop_spike() {
         use std::path::PathBuf;
         let base = std::env::var("SWARMZ_SPIKE_DIR")
@@ -1903,7 +1903,7 @@ mod tests {
     // Ignored by default (needs codex + login + network + git); run with:
     //   SWARMZ_SPIKE_DIR=<scratch> cargo test phase8_codex_swarm_integration_spike -- --ignored --nocapture
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn phase8_codex_swarm_integration_spike() {
         use crate::codex::sessions::classify_approval;
         use std::path::PathBuf;
@@ -2228,7 +2228,7 @@ mod tests {
     // asks for the codeword and must still know it. Ignored by default; run:
     //   cargo test phase8_compact_spike -- --ignored --nocapture
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn phase8_compact_spike() {
         let cwd = std::env::temp_dir().join("swarmz-phase8-compact-spike");
         std::fs::create_dir_all(&cwd).unwrap();

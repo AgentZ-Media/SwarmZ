@@ -1667,7 +1667,7 @@ mod tests {
     /// Requires an installed, logged-in gh and the SwarmZ checkout's GitHub
     /// remote (AgentZ-Media/SwarmZ). Runs no write commands.
     #[test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     fn github_live_spike() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1736,7 +1736,7 @@ mod tests {
     #[test]
     fn gh_bin_prefers_override_then_known_paths() {
         assert_eq!(gh_bin(Some("/custom/gh")), "/custom/gh");
-        assert_eq!(gh_bin(Some("  ")).is_empty(), false);
+        assert!(!gh_bin(Some("  ")).is_empty());
         let resolved = gh_bin(None);
         assert!(resolved.ends_with("gh"), "{resolved}");
     }

@@ -40,7 +40,7 @@ use std::time::Duration;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
@@ -117,11 +117,91 @@ impl PendingRpc {
 /// force-killed — a codex that ignores the EOF must not linger as a zombie.
 const SHUTDOWN_KILL_AFTER_MS: u64 = 5_000;
 
+/// Hard cap on ONE protocol line from the child's stdout (audit R8): a
+/// broken/hostile child streaming an endless line must not OOM the app.
+/// Generous — real codex events (full-diff notifications included) stay far
+/// below this; an oversized line is consumed and DROPPED with a log (the
+/// protocol is line-delimited JSON, so one lost record degrades a feature,
+/// never corrupts the framing).
+const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+/// Stderr is log output — one line beyond this is noise, not data.
+const MAX_STDERR_LINE_BYTES: usize = 8 * 1024;
+/// Server-event queue between the reader task and the router (audit R8):
+/// bounded so a flood backpressures the child's stdout pipe instead of
+/// growing an unbounded queue. The router forwards to per-thread sinks
+/// without blocking, so the queue drains fast in steady state.
+const EVENTS_CHANNEL_CAPACITY: usize = 4_096;
+/// Outgoing-line queue to the writer task (audit R8): RPCs and approval
+/// responses are small and rare; a full queue means the child stopped
+/// reading its stdin — failing fast is correct then.
+const STDIN_CHANNEL_CAPACITY: usize = 1_024;
+
+/// One bounded read from a line-delimited stream.
+enum BoundedLine {
+    Line(String),
+    /// the line exceeded the cap — it was fully consumed and discarded
+    Oversize,
+    Eof,
+}
+
+/// Read the next newline-terminated line without ever buffering more than
+/// `max` bytes (audit R8 — `BufRead::lines()` would buffer the whole line).
+async fn next_line_bounded<R>(reader: &mut R, max: usize) -> std::io::Result<BoundedLine>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut skipping = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            // EOF
+            return Ok(if skipping {
+                BoundedLine::Oversize
+            } else if buf.is_empty() {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Line(String::from_utf8_lossy(&buf).into_owned())
+            });
+        }
+        match chunk.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                let over = !skipping && buf.len() + pos > max;
+                if !skipping && !over {
+                    buf.extend_from_slice(&chunk[..pos]);
+                }
+                reader.consume(pos + 1);
+                if skipping || over {
+                    return Ok(BoundedLine::Oversize);
+                }
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+                return Ok(BoundedLine::Line(String::from_utf8_lossy(&buf).into_owned()));
+            }
+            None => {
+                let len = chunk.len();
+                if !skipping {
+                    if buf.len() + len > max {
+                        buf = Vec::new(); // drop what we buffered
+                        skipping = true;
+                    } else {
+                        buf.extend_from_slice(chunk);
+                    }
+                }
+                reader.consume(len);
+            }
+        }
+    }
+}
+
 /// Handle to one running `codex app-server` process.
 pub struct Client {
     /// Writer channel — `None` after `shutdown()` (closing it drops the
     /// child's stdin → EOF → codex exits; the reader task then reaps it).
-    stdin_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    /// Bounded (audit R8): a child that stopped reading fails sends fast.
+    stdin_tx: Mutex<Option<mpsc::Sender<String>>>,
     pending: Arc<PendingRpc>,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
@@ -132,11 +212,12 @@ pub struct Client {
 
 impl Client {
     /// Spawn `<program> app-server` and wire the stdio pumps. Server-initiated
-    /// requests and notifications go to `events`; responses resolve the
-    /// pending map. Must run inside a tokio runtime.
+    /// requests and notifications go to `events` (bounded — see
+    /// `EVENTS_CHANNEL_CAPACITY`); responses resolve the pending map. Must
+    /// run inside a tokio runtime.
     pub async fn spawn(
         program: &str,
-        events: mpsc::UnboundedSender<ServerEvent>,
+        events: mpsc::Sender<ServerEvent>,
     ) -> Result<Self, String> {
         // enrich the child's PATH with the binary's own dir — the built app's
         // minimal GUI PATH otherwise breaks anything codex spawns by name
@@ -149,9 +230,12 @@ impl Client {
         // SwarmZ processes run WITHOUT the user's global MCP servers (see
         // `mcp_disable_args`) — the user's config.toml is only READ, never
         // modified. The read is tiny but still file I/O → spawn_blocking.
+        // FAIL-CLOSED (audit R12): an enabled server whose name cannot ride
+        // the `-c` disable path refuses the spawn instead of silently
+        // booting that server into every SwarmZ child.
         let mcp_off = tokio::task::spawn_blocking(mcp_disable_args)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())??;
         let mut child = cmd
             .arg("app-server")
             .args(&mcp_off)
@@ -165,7 +249,7 @@ impl Client {
         let stdout = child.stdout.take().ok_or("app-server: no stdout")?;
         let stderr = child.stderr.take();
 
-        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+        let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(STDIN_CHANNEL_CAPACITY);
         let pending = Arc::new(PendingRpc::default());
         let alive = Arc::new(AtomicBool::new(true));
 
@@ -182,12 +266,20 @@ impl Client {
             // channel closed (Client dropped) → stdin drops → EOF → codex exits
         });
 
-        // stderr → log lines (codex logs there; useful when things go wrong)
+        // stderr → log lines (codex logs there; useful when things go wrong).
+        // Bounded per line (audit R8/R12): a flooding child can't OOM the
+        // logger, and one runaway line is truncated instead of echoed whole.
         if let Some(err) = stderr {
             tokio::spawn(async move {
-                let mut lines = BufReader::new(err).lines();
-                while let Ok(Some(l)) = lines.next_line().await {
-                    eprintln!("[codex app-server] {l}");
+                let mut reader = BufReader::new(err);
+                loop {
+                    match next_line_bounded(&mut reader, MAX_STDERR_LINE_BYTES).await {
+                        Ok(BoundedLine::Line(l)) => eprintln!("[codex app-server] {l}"),
+                        Ok(BoundedLine::Oversize) => {
+                            eprintln!("[codex app-server] (oversized stderr line truncated)")
+                        }
+                        Ok(BoundedLine::Eof) | Err(_) => break,
+                    }
                 }
             });
         }
@@ -196,17 +288,26 @@ impl Client {
 
         // reader: classify each line; owns the child for reaping on EOF and
         // for the force-kill fallback (the kill notify fires when a graceful
-        // shutdown's EOF grace period elapsed)
+        // shutdown's EOF grace period elapsed). Lines are read BOUNDED
+        // (audit R8) and events go into a BOUNDED queue — a flood
+        // backpressures the child's stdout pipe instead of growing memory.
         {
             let pending = pending.clone();
             let alive = alive.clone();
             let kill = kill.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
+                let mut reader = BufReader::new(stdout);
                 loop {
                     tokio::select! {
-                        line = lines.next_line() => {
-                            let Ok(Some(line)) = line else { break };
+                        line = next_line_bounded(&mut reader, MAX_LINE_BYTES) => {
+                            let line = match line {
+                                Ok(BoundedLine::Line(line)) => line,
+                                Ok(BoundedLine::Oversize) => {
+                                    eprintln!("[codex host] dropped an oversized protocol line (> {MAX_LINE_BYTES} bytes)");
+                                    continue;
+                                }
+                                Ok(BoundedLine::Eof) | Err(_) => break,
+                            };
                             match protocol::parse_line(&line) {
                                 Some(Incoming::Response { id, result }) => {
                                     if !pending.resolve(id, result) {
@@ -214,10 +315,10 @@ impl Client {
                                     }
                                 }
                                 Some(Incoming::ServerRequest { id, method, params }) => {
-                                    let _ = events.send(ServerEvent::Request { id, method, params });
+                                    let _ = events.send(ServerEvent::Request { id, method, params }).await;
                                 }
                                 Some(Incoming::Notification { method, params }) => {
-                                    let _ = events.send(ServerEvent::Notification { method, params });
+                                    let _ = events.send(ServerEvent::Notification { method, params }).await;
                                 }
                                 None => {} // unknown/unparseable line: ignore silently
                             }
@@ -232,7 +333,7 @@ impl Client {
                 }
                 alive.store(false, Ordering::SeqCst);
                 pending.fail_all("codex app-server exited");
-                let _ = events.send(ServerEvent::Exited);
+                let _ = events.send(ServerEvent::Exited).await;
                 let _ = child.wait().await; // reap
             });
         }
@@ -250,10 +351,12 @@ impl Client {
         self.alive.load(Ordering::SeqCst)
     }
 
-    /// Send one line to the writer task. Err = writer gone (shutdown/exited).
+    /// Send one line to the writer task. Err = writer gone (shutdown/exited)
+    /// or the queue is full (the child stopped reading its stdin — audit R8:
+    /// fail fast instead of queueing without bound).
     fn send_line(&self, line: String) -> Result<(), ()> {
         match &*self.stdin_tx.lock() {
-            Some(tx) => tx.send(line).map_err(|_| ()),
+            Some(tx) => tx.try_send(line).map_err(|_| ()),
             None => Err(()),
         }
     }
@@ -498,33 +601,47 @@ fn is_bare_toml_key(name: &str) -> bool {
 
 /// The per-spawn CLI args that disable MCP servers for one `codex
 /// app-server` child (pure — unit-tested; `config_text` is the user's
-/// config.toml, empty/unparseable degrades to just the `apps` opt-out).
-pub(crate) fn mcp_disable_args_from(config_text: &str) -> Vec<String> {
+/// config.toml, empty/unparseable degrades to just the `apps` opt-out —
+/// codex itself refuses a config IT can't parse, so nothing boots then).
+///
+/// FAIL-CLOSED (audit R12): a server whose name cannot ride a bare `-c`
+/// dotted path CANNOT be disabled per process — if that server is ENABLED,
+/// this errors and the spawn refuses, instead of silently letting the
+/// undisableable server boot into every SwarmZ child. A quoted-name server
+/// that is already `enabled = false` in the config is safely skipped.
+pub(crate) fn mcp_disable_args_from(config_text: &str) -> Result<Vec<String>, String> {
     let mut args: Vec<String> = vec!["--disable".into(), "apps".into()];
     let parsed: toml::Table = match config_text.parse() {
         Ok(v) => v,
-        Err(_) => return args, // codex itself will complain about its config
+        Err(_) => return Ok(args), // codex itself will complain about its config
     };
     let Some(servers) = parsed.get("mcp_servers").and_then(|v| v.as_table()) else {
-        return args;
+        return Ok(args);
     };
-    for name in servers.keys() {
+    for (name, table) in servers {
         if is_bare_toml_key(name) {
             args.push("-c".into());
             args.push(format!("mcp_servers.{name}.enabled=false"));
         } else {
-            eprintln!(
-                "[codex host] mcp server name {name:?} is not a bare TOML key — cannot disable it for this process"
-            );
+            let already_disabled = table
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .map(|b| !b)
+                .unwrap_or(false);
+            if !already_disabled {
+                return Err(format!(
+                    "mcp server name {name:?} in ~/.codex/config.toml cannot be disabled per process (not a bare TOML key) — disable it in the config or rename it before SwarmZ can spawn codex"
+                ));
+            }
         }
     }
-    args
+    Ok(args)
 }
 
 /// Read the user's config.toml (READ-ONLY) and build the disable args.
 /// Missing file = no user servers = just the `apps` opt-out. Recomputed per
 /// spawn so config edits apply to the next process.
-fn mcp_disable_args() -> Vec<String> {
+fn mcp_disable_args() -> Result<Vec<String>, String> {
     let text = codex_config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
@@ -627,7 +744,7 @@ impl Connection {
     /// from scratch (codex may have moved/uninstalled).
     async fn open() -> Result<Arc<Connection>, String> {
         let program = resolved_program().await?;
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
         let client = match Client::spawn(&program, events_tx).await {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -695,7 +812,7 @@ impl Connection {
 fn spawn_router(
     client: Arc<Client>,
     routes: Arc<RouteTable>,
-    mut rx: mpsc::UnboundedReceiver<ServerEvent>,
+    mut rx: mpsc::Receiver<ServerEvent>,
 ) {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
@@ -960,7 +1077,7 @@ CODEX_HOME = "/Users/x/.codex"
 command = "…"
 enabled = false
 "#;
-        let args = mcp_disable_args_from(config);
+        let args = mcp_disable_args_from(config).unwrap();
         assert_eq!(args[0..2], ["--disable".to_string(), "apps".to_string()]);
         assert!(args
             .chunks(2)
@@ -977,17 +1094,61 @@ enabled = false
         // no config / no mcp_servers table → just the built-in apps opt-out
         for text in ["", "model = \"o3\"", "not [ valid toml"] {
             assert_eq!(
-                mcp_disable_args_from(text),
+                mcp_disable_args_from(text).unwrap(),
                 vec!["--disable".to_string(), "apps".to_string()],
                 "{text:?}"
             );
         }
         // inline-table form counts too
-        let args = mcp_disable_args_from(r#"mcp_servers = { foo = { command = "x" } }"#);
+        let args = mcp_disable_args_from(r#"mcp_servers = { foo = { command = "x" } }"#).unwrap();
         assert!(args.chunks(2).any(|c| c == ["-c", "mcp_servers.foo.enabled=false"]));
-        // a name that can't ride a bare dotted -c path is skipped, never guessed
-        let args = mcp_disable_args_from("[mcp_servers.\"we ird\"]\ncommand = \"x\"\n");
+        // FAIL-CLOSED (audit R12): an ENABLED server whose name can't ride a
+        // bare dotted -c path refuses the spawn — never silently boots
+        let err = mcp_disable_args_from("[mcp_servers.\"we ird\"]\ncommand = \"x\"\n").unwrap_err();
+        assert!(err.contains("cannot be disabled"), "{err}");
+        // …but a quoted-name server that is ALREADY disabled is safely skipped
+        let args = mcp_disable_args_from(
+            "[mcp_servers.\"we ird\"]\ncommand = \"x\"\nenabled = false\n",
+        )
+        .unwrap();
         assert_eq!(args, vec!["--disable".to_string(), "apps".to_string()]);
+    }
+
+    /// Audit R8 (frozen): the bounded line reader never buffers more than the
+    /// cap — an endless line is consumed and DROPPED, framing stays intact.
+    #[tokio::test]
+    async fn bounded_line_reader_drops_oversize_and_keeps_framing() {
+        let data = {
+            let mut v = Vec::new();
+            v.extend_from_slice(b"short line\n");
+            v.extend_from_slice(&vec![b'x'; 1024]); // oversized (cap below: 64)
+            v.push(b'\n');
+            v.extend_from_slice(b"after\r\n");
+            v.extend_from_slice(b"tail without newline");
+            v
+        };
+        let mut reader = BufReader::new(std::io::Cursor::new(data));
+        assert!(matches!(
+            next_line_bounded(&mut reader, 64).await.unwrap(),
+            BoundedLine::Line(l) if l == "short line"
+        ));
+        assert!(matches!(
+            next_line_bounded(&mut reader, 64).await.unwrap(),
+            BoundedLine::Oversize
+        ));
+        // the NEXT line still parses cleanly (framing preserved, \r stripped)
+        assert!(matches!(
+            next_line_bounded(&mut reader, 64).await.unwrap(),
+            BoundedLine::Line(l) if l == "after"
+        ));
+        assert!(matches!(
+            next_line_bounded(&mut reader, 64).await.unwrap(),
+            BoundedLine::Line(l) if l == "tail without newline"
+        ));
+        assert!(matches!(
+            next_line_bounded(&mut reader, 64).await.unwrap(),
+            BoundedLine::Eof
+        ));
     }
 
     #[test]
@@ -1267,7 +1428,7 @@ enabled = false
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn session_spike() {
         let base = std::env::temp_dir().join("swarmz-session-spike");
         let cwd_a = base.join("a");
@@ -1349,13 +1510,13 @@ enabled = false
     //   cargo test mcp_disable_spike -- --ignored --nocapture
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live spike — needs the codex CLI, a login and network"]
     async fn mcp_disable_spike() {
         let cwd = std::env::temp_dir().join("swarmz-mcp-disable-spike");
         std::fs::create_dir_all(&cwd).unwrap();
 
         // context: what the user's config would boot WITHOUT the fix
-        let disable_args = mcp_disable_args();
+        let disable_args = mcp_disable_args().expect("mcp disable args");
         println!("disable args: {disable_args:?}");
 
         let host = ProcessHost::new();

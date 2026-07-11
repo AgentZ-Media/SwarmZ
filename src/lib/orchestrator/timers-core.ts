@@ -3,6 +3,7 @@
 // fire → autonomous-turn delivery) lives in ./timers.ts.
 
 import type { ConductorTimer } from "@/types";
+import { clip } from "./triggers-core";
 
 /** Max pending timers per project — the set_timer tool refuses beyond it. */
 export const MAX_TIMERS_PER_PROJECT = 20;
@@ -131,5 +132,7 @@ export function timerWireText(note: string, missed: boolean): string {
   const fired = missed
     ? "[timer fired — it was missed while the app was closed]"
     : "[timer fired]";
-  return `${fired} Your note to yourself: ${note}\n\nThis is an autonomous follow-up turn you scheduled. Act on the note now: check the fleet, follow up with agents where needed, and address the user only if something needs them.`;
+  // the note is model-authored (set_timer) — flatten it to one line so it can
+  // never fabricate a structural wire marker on a later autonomous turn
+  return `${fired} Your note to yourself: ${clip(note, MAX_NOTE_CHARS)}\n\nThis is an autonomous follow-up turn you scheduled. Act on the note now: check the fleet, follow up with agents where needed, and address the user only if something needs them.`;
 }

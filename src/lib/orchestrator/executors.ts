@@ -58,6 +58,8 @@ import {
   watchPr,
 } from "@/lib/github/controller";
 import { useOrchestrator } from "./chat-store";
+import { isAutonomousTurnInFlight } from "./controller";
+import { isFlattenedChar } from "./triggers-core";
 import {
   AGENT_REPORT_SCHEMA,
   bindReportExpectation,
@@ -208,6 +210,25 @@ function stripNotes(items: NoteItem[]): ToolNoteItem[] {
   return items.map((n) => ({ text: n.text, done: n.done }));
 }
 
+/**
+ * The (trailing-slash-normalized) folder paths whose quick-notes THIS project
+ * may see: its own project dir plus every path its sessions work in (session
+ * cwds + worktree roots). Returns null when there is no project context
+ * (dev-hook call) — the caller then exposes NO folder notes, only global.
+ */
+function allowedProjectNotePaths(ctx: ToolCallContext): Set<string> | null {
+  if (!ctx.projectId) return null;
+  const norm = (p: string) => p.replace(/\/+$/, "");
+  const allowed = new Set<string>();
+  const dir = useProjects.getState().projects[ctx.projectId]?.dir?.trim();
+  if (dir) allowed.add(norm(dir));
+  for (const e of orderedSessions(ctx.projectId)) {
+    if (e.session.projectDir?.trim()) allowed.add(norm(e.session.projectDir));
+    if (e.session.worktree?.root) allowed.add(norm(e.session.worktree.root));
+  }
+  return allowed;
+}
+
 /** The Conductor's project record — required by project-scoped tools. */
 function requireProject(ctx: ToolCallContext): { id: string; dir: string } {
   const projectId = ctx.projectId ?? "";
@@ -247,6 +268,36 @@ function requireGithub(): void {
     throw new Error(
       "GitHub integration is disabled (Settings → GitHub) — this tool is unavailable. Do not retry; if the user wants GitHub work, tell them to enable the integration.",
     );
+}
+
+/**
+ * Gate of the OUTWARD-FACING github writes (create_pr, comment_pr, and
+ * review_pr when it POSTS): these push to origin / post on github.com on the
+ * user's behalf. In an AUTONOMOUS turn (a fleet event, not a user message,
+ * drove it) they must NOT run unless the user explicitly opted in
+ * (Settings → autonomousGithubWrites, default off) — otherwise a
+ * prompt-injected autonomous cascade could open/approve/comment on the user's
+ * repo. A HUMAN-triggered turn (the user asked for it directly) stays allowed
+ * under the normal master toggle. The Conductor keeps its ability to PROPOSE
+ * the write and act on the user's next message — it only loses the ability to
+ * fire it unattended.
+ */
+function guardOutwardGithub(ctx: ToolCallContext, action: string): void {
+  if (!isAutonomousTurnInFlight(ctx.chatId)) return; // human-triggered — allowed
+  if (useSwarm.getState().settings.autonomousGithubWrites === true) return;
+  throw new Error(
+    `refused: ${action} posts to GitHub on the user's behalf and this is an AUTONOMOUS turn. Outward GitHub writes stay with the user unless they enable Settings → "Autonomous GitHub actions". Report what you would ${action} and let the user run it (or ask them to).`,
+  );
+}
+
+/**
+ * Strip any userinfo (`user:token@`) from a remote URL before it reaches the
+ * model — a PAT embedded in an `origin` URL must never leak into a tool
+ * result. Idempotent with the Rust-side redaction (git.rs); belt and braces.
+ */
+export function redactRemoteUrl(url: string | null): string | null {
+  if (!url) return null;
+  return url.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@]*@/, "$1");
 }
 
 /** Validate a PR `number` argument. */
@@ -316,6 +367,37 @@ async function withWorktreeLock<T>(
 // ---- spawn_agents ----
 
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/;
+
+/**
+ * Resolve an agent's access for a CONDUCTOR-driven tool. The Conductor can
+ * only ever grant "workspace" — "full" (danger-full-access + approvalPolicy
+ * never = the guard bypassed) is human-only, set via the session access
+ * toggle in the UI. The Rust registry drops "full" from the model-callable
+ * schema; this is the defense-in-depth twin — if "full" reaches the executor
+ * anyway it is REFUSED (never silently downgraded, so the model learns why).
+ */
+export function resolveAgentAccess(raw: unknown): VibeAccess {
+  if (raw === "full")
+    throw new Error(
+      'access "full" (danger-full-access) is human-only — the Conductor can only use "workspace". If full access is truly needed, ask the user to grant it via the agent\'s access toggle.',
+    );
+  return "workspace";
+}
+
+/**
+ * Single-line-sanitize a model-supplied agent name: control chars, the C1
+ * range and the Unicode line/para separators collapse to spaces (an agent
+ * name is interpolated into UNTRUSTED autonomous wires as «name» — a smuggled
+ * newline must never fabricate a structural line), whitespace collapses, and
+ * the result is length-capped. Empty after sanitizing = treat as "no name".
+ */
+export function sanitizeAgentName(raw: string): string {
+  let out = "";
+  for (const c of raw) {
+    out += isFlattenedChar(c.charCodeAt(0)) ? " " : c;
+  }
+  return out.replace(/\s+/g, " ").trim().slice(0, 60);
+}
 
 /**
  * How long a shared lane's NEXT initial turn waits for the previous agent's
@@ -416,8 +498,9 @@ async function spawnOneAgent(
     typeof spec.effort === "string" && spec.effort.trim()
       ? spec.effort.trim()
       : "medium"; // swarm default: sub-agents run medium unless chosen otherwise
-  const access: VibeAccess = spec.access === "full" ? "full" : "workspace";
-  const explicit = typeof spec.name === "string" ? spec.name.trim() : "";
+  const access: VibeAccess = resolveAgentAccess(spec.access);
+  const explicit =
+    typeof spec.name === "string" ? sanitizeAgentName(spec.name) : "";
   if (explicit && reservedNames.has(explicit.toLowerCase())) {
     throw new Error(
       `agent name "${explicit}" is already in use in this project — pick a different name or omit it`,
@@ -584,17 +667,21 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     return projectDocs(root);
   },
 
-  read_notes: async () => {
+  read_notes: async (_args, ctx) => {
     const { quickNotes } = useSwarm.getState();
-    return {
-      global: stripNotes(quickNotes.global),
-      folders: Object.fromEntries(
-        Object.entries(quickNotes.folders).map(([path, items]) => [
-          path,
-          stripNotes(items),
-        ]),
-      ),
-    };
+    // scope folder notes to the CALLING project only — a project's Conductor
+    // must never see another project's folder notes. Allowed paths: the
+    // project dir + every path its own sessions work in (their cwds and
+    // worktree roots). Global notes are the deliberately-shared surface.
+    const allowed = allowedProjectNotePaths(ctx);
+    const folders: Record<string, ToolNoteItem[]> = {};
+    if (allowed) {
+      for (const [path, items] of Object.entries(quickNotes.folders)) {
+        if (allowed.has(path.replace(/\/+$/, "")))
+          folders[path] = stripNotes(items);
+      }
+    }
+    return { global: stripNotes(quickNotes.global), folders };
   },
 
   git_status: async (args, ctx) => {
@@ -623,7 +710,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         deletions: g.deletions,
         untracked: g.untracked,
         dirty: g.insertions + g.deletions + g.untracked > 0,
-        remote_url: g.remote_url,
+        remote_url: redactRemoteUrl(g.remote_url),
       },
     };
   },
@@ -864,7 +951,8 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
       if (args.effort !== undefined) touched.push("effort");
     }
     if (args.access !== undefined) {
-      const access = args.access === "full" ? "full" : "workspace";
+      // the Conductor can only set "workspace" — "full" is human-only
+      const access = resolveAgentAccess(args.access);
       await setVibeAccess(id, access);
       touched.push("access");
     }
@@ -1255,6 +1343,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
 
   create_pr: async (args, ctx) => {
     requireGithub();
+    guardOutwardGithub(ctx, "open a pull request");
     const { id: projectId } = requireProject(ctx);
     const title = String(args.title ?? "").trim();
     const body = String(args.body ?? "").trim();
@@ -1348,6 +1437,9 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     const res = await reviewSession(entry.session.id, `branch:${base}`);
     const reviewText = res.review ?? "(the review returned no findings text)";
     const post = args.post === true;
+    // POSTING the review to GitHub is outward-facing — gate it in autonomous
+    // turns (running the review locally to REPORT findings stays allowed)
+    if (post) guardOutwardGithub(ctx, "post a review to");
     let posted = false;
     let postError: string | null = null;
     if (post) {
@@ -1386,6 +1478,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
 
   comment_pr: async (args, ctx) => {
     requireGithub();
+    guardOutwardGithub(ctx, "comment on a pull request");
     const { dir } = requireProject(ctx);
     const number = requirePrNumber(args.number);
     const body = String(args.body ?? "").trim();

@@ -96,16 +96,14 @@ export const tauriBackend: Backend = {
   },
 
   loadAutonomyBudgets: async () => {
-    try {
-      return (
-        (await store.get<PersistedAutonomyBudgets>("autonomyBudgets")) ?? null
-      );
-    } catch {
-      // unreadable = treated as empty; the budget only ever gets MORE
-      // permissive from that, and the caps re-establish themselves within
-      // one window — unlike the timers, nothing is lost forever
-      return null;
-    }
+    // a store READ ERROR must THROW (like loadConductorTimers) — swallowing it
+    // would make "unreadable" look like "fresh install" and silently un-latch
+    // a tripped breaker / mint a fresh allowance after a corrupt store. The
+    // hydrate distinguishes the throw (fail closed — pause autonomy) from a
+    // genuinely missing key (null = fresh, no restriction).
+    return (
+      (await store.get<PersistedAutonomyBudgets>("autonomyBudgets")) ?? null
+    );
   },
   saveAutonomyBudgets: async (data) => {
     await store.set("autonomyBudgets", data);

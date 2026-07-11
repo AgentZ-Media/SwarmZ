@@ -52,6 +52,29 @@ interface ProjectBudget {
 
 const budgets = new Map<string, ProjectBudget>();
 
+/**
+ * Fail-closed latch for a persisted-budget LOAD FAILURE. When the
+ * `autonomyBudgets` store key is unreadable (corrupt/IO error — as opposed to
+ * genuinely absent) we cannot know whether a breaker was tripped, so autonomy
+ * is paused GLOBALLY until a human takes the wheel. Only a real human message
+ * (`noteHumanTurn`) clears it — the same authority that re-arms a per-project
+ * breaker. A relaunch on a corrupt store therefore never runs an unattended
+ * autonomous turn against un-known budget state.
+ */
+let budgetsUnavailable = false;
+
+/** Latch autonomy off globally after a persisted-budget read failure. */
+export function latchAutonomyUnavailable(): void {
+  if (budgetsUnavailable) return;
+  budgetsUnavailable = true;
+  notifyAutonomyChange();
+}
+
+/** Is autonomy globally paused because the budget store could not be read? */
+export function autonomyUnavailable(): boolean {
+  return budgetsUnavailable;
+}
+
 // ---- breaker-state subscription (Phase 5: the state is UI-visible) ----
 // The Deck's orch dot (and later Phase-6 surfaces) read the latched state via
 // useSyncExternalStore: subscribe here, snapshot via `autonomyTripped` (a
@@ -124,6 +147,16 @@ export function checkAutonomyBudget(
   projectId: string,
   now: number = Date.now(),
 ): AutonomyVerdict {
+  // fail-closed: a persisted-budget read failure pauses autonomy everywhere
+  // until a human message clears it (we don't know what breakers were tripped)
+  if (budgetsUnavailable) {
+    return {
+      ok: false,
+      freshTrip: false,
+      reason:
+        "the autonomy budget state could not be loaded — autonomy is paused until you send a message",
+    };
+  }
   const b = budgetOf(projectId);
   prune(b, now);
   if (b.tripped) {
@@ -194,13 +227,23 @@ export function releaseAutonomousTurn(projectId: string, at: number): void {
  * is about volume, not lineage).
  */
 export function noteHumanTurn(projectId: string): void {
+  // a human is back in the loop — clear the global fail-closed latch too (a
+  // load-failure pause is lifted the moment a human takes the wheel)
+  let announce = false;
+  if (budgetsUnavailable) {
+    budgetsUnavailable = false;
+    announce = true;
+  }
   const b = budgets.get(projectId);
-  if (!b) return;
+  if (!b) {
+    if (announce) notifyAutonomyChange();
+    return;
+  }
   const wasTripped = b.tripped;
   const changed = wasTripped || b.consecutive !== 0;
   b.consecutive = 0;
   b.tripped = false;
-  if (wasTripped) notifyAutonomyChange();
+  if (wasTripped || announce) notifyAutonomyChange();
   if (changed) markDirty();
 }
 
@@ -284,5 +327,6 @@ export function hydrateAutonomyBudgets(
 /** Test seam — budgets are module state. */
 export function resetAutonomyBudgets(): void {
   budgets.clear();
+  budgetsUnavailable = false;
   notifyAutonomyChange();
 }

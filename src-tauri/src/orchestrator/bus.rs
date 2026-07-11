@@ -205,6 +205,40 @@ mod tests {
         assert_eq!(pending.len(), 0);
     }
 
+    /// Audit R1 (frozen): a Conductor tool call asking for full access is
+    /// refused AT THE BUS — no request ever reaches the webview, so no
+    /// session can start or reconfigure with `danger-full-access` on the
+    /// Conductor's behalf, whatever the model (or a prompt injection) sends.
+    #[tokio::test]
+    async fn full_access_is_refused_at_the_bus_entry() {
+        let pending = PendingMap::default();
+        let err = run_tool_via(
+            &pending,
+            |_req| panic!("a full-access spawn must never reach the webview"),
+            "spawn_agents",
+            json!({ "agents": [{ "task": "x", "worktree": "new", "access": "full" }] }),
+            Some("chat-1".into()),
+            Some("proj-1".into()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+        let err = run_tool_via(
+            &pending,
+            |_req| panic!("a full-access retune must never reach the webview"),
+            "set_agent_config",
+            json!({ "agent": "maya", "access": "full" }),
+            Some("chat-1".into()),
+            Some("proj-1".into()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+        assert_eq!(pending.len(), 0);
+    }
+
     #[tokio::test]
     async fn timeout_fires_and_cleans_the_pending_map() {
         let pending = PendingMap::default();

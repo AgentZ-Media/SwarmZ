@@ -290,6 +290,16 @@ export interface AppSettings {
   githubSuggestPrOnFinish?: boolean;
   /** PR watcher poll interval in seconds (default 120, floor 30). */
   githubWatchIntervalSec?: number;
+  /**
+   * Opt-in (default OFF) that lets the Conductor perform OUTWARD-FACING GitHub
+   * writes (open a PR, comment, post a review) DURING AN AUTONOMOUS turn — a
+   * fleet event drove it, not a user message. Off = those writes are refused
+   * in autonomous turns and the Conductor must PROPOSE them to the user
+   * instead; human-triggered turns (the user asked directly) always allow them
+   * under the master toggle. The safety cap against a prompt-injected
+   * autonomous cascade pushing/posting/approving on the user's repo.
+   */
+  autonomousGithubWrites?: boolean;
 }
 
 /**

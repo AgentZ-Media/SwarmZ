@@ -129,23 +129,61 @@ fn main_root(bin: &str, cwd: &Path) -> Result<PathBuf, String> {
 
 /// Make git ignore `.worktrees/` via the repo-local `.git/info/exclude` —
 /// same effect as a `.gitignore` entry, but never touches a tracked file.
+/// Anchored + no-follow (audit R4): `.git`/`info`/`exclude` are reached
+/// through no-follow handles and the exclude file is replaced atomically —
+/// a symlink planted anywhere on that chain refuses instead of redirecting
+/// the write to a host file.
 fn ensure_excluded(root: &Path) -> Result<(), String> {
-    let info = root.join(".git").join("info");
-    let exclude = info.join("exclude");
-    let current = fs::read_to_string(&exclude).unwrap_or_default();
+    use crate::fsx::DirHandle;
+    use std::io::{Read as _, Write as _};
+    let handle = DirHandle::open_root(root)?;
+    let git = handle
+        .open_dir(".git")
+        .map_err(|e| format!("refusing the .git component (symlink?): {e}"))?;
+    let info = git
+        .ensure_dir("info")
+        .map_err(|e| format!("refusing the .git/info component (symlink?): {e}"))?;
+    let current = match info.open_file("exclude") {
+        Ok(Some(file)) => {
+            let mut s = String::new();
+            // bounded — an exclude file is small; 1 MiB of it is plenty
+            std::io::Read::take(file, 1024 * 1024)
+                .read_to_string(&mut s)
+                .map_err(|e| e.to_string())?;
+            s
+        }
+        Ok(None) => String::new(),
+        Err(e) => return Err(format!("refusing the exclude file (symlink?): {e}")),
+    };
     let has_entry = current.lines().any(|l| {
         matches!(l.trim(), "/.worktrees/" | "/.worktrees" | ".worktrees/" | ".worktrees")
     });
     if has_entry {
         return Ok(());
     }
-    fs::create_dir_all(&info).map_err(|e| e.to_string())?;
     let mut next = current;
     if !next.is_empty() && !next.ends_with('\n') {
         next.push('\n');
     }
     next.push_str("# SwarmZ worktrees\n/.worktrees/\n");
-    fs::write(&exclude, next).map_err(|e| e.to_string())
+    let tmp_name = format!(
+        ".exclude.tmp-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let mut tmp = info.create_new(&tmp_name)?;
+    if let Err(e) = tmp.write_all(next.as_bytes()) {
+        let _ = info.unlink(&tmp_name);
+        return Err(e.to_string());
+    }
+    drop(tmp);
+    if let Err(e) = info.rename(&tmp_name, "exclude") {
+        let _ = info.unlink(&tmp_name);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Worktree folder name from the branch: everything after the last `/`,
@@ -225,7 +263,20 @@ pub fn add(
     run(bin, &root, &["check-ref-format", "--branch", branch])
         .map_err(|_| format!("\"{branch}\" is not a valid branch name"))?;
 
-    let path = root.join(WORKTREES_DIR).join(slug(branch));
+    // audit R4: a symlinked `.worktrees` would redirect the whole checkout
+    // (and the env copy — .env files included) to an arbitrary host folder
+    let container = root.join(WORKTREES_DIR);
+    if container
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "refusing: {} is a symlink — worktrees must live in a real folder",
+            container.display()
+        ));
+    }
+    let path = container.join(slug(branch));
     if path.exists() {
         return Err(format!(
             "worktree folder already exists: {}",
@@ -313,16 +364,59 @@ pub fn status(path: &str, bin_override: Option<&str>) -> WorktreeStatus {
     }
 }
 
+/// Resolve which SwarmZ worktree of `root` sits at `path` — from `git
+/// worktree list --porcelain`, never from caller-supplied claims. Returns
+/// `(canonical_path, branch_from_git, prunable)`; `None` when git lists no
+/// worktree at that path.
+fn find_registered_worktree(
+    bin: &str,
+    root: &Path,
+    path: &str,
+) -> Option<(String, Option<String>, bool)> {
+    let porcelain = run(bin, root, &["worktree", "list", "--porcelain"]).ok()?;
+    let wanted = crate::fsx::canonicalize_lenient(Path::new(path.trim()))?;
+    for block in porcelain.split("\n\n") {
+        let mut wt_path = None;
+        let mut branch = None;
+        let mut prunable = false;
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                wt_path = Some(p.to_string());
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+            } else if line.starts_with("prunable") {
+                prunable = true;
+            }
+        }
+        let Some(wt_path) = wt_path else { continue };
+        let Some(listed) = crate::fsx::canonicalize_lenient(Path::new(&wt_path)) else {
+            continue;
+        };
+        if listed == wanted {
+            return Some((wt_path, branch, prunable));
+        }
+    }
+    None
+}
+
 /// Remove the worktree folder and delete its branch.
 ///
-/// `force: true` discards uncommitted changes / local-only commits — for
-/// explicitly user-confirmed deletions only. `force: false` is the GATED
-/// path (the Conductor's cleanup_worktree and the silent clean-safe flows):
-/// the status is re-checked HERE, inside the same call as the removal —
-/// dirty, local-only commits or an UNCOMPUTABLE ahead count refuse — and the
-/// `git worktree remove` runs WITHOUT `--force`, so git itself refuses work
-/// that appeared between the check and the removal (the TOCTOU net; the
-/// copied gitignored env files don't block a non-force removal).
+/// Hardened surface (audit R5) — the raw command can no longer be steered at
+/// foreign paths or branches:
+///   - `path` must resolve STRICTLY inside `<root>/.worktrees` (canonical,
+///     symlink-resolving) — anything else refuses,
+///   - the worktree must be REGISTERED with git at that path, and the branch
+///     to delete is DERIVED from `git worktree list` — a caller-supplied
+///     `branch` must match it exactly or the call refuses (`git branch -D
+///     main` via a spoofed branch argument is impossible),
+///   - `force: true` discards uncommitted changes / local-only commits — for
+///     explicitly user-confirmed deletions only. `force: false` is the GATED
+///     path (the Conductor's cleanup_worktree and the silent clean-safe
+///     flows): the status is re-checked HERE, inside the same call as the
+///     removal — dirty, local-only commits or an UNCOMPUTABLE ahead count
+///     refuse — and the `git worktree remove` runs WITHOUT `--force`, so git
+///     itself refuses work that appeared between the check and the removal
+///     (the TOCTOU net; copied gitignored env files don't block it).
 pub fn remove(
     root: &str,
     path: &str,
@@ -331,13 +425,41 @@ pub fn remove(
     bin_override: Option<&str>,
 ) -> Result<(), String> {
     let bin = git_bin(bin_override);
-    let root_p = Path::new(root);
-    if Path::new(path).exists() {
+    // normalize the root through git itself — also verifies it IS a repo
+    let root_p = main_root(bin, Path::new(root))?;
+    let container = root_p.join(WORKTREES_DIR);
+    // R5 confinement: only paths strictly inside <root>/.worktrees are ever
+    // removable through this surface — `/`, the repo itself, a home folder
+    // or a foreign repo all refuse before any git write runs
+    if !crate::fsx::path_strictly_within(&container.to_string_lossy(), path) {
+        return Err(format!(
+            "refused: {path:?} is not inside this repo's .worktrees folder"
+        ));
+    }
+    // R5 identity: the worktree must be git-registered at that path, and the
+    // branch comes from git — the caller's claim is only cross-checked
+    let Some((registered_path, derived_branch, _prunable)) =
+        find_registered_worktree(bin, &root_p, path)
+    else {
+        return Err(format!(
+            "refused: git lists no worktree at {path:?} — nothing to remove"
+        ));
+    };
+    let caller_branch = branch.trim();
+    if let Some(derived) = &derived_branch {
+        if !caller_branch.is_empty() && caller_branch != derived {
+            return Err(format!(
+                "refused: branch mismatch — the worktree at {path:?} is on \"{derived}\", not \"{caller_branch}\""
+            ));
+        }
+    }
+
+    if Path::new(&registered_path).exists() {
         if force {
-            run(bin, root_p, &["worktree", "remove", "--force", path])?;
+            run(bin, &root_p, &["worktree", "remove", "--force", &registered_path])?;
         } else {
             // final re-check + removal in ONE call — unknown status = refusal
-            let st = status(path, bin_override);
+            let st = status(&registered_path, bin_override);
             if st.dirty {
                 return Err("refused: the worktree has uncommitted changes".into());
             }
@@ -348,28 +470,32 @@ pub fn remove(
             }
             if st.ahead > 0 {
                 return Err(format!(
-                    "refused: branch \"{branch}\" holds {} local-only commit(s)",
+                    "refused: branch \"{}\" holds {} local-only commit(s)",
+                    derived_branch.as_deref().unwrap_or("(detached)"),
                     st.ahead
                 ));
             }
-            run(bin, root_p, &["worktree", "remove", path])
+            run(bin, &root_p, &["worktree", "remove", &registered_path])
                 .map_err(|e| format!("git refused the removal (worktree not clean?): {e}"))?;
         }
     } else {
-        let _ = run(bin, root_p, &["worktree", "prune"]);
+        let _ = run(bin, &root_p, &["worktree", "prune"]);
         if !force {
             // a hand-deleted FOLDER may leave a branch holding commits
             // nothing else reaches — the gated path refuses to -D it then
-            match branch_ahead(bin, root_p, branch) {
+            let Some(derived) = &derived_branch else {
+                return Ok(()); // detached, folder gone — nothing to delete
+            };
+            match branch_ahead(bin, &root_p, derived) {
                 Some(0) => {}
                 Some(n) => {
                     return Err(format!(
-                        "refused: branch \"{branch}\" holds {n} local-only commit(s) — the folder is gone but the branch stays"
+                        "refused: branch \"{derived}\" holds {n} local-only commit(s) — the folder is gone but the branch stays"
                     ))
                 }
                 None => {
                     // branch already gone entirely? then nothing to delete
-                    if run(bin, root_p, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).is_ok() {
+                    if run(bin, &root_p, &["rev-parse", "--verify", &format!("refs/heads/{derived}")]).is_ok() {
                         return Err(
                             "refused: could not verify the branch's commits — resolve manually".into(),
                         );
@@ -379,8 +505,11 @@ pub fn remove(
             }
         }
     }
-    // best-effort: the branch may be checked out elsewhere or already gone
-    let _ = run(bin, root_p, &["branch", "-D", branch]);
+    // best-effort, DERIVED branch only: it may be checked out elsewhere or
+    // already gone; a caller-named branch is never deleted on its own
+    if let Some(derived) = &derived_branch {
+        let _ = run(bin, &root_p, &["branch", "-D", derived]);
+    }
     Ok(())
 }
 
@@ -509,7 +638,7 @@ mod tests {
         assert!(!st.dirty && st.ahead == 1);
 
         // list finds it under the repo root and reports the root as scanned
-        let scan = list(&[cwd.clone()], None);
+        let scan = list(std::slice::from_ref(&cwd), None);
         assert_eq!(scan.scanned, vec![cwd.clone()]);
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].branch, "test/brave-falcon-7341");
@@ -600,7 +729,7 @@ mod tests {
         run(git_bin(None), Path::new(&info.path), &["commit", "-qam", "wt"]).unwrap();
         fs::remove_dir_all(&info.path).unwrap();
 
-        let scan = list(&[cwd.clone()], None);
+        let scan = list(std::slice::from_ref(&cwd), None);
         assert_eq!(scan.entries.len(), 1);
         let entry = &scan.entries[0];
         assert!(entry.missing);
@@ -621,6 +750,67 @@ mod tests {
         assert_eq!(second.root, cwd);
         assert!(second.path.starts_with(&cwd));
         fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Audit R5 (frozen): the raw remove surface cannot be steered at
+    /// foreign paths or branches — confinement to `<root>/.worktrees`, git
+    /// as the identity source, caller branch cross-checked.
+    #[test]
+    fn remove_refuses_foreign_paths_and_branch_spoofing() {
+        let repo = temp_repo();
+        let cwd = repo.to_string_lossy().into_owned();
+        let info = add(&cwd, "test/confined", false, None).unwrap();
+
+        // (a) paths outside .worktrees refuse — even with force
+        for target in [
+            cwd.as_str(),                       // the repo itself
+            "/tmp",                             // arbitrary host folder
+            "/",                                // root
+            repo.join("src").to_string_lossy().as_ref(),
+        ] {
+            let err = remove(&cwd, target, "whatever", true, None).unwrap_err();
+            assert!(err.contains("refused"), "{target}: {err}");
+        }
+        // traversal out of .worktrees refuses too
+        let sneaky = format!("{}/.worktrees/../..", cwd);
+        assert!(remove(&cwd, &sneaky, "x", true, None).is_err());
+
+        // (b) an in-container path git does NOT list refuses
+        let fake = repo.join(".worktrees/never-created");
+        let err = remove(&cwd, &fake.to_string_lossy(), "x", true, None).unwrap_err();
+        assert!(err.contains("no worktree"), "{err}");
+
+        // (c) branch spoofing: the caller naming a FOREIGN branch refuses,
+        //     and `main` survives untouched
+        let err = remove(&cwd, &info.path, "main", true, None).unwrap_err();
+        assert!(err.contains("branch mismatch"), "{err}");
+        assert!(run(git_bin(None), &repo, &["rev-parse", "--verify", "refs/heads/main"]).is_ok());
+        assert!(Path::new(&info.path).exists(), "the worktree must survive the refusals");
+
+        // (d) the honest call (matching or empty branch) still works
+        remove(&cwd, &info.path, "", true, None).unwrap();
+        assert!(!Path::new(&info.path).exists());
+        assert!(
+            run(git_bin(None), &repo, &["rev-parse", "--verify", "refs/heads/test/confined"]).is_err(),
+            "the derived branch is deleted with the worktree"
+        );
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Audit R4 (frozen): a symlinked `.worktrees` container refuses the add
+    /// — the checkout and env copy must never be redirected to a host folder.
+    #[test]
+    fn add_refuses_a_symlinked_worktrees_container() {
+        let repo = temp_repo();
+        let cwd = repo.to_string_lossy().into_owned();
+        let outside = std::env::temp_dir().join(format!("swarmz-wt-out-{}", std::process::id()));
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join(".worktrees")).unwrap();
+        let err = add(&cwd, "test/redirected", true, None).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        fs::remove_dir_all(&repo).ok();
+        fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

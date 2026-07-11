@@ -104,7 +104,17 @@ function inlineField(s: string, max: number): string {
   let lastSpace = true;
   for (const c of s) {
     const code = c.charCodeAt(0);
-    const ch = code < 32 || code === 127 ? " " : c;
+    // C0 controls + DEL, the C1 range (0x80–0x9F) and the Unicode line/para
+    // separators (U+0085 NEL, U+2028, U+2029) all collapse to a space so a
+    // report field can never fabricate a structural wire line
+    const ch =
+      code < 32 ||
+      code === 127 ||
+      (code >= 0x80 && code <= 0x9f) ||
+      code === 0x2028 ||
+      code === 0x2029
+        ? " "
+        : c;
     if (ch === " ") {
       if (lastSpace) continue;
       lastSpace = true;

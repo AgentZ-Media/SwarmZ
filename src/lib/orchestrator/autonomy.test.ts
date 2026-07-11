@@ -4,8 +4,10 @@ import {
   MAX_AUTONOMOUS_TURNS_PER_WINDOW,
   MAX_CONSECUTIVE_AUTONOMOUS_TURNS,
   autonomyTripped,
+  autonomyUnavailable,
   checkAutonomyBudget,
   hydrateAutonomyBudgets,
+  latchAutonomyUnavailable,
   noteAutonomousTurn,
   noteHumanTurn,
   registerAutonomyPersist,
@@ -221,5 +223,49 @@ describe("autonomy budget", () => {
     }
     checkAutonomyBudget("p", T0 + 400);
     expect(notified).toBe(2);
+  });
+});
+
+describe("fail-closed load-failure latch (T3)", () => {
+  it("pauses ALL projects while latched, regardless of per-project state", () => {
+    // a fresh project would normally be allowed
+    expect(checkAutonomyBudget("p", T0).ok).toBe(true);
+    latchAutonomyUnavailable();
+    expect(autonomyUnavailable()).toBe(true);
+    const v = checkAutonomyBudget("p", T0 + 1);
+    expect(v.ok).toBe(false);
+    if (!v.ok) {
+      expect(v.freshTrip).toBe(false); // not a per-project trip
+      expect(v.reason).toContain("could not be loaded");
+    }
+    // a completely different project is paused too (global latch)
+    expect(checkAutonomyBudget("other", T0 + 2).ok).toBe(false);
+  });
+
+  it("only a human message clears the latch", () => {
+    latchAutonomyUnavailable();
+    expect(checkAutonomyBudget("p", T0).ok).toBe(false);
+    noteHumanTurn("p");
+    expect(autonomyUnavailable()).toBe(false);
+    expect(checkAutonomyBudget("p", T0 + 1).ok).toBe(true);
+  });
+
+  it("notifies subscribers on latch and on the human-cleared un-latch", () => {
+    let notified = 0;
+    const unsub = subscribeAutonomy(() => notified++);
+    latchAutonomyUnavailable();
+    expect(notified).toBe(1);
+    latchAutonomyUnavailable(); // idempotent — no second notify
+    expect(notified).toBe(1);
+    noteHumanTurn("fresh-project"); // clears the global latch even with no budget
+    expect(notified).toBe(2);
+    unsub();
+  });
+
+  it("resetAutonomyBudgets clears the latch (test hygiene)", () => {
+    latchAutonomyUnavailable();
+    resetAutonomyBudgets();
+    expect(autonomyUnavailable()).toBe(false);
+    expect(checkAutonomyBudget("p", T0).ok).toBe(true);
   });
 });

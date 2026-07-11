@@ -93,68 +93,66 @@ pub fn is_valid_slug(slug: &str) -> bool {
         && slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Refuse when `path` exists as a symlink (no-follow confinement) — a
-/// missing or regular entry passes.
-fn assert_no_symlink(path: &Path) -> Result<(), String> {
-    match path.symlink_metadata() {
-        Ok(m) if m.file_type().is_symlink() => Err(format!(
-            "refusing to follow the symlink at {}",
-            path.display()
-        )),
-        _ => Ok(()),
-    }
+use crate::fsx::DirHandle;
+
+/// The plans dir's on-disk path (for display fields only — every OPERATION
+/// goes through the anchored `DirHandle`s below, never through this path).
+fn plans_path(project_dir: &str) -> PathBuf {
+    Path::new(project_dir.trim()).join(".swarmz").join("plans")
 }
 
-/// The project's plans dir, with the `.swarmz` and `plans` components checked
-/// no-follow. The project dir itself must exist (it comes from the trusted
-/// project record, not the model).
-fn plans_dir(project_dir: &str) -> Result<PathBuf, String> {
-    let root = Path::new(project_dir.trim());
-    if project_dir.trim().is_empty() || !root.is_dir() {
+/// Open the project root as the trusted anchor. The project dir comes from
+/// the trusted project record (never the model).
+fn open_project_root(project_dir: &str) -> Result<DirHandle, String> {
+    let trimmed = project_dir.trim();
+    if trimmed.is_empty() || !Path::new(trimmed).is_dir() {
         return Err("no usable project folder for plan documents".into());
     }
-    let swarmz = root.join(".swarmz");
-    assert_no_symlink(&swarmz)?;
-    let dir = swarmz.join("plans");
-    assert_no_symlink(&dir)?;
-    Ok(dir)
+    DirHandle::open_root(Path::new(trimmed))
 }
 
-/// Open a plan file read-only WITHOUT following a symlink at the leaf, after
-/// confirming it is a regular file (a FIFO/device would hang the open or the
-/// read). Returns None when the file is missing.
-fn open_plan_nofollow(path: &Path) -> Result<Option<fs::File>, String> {
-    match path.symlink_metadata() {
-        Err(_) => return Ok(None), // missing
-        Ok(m) if m.file_type().is_symlink() => {
-            return Err(format!(
-                "refusing to follow the symlink at {}",
-                path.display()
-            ))
-        }
-        Ok(m) if !m.is_file() => {
-            return Err(format!("not a regular file: {}", path.display()))
-        }
-        Ok(_) => {}
-    }
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
+/// Open the existing plans dir ANCHORED and NO-FOLLOW: `.swarmz` and `plans`
+/// are opened component by component with `O_NOFOLLOW | O_DIRECTORY` (audit
+/// R4 — a component swapped for a symlink between check and use can no
+/// longer redirect anything; every later operation runs on the held fd).
+/// Ok(None) = the chain does not exist yet; a symlink anywhere → Err.
+fn open_plans(project_dir: &str) -> Result<Option<DirHandle>, String> {
+    let root = open_project_root(project_dir)?;
+    let swarmz = match root.is_regular_file(".swarmz")? {
+        None => return Ok(None), // nothing there yet
+        Some(true) => return Err("refusing: .swarmz is not a directory".into()),
+        Some(false) => root
+            .open_dir(".swarmz")
+            .map_err(|e| format!("refusing the .swarmz component (symlink?): {e}"))?,
     };
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new().read(true).open(path);
-    file.map(Some)
-        .map_err(|e| format!("could not open the plan: {e}"))
+    match swarmz.is_regular_file("plans")? {
+        None => Ok(None),
+        Some(true) => Err("refusing: .swarmz/plans is not a directory".into()),
+        Some(false) => Ok(Some(swarmz.open_dir("plans").map_err(|e| {
+            format!("refusing the plans component (symlink?): {e}")
+        })?)),
+    }
 }
 
-/// Bounded read of a plan file (no-follow): at most `max` bytes; a larger
-/// file errors instead of flooding memory. None = missing file.
-fn read_bounded(path: &Path, max: usize) -> Result<Option<String>, String> {
-    let Some(file) = open_plan_nofollow(path)? else {
+/// Like `open_plans`, but creates the chain when missing (write path).
+fn ensure_plans(project_dir: &str) -> Result<DirHandle, String> {
+    let root = open_project_root(project_dir)?;
+    let swarmz = root
+        .ensure_dir(".swarmz")
+        .map_err(|e| format!("could not create the .swarmz folder (symlink?): {e}"))?;
+    swarmz
+        .ensure_dir("plans")
+        .map_err(|e| format!("could not create the plans folder (symlink?): {e}"))
+}
+
+/// Bounded read of one plan file through the anchored handle (no-follow,
+/// regular files only): at most `max` bytes; a larger file errors instead of
+/// flooding memory. None = missing file.
+fn read_bounded(dir: &DirHandle, name: &str, max: usize) -> Result<Option<String>, String> {
+    let Some(file) = dir
+        .open_file(name)
+        .map_err(|e| format!("could not open the plan: {e}"))?
+    else {
         return Ok(None);
     };
     let mut buf = String::new();
@@ -171,21 +169,38 @@ fn read_bounded(path: &Path, max: usize) -> Result<Option<String>, String> {
 }
 
 /// Make git ignore `.swarmz/` via the repo-local `.git/info/exclude` —
-/// best-effort: a non-repo project simply skips this.
-fn ensure_excluded(project_dir: &Path) {
-    let info = project_dir.join(".git").join("info");
-    if !project_dir.join(".git").exists() {
+/// best-effort: a non-repo project simply skips this. Anchored + no-follow
+/// (audit R4): `.git`, `info` and the exclude file itself are reached
+/// through no-follow handles, and the exclude file is replaced atomically
+/// via a fresh temp + rename — a planted symlink is never written through.
+fn ensure_excluded(project_dir: &str) {
+    let Ok(root) = open_project_root(project_dir) else {
         return;
-    }
-    let exclude = info.join("exclude");
-    let current = fs::read_to_string(&exclude).unwrap_or_default();
+    };
+    // `.git` must be a real directory (a worktree's `.git` FILE skips —
+    // plans always live in the main project root anyway)
+    let Ok(git) = root.open_dir(".git") else {
+        return;
+    };
+    let Ok(info) = git.ensure_dir("info") else {
+        return;
+    };
+    let current = match info.open_file("exclude") {
+        Ok(Some(file)) => {
+            let mut s = String::new();
+            // bounded: an exclude file is small; 1 MiB of it is plenty
+            if file.take(1024 * 1024).read_to_string(&mut s).is_err() {
+                return;
+            }
+            s
+        }
+        Ok(None) => String::new(),
+        Err(_) => return, // symlinked/non-regular exclude — leave it alone
+    };
     let has_entry = current.lines().any(|l| {
         matches!(l.trim(), "/.swarmz/" | "/.swarmz" | ".swarmz/" | ".swarmz")
     });
     if has_entry {
-        return;
-    }
-    if fs::create_dir_all(&info).is_err() {
         return;
     }
     let mut next = current;
@@ -193,12 +208,31 @@ fn ensure_excluded(project_dir: &Path) {
         next.push('\n');
     }
     next.push_str("# SwarmZ conductor plans\n/.swarmz/\n");
-    let _ = fs::write(&exclude, next);
+    let tmp_name = format!(
+        ".exclude.tmp-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let Ok(mut tmp) = info.create_new(&tmp_name) else {
+        return;
+    };
+    use std::io::Write;
+    if tmp.write_all(next.as_bytes()).is_err() {
+        let _ = info.unlink(&tmp_name);
+        return;
+    }
+    drop(tmp);
+    if info.rename(&tmp_name, "exclude").is_err() {
+        let _ = info.unlink(&tmp_name);
+    }
 }
 
-/// First `# ` heading of a file's head (bounded, no-follow), else None.
-fn read_title(path: &Path) -> Option<String> {
-    let file = open_plan_nofollow(path).ok().flatten()?;
+/// First `# ` heading of a file's head (bounded, no-follow through the
+/// anchored handle), else None.
+fn read_title(dir: &DirHandle, name: &str) -> Option<String> {
+    let file = dir.open_file(name).ok().flatten()?;
     let mut head = String::new();
     // a bounded read may cut a multibyte char at the boundary — read bytes,
     // convert lossily (the title scan only needs the first lines)
@@ -232,12 +266,29 @@ fn modified_ms(meta: &fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
+/// Process-wide write locks per project dir (audit R12): the collision
+/// check + temp write + rename run as ONE transaction, so two parallel
+/// `write_plan` calls can no longer race the collision check into silently
+/// overwriting each other's document.
+static WRITE_LOCKS: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<parking_lot::Mutex<()>>>>,
+> = once_cell::sync::Lazy::new(Default::default);
+
+fn write_lock_for(project_dir: &str) -> std::sync::Arc<parking_lot::Mutex<()>> {
+    let key = Path::new(project_dir.trim())
+        .canonicalize()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| project_dir.trim().to_string());
+    WRITE_LOCKS.lock().entry(key).or_default().clone()
+}
+
 /// Write (or replace) one plan document. Returns the written document's info.
 ///
 /// Same title → same slug → replace. A DIFFERENT title that collides on the
 /// same slug gets a stable hash suffix instead of silently overwriting the
-/// other document. The write is atomic: fresh temp file + rename (a planted
-/// symlink at the target is REPLACED, never followed).
+/// other document. The write is atomic: fresh temp file + rename ON THE
+/// ANCHORED handle (a planted symlink at the target is REPLACED, never
+/// followed — and a swapped intermediate component can't redirect the write).
 pub fn write(project_dir: &str, title: &str, markdown: &str) -> Result<PlanInfo, String> {
     let title = title.trim();
     if title.is_empty() {
@@ -258,9 +309,13 @@ pub fn write(project_dir: &str, title: &str, markdown: &str) -> Result<PlanInfo,
             markdown.len()
         ));
     }
-    let dir = plans_dir(project_dir)?;
-    fs::create_dir_all(&dir).map_err(|e| format!("could not create the plans folder: {e}"))?;
-    ensure_excluded(Path::new(project_dir.trim()));
+    // one write transaction per project at a time (audit R12)
+    let lock = write_lock_for(project_dir);
+    let _guard = lock.lock();
+
+    let dir = ensure_plans(project_dir)?;
+    let dir_path = plans_path(project_dir);
+    ensure_excluded(project_dir);
 
     // ensure a leading H1 title so list() can show it (## alone is not one)
     let content = if markdown.trim_start().starts_with("# ") {
@@ -279,8 +334,7 @@ pub fn write(project_dir: &str, title: &str, markdown: &str) -> Result<PlanInfo,
     // slug collision of DIFFERENT titles → deterministic hash suffix
     let mut slug = slugify(title);
     debug_assert!(is_valid_slug(&slug));
-    let candidate = dir.join(format!("{slug}.md"));
-    if let Some(existing_title) = read_title(&candidate) {
+    if let Some(existing_title) = read_title(&dir, &format!("{slug}.md")) {
         if existing_title != effective_title {
             let base_max = MAX_SLUG_LEN - 9; // room for "-xxxxxxxx"
             let mut base = slug.clone();
@@ -290,8 +344,7 @@ pub fn write(project_dir: &str, title: &str, markdown: &str) -> Result<PlanInfo,
             }
             slug = format!("{base}-{}", hash8(title));
             debug_assert!(is_valid_slug(&slug));
-            let suffixed = dir.join(format!("{slug}.md"));
-            if let Some(t) = read_title(&suffixed) {
+            if let Some(t) = read_title(&dir, &format!("{slug}.md")) {
                 if t != effective_title {
                     return Err(format!(
                         "slug collision: \"{slug}\" already holds a different plan — pick a more distinct title"
@@ -301,31 +354,38 @@ pub fn write(project_dir: &str, title: &str, markdown: &str) -> Result<PlanInfo,
         }
     }
 
-    let path = dir.join(format!("{slug}.md"));
+    let file_name = format!("{slug}.md");
     // no-follow: a planted symlink (or FIFO) at the target refuses — the
     // rename below would replace it, but never write THROUGH it either way
-    match path.symlink_metadata() {
-        Ok(m) if !m.is_file() => {
-            return Err(format!(
-                "refusing to replace the non-regular file at {}",
-                path.display()
-            ))
-        }
-        _ => {}
+    if matches!(dir.is_regular_file(&file_name), Ok(Some(false))) {
+        return Err(format!(
+            "refusing to replace the non-regular file at {}",
+            dir_path.join(&file_name).display()
+        ));
     }
-    // atomic replace: fresh temp file in the same dir + rename over
-    let tmp = dir.join(format!(
+    // atomic replace: fresh temp file in the same (anchored) dir + rename
+    let tmp_name = format!(
         ".{slug}.tmp-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
-    ));
-    fs::write(&tmp, &content).map_err(|e| format!("could not write the plan: {e}"))?;
-    if let Err(e) = fs::rename(&tmp, &path) {
-        let _ = fs::remove_file(&tmp);
+    );
+    {
+        use std::io::Write;
+        let mut tmp = dir
+            .create_new(&tmp_name)
+            .map_err(|e| format!("could not write the plan: {e}"))?;
+        if let Err(e) = tmp.write_all(content.as_bytes()) {
+            let _ = dir.unlink(&tmp_name);
+            return Err(format!("could not write the plan: {e}"));
+        }
+    }
+    if let Err(e) = dir.rename(&tmp_name, &file_name) {
+        let _ = dir.unlink(&tmp_name);
         return Err(format!("could not write the plan: {e}"));
     }
+    let path = dir_path.join(&file_name);
     let meta = path.symlink_metadata().map_err(|e| e.to_string())?;
     Ok(PlanInfo {
         slug,
@@ -338,42 +398,48 @@ pub fn write(project_dir: &str, title: &str, markdown: &str) -> Result<PlanInfo,
 
 /// All plan documents of a project, newest modified first. Only regular
 /// `<valid-slug>.md` files are served — symlinks and foreign files never.
+/// Enumeration reads names from the directory; every per-file check and read
+/// then runs through the anchored no-follow handle (audit R4).
 pub fn list(project_dir: &str) -> Result<Vec<PlanInfo>, String> {
-    let dir = plans_dir(project_dir)?;
-    let Ok(entries) = fs::read_dir(&dir) else {
+    let Some(dir) = open_plans(project_dir)? else {
         return Ok(Vec::new()); // no plans yet
+    };
+    let dir_path = plans_path(project_dir);
+    let Ok(entries) = fs::read_dir(&dir_path) else {
+        return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else { continue };
+        let Some(stem) = name.strip_suffix(".md") else {
             continue;
         };
-        if path.extension().and_then(|e| e.to_str()) != Some("md") || !is_valid_slug(stem) {
+        if !is_valid_slug(stem) {
             continue; // foreign files in the folder are ignored, never served
         }
-        // no-follow: DirEntry::file_type() does NOT traverse symlinks — a
+        // no-follow, ON THE HANDLE: only regular files are served — a
         // safe-named symlink to a host file is skipped, not leaked
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_file() {
+        if !matches!(dir.is_regular_file(name), Ok(Some(true))) {
             continue;
         }
+        let path = dir_path.join(name);
         let Ok(meta) = path.symlink_metadata() else { continue };
         out.push(PlanInfo {
             slug: stem.to_string(),
-            title: read_title(&path).unwrap_or_else(|| stem.to_string()),
+            title: read_title(&dir, name).unwrap_or_else(|| stem.to_string()),
             path: path.to_string_lossy().into_owned(),
             modified_ms: modified_ms(&meta),
             size: meta.len(),
         });
     }
-    out.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    out.sort_by_key(|p| std::cmp::Reverse(p.modified_ms));
     Ok(out)
 }
 
-/// Read one plan by slug — the slug is re-validated, the open is no-follow
-/// and the read bounded, so only regular files the Conductor itself wrote
-/// are reachable.
+/// Read one plan by slug — the slug is re-validated, the open runs no-follow
+/// on the anchored handle and the read is bounded, so only regular files the
+/// Conductor itself wrote are reachable.
 pub fn read(project_dir: &str, slug: &str) -> Result<PlanDocument, String> {
     let slug = slug.trim();
     if !is_valid_slug(slug) {
@@ -381,13 +447,16 @@ pub fn read(project_dir: &str, slug: &str) -> Result<PlanDocument, String> {
             "invalid plan slug {slug:?} — slugs are lowercase a-z0-9- (from list_plans)"
         ));
     }
-    let dir = plans_dir(project_dir)?;
-    let path = dir.join(format!("{slug}.md"));
-    let content = read_bounded(&path, MAX_PLAN_BYTES)?
+    let dir = open_plans(project_dir)?
+        .ok_or_else(|| format!("no plan \"{slug}\" in this project (see list_plans)"))?;
+    let content = read_bounded(&dir, &format!("{slug}.md"), MAX_PLAN_BYTES)?
         .ok_or_else(|| format!("no plan \"{slug}\" in this project (see list_plans)"))?;
     Ok(PlanDocument {
         slug: slug.to_string(),
-        path: path.to_string_lossy().into_owned(),
+        path: plans_path(project_dir)
+            .join(format!("{slug}.md"))
+            .to_string_lossy()
+            .into_owned(),
         content,
     })
 }

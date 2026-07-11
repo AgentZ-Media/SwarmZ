@@ -231,6 +231,35 @@ function capPerProject(
   return kept;
 }
 
+/**
+ * Backend cleanup sink for sessions the per-project cap EVICTS. Registered by
+ * the controller (a store→controller import would be a cycle — same
+ * registration pattern as the timer/autonomy sinks). The store removes the
+ * evicted entry from its OWN state; this sink ends the Rust child process and
+ * drops the controller's per-session maps (liveBackends / streams /
+ * lastTurnOutcomes / schemaTurns / compacting / usage-mirror timers) — without
+ * it the process and those maps leak on every eviction. Called with the
+ * entries STILL PRESENT in the store so the sink can flush final usage
+ * accounting before they vanish.
+ */
+let evictionSink: ((ids: string[]) => void) | null = null;
+
+/** Install the eviction sink (controller.ts, at module load). */
+export function registerSessionEvictionSink(
+  fn: ((ids: string[]) => void) | null,
+): void {
+  evictionSink = fn;
+}
+
+function notifyEvicted(ids: string[]): void {
+  if (!ids.length || !evictionSink) return;
+  try {
+    evictionSink(ids);
+  } catch {
+    /* a broken sink must never break a store update */
+  }
+}
+
 /** Replace one session entry immutably, only touching that entry's reference. */
 function withEntry(
   state: VibeState,
@@ -299,9 +328,12 @@ export const useVibe = create<VibeState>((set, get) => ({
     // newest first — the PER-PROJECT cap drops that project's oldest sessions
     const sessions = { ...state.sessions, [s.id]: entry };
     const order = capPerProject([s.id, ...state.order], sessions);
-    for (const oid of state.order) {
-      if (!order.includes(oid)) delete sessions[oid];
-    }
+    const evicted = state.order.filter((oid) => !order.includes(oid));
+    // close the evicted sessions' backends BEFORE removing them from state —
+    // the sink reads the live entry to flush final usage accounting, then
+    // ends the Rust process + controller maps (the real per-eviction leak fix)
+    if (evicted.length) notifyEvicted(evicted);
+    for (const oid of evicted) delete sessions[oid];
     set({
       sessions,
       order,
@@ -781,9 +813,16 @@ export async function hydrateVibeSessions(): Promise<void> {
       : order,
     mergedSessions,
   );
-  // drop anything beyond the per-project cap
+  // drop anything beyond the per-project cap — a LIVE pre-hydrate session
+  // dropped here (rare: live picks are newest, so normally kept) still needs
+  // its backend torn down, so route the eviction through the sink too
+  const evictedOnHydrate: string[] = [];
   for (const id of Object.keys(mergedSessions))
-    if (!mergedOrder.includes(id)) delete mergedSessions[id];
+    if (!mergedOrder.includes(id)) {
+      delete mergedSessions[id];
+      evictedOnHydrate.push(id);
+    }
+  if (evictedOnHydrate.length) notifyEvicted(evictedOnHydrate);
   // per-project selection map: only entries whose session survived AND still
   // belongs to that project; live (pre-hydrate) picks win
   const activeIdByProject: Record<string, string> = {};

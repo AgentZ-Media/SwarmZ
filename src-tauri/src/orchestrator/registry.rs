@@ -146,7 +146,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                                 "worktree": { "type": "string", "description": "\"new\" | \"shared:<agentName>\" | \"none\" — where the agent works" },
                                 "model": { "type": "string", "description": "codex model id; OMIT for the default (gpt-5.6-sol)" },
                                 "effort": { "type": "string", "description": "reasoning effort (e.g. low, medium, high, xhigh); OMIT for medium" },
-                                "access": { "type": "string", "enum": ["workspace", "full"], "description": "sandbox level — omit for workspace (recommended)" },
+                                // SECURITY (audit R1): "full" (danger-full-access, approvals off)
+                                // is deliberately NOT model-callable — only the human can grant
+                                // it via the session's access toggle. The bus validates against
+                                // this enum server-side, so a Conductor call asking for "full"
+                                // is refused before any session starts.
+                                "access": { "type": "string", "enum": ["workspace"], "description": "sandbox level — always the workspace sandbox; full access can only be granted by the human in the UI" },
                                 "name": { "type": "string", "description": "agent name (default: auto from the pool)" },
                                 "expect_report": { "type": "boolean", "description": "true = the agent must end its task turn with a machine-readable status report (done, summary, files_changed, tests_pass, needs_human, question, followups) — set it for implementation tasks whose completion you will judge; the report reaches you with the agent-finished notice" }
                             },
@@ -201,7 +206,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "agent": agent_param(),
                     "model": { "type": "string", "description": "codex model id (\"\" clears the override)" },
                     "effort": { "type": "string", "description": "reasoning effort (\"\" clears the override)" },
-                    "access": { "type": "string", "enum": ["workspace", "full"], "description": "sandbox level" }
+                    // SECURITY (audit R1): no "full" here either — see spawn_agents.
+                    // The Conductor may re-confine an agent to workspace, never widen it.
+                    "access": { "type": "string", "enum": ["workspace"], "description": "sandbox level — always the workspace sandbox; full access can only be granted by the human in the UI" }
                 },
                 "required": ["agent"]
             }),
@@ -571,8 +578,55 @@ mod tests {
         "watch_pr",
     ];
 
+    /// Audit R1 (frozen): the Conductor can NEVER request full access.
+    /// "full" is absent from every model-callable schema, and the Rust-side
+    /// bus validation (`validate_args`, enum check in `run_tool_via`)
+    /// hard-refuses it BEFORE any session starts or reconfigures. Full
+    /// access remains a human-only UI action (`vibe_session_set_access`).
     #[test]
-    fn catalog_is_the_frozen_phase4_arsenal_and_serializes() {
+    fn conductor_cannot_request_full_access() {
+        let spawn = find_tool("spawn_agents").unwrap();
+        assert_eq!(
+            spawn.parameters["properties"]["agents"]["items"]["properties"]["access"]["enum"],
+            json!(["workspace"]),
+            "spawn_agents access enum must be workspace-only"
+        );
+        let config = find_tool("set_agent_config").unwrap();
+        assert_eq!(
+            config.parameters["properties"]["access"]["enum"],
+            json!(["workspace"]),
+            "set_agent_config access enum must be workspace-only"
+        );
+        // the bus-side validation refuses "full" outright…
+        let err = validate_args(
+            &spawn,
+            &json!({ "agents": [{ "task": "x", "worktree": "none", "access": "full" }] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+        let err = validate_args(&config, &json!({ "agent": "maya", "access": "full" })).unwrap_err();
+        assert!(err.contains("one of"), "unexpected error: {err}");
+        // …while "workspace" (and omitting access) keeps working
+        assert!(validate_args(
+            &spawn,
+            &json!({ "agents": [{ "task": "x", "worktree": "none", "access": "workspace" }] })
+        )
+        .is_ok());
+        assert!(validate_args(&config, &json!({ "agent": "maya", "access": "workspace" })).is_ok());
+        // no other tool sneaks in an access enum carrying "full"
+        for def in tool_definitions() {
+            let s = serde_json::to_string(&def.parameters).unwrap();
+            assert!(
+                !s.contains(r#""enum":["workspace","full"]"#)
+                    && !s.contains(r#""enum": ["workspace", "full"]"#),
+                "tool {} still offers full access",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_is_the_frozen_phase7_arsenal_and_serializes() {
         let defs = tool_definitions();
         let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
         for expected in EXPECTED_TOOLS {
