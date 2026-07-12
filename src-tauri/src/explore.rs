@@ -151,6 +151,10 @@ fn child_names(project_dir: &str, base: &[&str], below: &[String]) -> Vec<String
     };
     let mut names: Vec<String> = entries
         .flatten()
+        // hard ceiling on the raw enumeration: a pathologically large
+        // directory must not force an unbounded read+sort before
+        // MAX_LIST_ENTRIES ever gets a chance to apply
+        .take(MAX_LIST_ENTRIES.saturating_mul(4))
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
         .filter(|n| !n.starts_with('.')) // hidden entries are never served
         .collect();
