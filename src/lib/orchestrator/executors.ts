@@ -60,6 +60,7 @@ import {
 import { useOrchestrator } from "./chat-store";
 import { isAutonomousTurnInFlight } from "./controller";
 import { isFlattenedChar } from "./triggers-core";
+import { withWorktreeBriefing } from "./briefing";
 import {
   AGENT_REPORT_SCHEMA,
   bindReportExpectation,
@@ -605,6 +606,20 @@ async function spawnOneAgent(
     useVibe.getState().setWorktreeShared(placement.sharedHostId, true);
   }
   const entry = useVibe.getState().sessions[id];
+  // worktree placements get the workspace briefing prepended to the first
+  // task — the agent must know it sits in a worktree, where the main repo
+  // lives and that dependency dirs were not copied (briefing.ts)
+  const text = withWorktreeBriefing(
+    task,
+    placement.worktree
+      ? {
+          worktreePath: placement.cwd,
+          branch: placement.worktree.branch,
+          mainRepoRoot: placement.worktree.root,
+          shared: placement.worktree.shared,
+        }
+      : null,
+  );
   return {
     result: {
       id,
@@ -613,7 +628,7 @@ async function spawnOneAgent(
       branch: placement.worktree?.branch ?? null,
       shared: placement.worktree?.shared ?? false,
     },
-    task: { id, text: task, expectReport: spec.expect_report === true },
+    task: { id, text, expectReport: spec.expect_report === true },
   };
 }
 
@@ -763,6 +778,32 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         remote_url: redactRemoteUrl(g.remote_url),
       },
     };
+  },
+
+  // ---- read-only project exploration (mission upgrades) ----
+  //
+  // Rust-confined (explore.rs): anchored no-follow walks, hidden components
+  // refused, listings/reads bounded. The project dir comes from the trusted
+  // chat context — the model only ever supplies RELATIVE paths.
+
+  list_files: async (args, ctx) => {
+    const { dir } = requireProject(ctx);
+    const path = typeof args.path === "string" ? args.path : "";
+    // clamp HERE too: the Rust command takes a u32, a negative/absurd depth
+    // must degrade into the sane range instead of a deserialization error
+    const depth =
+      typeof args.depth === "number" && Number.isFinite(args.depth)
+        ? Math.max(1, Math.min(3, Math.trunc(args.depth)))
+        : 2;
+    return invoke("conductor_fs_list", { projectDir: dir, path, depth });
+  },
+
+  read_file: async (args, ctx) => {
+    const { dir } = requireProject(ctx);
+    return invoke("conductor_fs_read", {
+      projectDir: dir,
+      path: String(args.path ?? ""),
+    });
   },
 
   list_projects: async (args) => {

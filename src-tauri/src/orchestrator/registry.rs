@@ -114,6 +114,30 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
         ToolDefinition {
+            name: "list_files",
+            description: "Read-only listing of THIS project's file tree (relative paths, sorted): folders and files with sizes, up to 3 levels deep, capped at 500 entries. Hidden files/folders (.env, .git, .swarmz, …) are never served, dependency/build dirs (node_modules, target, …) show as an entry but are not descended into, symlinks are skipped. Use this to ground your decomposition and agent briefs in the real repo layout before spawning anyone — it does not replace agents for actual analysis work.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "folder to list, relative to the project root — omit or \"\" for the root" },
+                    "depth": { "type": "integer", "description": "levels to descend, 1–3 (default 2)" }
+                }
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        ToolDefinition {
+            name: "read_file",
+            description: "Read ONE text file of THIS project (relative path from list_files), bounded: content is capped at 128 KiB (larger files truncate and say so), binary files refuse, hidden files (.env, .git, …) are never served. For orientation and brief-writing — deep analysis still belongs to agents.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "file path relative to the project root" }
+                },
+                "required": ["path"]
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
+        ToolDefinition {
             name: "list_projects",
             description: "Discover the user's project folders: Codex session history, folders the app already knows, and a shallow scan of extra roots for git repos. When scan_roots is omitted, the user's configured default scan folders are used. Sorted by last activity, most recent first.",
             parameters: json!({
@@ -543,14 +567,16 @@ pub fn validate_args(def: &ToolDefinition, args: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// The frozen Phase-4 catalog + the Phase-7 GitHub tools — a missing or
-    /// extra tool fails loudly.
-    pub const EXPECTED_TOOLS: [&str; 30] = [
+    /// The frozen Phase-4 catalog + the Phase-7 GitHub tools + the
+    /// mission-upgrade explore pair — a missing or extra tool fails loudly.
+    pub const EXPECTED_TOOLS: [&str; 32] = [
         "fleet_snapshot",
         "read_agent",
         "read_project_docs",
         "read_notes",
         "git_status",
+        "list_files",
+        "read_file",
         "list_projects",
         "spawn_agents",
         "prompt_agent",
@@ -649,6 +675,21 @@ mod tests {
         for legacy in ["create_panes", "prompt_pane", "read_transcript"] {
             assert!(find_tool(legacy).is_none(), "legacy tool {legacy} still present");
         }
+    }
+
+    #[test]
+    fn explore_tools_validate_args() {
+        let read = find_tool("read_file").unwrap();
+        let err = validate_args(&read, &json!({})).unwrap_err();
+        assert!(err.contains("path"), "unexpected error: {err}");
+        assert!(validate_args(&read, &json!({ "path": "src/main.rs" })).is_ok());
+        let err = validate_args(&read, &json!({ "path": 3 })).unwrap_err();
+        assert!(err.contains("string"), "unexpected error: {err}");
+        let list = find_tool("list_files").unwrap();
+        assert!(validate_args(&list, &json!({})).is_ok());
+        assert!(validate_args(&list, &json!({ "path": "src", "depth": 2 })).is_ok());
+        let err = validate_args(&list, &json!({ "depth": "two" })).unwrap_err();
+        assert!(err.contains("integer"), "unexpected error: {err}");
     }
 
     #[test]

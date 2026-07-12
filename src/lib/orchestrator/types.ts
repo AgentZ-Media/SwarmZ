@@ -64,13 +64,16 @@ export interface ProjectEntry {
 // only (executor lookup + typing); schemas are never duplicated here.
 
 /** The tool names — must match the Rust registry exactly (Phase 4: 24,
- * Phase 7 adds the 7 GitHub tools → 31). */
+ * Phase 7 adds the 7 GitHub tools → 31, the mission upgrades add
+ * list_files/read_file → 33). */
 export const ORCHESTRATOR_TOOL_NAMES = [
   "fleet_snapshot",
   "read_agent",
   "read_project_docs",
   "read_notes",
   "git_status",
+  "list_files",
+  "read_file",
   "list_projects",
   "spawn_agents",
   "prompt_agent",

@@ -32,6 +32,19 @@ export const TRIGGER_RETRY_MS = 30_000;
 export const MAX_TRIGGER_ATTEMPTS = 10;
 /** Every Nth delivered agent-finished turn carries the reflect nudge. */
 export const REFLECT_EVERY_N_FINISHES = 3;
+/**
+ * Kinds that COALESCE: finish/blocked events that pile up behind a running
+ * turn are batched into ONE autonomous turn (one budget unit) instead of
+ * burning the 5-consecutive allowance one agent at a time — a 15-agent wave
+ * used to trip the breaker at the 6th finish. Approvals, timers, idle checks
+ * and PR updates stay individual (urgent, rare, or re-checked at delivery).
+ */
+export const COALESCE_KINDS: ReadonlySet<AutonomousTriggerKind> = new Set([
+  "agent-finished",
+  "agent-blocked",
+]);
+/** Max events one batched turn carries — the excess flushes as the next turn. */
+export const MAX_COALESCED_EVENTS = 8;
 
 export type TriggerEligibility = "ok" | "retry" | "drop";
 export type TriggerOutcome = "delivered" | "retry" | "drop";
@@ -107,7 +120,18 @@ export function createTriggerRouter(deps: TriggerRouterDeps): TriggerRouter {
   const held = new Set<string>();
   /** per-project serialization chains */
   const chains = new Map<string, Promise<unknown>>();
+  /** prepared COALESCE_KINDS triggers waiting for the next batched flush */
+  const ready = new Map<string, ReadyItem[]>();
+  /** projects with a flush already queued into their chain */
+  const flushQueued = new Set<string>();
   let generation = 0; // reset() invalidates scheduled retries
+
+  interface ReadyItem {
+    t: QueuedTrigger;
+    key: string;
+    gen: number;
+    retryLater: () => void;
+  }
 
   function runExclusive<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
     const tail = chains.get(projectId) ?? Promise.resolve();
@@ -126,6 +150,63 @@ export function createTriggerRouter(deps: TriggerRouterDeps): TriggerRouter {
     } catch {
       /* observer errors never break the router */
     }
+  }
+
+  /**
+   * Flush the project's ready batch as ONE autonomous turn (one budget
+   * unit). Runs inside the serialization chain; events that piled up while
+   * a previous turn ran are combined via `combineFleetEvents`. Outcomes are
+   * per batch: delivered/drop settle every member, retry re-arms every
+   * member individually (each keeps its own attempt counter).
+   */
+  function queueFlush(projectId: string): void {
+    if (flushQueued.has(projectId)) return;
+    flushQueued.add(projectId);
+    const gen = generation;
+    void runExclusive(projectId, async () => {
+      flushQueued.delete(projectId);
+      if (gen !== generation) return;
+      const list = ready.get(projectId) ?? [];
+      const batch = list
+        .splice(0, MAX_COALESCED_EVENTS)
+        .filter((i) => i.gen === generation);
+      if (list.length === 0) ready.delete(projectId);
+      else queueFlush(projectId); // the excess flushes as the next turn
+      if (batch.length === 0) return;
+      // re-check eligibility inside the chain — the world may have changed
+      const passing: ReadyItem[] = [];
+      for (const item of batch) {
+        const gate = deps.eligibility(item.t.projectId, item.t.kind);
+        if (gate === "drop") settle(item.t, item.key, "dropped");
+        else if (gate === "retry") item.retryLater();
+        else passing.push(item);
+      }
+      // build fresh, at delivery time (the build may refine the kind)
+      const built: { item: ReadyItem; built: BuiltTrigger }[] = [];
+      for (const item of passing) {
+        const b = await item.t.build().catch(() => null);
+        if (!b) settle(item.t, item.key, "dropped");
+        else built.push({ item, built: { ...b, kind: b.kind ?? item.t.kind } });
+      }
+      if (built.length === 0) return;
+      const combined = combineFleetEvents(built.map((b) => b.built));
+      let outcome: TriggerOutcome;
+      try {
+        outcome = await deps.run(
+          projectId,
+          combined.kind ?? built[0].item.t.kind,
+          combined,
+        );
+      } catch {
+        outcome = "retry"; // a thrown runner counts as transient
+      }
+      if (gen !== generation) return;
+      for (const { item } of built) {
+        if (outcome === "delivered") settle(item.t, item.key, "delivered");
+        else if (outcome === "drop") settle(item.t, item.key, "dropped");
+        else item.retryLater();
+      }
+    });
   }
 
   function attempt(t: QueuedTrigger, key: string, attemptNo: number, gen: number): void {
@@ -152,6 +233,19 @@ export function createTriggerRouter(deps: TriggerRouterDeps): TriggerRouter {
     const prepared: Promise<void> = t.prepare
       ? t.prepare().catch(() => {})
       : Promise.resolve();
+    if (COALESCE_KINDS.has(t.kind)) {
+      // finish/blocked events land in the project's ready batch once
+      // prepared; the flush combines everything that accumulated while a
+      // previous turn ran into ONE turn (one budget unit)
+      void prepared.then(() => {
+        if (gen !== generation) return;
+        const list = ready.get(t.projectId) ?? [];
+        list.push({ t, key, gen, retryLater });
+        ready.set(t.projectId, list);
+        queueFlush(t.projectId);
+      });
+      return;
+    }
     void prepared.then(() => runExclusive(t.projectId, async () => {
       // re-check inside the chain — the world may have changed while queued
       const gate2 = deps.eligibility(t.projectId, t.kind);
@@ -189,6 +283,8 @@ export function createTriggerRouter(deps: TriggerRouterDeps): TriggerRouter {
       generation += 1;
       held.clear();
       chains.clear();
+      ready.clear();
+      flushQueued.clear();
     },
   };
 }
@@ -235,7 +331,7 @@ export function classifyAgentFinish(
 
 // ---- wire-text builders (English, like every other Conductor wire) ----
 
-const LEAD_CONTRACT =
+export const LEAD_CONTRACT =
   "This is an autonomous turn — no user message triggered it. Act as the lead: judge the result (read_agent / git_status / review_agent when warranted), hand out follow-up tasks yourself when they clearly serve the user's standing goal, and close the loop with a compact report of what got done and what you suggest next. Escalate to the user only what genuinely needs their call.";
 
 /** The soft learning nudge, appended every Nth finished cycle. */
@@ -340,6 +436,63 @@ export function agentFinishedWire(input: AgentFinishedWireInput): string {
 
 export function agentFinishedMarker(name: string): string {
   return `⚙ Agent finished: «${clip(name, 80)}»`;
+}
+
+// ---- batched fleet events (finish coalescing) ----
+
+/** "3 finished · 1 needs direction" (blocked part omitted when zero). */
+function fleetEventCounts(finished: number, blocked: number): string {
+  const parts: string[] = [];
+  if (finished > 0) parts.push(`${finished} finished`);
+  if (blocked > 0)
+    parts.push(`${blocked} need${blocked === 1 ? "s" : ""} direction`);
+  return parts.join(" · ") || "0 events";
+}
+
+/**
+ * Combine several built finish/blocked triggers into ONE turn. A single
+ * event passes through untouched. For a batch, each event's wire becomes a
+ * marker-free section (the leading structural `[…]` marker is stripped —
+ * per doctrine an event marker is genuine only at the very START of a
+ * wake-up message, so only the batch's own `[fleet events]` header carries
+ * one) and the shared LEAD_CONTRACT / REFLECT_NUDGE paragraphs are deduped
+ * to a single trailing copy. Safe on untrusted payloads: everything inside
+ * the wires is already single-line flattened, so no payload can span a
+ * `\n\n` paragraph boundary and impersonate the contract.
+ */
+export function combineFleetEvents(built: BuiltTrigger[]): BuiltTrigger {
+  if (built.length === 1) return built[0];
+  const n = built.length;
+  const blocked = built.filter((b) => b.kind === "agent-blocked").length;
+  const finished = n - blocked;
+  let anyNudge = false;
+  const sections = built.map((b, i) => {
+    const paras = b.wire.split("\n\n").filter((p) => {
+      if (p === REFLECT_NUDGE) {
+        anyNudge = true;
+        return false;
+      }
+      return p !== LEAD_CONTRACT;
+    });
+    if (paras.length > 0) {
+      // strip the event's own leading structural marker — only the batch
+      // header may carry one
+      paras[0] = paras[0].replace(/^\[[^\]\n]{1,60}\]\s*/, "");
+    }
+    return `— Event ${i + 1}/${n} —\n${paras.join("\n\n")}`;
+  });
+  const parts = [
+    `[fleet events] ${n} fleet events landed while you worked (${fleetEventCounts(finished, blocked)}). One section per event below — work through ALL of them in this single turn.`,
+    ...sections,
+    LEAD_CONTRACT,
+  ];
+  if (anyNudge) parts.push(REFLECT_NUDGE);
+  return {
+    marker: `⚙ Fleet events: ${fleetEventCounts(finished, blocked)}`,
+    wire: parts.join("\n\n"),
+    // one agent asking for direction outranks the finishes in urgency
+    kind: blocked > 0 ? "agent-blocked" : "agent-finished",
+  };
 }
 
 export interface AgentBlockedWireInput {
