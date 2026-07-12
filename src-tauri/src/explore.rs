@@ -89,7 +89,10 @@ fn components_of(rel: &str) -> Result<Vec<&str>, String> {
             "absolute paths are not allowed here — pass a path relative to the project root, got {rel:?}"
         ));
     }
-    if rel.contains('\\') || rel.contains('\0') {
+    // ':' is rejected wholesale: on Windows a `C:`-prefixed component makes
+    // `PathBuf::join` DISCARD the base path (drive-prefix semantics), and no
+    // legitimate project-relative path needs one — fail closed on any colon
+    if rel.contains('\\') || rel.contains('\0') || rel.contains(':') {
         return Err(format!("invalid path {rel:?}"));
     }
     let mut out = Vec::new();
@@ -307,6 +310,9 @@ mod tests {
             ".git/config",
             "src/.env",
             "a\\b",
+            "C:/outside",
+            "C:\\outside",
+            "src/C:evil",
             &format!("{}/x", "a/".repeat(600)),
         ] {
             assert!(read(&dir, bad).is_err(), "read({bad:?}) must refuse");
@@ -416,7 +422,9 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let fifo = project.join("pipe.txt");
         let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        // the FIFO must actually exist, or the assertions below would pass
+        // via the unrelated "no such file" path without testing anything
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
         assert!(read(&dir, "pipe.txt").is_err());
         assert!(list(&dir, "", 1).unwrap().entries.is_empty());
         fs::remove_dir_all(&project).ok();

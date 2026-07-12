@@ -451,7 +451,15 @@ mod anchored_fallback {
     }
 
     fn assert_component(name: &str) -> Result<(), String> {
-        if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        // ':' included: a `C:`-prefixed component would make `PathBuf::join`
+        // DISCARD the base path on Windows (drive-prefix semantics)
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains(':')
+        {
             return Err(format!("invalid path component {name:?}"));
         }
         Ok(())
