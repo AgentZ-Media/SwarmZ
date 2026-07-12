@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
+  Bot,
   ExternalLink,
+  GitMerge,
   GitPullRequest,
   RefreshCw,
   X,
@@ -14,6 +16,8 @@ import {
   refreshProjectGithub,
 } from "@/lib/github/controller";
 import { fetchGhPrView } from "@/lib/github/api";
+import { spawnPrAgent } from "@/lib/github/agent";
+import type { PrAgentMode } from "@/lib/github/core";
 import type { GhPr, GhPrDetail } from "@/lib/github/types";
 import { splitUnifiedDiff } from "@/lib/vibe/diff";
 import { TurnDiffFiles } from "./vibe/DiffCard";
@@ -27,9 +31,13 @@ import { cn } from "@/lib/utils";
  * the gh auth chip, the open PRs with status badges (checks / review /
  * draft / conflicts in the signal triad), and a PR detail view whose diff
  * renders through the SAME @pierre/diffs stack as the transcripts
- * (`gh pr diff` → splitUnifiedDiff → TurnDiffFiles). Read-only: it works
- * with the integration toggle OFF too (local gh state only) — a footer line
- * then points at Settings for the automation.
+ * (`gh pr diff` → splitUnifiedDiff → TurnDiffFiles). The view is read-only
+ * and works with the integration toggle OFF too (local gh state only) — a
+ * footer line then points at Settings for the automation. Every PR carries
+ * the two agent spawn buttons (Review / Review & merge, `PrAgentButtons`):
+ * human-triggered and toggle-independent — the spawned agent's gh calls run
+ * through the normal approval classification, so a merge always ends at a
+ * human approval click.
  */
 export function GitHubPanel() {
   const open = useSwarm((s) => s.githubOpen);
@@ -268,6 +276,69 @@ function StateBadges({ pr }: { pr: GhPr }) {
   );
 }
 
+// ---- PR agent actions (Review / Review & merge spawn buttons) ----
+
+/**
+ * The two spawn buttons every PR carries (list row + detail): start a fresh
+ * workspace agent on the project whose first prompt is the PR brief
+ * (`prAgentPrompt`). Spawning focuses the new agent and closes the drawer;
+ * a failed start stays here as an inline error. The merge variant only ADDS
+ * the merge step to the prompt — the agent's `gh pr merge` still escalates
+ * to a human approval click (destructive by classification).
+ */
+function PrAgentButtons({ projectId, pr }: { projectId: string; pr: GhPr }) {
+  const setOpen = useSwarm((s) => s.setGithubOpen);
+  const [spawning, setSpawning] = useState<PrAgentMode | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const spawn = async (mode: PrAgentMode) => {
+    if (spawning) return;
+    setSpawning(mode);
+    setError(null);
+    try {
+      await spawnPrAgent(projectId, pr, mode);
+      setOpen(false);
+    } catch (e) {
+      setError(String(e).replace(/^Error:\s*/, ""));
+      setSpawning(null);
+    }
+  };
+
+  const btn =
+    "focus-ring flex h-6 items-center gap-1 rounded-md border border-line px-2 font-mono text-10 text-mut transition-colors hover:border-line2 hover:text-txt disabled:opacity-50";
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <div className="flex items-center gap-1.5">
+        <Tip label="Spawn an agent that reviews this PR and reports its findings">
+          <button
+            onClick={() => void spawn("review")}
+            disabled={spawning !== null}
+            className={btn}
+          >
+            <Bot size={11} />
+            {spawning === "review" ? "starting…" : "Review"}
+          </button>
+        </Tip>
+        <Tip label="Spawn an agent that reviews this PR and, if it holds up, merges it — the merge command still asks for your approval">
+          <button
+            onClick={() => void spawn("review_merge")}
+            disabled={spawning !== null}
+            className={btn}
+          >
+            <GitMerge size={11} />
+            {spawning === "review_merge" ? "starting…" : "Review & merge"}
+          </button>
+        </Tip>
+      </div>
+      {error && (
+        <p className="break-words font-mono text-10 leading-relaxed text-err">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 // ---- PR list ----
 
 function PrList({
@@ -332,38 +403,48 @@ function PrList({
       )}
       <div className="flex flex-col gap-1.5">
         {prs.map((pr) => (
-          <button
+          // a DIV, not a button — the open-detail area and the agent spawn
+          // buttons are SIBLINGS inside (no nested interactives, the project
+          // tabs' pattern)
+          <div
             key={pr.number}
-            onClick={() => onSelect(pr.number)}
-            className="focus-ring flex flex-col gap-1 rounded-lg border border-line bg-card px-3 py-2 text-left transition-colors hover:border-line2"
+            className="flex flex-col rounded-lg border border-line bg-card transition-colors hover:border-line2"
           >
-            <span className="flex items-center gap-2">
-              <span className="shrink-0 font-mono text-11 tabular-nums text-fnt">
-                #{pr.number}
+            <button
+              onClick={() => onSelect(pr.number)}
+              className="focus-ring flex flex-col gap-1 rounded-t-lg px-3 pb-1 pt-2 text-left"
+            >
+              <span className="flex items-center gap-2">
+                <span className="shrink-0 font-mono text-11 tabular-nums text-fnt">
+                  #{pr.number}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-12 font-medium text-txt">
+                  {pr.title}
+                </span>
+                {(watched ?? []).includes(pr.number) && (
+                  <Tip label="The Conductor watches this PR">
+                    <span
+                      tabIndex={0}
+                      className="focus-ring shrink-0 rounded-xs font-mono text-10 text-acc"
+                    >
+                      ◉
+                    </span>
+                  </Tip>
+                )}
               </span>
-              <span className="min-w-0 flex-1 truncate text-12 font-medium text-txt">
-                {pr.title}
+              <span className="flex min-w-0 items-center gap-1.5">
+                <span className="min-w-0 truncate font-mono text-10 text-fnt">
+                  {pr.author} · {pr.head_ref} → {pr.base_ref}
+                </span>
+                <span className="ml-auto flex shrink-0 items-center gap-1">
+                  <StateBadges pr={pr} />
+                </span>
               </span>
-              {(watched ?? []).includes(pr.number) && (
-                <Tip label="The Conductor watches this PR">
-                  <span
-                    tabIndex={0}
-                    className="focus-ring shrink-0 rounded-xs font-mono text-10 text-acc"
-                  >
-                    ◉
-                  </span>
-                </Tip>
-              )}
-            </span>
-            <span className="flex min-w-0 items-center gap-1.5">
-              <span className="min-w-0 truncate font-mono text-10 text-fnt">
-                {pr.author} · {pr.head_ref} → {pr.base_ref}
-              </span>
-              <span className="ml-auto flex shrink-0 items-center gap-1">
-                <StateBadges pr={pr} />
-              </span>
-            </span>
-          </button>
+            </button>
+            <div className="px-3 pb-2 pt-0.5">
+              <PrAgentButtons projectId={projectId} pr={pr} />
+            </div>
+          </div>
         ))}
       </div>
     </div>
@@ -471,6 +552,7 @@ function PrDetail({
                 </span>
               )}
             </div>
+            <PrAgentButtons projectId={projectId} pr={detail} />
             {detail.body && (
               <p className="max-h-40 overflow-y-auto whitespace-pre-wrap text-12 leading-relaxed text-mut">
                 {detail.body}
