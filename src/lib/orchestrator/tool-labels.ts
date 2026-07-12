@@ -29,6 +29,10 @@ export function toolActivityLabel(
       return "Read notes";
     case "git_status":
       return "Checked git";
+    case "list_files":
+      return "Listed project files";
+    case "read_file":
+      return "Read a file";
     case "list_projects":
       return "Looked up projects";
     case "prompt_agent":

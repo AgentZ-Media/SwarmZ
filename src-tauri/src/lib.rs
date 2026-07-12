@@ -1,5 +1,6 @@
 mod codex;
 mod codex_usage;
+mod explore;
 mod fsx;
 mod git;
 mod github;
@@ -756,6 +757,34 @@ async fn conductor_plan_read(
         .map_err(|e| e.to_string())?
 }
 
+// ---- Conductor read-only exploration — see explore.rs ----
+//
+// Bounded, fail-closed window into the project tree for the Conductor's
+// `list_files`/`read_file` tools: no-follow, hidden components refused,
+// listings and reads capped. The project dir comes from the trusted chat
+// context.
+
+#[tauri::command]
+async fn conductor_fs_list(
+    project_dir: String,
+    path: String,
+    depth: u32,
+) -> Result<explore::FsListing, String> {
+    tauri::async_runtime::spawn_blocking(move || explore::list(&project_dir, &path, depth))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn conductor_fs_read(
+    project_dir: String,
+    path: String,
+) -> Result<explore::FsFile, String> {
+    tauri::async_runtime::spawn_blocking(move || explore::read(&project_dir, &path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -826,6 +855,8 @@ pub fn run() {
             conductor_plan_write,
             conductor_plan_list,
             conductor_plan_read,
+            conductor_fs_list,
+            conductor_fs_read,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
