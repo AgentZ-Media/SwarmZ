@@ -23,6 +23,7 @@ import type {
 import type { Backend } from "./backend-types";
 import type { PersistedMissions } from "@/lib/missions/types";
 import type { PersistedMissionOutbox } from "@/lib/missions/outbox";
+import type { PersistedRuntimeEnvironments } from "@/lib/runtime/core";
 
 const store = new LazyStore("swarmz.json");
 
@@ -111,6 +112,14 @@ export const tauriBackend: Backend = {
   },
   saveMissionOutbox: async (data) => {
     await store.set("missionOutbox", data);
+    await store.save();
+  },
+
+  loadRuntimeEnvironments: async () => {
+    return (await store.get<PersistedRuntimeEnvironments>("runtimeEnvironments")) ?? null;
+  },
+  saveRuntimeEnvironments: async (data) => {
+    await store.set("runtimeEnvironments", data);
     await store.save();
   },
 

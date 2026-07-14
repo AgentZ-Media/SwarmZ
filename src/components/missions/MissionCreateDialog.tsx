@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, FileInput, X } from "lucide-react";
+import { AlertTriangle, FileInput, GitBranch, X } from "lucide-react";
 import { nanoid } from "nanoid";
 import { importTasks } from "@/lib/intake/task-import";
 import { useMissions } from "@/lib/missions/store";
@@ -8,6 +8,7 @@ import { useProjects } from "@/lib/projects/store";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { BUILTIN_PLAYBOOKS } from "@/lib/playbooks/builtins";
 import { expandPlaybook } from "@/lib/playbooks";
+import { GitHubIssueImportPanel } from "./GitHubIssueImportPanel";
 
 const EXAMPLE = `[AUTH] Fix authentication race P0 @security
   Done when: concurrent refresh requests share one token exchange
@@ -25,6 +26,9 @@ export function MissionCreateDialog() {
   const open = useVibeUi((state) => state.missionCreateOpen);
   const close = () => useVibeUi.getState().setMissionCreateOpen(false);
   const activeProjectId = useProjects((state) => state.activeProjectId);
+  const activeProjectDir = useProjects((state) =>
+    state.activeProjectId ? state.projects[state.activeProjectId]?.dir ?? "" : "",
+  );
   const hydrateStatus = useMissions((state) => state.hydrateStatus);
   const [title, setTitle] = useState("");
   const [objective, setObjective] = useState("");
@@ -39,6 +43,7 @@ export function MissionCreateDialog() {
   const [maxTokens, setMaxTokens] = useState("");
   const [maxMinutes, setMaxMinutes] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [githubImportOpen, setGithubImportOpen] = useState(false);
   const titleRef = useRef<HTMLInputElement>(null);
   const parsed = useMemo(() => importTasks(input), [input]);
 
@@ -231,9 +236,30 @@ export function MissionCreateDialog() {
               <textarea value={objective} onChange={(event) => setObjective(event.target.value)} maxLength={3000} rows={3} placeholder="What must be true when this mission is complete?" className="focus-ring mt-1.5 w-full resize-y rounded-md border border-line2 bg-card px-3 py-2 text-13 normal-case leading-relaxed tracking-normal text-txt placeholder:text-fnt" />
             </label>
             <label className="block text-11 font-medium uppercase tracking-[0.08em] text-fnt">
-              Task list · Markdown, plain text, CSV or JSON
+              <span className="flex items-center justify-between gap-3">
+                <span>Task list · Markdown, plain text, CSV or JSON</span>
+                <button
+                  type="button"
+                  onClick={() => setGithubImportOpen((value) => !value)}
+                  aria-expanded={githubImportOpen}
+                  className="focus-ring flex h-7 items-center gap-1.5 rounded-md border border-line2 px-2.5 text-10 normal-case tracking-normal text-mut hover:bg-card hover:text-txt"
+                >
+                  <GitBranch size={11} /> {githubImportOpen ? "Hide GitHub" : "Import issues"}
+                </button>
+              </span>
               <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={12} spellCheck={false} className="focus-ring mt-1.5 w-full resize-y rounded-md border border-line2 bg-bg px-3 py-2 font-mono text-12 normal-case leading-relaxed tracking-normal text-txt" />
             </label>
+            {githubImportOpen && (
+              <GitHubIssueImportPanel
+                projectDir={activeProjectDir}
+                className="max-h-[420px]"
+                onImport={(_tasks, json) => {
+                  setInput(json);
+                  setGithubImportOpen(false);
+                  setError(null);
+                }}
+              />
+            )}
           </div>
 
           <aside className="space-y-4">

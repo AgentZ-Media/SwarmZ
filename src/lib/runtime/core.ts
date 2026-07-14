@@ -5,7 +5,8 @@ export const RUNTIME_COMMAND_CAP = 32;
 
 export interface RuntimeCommandSpec {
   id: string;
-  command: string;
+  /** Direct executable + arguments. Never parsed or joined into a shell string. */
+  argv: string[];
   cwdRelative: string;
   timeoutMs: number;
   maxOutputBytes: number;
@@ -42,6 +43,12 @@ export interface RuntimeEnvironmentSpec {
   databaseNamespacePrefix: string | null;
 }
 
+export interface PersistedRuntimeEnvironments {
+  version: 1;
+  byProject: Record<string, RuntimeEnvironmentSpec[]>;
+  selectedByProject: Record<string, string | null>;
+}
+
 export interface RuntimeExecutionPlan {
   environmentId: string;
   missionId: string;
@@ -70,8 +77,21 @@ function validEnvName(value: string): boolean {
 
 function validateCommand(command: RuntimeCommandSpec, prefix: string, errors: string[]) {
   if (!validId(command.id)) errors.push(`${prefix}.id is invalid`);
-  if (!command.command.trim() || command.command.length > 8_000)
-    errors.push(`${prefix}.command must contain 1–8000 characters`);
+  if (
+    command.argv.length < 1 ||
+    command.argv.length > 128 ||
+    command.argv.some((argument) => !argument || argument.length > 4_096) ||
+    command.argv.reduce((total, argument) => total + argument.length, 0) > 32_768
+  )
+    errors.push(`${prefix}.argv must contain 1–128 bounded arguments (32 KiB total)`);
+  const executableParts = command.argv[0]?.split(/[\\/]/) ?? [];
+  const executable = executableParts[executableParts.length - 1]?.toLowerCase();
+  if (
+    ["sh", "bash", "zsh", "fish", "dash", "cmd", "cmd.exe", "powershell", "pwsh"].includes(
+      executable ?? "",
+    )
+  )
+    errors.push(`${prefix}.argv must not invoke a shell`);
   if (
     command.cwdRelative.startsWith("/") ||
     command.cwdRelative.split(/[\\/]/).some((part) => part === "..")
@@ -96,24 +116,48 @@ export function validateRuntimeEnvironment(
     errors.push(`cleanup command cap is ${RUNTIME_COMMAND_CAP}`);
   if (spec.services.length > RUNTIME_SERVICE_CAP)
     errors.push(`service cap is ${RUNTIME_SERVICE_CAP}`);
+  if (spec.secrets.length > 32) errors.push("secret reference cap is 32");
+  const commandIds = new Set<string>();
   spec.setup.forEach((command, index) =>
     validateCommand(command, `setup[${index}]`, errors),
   );
   spec.cleanup.forEach((command, index) =>
     validateCommand(command, `cleanup[${index}]`, errors),
   );
+  for (const [group, commands] of [
+    ["setup", spec.setup],
+    ["cleanup", spec.cleanup],
+  ] as const) {
+    for (const [index, command] of commands.entries()) {
+      if (commandIds.has(command.id)) errors.push(`${group}[${index}].id is duplicated`);
+      commandIds.add(command.id);
+    }
+  }
+  if (
+    spec.databaseNamespacePrefix !== null &&
+    (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$/.test(spec.databaseNamespacePrefix))
+  )
+    errors.push("databaseNamespacePrefix is invalid");
 
   const serviceIds = new Set<string>();
   const requestedPorts = new Set<number>();
   for (const [index, service] of spec.services.entries()) {
     const prefix = `services[${index}]`;
     if (!validId(service.id)) errors.push(`${prefix}.id is invalid`);
+    if (!service.label.trim() || service.label.length > 120)
+      errors.push(`${prefix}.label must contain 1–120 characters`);
     if (serviceIds.has(service.id)) errors.push(`${prefix}.id is duplicated`);
     serviceIds.add(service.id);
     validateCommand(service.command, `${prefix}.command`, errors);
+    if (commandIds.has(service.command.id)) errors.push(`${prefix}.command.id is duplicated`);
+    commandIds.add(service.command.id);
+    const portNames = new Set<string>();
     for (const [portIndex, port] of service.ports.entries()) {
       if (!validEnvName(port.env))
         errors.push(`${prefix}.ports[${portIndex}].env is invalid`);
+      if (portNames.has(port.env))
+        errors.push(`${prefix}.ports[${portIndex}].env is duplicated`);
+      portNames.add(port.env);
       if (port.preferred !== null) {
         if (port.preferred < 1_024 || port.preferred > 65_535)
           errors.push(`${prefix}.ports[${portIndex}].preferred is outside 1024–65535`);
@@ -121,6 +165,15 @@ export function validateRuntimeEnvironment(
           errors.push(`${prefix}.ports[${portIndex}].preferred is duplicated`);
         requestedPorts.add(port.preferred);
       }
+    }
+    if (service.healthcheckUrl !== null) {
+      const match = service.healthcheckUrl.match(
+        /^http:\/\/(?:127\.0\.0\.1|localhost):\$\{([A-Z_][A-Z0-9_]*)\}(?:\/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]*)?$/,
+      );
+      if (!match || !portNames.has(match[1]))
+        errors.push(
+          `${prefix}.healthcheckUrl must use http://127.0.0.1 or localhost with a declared port placeholder`,
+        );
     }
   }
 
@@ -130,6 +183,14 @@ export function validateRuntimeEnvironment(
     if (!validEnvName(secret.targetEnv)) errors.push(`${prefix}.targetEnv is invalid`);
     if (!secret.sourceKey.trim() || secret.sourceKey.length > 256)
       errors.push(`${prefix}.sourceKey must contain 1–256 characters`);
+    if (secret.source === "host_env" && !validEnvName(secret.sourceKey))
+      errors.push(`${prefix}.sourceKey must name a host environment variable`);
+    if (
+      secret.source === "keychain" &&
+      (!/^[a-zA-Z0-9][a-zA-Z0-9._/:-]{0,255}$/.test(secret.sourceKey) ||
+        !secret.sourceKey.includes("/"))
+    )
+      errors.push(`${prefix}.sourceKey must be an opaque Keychain service reference`);
     if (secretTargets.has(secret.targetEnv)) errors.push(`${prefix}.targetEnv is duplicated`);
     secretTargets.add(secret.targetEnv);
     // Durable specs contain references, never inline values. URI-like and

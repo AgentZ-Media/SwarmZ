@@ -36,6 +36,17 @@ export interface GhRepoInfo {
   visibility: string;
 }
 
+/** One GitHub issue returned by the read-only mission-intake query. */
+export interface GhIssue {
+  number: number;
+  title: string;
+  body: string;
+  labels: string[];
+  /** "OPEN" | "CLOSED" */
+  state: "OPEN" | "CLOSED";
+  url: string;
+}
+
 /** Aggregated CI state of one PR (derived Rust-side from statusCheckRollup). */
 export interface GhChecksSummary {
   passing: number;

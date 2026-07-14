@@ -9,6 +9,7 @@ mod mission_evidence;
 mod orchestrator;
 mod plans;
 mod projects;
+mod runtime_native;
 mod storefile;
 mod transcript;
 mod worktree;
@@ -112,6 +113,82 @@ fn acceptance_command_cancel(run_id: String) -> bool {
     integration_native::acceptance_command_cancel(&run_id)
 }
 
+fn runtime_lease_root(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("runtime-services"))
+        .map_err(|error| format!("runtime lease directory is unavailable: {error}"))
+}
+
+#[tauri::command]
+async fn runtime_command_run(
+    request: runtime_native::RuntimeCommandRequest,
+) -> Result<runtime_native::RuntimeCommandResult, String> {
+    tauri::async_runtime::spawn_blocking(move || runtime_native::command_run(request))
+        .await
+        .map_err(|error| format!("runtime command worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn runtime_command_cancel(run_id: String) -> bool {
+    runtime_native::command_cancel(&run_id)
+}
+
+#[tauri::command]
+async fn runtime_service_start(
+    app: AppHandle,
+    request: runtime_native::RuntimeServiceStartRequest,
+) -> Result<runtime_native::RuntimeServiceSnapshot, String> {
+    let leases = runtime_lease_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || runtime_native::service_start(&leases, request))
+        .await
+        .map_err(|error| format!("runtime service worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn runtime_service_stop(
+    app: AppHandle,
+    instance_id: String,
+    service_id: String,
+) -> Result<bool, String> {
+    let leases = runtime_lease_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime_native::service_stop(&leases, &instance_id, &service_id)
+    })
+    .await
+    .map_err(|error| format!("runtime service stop worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn runtime_service_list(
+    app: AppHandle,
+) -> Result<Vec<runtime_native::RuntimeServiceSnapshot>, String> {
+    let leases = runtime_lease_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || runtime_native::service_list(&leases))
+        .await
+        .map_err(|error| format!("runtime service list worker failed: {error}"))
+}
+
+#[tauri::command]
+async fn runtime_service_reconcile(
+    app: AppHandle,
+) -> Result<runtime_native::RuntimeReconcileResult, String> {
+    let leases = runtime_lease_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || runtime_native::service_reconcile(&leases))
+        .await
+        .map_err(|error| format!("runtime reconcile worker failed: {error}"))
+}
+
+#[tauri::command]
+async fn runtime_service_stop_all(
+    app: AppHandle,
+) -> Result<runtime_native::RuntimeReconcileResult, String> {
+    let leases = runtime_lease_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || runtime_native::service_stop_all(&leases))
+        .await
+        .map_err(|error| format!("runtime stop-all worker failed: {error}"))
+}
+
 #[tauri::command]
 async fn worktree_add(
     cwd: String,
@@ -125,6 +202,13 @@ async fn worktree_add(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn worktree_resolve_main_root(cwd: String, bin: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || worktree::resolve_main_root(&cwd, bin.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -208,6 +292,17 @@ async fn gh_pr_list(
     bin: Option<String>,
 ) -> Result<github::GhOutcome<Vec<github::GhPr>>, String> {
     tauri::async_runtime::spawn_blocking(move || github::pr_list(&dir, bin.as_deref()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Open and closed GitHub issues for read-only mission intake.
+#[tauri::command]
+async fn gh_issue_list(
+    dir: String,
+    bin: Option<String>,
+) -> Result<github::GhOutcome<Vec<github::GhIssue>>, String> {
+    tauri::async_runtime::spawn_blocking(move || github::issue_list(&dir, bin.as_deref()))
         .await
         .map_err(|e| e.to_string())
 }
@@ -876,13 +971,22 @@ pub fn run() {
             integration_rollback,
             acceptance_command_run,
             acceptance_command_cancel,
+            runtime_command_run,
+            runtime_command_cancel,
+            runtime_service_start,
+            runtime_service_stop,
+            runtime_service_list,
+            runtime_service_reconcile,
+            runtime_service_stop_all,
             worktree_add,
+            worktree_resolve_main_root,
             worktree_status,
             worktree_remove,
             worktree_list,
             gh_auth_status,
             gh_repo_info,
             gh_pr_list,
+            gh_issue_list,
             gh_pr_view,
             gh_pr_create,
             gh_pr_comment,
@@ -935,6 +1039,11 @@ pub fn run() {
             // prevent_exit() is a built-in no-op for the updater's restart
             // (RESTART_EXIT_CODE), so updates keep working.
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if code.is_none() {
+                    if let Ok(leases) = runtime_lease_root(app) {
+                        let _ = runtime_native::service_stop_all(&leases);
+                    }
+                }
                 if code.is_some() {
                     api.prevent_exit();
                     let _ = app.emit("app://quit-requested", ());

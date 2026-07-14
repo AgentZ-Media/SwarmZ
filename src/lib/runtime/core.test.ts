@@ -8,7 +8,7 @@ import {
 
 const command = {
   id: "start-api",
-  command: "pnpm dev",
+  argv: ["pnpm", "dev"],
   cwdRelative: ".",
   timeoutMs: 60_000,
   maxOutputBytes: 64_000,
@@ -18,8 +18,8 @@ const command = {
 const spec: RuntimeEnvironmentSpec = {
   id: "web-stack",
   name: "Web stack",
-  setup: [{ ...command, id: "install", command: "pnpm install --offline" }],
-  cleanup: [{ ...command, id: "cleanup", command: "pnpm db:drop" }],
+  setup: [{ ...command, id: "install", argv: ["pnpm", "install", "--offline"] }],
+  cleanup: [{ ...command, id: "cleanup", argv: ["pnpm", "db:drop"] }],
   services: [
     {
       id: "api",
@@ -90,5 +90,19 @@ describe("runtime environment contracts", () => {
     expect(validation.valid).toBe(false);
     expect(validation.errors.join(" ")).toContain("cwdRelative");
     expect(validation.errors.join(" ")).toContain("secret value");
+  });
+
+  it("only permits local health checks with declared port placeholders", () => {
+    const external = {
+      ...spec,
+      services: [{ ...spec.services[0], healthcheckUrl: "http://metadata.internal/latest" }],
+    };
+    expect(validateRuntimeEnvironment(external).errors.join(" ")).toContain("healthcheckUrl");
+    const unknownPort = {
+      ...spec,
+      services: [{ ...spec.services[0], healthcheckUrl: "http://localhost:${OTHER_PORT}/health" }],
+    };
+    expect(validateRuntimeEnvironment(unknownPort).errors.join(" ")).toContain("healthcheckUrl");
+    expect(validateRuntimeEnvironment(spec).valid).toBe(true);
   });
 });

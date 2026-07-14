@@ -12,6 +12,7 @@ import type {
 } from "@/types";
 import type { PersistedMissions } from "@/lib/missions/types";
 import type { PersistedMissionOutbox } from "@/lib/missions/outbox";
+import type { PersistedRuntimeEnvironments } from "@/lib/runtime/core";
 
 export type Unlisten = () => void;
 
@@ -61,6 +62,10 @@ export interface Backend {
   /** Write-ahead Mission Control side-effect commands and delivery leases. */
   loadMissionOutbox(): Promise<PersistedMissionOutbox | null>;
   saveMissionOutbox(data: PersistedMissionOutbox): Promise<void>;
+
+  /** Project-scoped runtime contracts. Secret values are never stored here. */
+  loadRuntimeEnvironments(): Promise<PersistedRuntimeEnvironments | null>;
+  saveRuntimeEnvironments(data: PersistedRuntimeEnvironments): Promise<void>;
 
   /**
    * Delete top-level swarmz.json keys (missing keys are a no-op) — the

@@ -166,6 +166,12 @@ fn main_root(bin: &str, cwd: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "not a regular git repository".into())
 }
 
+/// Read-only canonical main-checkout root used by durable Mission placement.
+pub fn resolve_main_root(cwd: &str, bin_override: Option<&str>) -> Result<String, String> {
+    let root = main_root(git_bin(bin_override), Path::new(cwd))?;
+    Ok(root.to_string_lossy().into_owned())
+}
+
 /// Make git ignore `.worktrees/` via the repo-local `.git/info/exclude` —
 /// same effect as a `.gitignore` entry, but never touches a tracked file.
 /// Anchored + no-follow (audit R4): `.git`/`info`/`exclude` are reached

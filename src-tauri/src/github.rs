@@ -6,7 +6,8 @@
 //! `no_remote` / `error`) so a missing or logged-out `gh` can never crash or
 //! hang a caller.
 //!
-//! Read-only detection (`auth_status`, `repo_info`, `pr_list`, `pr_view`)
+//! Read-only detection (`auth_status`, `repo_info`, `pr_list`, `pr_view`,
+//! `issue_list`)
 //! works unconditionally. WRITE ops (`pr_create`, `pr_comment`, `pr_review`)
 //! are double-gated: the webview executors check the Settings master toggle,
 //! and Rust re-checks the `INTEGRATION_ENABLED` flag (synced via the
@@ -33,7 +34,7 @@ use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +51,10 @@ const GH_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 const DIFF_BYTE_CAP: usize = 512 * 1024;
 /// PR body cap in `pr_view` responses (the Conductor reads these).
 const BODY_CHAR_CAP: usize = 4_000;
+/// Issue intake is deliberately bounded even though the shared subprocess
+/// reader already has a larger hard cap. 500 issues with capped bodies fit
+/// comfortably; a larger response is suspicious or unusable for the UI.
+const ISSUE_JSON_BYTE_CAP: usize = 8 * 1024 * 1024;
 
 // ---- integration gate ----------------------------------------------------
 
@@ -668,6 +673,110 @@ pub fn pr_list(dir: &str, bin_override: Option<&str>) -> GhOutcome<Vec<GhPr>> {
         Ok(Value::Array(items)) => GhOutcome::Ok(items.iter().map(parse_pr).collect()),
         Ok(_) => GhOutcome::Error("unexpected gh pr list shape".into()),
         Err(e) => GhOutcome::Error(format!("unparseable gh pr list output: {e}")),
+    }
+}
+
+/// One GitHub issue available for read-only mission intake.
+#[derive(Debug, Clone, Serialize)]
+pub struct GhIssue {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+    /// "OPEN" | "CLOSED"
+    pub state: String,
+    pub url: String,
+}
+
+const ISSUE_LIST_FIELDS: &str = "number,title,body,labels,state,url";
+const ISSUE_LIST_MAX: usize = 500;
+
+/// Parse and bound GitHub-authored data before it crosses into the webview.
+/// Malformed records are skipped rather than partially invented.
+fn parse_issue(v: &Value) -> Option<GhIssue> {
+    let number = v.get("number")?.as_u64()?;
+    if number == 0 {
+        return None;
+    }
+    let title = v.get("title")?.as_str()?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let state = match v.get("state")?.as_str()?.to_ascii_uppercase().as_str() {
+        "OPEN" => "OPEN",
+        "CLOSED" => "CLOSED",
+        _ => return None,
+    };
+    let mut seen_labels = HashSet::new();
+    let labels = v
+        .get("labels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|label| label.get("name").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| cap_chars(name, 80))
+        .filter(|name| seen_labels.insert(name.clone()))
+        .take(30)
+        .collect();
+
+    Some(GhIssue {
+        number,
+        title: cap_chars(title, 300),
+        body: cap_chars(
+            v.get("body").and_then(Value::as_str).unwrap_or("").trim(),
+            BODY_CHAR_CAP,
+        ),
+        labels,
+        state: state.to_string(),
+        url: cap_chars(
+            v.get("url").and_then(Value::as_str).unwrap_or("").trim(),
+            2_000,
+        ),
+    })
+}
+
+/// Up to 500 open and closed issues of the repo behind `dir`.
+/// This is an unconditional READ operation over the user's local `gh` CLI;
+/// it never enables or crosses the GitHub write gate.
+pub fn issue_list(dir: &str, bin_override: Option<&str>) -> GhOutcome<Vec<GhIssue>> {
+    let bin = gh_bin(bin_override);
+    let stdout = match run_gh(
+        &bin,
+        Some(dir),
+        &[
+            "issue",
+            "list",
+            "--state",
+            "all",
+            "--limit",
+            "500",
+            "--json",
+            ISSUE_LIST_FIELDS,
+        ],
+        GH_TIMEOUT,
+    ) {
+        Ok(s) => s,
+        Err(fail) => return retag(fail),
+    };
+    parse_issue_list_output(&stdout)
+}
+
+fn parse_issue_list_output(stdout: &str) -> GhOutcome<Vec<GhIssue>> {
+    if stdout.len() > ISSUE_JSON_BYTE_CAP {
+        return GhOutcome::Error("gh issue list output exceeded the 8 MiB safety limit".into());
+    }
+    match serde_json::from_str::<Value>(stdout) {
+        Ok(Value::Array(items)) => GhOutcome::Ok(
+            items
+                .iter()
+                .filter_map(parse_issue)
+                .take(ISSUE_LIST_MAX)
+                .collect(),
+        ),
+        Ok(_) => GhOutcome::Error("unexpected gh issue list shape".into()),
+        Err(e) => GhOutcome::Error(format!("unparseable gh issue list output: {e}")),
     }
 }
 
@@ -1437,6 +1546,87 @@ mod tests {
             serde_json::to_value(&err).unwrap(),
             json!({ "status": "error", "data": "boom" })
         );
+    }
+
+    #[test]
+    fn issue_list_parser_sanitizes_and_bounds_github_data() {
+        let long_body = "x".repeat(BODY_CHAR_CAP + 50);
+        let long_title = "t".repeat(350);
+        let mut labels = vec![json!({ "name": "bug" }), json!({ "name": "bug" })];
+        labels.extend((0..40).map(|index| json!({ "name": format!("label-{index}") })));
+        let payload = json!([
+            {
+                "number": 42,
+                "title": long_title,
+                "body": long_body,
+                "labels": labels,
+                "state": "open",
+                "url": "https://github.com/example/repo/issues/42"
+            },
+            {
+                "number": 0,
+                "title": "invalid",
+                "body": "",
+                "labels": [],
+                "state": "OPEN",
+                "url": ""
+            },
+            {
+                "number": 43,
+                "title": "unknown state",
+                "body": "",
+                "labels": [],
+                "state": "MERGED",
+                "url": ""
+            }
+        ]);
+
+        let GhOutcome::Ok(issues) = parse_issue_list_output(&payload.to_string()) else {
+            panic!("expected parsed issues")
+        };
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].number, 42);
+        assert_eq!(issues[0].state, "OPEN");
+        assert_eq!(issues[0].title.chars().count(), 301); // 300 + ellipsis
+        assert_eq!(issues[0].body.chars().count(), BODY_CHAR_CAP + 1);
+        assert_eq!(issues[0].labels.len(), 30);
+        assert_eq!(issues[0].labels[0], "bug");
+    }
+
+    #[test]
+    fn issue_list_parser_caps_records_and_rejects_wrong_shapes() {
+        let records: Vec<Value> = (1..=ISSUE_LIST_MAX + 25)
+            .map(|number| {
+                json!({
+                    "number": number,
+                    "title": format!("Issue {number}"),
+                    "body": "",
+                    "labels": [],
+                    "state": "CLOSED",
+                    "url": ""
+                })
+            })
+            .collect();
+        let GhOutcome::Ok(issues) =
+            parse_issue_list_output(&serde_json::to_string(&records).unwrap())
+        else {
+            panic!("expected parsed issues")
+        };
+        assert_eq!(issues.len(), ISSUE_LIST_MAX);
+
+        assert!(matches!(
+            parse_issue_list_output("{}"),
+            GhOutcome::Error(message) if message.contains("unexpected")
+        ));
+        assert!(matches!(
+            parse_issue_list_output("not json"),
+            GhOutcome::Error(message) if message.contains("unparseable")
+        ));
+        let oversized = " ".repeat(ISSUE_JSON_BYTE_CAP + 1);
+        assert!(matches!(
+            parse_issue_list_output(&oversized),
+            GhOutcome::Error(message) if message.contains("8 MiB")
+        ));
     }
 
     #[test]

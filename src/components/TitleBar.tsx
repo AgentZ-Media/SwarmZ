@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart3,
+  Box,
   Download,
   FolderOpen,
   GitPullRequest,
@@ -43,7 +44,13 @@ import type { ProjectEntry } from "@/lib/orchestrator/types";
 const BAR_BTN =
   "no-drag focus-ring flex h-8 w-8 items-center justify-center rounded-md text-mut hover:bg-card hover:text-txt";
 
-export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
+export function TitleBar({
+  onOpenSettings,
+  onOpenRuntime,
+}: {
+  onOpenSettings: () => void;
+  onOpenRuntime: () => void;
+}) {
   const setDashboardOpen = useSwarm((s) => s.setDashboardOpen);
   const dashboardOpen = useSwarm((s) => s.dashboardOpen);
   const notesOpen = useSwarm((s) => s.notesOpen);
@@ -126,6 +133,12 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
 
         {/* appears only once at least one git worktree exists */}
         <WorktreesButton />
+
+        <Tip label="Runtime environments">
+          <button onClick={onOpenRuntime} className={BAR_BTN} aria-label="Runtime environments">
+            <Box size={15} />
+          </button>
+        </Tip>
 
         <GitHubButton />
 

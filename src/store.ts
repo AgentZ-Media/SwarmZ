@@ -69,6 +69,10 @@ import {
   flushMissionOutboxPersist,
   hydrateMissionOutbox,
 } from "@/lib/missions/outbox-store";
+import {
+  flushRuntimeEnvironmentsPersist,
+  hydrateRuntimeEnvironments,
+} from "@/lib/runtime/store";
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
@@ -209,6 +213,8 @@ export async function flushAllPersists(): Promise<void> {
     flushMissionsPersist(),
     // write-ahead Mission Control side effects and claims
     flushMissionOutboxPersist(),
+    // project-scoped reproducible runtime contracts
+    flushRuntimeEnvironmentsPersist(),
     // the autonomy budgets keep their own debounced slice
     flushAutonomyPersist(),
   ]);
@@ -442,6 +448,13 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       await hydrateMissionOutbox();
     } catch {
       /* the outbox store exposes its fail-closed hydration state */
+    }
+    try {
+      // Runtime contracts resolve against project ids and are required before
+      // any mission attempt may opt into a configured environment.
+      await hydrateRuntimeEnvironments();
+    } catch {
+      /* runtime execution remains unavailable until its slice hydrates */
     }
     // both hydrators also SWALLOW load failures internally (per-slice
     // tolerance) — their `hydrated` flags are the authoritative success

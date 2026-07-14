@@ -32,6 +32,8 @@ import {
 } from "./lib/vibe/controller";
 import { ensureNotifyPermission, notify } from "./lib/transport";
 import { startMissionController } from "./lib/missions/controller";
+import { useProjects } from "./lib/projects/store";
+import { startIntegrationController } from "./lib/integration/controller";
 
 // Optional surfaces are sizeable and closed on a normal launch. Keep them out
 // of the startup graph; after first use they remain mounted so Radix can finish
@@ -61,6 +63,11 @@ const GitHubPanel = lazy(() =>
     default: module.GitHubPanel,
   })),
 );
+const RuntimeEnvironmentsPanel = lazy(() =>
+  import("./components/RuntimeEnvironmentsPanel").then((module) => ({
+    default: module.RuntimeEnvironmentsPanel,
+  })),
+);
 
 // dev-only orchestrator smoke-test hook (`window.__orch`) — the DEV guard
 // makes production builds drop the import entirely
@@ -72,6 +79,11 @@ export default function App() {
   const hydrate = useSwarm((s) => s.hydrate);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [runtimeOpen, setRuntimeOpen] = useState(false);
+  const activeProjectId = useProjects((state) => state.activeProjectId);
+  const activeProjectDir = useProjects((state) =>
+    state.activeProjectId ? state.projects[state.activeProjectId]?.dir ?? null : null,
+  );
   const paletteOpen = useSwarm((s) => s.paletteOpen);
   const dashboardOpen = useSwarm((s) => s.dashboardOpen);
   const notesOpen = useSwarm((s) => s.notesOpen);
@@ -81,6 +93,7 @@ export default function App() {
   const dashboardRequested = useLoadOnce(dashboardOpen);
   const notesRequested = useLoadOnce(notesOpen);
   const githubRequested = useLoadOnce(githubOpen);
+  const runtimeRequested = useLoadOnce(runtimeOpen);
   const notifyGranted = useRef(false);
   const prevPending = useRef<Set<string>>(new Set());
 
@@ -113,6 +126,9 @@ export default function App() {
     // Durable Mission scheduler: remains fail-closed until missions, outbox
     // and session stores hydrate; owns only temporary one-assignment workers.
     const stopMissions = startMissionController();
+    // Integration trains consume only independently verified attempt commits
+    // and execute combined regression behind the durable outbox boundary.
+    const stopIntegration = startIntegrationController();
     return () => {
       updates.stopBackgroundPolling();
       stopLimits();
@@ -121,6 +137,7 @@ export default function App() {
       stopVibePings();
       stopGithub();
       stopMissions();
+      stopIntegration();
     };
   }, [hydrate]);
 
@@ -272,7 +289,10 @@ export default function App() {
   return (
     <TooltipProvider delayDuration={300}>
       <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg">
-        <TitleBar onOpenSettings={() => setSettingsOpen(true)} />
+        <TitleBar
+          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenRuntime={() => setRuntimeOpen(true)}
+        />
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="relative min-h-0 min-w-0 flex-1">
             <VibeLayer />
@@ -308,6 +328,16 @@ export default function App() {
       {githubRequested && (
         <Suspense fallback={<SurfaceLoading label="Opening GitHub" side />}>
           <GitHubPanel />
+        </Suspense>
+      )}
+      {runtimeRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening runtimes" side />}>
+          <RuntimeEnvironmentsPanel
+            open={runtimeOpen}
+            onOpenChange={setRuntimeOpen}
+            projectId={activeProjectId}
+            projectDir={activeProjectDir}
+          />
         </Suspense>
       )}
     </TooltipProvider>
