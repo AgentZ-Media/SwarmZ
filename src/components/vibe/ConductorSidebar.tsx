@@ -53,6 +53,7 @@ import {
 } from "@/lib/orchestrator/composer-drafts";
 
 const MAX_ROWS_PX = 168; // ~6 lines
+const SIDEBAR_MIN_WIDTH = 300;
 
 export function ConductorSidebar() {
   const open = useVibeUi((s) => s.conductorOpen);
@@ -85,11 +86,16 @@ export function ConductorSidebar() {
   // Keep enough room for a real fleet card even when an old wide sidebar
   // value survives a window resize. At the 900 px app minimum this caps the
   // lead at 378 px instead of letting a 680 px preference crush the stage.
-  const responsiveMaxWidth =
+  const responsiveMaxWidth = Math.max(
+    SIDEBAR_MIN_WIDTH,
     viewportWidth < 1050
       ? Math.floor(viewportWidth * 0.42)
-      : Math.min(680, viewportWidth - 520);
-  const visibleWidth = Math.max(300, Math.min(width, responsiveMaxWidth));
+      : Math.min(680, viewportWidth - 520),
+  );
+  const visibleWidth = Math.max(
+    SIDEBAR_MIN_WIDTH,
+    Math.min(width, responsiveMaxWidth),
+  );
 
   // drag-to-resize: window listeners for the duration of one drag. Cleanup is
   // CENTRALIZED and re-entrant — mouseup, window blur (⌘-tab mid-drag) and
@@ -122,6 +128,29 @@ export function ConductorSidebar() {
     endDragRef.current = endDrag;
   };
 
+  const resizeWithKeyboard = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 40 : 16;
+    let nextWidth: number | null = null;
+    switch (event.key) {
+      case "ArrowLeft":
+        nextWidth = visibleWidth - step;
+        break;
+      case "ArrowRight":
+        nextWidth = visibleWidth + step;
+        break;
+      case "Home":
+        nextWidth = SIDEBAR_MIN_WIDTH;
+        break;
+      case "End":
+        nextWidth = responsiveMaxWidth;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    setWidth(Math.max(SIDEBAR_MIN_WIDTH, Math.min(responsiveMaxWidth, nextWidth)));
+  };
+
   if (!open) return null;
 
   return (
@@ -146,8 +175,17 @@ export function ConductorSidebar() {
       {/* resize handle (straddles the border) */}
       <div
         onMouseDown={startResize}
-        title="Drag to resize"
-        className="relative z-20 -mx-[3px] w-[7px] shrink-0 cursor-col-resize hover:bg-[linear-gradient(90deg,transparent,color-mix(in_srgb,var(--acc)_30%,transparent),transparent)]"
+        onKeyDown={resizeWithKeyboard}
+        role="separator"
+        aria-label="Resize Orchestrator sidebar"
+        aria-orientation="vertical"
+        aria-valuemin={SIDEBAR_MIN_WIDTH}
+        aria-valuemax={responsiveMaxWidth}
+        aria-valuenow={Math.round(visibleWidth)}
+        aria-valuetext={`${Math.round(visibleWidth)} pixels wide`}
+        tabIndex={0}
+        title="Drag or use arrow keys to resize"
+        className="focus-ring relative z-20 -mx-[3px] w-[7px] shrink-0 cursor-col-resize hover:bg-[linear-gradient(90deg,transparent,color-mix(in_srgb,var(--acc)_30%,transparent),transparent)] focus-visible:bg-acc/25"
       />
     </>
   );

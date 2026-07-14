@@ -345,7 +345,7 @@ export function MissionCreateDialog() {
           {error && <p role="alert" aria-live="assertive" className="min-w-full flex-1 break-words text-11 text-err sm:min-w-0">{error}</p>}
           {!error && <p className="min-w-full flex-1 text-11 text-fnt sm:min-w-0">Your click approves exactly this scope and envelope revision.</p>}
           <button onClick={close} className="focus-ring h-8 rounded-md px-3 text-12 text-mut hover:bg-card hover:text-txt">Cancel</button>
-          <button onClick={create} disabled={!activeProjectId || parsed.tasks.length === 0 || hydrateStatus !== "ready"} className="focus-ring h-8 rounded-md bg-acc px-4 text-12 font-semibold text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">Approve &amp; start</button>
+          <button onClick={create} disabled={!activeProjectId || parsed.tasks.length === 0 || hydrateStatus !== "ready"} className="focus-ring h-8 rounded-md bg-acc px-4 text-12 font-semibold text-bg hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">Approve &amp; start</button>
         </div>
       </DialogContent>
     </Dialog>

@@ -222,7 +222,7 @@ function ApprovalTakeover({
         <button
           onClick={() => respond("accept")}
           disabled={responding}
-          className="focus-ring rounded-md bg-acc px-4 py-1.5 font-mono text-11 font-bold text-white hover:brightness-110 disabled:opacity-40"
+          className="focus-ring rounded-md bg-acc px-4 py-1.5 font-mono text-11 font-bold text-bg hover:brightness-110 disabled:opacity-40"
         >
           Allow <span className="opacity-70">↵</span>
         </button>

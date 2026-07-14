@@ -160,7 +160,7 @@ export function GitHubIssueImportPanel({
           </p>
         </div>
         <span className="rounded-sm border border-line2 bg-panel px-2 py-1 font-mono text-10 tabular-nums text-mut">
-          {issues.length} issues
+          {loading ? "— issues" : `${issues.length} ${issues.length === 1 ? "issue" : "issues"}`}
         </span>
         <button
           type="button"
@@ -169,7 +169,7 @@ export function GitHubIssueImportPanel({
           aria-label="Refresh GitHub issues"
           className="focus-ring flex h-8 w-8 items-center justify-center rounded-md text-mut hover:bg-pop hover:text-txt disabled:cursor-not-allowed disabled:opacity-40"
         >
-          <RefreshCw size={13} className={cn(loading && "animate-spin")} aria-hidden />
+          <RefreshCw size={13} aria-hidden />
         </button>
       </header>
 
@@ -281,7 +281,7 @@ export function GitHubIssueImportPanel({
               type="button"
               onClick={importSelection}
               disabled={selected.size === 0}
-              className="focus-ring h-8 shrink-0 rounded-md bg-acc px-3.5 text-11 font-semibold text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+              className="focus-ring h-8 shrink-0 rounded-md bg-acc px-3.5 text-11 font-semibold text-bg hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
             >
               Import {selected.size || "selected"}
             </button>

@@ -177,7 +177,7 @@ export function MissionIntegrationView({ missionId }: { missionId: string }) {
           {error && <div role="alert" className="mt-3 flex items-start gap-2 rounded-md border border-err/30 bg-err/5 p-3 text-10 leading-relaxed text-err"><CircleAlert size={13} className="mt-0.5 shrink-0" />{error}</div>}
           <div className="mt-5 flex justify-end gap-2">
             <button type="button" disabled={pending} onClick={closeAction} className="focus-ring h-8 rounded-md px-3 text-11 text-mut hover:bg-card disabled:opacity-40">Cancel</button>
-            <button type="button" disabled={!canSubmit || pending} onClick={() => void submit()} className={cn("focus-ring flex h-8 items-center gap-2 rounded-md px-3 text-11 font-semibold text-white disabled:opacity-35", action?.kind === "retry" ? "bg-acc" : "bg-err")}>
+            <button type="button" disabled={!canSubmit || pending} onClick={() => void submit()} className={cn("focus-ring flex h-8 items-center gap-2 rounded-md px-3 text-11 font-semibold text-bg disabled:opacity-35", action?.kind === "retry" ? "bg-acc" : "bg-err")}>
               {pending && <LoaderCircle size={13} className="animate-spin" />}
               {action?.kind === "retry" ? "Retry entry" : action?.kind === "skip" ? "Skip entry" : "Roll back"}
             </button>

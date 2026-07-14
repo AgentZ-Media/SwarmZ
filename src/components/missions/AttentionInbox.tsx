@@ -1,39 +1,23 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { AlertTriangle, Bot, CheckCheck, ChevronRight } from "lucide-react";
 import { useMissions } from "@/lib/missions/store";
-import type { MissionTask, TaskStatus } from "@/lib/missions/types";
-import { focusSession } from "@/lib/vibe/controller";
-import { useVibe } from "@/lib/vibe/session-store";
-import { vibeTriageEntries } from "@/lib/vibe/triage";
+import {
+  type AttentionRow,
+  type AttentionTone,
+} from "@/lib/attention/core";
+import { useAttentionRows } from "@/lib/attention/use-attention";
+import { activateProject, focusSession } from "@/lib/vibe/controller";
 import { useVibeUi } from "@/lib/vibe/ui-store";
+import { useSwarm } from "@/store";
 import { cn } from "@/lib/utils";
-
-type AttentionTone = "attention" | "blocked" | "failed";
-
-interface AttentionRow {
-  key: string;
-  source: "mission" | "train" | "worker";
-  sourceId: string;
-  missionId: string | null;
-  title: string;
-  place: string;
-  detail: string;
-  since: number;
-  tone: AttentionTone;
-  statusLabel: string;
-}
 
 export interface AttentionInboxProps {
   className?: string;
   /** Useful when the inbox is embedded in a compact overview column. */
   maxItems?: number;
+  /** Reserve the drawer header's top-right close-button footprint. */
+  reserveCloseButtonSpace?: boolean;
 }
-
-const ATTENTION_TASK_STATUSES = new Set<TaskStatus>([
-  "needs_human",
-  "blocked",
-  "failed",
-]);
 
 /**
  * Global decision queue across durable mission state and live worker state.
@@ -44,44 +28,12 @@ const ATTENTION_TASK_STATUSES = new Set<TaskStatus>([
 export function AttentionInbox({
   className,
   maxItems,
+  reserveCloseButtonSpace = false,
 }: AttentionInboxProps) {
   const titleId = useId();
-  const missionSignature = useMissions((state) => {
-    const parts: string[] = [];
-    for (const task of Object.values(state.projection.tasks)) {
-      if (!ATTENTION_TASK_STATUSES.has(task.status)) continue;
-      const taskAttempts = task.attemptIds
-        .map((id) => state.projection.attempts[id])
-        .filter(Boolean);
-      const latestAttempt = taskAttempts[taskAttempts.length - 1];
-      const failedGate = task.qualityGateIds
-        .map((id) => state.projection.qualityGates[id])
-        .find((gate) => gate?.status === "failed");
-      parts.push(
-        `${task.id}:${task.status}:${task.updatedAt}:${task.title}:${task.description}:${latestAttempt?.status ?? ""}:${latestAttempt?.finishedAt ?? ""}:${latestAttempt?.error ?? ""}:${latestAttempt?.summary ?? ""}:${reportQuestion(latestAttempt?.report ?? null) ?? ""}:${failedGate?.updatedAt ?? ""}:${failedGate?.details ?? ""}`,
-      );
-    }
-    for (const train of Object.values(state.projection.integrationTrains)) {
-      if (train.status !== "blocked") continue;
-      parts.push(`${train.id}:${train.status}:${train.updatedAt}:${train.entries.map((entry) => `${entry.taskId}:${entry.status}:${entry.detail ?? ""}`).join(",")}`);
-    }
-    return parts.join("|");
-  });
-  const vibeSignature = useVibe((state) =>
-    vibeTriageEntries(state)
-      .map(
-        (entry) =>
-          `${entry.id}:${entry.kind}:${entry.since ?? ""}:${entry.name}:${entry.project}:${entry.summary ?? ""}`,
-      )
-      .join("|"),
-  );
   const hydrateStatus = useMissions((state) => state.hydrateStatus);
   const hydrateError = useMissions((state) => state.hydrateError);
-
-  const rows = useMemo(
-    () => buildAttentionRows(),
-    [missionSignature, vibeSignature],
-  );
+  const rows = useAttentionRows();
   const visibleRows =
     maxItems === undefined ? rows : rows.slice(0, Math.max(1, maxItems));
   const hiddenCount = rows.length - visibleRows.length;
@@ -103,7 +55,12 @@ export function AttentionInbox({
         className,
       )}
     >
-      <header className="flex min-h-12 flex-wrap items-center gap-2 border-b border-line px-4 py-2">
+      <header
+        className={cn(
+          "flex min-h-12 flex-wrap items-center gap-2 border-b border-line px-4 py-2",
+          reserveCloseButtonSpace && "pr-12",
+        )}
+      >
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <span aria-hidden className="font-mono text-13 text-attn">
@@ -181,8 +138,15 @@ function AttentionItem({ row }: { row: AttentionRow }) {
   const navigate = () => {
     const ui = useVibeUi.getState();
     ui.setAttentionOpen(false);
+    // Attention is global. Re-open/activate the owning project before any
+    // mission, integration or GitHub navigation mutates its local selection.
+    activateProject(row.projectId);
     if (row.source === "worker") {
       focusSession(row.sourceId);
+      return;
+    }
+    if (row.source === "github") {
+      useSwarm.getState().setGithubOpen(true);
       return;
     }
     ui.setSelectedMissionId(row.missionId);
@@ -256,126 +220,6 @@ function AttentionItem({ row }: { row: AttentionRow }) {
       </button>
     </div>
   );
-}
-
-function buildAttentionRows(): AttentionRow[] {
-  const missionState = useMissions.getState();
-  const missionRows: AttentionRow[] = [];
-  for (const task of Object.values(missionState.projection.tasks)) {
-    if (!ATTENTION_TASK_STATUSES.has(task.status)) continue;
-    const mission = missionState.projection.missions[task.missionId];
-    missionRows.push(
-      missionTaskRow(
-        task,
-        mission?.title ?? "Unknown mission",
-        missionState.projection.attempts,
-        missionState.projection.qualityGates,
-      ),
-    );
-  }
-  for (const train of Object.values(missionState.projection.integrationTrains)) {
-    if (train.status !== "blocked") continue;
-    const mission = missionState.projection.missions[train.missionId];
-    const failed = train.entries.find((entry) => entry.status === "failed");
-    missionRows.push({
-      key: `train:${train.id}`,
-      source: "train",
-      sourceId: train.id,
-      missionId: train.missionId,
-      title: "Integration train blocked",
-      place: `${mission?.title ?? "Unknown mission"} · ${train.integrationBranch}`,
-      detail: failed?.detail || "The integration branch needs review before the mission can complete.",
-      since: train.updatedAt,
-      tone: failed ? "failed" : "blocked",
-      statusLabel: failed ? "conflict" : "blocked",
-    });
-  }
-
-  const workerRows: AttentionRow[] = vibeTriageEntries(useVibe.getState()).map(
-    (entry) => ({
-      key: `worker:${entry.id}`,
-      source: "worker",
-      sourceId: entry.id,
-      missionId: null,
-      title: entry.name,
-      place: `${entry.project} · worker`,
-      detail:
-        entry.summary ||
-        (entry.kind === "approval"
-          ? "A worker is waiting for an approval decision."
-          : "A worker has a structured question that needs an answer."),
-      since: entry.since ?? Date.now(),
-      tone: "attention",
-      statusLabel: entry.kind === "approval" ? "approval" : "question",
-    }),
-  );
-
-  return [...missionRows, ...workerRows].sort(
-    (left, right) =>
-      attentionRank(left.tone) - attentionRank(right.tone) ||
-      left.since - right.since ||
-      left.title.localeCompare(right.title),
-  );
-}
-
-function missionTaskRow(
-  task: MissionTask,
-  missionTitle: string,
-  attempts: ReturnType<typeof useMissions.getState>["projection"]["attempts"],
-  gates: ReturnType<typeof useMissions.getState>["projection"]["qualityGates"],
-): AttentionRow {
-  const tone: AttentionTone =
-    task.status === "needs_human"
-      ? "attention"
-      : task.status === "failed"
-        ? "failed"
-        : "blocked";
-  const taskAttempts = task.attemptIds
-    .map((id) => attempts[id])
-    .filter(Boolean);
-  const latestAttempt = taskAttempts[taskAttempts.length - 1];
-  const failedGate = task.qualityGateIds
-    .map((id) => gates[id])
-    .find((gate) => gate?.status === "failed");
-  const question = reportQuestion(latestAttempt?.report ?? null);
-  return {
-    key: `task:${task.id}`,
-    source: "mission",
-    sourceId: task.id,
-    missionId: task.missionId,
-    title: task.title,
-    place: missionTitle,
-    detail:
-      question ||
-      latestAttempt?.error ||
-      failedGate?.details ||
-      latestAttempt?.summary ||
-      task.description ||
-      (tone === "attention"
-        ? "This task needs a human decision."
-        : tone === "failed"
-          ? "This task failed and needs review before it can continue."
-          : "This task is blocked and cannot make progress."),
-    since: Math.max(
-      task.updatedAt,
-      latestAttempt?.finishedAt ?? 0,
-      failedGate?.updatedAt ?? 0,
-    ),
-    tone,
-    statusLabel:
-      tone === "attention" ? "needs you" : tone === "failed" ? "failed" : "blocked",
-  };
-}
-
-function reportQuestion(report: Record<string, unknown> | null): string | null {
-  const question = report?.question;
-  return typeof question === "string" && question.trim()
-    ? question.trim()
-    : null;
-}
-
-function attentionRank(tone: AttentionTone): number {
-  return tone === "attention" ? 0 : tone === "failed" ? 1 : 2;
 }
 
 function statusGlyph(tone: AttentionTone): string {

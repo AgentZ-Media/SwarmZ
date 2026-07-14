@@ -8,6 +8,12 @@ import {
   CloseProjectConfirm,
   CloseSessionConfirm,
 } from "./CloseConfirmDialogs";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 const FocusStage = lazy(() =>
   import("./FocusStage").then((module) => ({ default: module.FocusStage })),
@@ -64,12 +70,30 @@ export function VibeLayer() {
         )}
       </div>
       {(newSessionRequested || newSessionOpen) && (
-        <Suspense fallback={<NewWorkerLoading />}>
+        <Suspense
+          fallback={(
+            <LazyDialogLoading
+              open={newSessionOpen}
+              title="Opening new worker"
+              message="Opening new worker…"
+              onClose={() => useVibeUi.getState().setNewSessionOpen(false)}
+            />
+          )}
+        >
           <NewVibeSessionDialog />
         </Suspense>
       )}
       {missionCreateOpen && (
-        <Suspense fallback={<MissionLoading />}>
+        <Suspense
+          fallback={(
+            <LazyDialogLoading
+              open={missionCreateOpen}
+              title="Opening mission intake"
+              message="Opening mission intake…"
+              onClose={() => useVibeUi.getState().setMissionCreateOpen(false)}
+            />
+          )}
+        >
           <MissionCreateDialog />
         </Suspense>
       )}
@@ -79,14 +103,39 @@ export function VibeLayer() {
   );
 }
 
-function MissionLoading() {
+function LazyDialogLoading({
+  open,
+  title,
+  message,
+  onClose,
+}: {
+  open: boolean;
+  title: string;
+  message: string;
+  onClose: () => void;
+}) {
   return (
-    <div role="dialog" aria-modal="true" aria-label="Opening mission intake" className="fixed inset-0 z-[70] flex bg-black/45">
-      <div role="status" aria-live="polite" className="m-auto flex h-24 w-[min(88vw,30rem)] items-center justify-center rounded-xl border border-line bg-panel shadow-2xl">
-        <span aria-hidden className="mr-2 h-2 w-2 animate-pulse rounded-full bg-acc" />
-        <span className="font-mono text-12 text-mut">Opening mission intake…</span>
-      </div>
-    </div>
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen) onClose();
+      }}
+    >
+      <DialogContent className="max-w-[min(88vw,30rem)] p-0">
+        <DialogTitle className="sr-only">{title}</DialogTitle>
+        <DialogDescription className="sr-only">
+          The requested interface is loading. Press Escape to cancel.
+        </DialogDescription>
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex h-24 items-center justify-center px-10"
+        >
+          <span aria-hidden className="mr-2 h-2 w-2 animate-pulse rounded-full bg-acc" />
+          <span className="font-mono text-12 text-mut">{message}</span>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -99,26 +148,6 @@ function StageLoading() {
     >
       <span aria-hidden className="mr-2 h-2 w-2 animate-pulse rounded-full bg-acc" />
       <span className="font-mono text-12 text-mut">Opening worker…</span>
-    </div>
-  );
-}
-
-function NewWorkerLoading() {
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label="Opening new worker"
-      className="fixed inset-0 z-50 flex bg-black/45"
-    >
-      <div
-        role="status"
-        aria-live="polite"
-        className="m-auto flex h-24 w-[min(88vw,30rem)] items-center justify-center rounded-xl border border-line bg-panel shadow-2xl"
-      >
-        <span aria-hidden className="mr-2 h-2 w-2 animate-pulse rounded-full bg-acc" />
-        <span className="font-mono text-12 text-mut">Opening new worker…</span>
-      </div>
     </div>
   );
 }

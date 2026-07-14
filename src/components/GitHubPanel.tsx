@@ -515,7 +515,11 @@ function PrDetail({
       ) : !detail ? (
         <EmptyState line="Loading PR…" />
       ) : (
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        <div
+          className="min-h-0 flex-1 overflow-y-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-acc/40"
+          tabIndex={0}
+          aria-label="Pull request details and diff"
+        >
           <div className="flex flex-col gap-2 border-b border-line px-4 py-3">
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="font-mono text-10 text-fnt">
@@ -539,7 +543,7 @@ function PrDetail({
             </div>
             <PrAgentButtons projectId={projectId} pr={detail} />
             {detail.body && (
-              <p className="max-h-40 overflow-y-auto whitespace-pre-wrap text-12 leading-relaxed text-mut">
+              <p className="whitespace-pre-wrap text-12 leading-relaxed text-mut">
                 {detail.body}
               </p>
             )}

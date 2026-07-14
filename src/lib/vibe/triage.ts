@@ -9,6 +9,8 @@ import { humanAttention } from "./attention";
 
 export interface VibeTriageEntry {
   id: string;
+  /** Owning project id — global attention surfaces switch tabs before jump. */
+  projectId: string;
   name: string;
   /** project folder basename (mono, faint in the queue) */
   project: string;
@@ -38,6 +40,7 @@ export function vibeTriageEntries(s: VibeState): VibeTriageEntry[] {
     if (!attention) continue;
     entries.push({
       id,
+      projectId: entry.session.projectId,
       name: entry.session.name,
       project: folderName(entry.session.projectDir),
       since: attention.since,

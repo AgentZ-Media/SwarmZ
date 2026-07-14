@@ -157,7 +157,7 @@ function EmptyState({
       {!filtered && hasProject && (
         <button
           onClick={onNew}
-          className="focus-ring flex h-8 items-center gap-1.5 rounded-md bg-acc px-4 text-12 font-semibold text-white hover:brightness-110"
+          className="focus-ring flex h-8 items-center gap-1.5 rounded-md bg-acc px-4 text-12 font-semibold text-bg hover:brightness-110"
         >
           <Plus size={12} /> New worker
         </button>

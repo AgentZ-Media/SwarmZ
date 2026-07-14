@@ -189,7 +189,7 @@ export function RuntimeEnvironmentsPanel({
             <div className="text-14 font-semibold tracking-[-0.01em] text-txt">
               Runtime environments
             </div>
-            <div className="font-mono text-10 text-fnt">isolated · argv-only · reference-only secrets</div>
+            <div className="font-mono text-10 text-fnt">optional · most missions need no runtime</div>
           </div>
           <span className="flex-1" />
           <button
@@ -291,7 +291,7 @@ export function RuntimeEnvironmentsPanel({
                 </div>
               </main>
             ) : (
-              <EmptyState text="Create an environment to define setup and services." />
+              <EmptyState text="Optional for advanced E2E work: add a runtime only when a Mission needs a dev server, API or local database." />
             )}
           </div>
         )}
@@ -582,34 +582,53 @@ function SecretsEditor({ draft, update }: { draft: RuntimeEnvironmentSpec; updat
 
 function LiveServices({ services, refreshing, refresh, stop }: { services: RuntimeServiceSnapshot[]; refreshing: boolean; refresh: () => void; stop: (service: RuntimeServiceSnapshot) => Promise<void> }) {
   return (
-    <div>
-      <div className="mb-2 flex items-center justify-between">
+    <div className="flex min-h-0 flex-col">
+      <div className="mb-2 flex shrink-0 items-center gap-1.5">
         <span className="font-mono text-10 uppercase tracking-[.08em] text-fnt">Live services</span>
-        <button className="focus-ring text-fnt hover:text-txt" onClick={refresh} aria-label="Refresh services">
-          <RefreshCw size={11} className={refreshing ? "animate-spin" : ""} />
+        <span
+          className="rounded-sm border border-line2 bg-card px-1.5 py-0.5 font-mono text-10 tabular-nums text-mut"
+          aria-label={`${services.length} live ${services.length === 1 ? "service" : "services"}`}
+        >
+          {services.length}
+        </span>
+        <button
+          type="button"
+          className="focus-ring ml-auto flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt disabled:cursor-wait disabled:opacity-50"
+          onClick={refresh}
+          disabled={refreshing}
+          aria-label={refreshing ? "Refreshing live services" : "Refresh live services"}
+        >
+          <RefreshCw size={11} className={refreshing ? "animate-spin" : ""} aria-hidden />
         </button>
       </div>
-      {services.length === 0 ? (
-        <p className="text-10 leading-relaxed text-fnt">No owned service processes.</p>
-      ) : (
-        <div className="space-y-1.5">
-          {services.map((service) => (
-            <div key={`${service.instanceId}:${service.serviceId}`} className="rounded-md border border-line bg-card p-2">
-              <div className="flex items-center gap-1.5">
-                <span className={cn("h-1.5 w-1.5 rounded-full", service.state === "running" ? "bg-ok" : service.state === "orphaned" ? "bg-warn" : "bg-fnt")} aria-hidden />
-                <span className="sr-only">{service.state}</span>
-                <span className="min-w-0 flex-1 truncate font-mono text-10 text-mut">{service.serviceId}</span>
-                <button className="focus-ring text-fnt hover:text-err" onClick={() => void stop(service)} aria-label={`Stop ${service.serviceId}`}>
-                  <Square size={10} />
-                </button>
+      <div className="min-h-0 max-h-24 overflow-y-auto pr-1 sm:max-h-48">
+        {services.length === 0 ? (
+          <p className="text-10 leading-relaxed text-fnt">No owned service processes.</p>
+        ) : (
+          <div className="space-y-1.5">
+            {services.map((service) => (
+              <div key={`${service.instanceId}:${service.serviceId}`} className="rounded-md border border-line bg-card p-2">
+                <div className="flex items-center gap-1.5">
+                  <span className={cn("h-1.5 w-1.5 rounded-full", service.state === "running" ? "bg-ok" : service.state === "orphaned" ? "bg-warn" : "bg-fnt")} aria-hidden />
+                  <span className="sr-only">{service.state}</span>
+                  <span className="min-w-0 flex-1 truncate font-mono text-10 text-mut">{service.serviceId}</span>
+                  <button
+                    type="button"
+                    className="focus-ring flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-fnt hover:bg-err/10 hover:text-err"
+                    onClick={() => void stop(service)}
+                    aria-label={`Stop live service ${service.serviceId}`}
+                  >
+                    <Square size={10} aria-hidden />
+                  </button>
+                </div>
+                <div className="mt-1 truncate font-mono text-10 text-fnt">
+                  {Object.entries(service.ports).map(([name, port]) => `${name}=${port}`).join(" · ") || service.state}
+                </div>
               </div>
-              <div className="mt-1 truncate font-mono text-10 text-fnt">
-                {Object.entries(service.ports).map(([name, port]) => `${name}=${port}`).join(" · ") || service.state}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

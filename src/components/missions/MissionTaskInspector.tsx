@@ -353,7 +353,7 @@ export function MissionTaskInspector({
                   className="focus-ring mt-1 w-full resize-y rounded-md border border-line2 bg-card px-2.5 py-2 text-11 leading-normal text-txt placeholder:text-fnt"
                 />
               </label>
-              <button type="button" onClick={requeueFreshAttempt} disabled={retryInstruction.trim().length < 2 || (attemptLimitExhausted && (!extendAttemptLimit || task.maxAttempts >= 20))} className="focus-ring h-8 shrink-0 rounded-md bg-acc px-3 text-11 font-semibold text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">
+              <button type="button" onClick={requeueFreshAttempt} disabled={retryInstruction.trim().length < 2 || (attemptLimitExhausted && (!extendAttemptLimit || task.maxAttempts >= 20))} className="focus-ring h-8 shrink-0 rounded-md bg-acc px-3 text-11 font-semibold text-bg hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">
                 Approve fresh retry
               </button>
             </div>

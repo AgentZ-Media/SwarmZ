@@ -22,7 +22,7 @@ import {
   activateProject,
   requestCloseProject,
 } from "@/lib/vibe/controller";
-import { vibeTriageEntries } from "@/lib/vibe/triage";
+import { useAttentionCount } from "@/lib/attention/use-attention";
 import { discoverProjects } from "@/lib/orchestrator/native";
 import { useUpdates } from "@/lib/updates";
 import { WorktreesButton } from "./WorktreePanel";
@@ -37,7 +37,6 @@ import {
 } from "./ui/dropdown-menu";
 import { cn, shortPath } from "@/lib/utils";
 import { IS_TAURI, pickDirectory } from "@/lib/transport";
-import { useMissions } from "@/lib/missions/store";
 import type { ProjectEntry } from "@/lib/orchestrator/types";
 
 /** Shared 32px icon-button treatment for the title-bar actions. */
@@ -73,7 +72,12 @@ export function TitleBar({
     >
       {/* Conductor sidebar toggle (⌘B) */}
       <Tip label={conductorOpen ? "Collapse the Orchestrator (⌘B)" : "Open the Orchestrator (⌘B)"}>
-        <button onClick={toggleConductor} className={BAR_BTN}>
+        <button
+          onClick={toggleConductor}
+          className={BAR_BTN}
+          aria-label={conductorOpen ? "Collapse the Orchestrator" : "Open the Orchestrator"}
+          aria-pressed={conductorOpen}
+        >
           <PanelLeft
             size={16}
             className={cn(!conductorOpen && "opacity-40")}
@@ -117,6 +121,8 @@ export function TitleBar({
           <button
             onClick={() => setDashboardOpen(!dashboardOpen)}
             className={cn(BAR_BTN, dashboardOpen && "bg-card text-txt")}
+            aria-label="Usage dashboard"
+            aria-pressed={dashboardOpen}
           >
             <BarChart3 size={15} />
           </button>
@@ -126,6 +132,8 @@ export function TitleBar({
           <button
             onClick={() => setNotesOpen(!notesOpen)}
             className={cn(BAR_BTN, notesOpen && "bg-card text-txt")}
+            aria-label="Quick notes"
+            aria-pressed={notesOpen}
           >
             <StickyNote size={15} />
           </button>
@@ -143,7 +151,7 @@ export function TitleBar({
         <GitHubButton />
 
         <Tip label="Settings (⌘,)">
-          <button onClick={onOpenSettings} className={BAR_BTN}>
+          <button onClick={onOpenSettings} className={BAR_BTN} aria-label="Settings">
             <Settings size={15} />
           </button>
         </Tip>
@@ -151,7 +159,7 @@ export function TitleBar({
         <Tip label="New mission">
           <button
             onClick={() => useVibeUi.getState().setMissionCreateOpen(true)}
-            className="no-drag focus-ring ml-1 flex h-8 items-center gap-1.5 rounded-md bg-acc px-3 text-12 font-semibold text-white hover:brightness-110"
+            className="no-drag focus-ring ml-1 flex h-8 items-center gap-1.5 rounded-md bg-acc px-3 text-12 font-semibold text-bg hover:brightness-110"
           >
             <Workflow size={13} strokeWidth={2.5} /> New mission
           </button>
@@ -171,6 +179,8 @@ function GitHubButton() {
       <button
         onClick={() => setGithubOpen(!githubOpen)}
         className={cn(BAR_BTN, githubOpen && "bg-card text-txt")}
+        aria-label="GitHub repository and pull requests"
+        aria-pressed={githubOpen}
       >
         <GitPullRequest size={15} />
       </button>
@@ -183,15 +193,9 @@ function GitHubButton() {
  * human. Click = jump to the oldest waiting session (same routing as ⌘⇧A).
  */
 function NeedsYouPill() {
-  // primitive count — vibeTriageEntries builds fresh arrays, so only its
-  // length may leave the selector (AGENTS.md)
-  const workerCount = useVibe((s) => vibeTriageEntries(s).length);
-  const missionCount = useMissions((state) =>
-    Object.values(state.projection.tasks).filter((task) =>
-      ["needs_human", "blocked", "failed"].includes(task.status),
-    ).length,
-  );
-  const count = workerCount + missionCount;
+  // Exact same row projection as the inbox: workers, mission tasks, blocked
+  // integration trains and actionable GitHub PR/CI failures cannot drift.
+  const count = useAttentionCount();
   if (count === 0) return null;
   const jump = () => {
     useVibeUi.getState().setAttentionOpen(true);
@@ -422,9 +426,10 @@ function ProjectTab({
         }}
         onMouseDown={(e) => e.stopPropagation()}
         title="Close project tab (sessions are kept)"
-        className="focus-ring pointer-events-none flex h-4 w-4 shrink-0 items-center justify-center rounded-xs text-fnt opacity-0 hover:bg-err/15 hover:text-err focus-visible:opacity-100 group-hover/tab:pointer-events-auto group-hover/tab:opacity-100"
+        aria-label={`Close ${name} project tab`}
+        className="focus-ring pointer-events-none flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-fnt opacity-0 hover:bg-err/15 hover:text-err focus-visible:opacity-100 group-hover/tab:pointer-events-auto group-hover/tab:opacity-100"
       >
-        <X size={10} />
+        <X size={11} />
       </button>
     </div>
   );

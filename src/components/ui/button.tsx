@@ -14,11 +14,11 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        default: "bg-acc font-semibold text-white hover:brightness-110",
+        default: "bg-acc font-semibold text-bg hover:brightness-110",
         confirm: "bg-txt font-semibold text-bg hover:brightness-90",
         secondary: "border border-line bg-pop text-txt hover:border-line2",
         ghost: "text-mut hover:bg-card hover:text-txt",
-        danger: "bg-err font-semibold text-white hover:brightness-110",
+        danger: "bg-err font-semibold text-bg hover:brightness-110",
         outline: "border border-line2 bg-transparent text-txt hover:bg-pop",
       },
       size: {

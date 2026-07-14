@@ -32,7 +32,6 @@ export function MissionWorkspace() {
   const projectId = useProjects((state) => state.activeProjectId);
   const selectedId = useVibeUi((state) => state.selectedMissionId);
   const view = useVibeUi((state) => state.workspaceView);
-  const attentionOpen = useVibeUi((state) => state.attentionOpen);
   const selectedTaskId = useVibeUi((state) => state.selectedMissionTaskId);
   const recoveryOpen = useVibeUi((state) => state.recoveryOpen);
   const missionSignature = useMissions((state) => Object.values(state.projection.missions)
@@ -48,9 +47,9 @@ export function MissionWorkspace() {
   useEffect(() => {
     if ((mission?.id ?? null) !== selectedId) useVibeUi.getState().setSelectedMissionId(mission?.id ?? null);
   }, [mission?.id, selectedId]);
-  if (!projectId) return <NoProject />;
-  if (!mission && view === "fleet") return <FleetGrid />;
-  if (!mission) return <NoMission />;
+  if (!projectId) return <><NoProject /><GlobalAttentionDrawer /></>;
+  if (!mission && view === "fleet") return <><FleetGrid /><GlobalAttentionDrawer /></>;
+  if (!mission) return <><NoMission /><GlobalAttentionDrawer /></>;
 
   return (
     <div className="relative flex min-h-0 flex-1 overflow-hidden">
@@ -73,14 +72,7 @@ export function MissionWorkspace() {
         {view === "timeline" && <MissionTimeline missionId={mission.id} />}
       </main>
       <aside className="hidden w-[304px] shrink-0 border-l border-line bg-panel/55 2xl:flex"><AttentionInbox className="h-full w-full rounded-none border-0" /></aside>
-      <Dialog open={attentionOpen} onOpenChange={(open) => { if (!open) useVibeUi.getState().setAttentionOpen(false); }}>
-        <DrawerContent className="w-[min(360px,94vw)]">
-          <DialogTitle className="sr-only">Attention inbox</DialogTitle>
-          <DialogDescription className="sr-only">Approvals, failed gates, blocked tasks and other mission decisions that need you.</DialogDescription>
-          <button onClick={() => useVibeUi.getState().setAttentionOpen(false)} aria-label="Close attention inbox" className="focus-ring absolute right-2 top-2 z-10 flex h-8 w-8 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt"><X size={14} aria-hidden /></button>
-          <AttentionInbox className="h-full w-full rounded-none border-0" />
-        </DrawerContent>
-      </Dialog>
+      <GlobalAttentionDrawer />
       <Dialog open={!!selectedTaskId} onOpenChange={(open) => { if (!open) useVibeUi.getState().setSelectedMissionTaskId(null); }}>
         <DrawerContent className="w-[min(760px,94vw)]">
           <DialogTitle className="sr-only">Mission task details</DialogTitle>
@@ -98,6 +90,42 @@ export function MissionWorkspace() {
         </DrawerContent>
       </Dialog>
     </div>
+  );
+}
+
+/**
+ * The inbox is global, so its portal must stay mounted even when Mission
+ * Control currently has no active project or no mission. The TitleBar pill
+ * and ⌘⇧A can therefore always open the same decision queue.
+ */
+function GlobalAttentionDrawer() {
+  const attentionOpen = useVibeUi((state) => state.attentionOpen);
+  return (
+    <Dialog
+      open={attentionOpen}
+      onOpenChange={(open) => {
+        if (!open) useVibeUi.getState().setAttentionOpen(false);
+      }}
+    >
+      <DrawerContent className="w-[min(360px,94vw)]">
+        <DialogTitle className="sr-only">Attention inbox</DialogTitle>
+        <DialogDescription className="sr-only">
+          Approvals, failed gates, blocked tasks and other mission decisions
+          that need you.
+        </DialogDescription>
+        <button
+          onClick={() => useVibeUi.getState().setAttentionOpen(false)}
+          aria-label="Close attention inbox"
+          className="focus-ring absolute right-2 top-2 z-10 flex h-8 w-8 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt"
+        >
+          <X size={14} aria-hidden />
+        </button>
+        <AttentionInbox
+          className="h-full w-full rounded-none border-0"
+          reserveCloseButtonSpace
+        />
+      </DrawerContent>
+    </Dialog>
   );
 }
 
@@ -144,7 +172,7 @@ function MissionHeader({ mission, missions, onOpenInsights }: { mission: Mission
         {!archived && <MissionHeaderActions mission={mission} />}
         {!archived && <button onClick={() => paused ? useMissions.getState().activateMission(mission.id) : useMissions.getState().pauseMission(mission.id)} disabled={terminal} className="focus-ring flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-line2 px-2.5 text-11 text-mut hover:bg-card hover:text-txt disabled:opacity-40">{paused ? <Play size={12} /> : <Pause size={12} />}{paused ? "Resume" : "Pause"}</button>}
         {archived && <span className="rounded-sm border border-line px-2 py-1 font-mono text-10 uppercase text-fnt">immutable · read only</span>}
-        <button onClick={() => useVibeUi.getState().setMissionCreateOpen(true)} className="focus-ring flex h-8 shrink-0 items-center gap-1.5 rounded-md bg-acc px-3 text-11 font-semibold text-white hover:brightness-110"><Plus size={12} /> Mission</button>
+        <button onClick={() => useVibeUi.getState().setMissionCreateOpen(true)} className="focus-ring flex h-8 shrink-0 items-center gap-1.5 rounded-md bg-acc px-3 text-11 font-semibold text-bg hover:brightness-110"><Plus size={12} /> Mission</button>
         </div>
       </div>
       <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1.5">
@@ -163,5 +191,5 @@ function NoProject() {
 }
 
 function NoMission() {
-  return <div className="dot-grid flex min-h-0 flex-1 items-center justify-center p-4 text-center sm:p-8"><div className="max-w-lg border-y border-line bg-panel/40 px-4 py-8 sm:px-8 sm:py-10"><Workflow size={28} className="mx-auto text-acc" /><h1 className="mt-4 text-16 font-semibold tracking-[-0.01em] text-txt">Turn a large goal into a controlled mission</h1><p className="mt-3 text-12 leading-relaxed text-fnt">Import a bug list or roadmap. SwarmZ builds the dependency graph, schedules temporary workers, prevents conflicting writes and verifies the combined result.</p><div className="mt-6 flex flex-wrap justify-center gap-2"><button onClick={() => useVibeUi.getState().setMissionCreateOpen(true)} className="focus-ring h-9 rounded-md bg-acc px-5 text-12 font-semibold text-white hover:brightness-110"><Plus size={13} className="mr-1.5 inline" />Create first mission</button><button onClick={() => useVibeUi.getState().setWorkspaceView("fleet")} className="focus-ring h-9 rounded-md px-4 text-12 text-mut hover:bg-card hover:text-txt">Open fleet</button></div></div></div>;
+  return <div className="dot-grid flex min-h-0 flex-1 items-center justify-center p-4 text-center sm:p-8"><div className="max-w-lg border-y border-line bg-panel/40 px-4 py-8 sm:px-8 sm:py-10"><Workflow size={28} className="mx-auto text-acc" /><h1 className="mt-4 text-16 font-semibold tracking-[-0.01em] text-txt">Turn a large goal into a controlled mission</h1><p className="mt-3 text-12 leading-relaxed text-fnt">Import a bug list or roadmap. SwarmZ builds the dependency graph, schedules temporary workers, prevents conflicting writes and verifies the combined result.</p><div className="mt-6 flex flex-wrap justify-center gap-2"><button onClick={() => useVibeUi.getState().setMissionCreateOpen(true)} className="focus-ring h-9 rounded-md bg-acc px-5 text-12 font-semibold text-bg hover:brightness-110"><Plus size={13} className="mr-1.5 inline" />Create first mission</button><button onClick={() => useVibeUi.getState().setWorkspaceView("fleet")} className="focus-ring h-9 rounded-md px-4 text-12 text-mut hover:bg-card hover:text-txt">Open fleet</button></div></div></div>;
 }
