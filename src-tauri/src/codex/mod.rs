@@ -15,6 +15,7 @@
 // state, instructions) stays in `orchestrator/` — this module knows nothing
 // about tools or chats.
 
+pub mod approval;
 pub mod host;
 pub mod protocol;
 pub mod sessions;

@@ -2535,7 +2535,7 @@ mod tests {
         // (b)+(c) two REAL agents in SEPARATE cwds; one returns a report
         // =====================================================================
         // a real production worktree for the implementation agent
-        let wt = crate::worktree::add(&repo_str, "swarm/impl-agent", false, None)
+        let wt = crate::worktree::add(&repo_str, "swarm/impl-agent", false, None, None)
             .expect("worktree::add");
         let wt_path = std::fs::canonicalize(&wt.path).unwrap();
         let wt_str = wt_path.to_string_lossy().into_owned();
