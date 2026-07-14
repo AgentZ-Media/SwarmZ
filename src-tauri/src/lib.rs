@@ -4,6 +4,7 @@ mod explore;
 mod fsx;
 mod git;
 mod github;
+mod integration_native;
 mod mission_evidence;
 mod orchestrator;
 mod plans;
@@ -75,6 +76,40 @@ async fn mission_git_evidence(
     })
     .await
     .map_err(|error| format!("mission evidence worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn integration_apply(
+    request: integration_native::IntegrationApplyRequest,
+) -> Result<integration_native::IntegrationApplyResult, String> {
+    tauri::async_runtime::spawn_blocking(move || integration_native::integration_apply(request))
+        .await
+        .map_err(|error| format!("integration worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn integration_rollback(
+    request: integration_native::IntegrationRollbackRequest,
+) -> Result<integration_native::IntegrationRollbackResult, String> {
+    tauri::async_runtime::spawn_blocking(move || integration_native::integration_rollback(request))
+        .await
+        .map_err(|error| format!("rollback worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn acceptance_command_run(
+    request: integration_native::AcceptanceCommandRequest,
+) -> Result<integration_native::AcceptanceCommandResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        integration_native::acceptance_command_run(request)
+    })
+    .await
+    .map_err(|error| format!("acceptance worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn acceptance_command_cancel(run_id: String) -> bool {
+    integration_native::acceptance_command_cancel(&run_id)
 }
 
 #[tauri::command]
@@ -837,6 +872,10 @@ pub fn run() {
             canonicalize_path,
             git_info,
             mission_git_evidence,
+            integration_apply,
+            integration_rollback,
+            acceptance_command_run,
+            acceptance_command_cancel,
             worktree_add,
             worktree_status,
             worktree_remove,
