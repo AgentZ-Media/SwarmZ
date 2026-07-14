@@ -61,6 +61,10 @@ import {
   registerAutonomyPersist,
   serializeAutonomyBudgets,
 } from "@/lib/orchestrator/autonomy";
+import {
+  flushMissionsPersist,
+  hydrateMissions,
+} from "@/lib/missions/store";
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
@@ -197,6 +201,8 @@ export async function flushAllPersists(): Promise<void> {
     flushProjectsPersist(),
     // the conductor timers keep their own debounced slice
     flushConductorTimersPersist(),
+    // durable Mission Control event log
+    flushMissionsPersist(),
     // the autonomy budgets keep their own debounced slice
     flushAutonomyPersist(),
   ]);
@@ -414,6 +420,14 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       await hydrateVibeSessions();
     } catch {
       migrationReady = false;
+    }
+    try {
+      // Mission projections reference project ids but are otherwise
+      // self-contained. Hydrate before chats/timers so recovered work is
+      // visible to every later orchestration surface in this app run.
+      await hydrateMissions();
+    } catch {
+      /* per-slice fail-closed health is exposed by the mission store */
     }
     // both hydrators also SWALLOW load failures internally (per-slice
     // tolerance) — their `hydrated` flags are the authoritative success

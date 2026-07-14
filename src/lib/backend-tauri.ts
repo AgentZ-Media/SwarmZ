@@ -21,6 +21,7 @@ import type {
   UsageHistoryEntry,
 } from "@/types";
 import type { Backend } from "./backend-types";
+import type { PersistedMissions } from "@/lib/missions/types";
 
 const store = new LazyStore("swarmz.json");
 
@@ -90,6 +91,16 @@ export const tauriBackend: Backend = {
   },
   saveAutonomyBudgets: async (data) => {
     await store.set("autonomyBudgets", data);
+    await store.save();
+  },
+
+  loadMissions: async () => {
+    // A read failure must throw. The mission store then remains write-gated;
+    // unreadable durable work must never be replaced by an empty event log.
+    return (await store.get<PersistedMissions>("missions")) ?? null;
+  },
+  saveMissions: async (data) => {
+    await store.set("missions", data);
     await store.save();
   },
 

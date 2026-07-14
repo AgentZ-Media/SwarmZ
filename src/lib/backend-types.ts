@@ -10,6 +10,7 @@ import type {
   QuickNotesData,
   UsageHistoryEntry,
 } from "@/types";
+import type { PersistedMissions } from "@/lib/missions/types";
 
 export type Unlisten = () => void;
 
@@ -51,6 +52,10 @@ export interface Backend {
   /** Autonomy budgets / circuit breakers — a relaunch must not reset them. */
   loadAutonomyBudgets(): Promise<PersistedAutonomyBudgets | null>;
   saveAutonomyBudgets(data: PersistedAutonomyBudgets): Promise<void>;
+
+  /** Append-only Mission Control event log and its schema envelope. */
+  loadMissions(): Promise<PersistedMissions | null>;
+  saveMissions(data: PersistedMissions): Promise<void>;
 
   /**
    * Delete top-level swarmz.json keys (missing keys are a no-op) — the
