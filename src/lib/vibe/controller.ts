@@ -14,7 +14,6 @@
 //     first send resumes the persisted thread (a lost rollout falls back to a
 //     fresh thread, surfaced as a warning item)
 
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { nanoid } from "nanoid";
 import { useSwarm } from "@/store";
@@ -41,6 +40,20 @@ import {
 import { pickAgentName } from "./names";
 import { reportItemIdOf } from "./report-item";
 import { useVibeUi } from "./ui-store";
+import {
+  closeNativeSession,
+  compactNativeSession,
+  interruptNativeSession,
+  respondNativeApproval,
+  resumeNativeSession,
+  reviewNativeSession,
+  sendNativeTurn,
+  setNativeSessionAccess,
+  setNativeSessionCwd,
+  setNativeSessionModelEffort,
+  startNativeSession,
+  steerNativeTurn,
+} from "./native";
 
 /** Trailing-edge delta flush — word-level deltas never write per event. */
 const DELTA_FLUSH_MS = 80;
@@ -75,141 +88,6 @@ export type VibeApprovalDecision =
   | "acceptForSession"
   | "decline"
   | "cancel";
-
-// ---- typed invoke wrappers ----
-
-/** The Settings codex-binary override, passed on every process-touching call. */
-function codexPath(): string {
-  return useSwarm.getState().settings.codexPath ?? "";
-}
-
-function invokeStart(
-  sessionId: string,
-  opts: StartOpts,
-): Promise<{ thread_id: string }> {
-  return invoke("vibe_session_start", {
-    sessionId,
-    cwd: opts.projectDir,
-    model: opts.model ?? null,
-    effort: opts.effort ?? null,
-    access: opts.access,
-    codexPath: codexPath(),
-  });
-}
-
-function invokeResume(
-  sessionId: string,
-  threadId: string,
-  opts: StartOpts,
-): Promise<{ thread_id: string; resumed: boolean }> {
-  return invoke("vibe_session_resume", {
-    sessionId,
-    threadId,
-    cwd: opts.projectDir,
-    model: opts.model ?? null,
-    effort: opts.effort ?? null,
-    access: opts.access,
-    codexPath: codexPath(),
-  });
-}
-
-function invokeSend(
-  sessionId: string,
-  text: string,
-  outputSchema?: Record<string, unknown>,
-  requireWorkspace?: boolean,
-): Promise<{ turn_id: string | null }> {
-  return invoke("vibe_session_send", {
-    sessionId,
-    text,
-    outputSchema: outputSchema ?? null,
-    // the Conductor path passes true → Rust refuses a full-access session
-    // (capability-reuse guard), authoritative at the backend boundary
-    requireWorkspace: requireWorkspace ?? false,
-  });
-}
-
-function invokeInterrupt(sessionId: string): Promise<void> {
-  return invoke("vibe_session_interrupt", { sessionId });
-}
-
-/** Blocks until the compaction turn genuinely completed (Rust waits on the
- * turn's terminal event — a following send never races the compaction). */
-function invokeCompact(sessionId: string): Promise<{ status: string }> {
-  return invoke("vibe_session_compact", { sessionId });
-}
-
-function invokeRespondApproval(
-  sessionId: string,
-  approvalId: string,
-  decision: VibeApprovalDecision,
-  requireRoutine: boolean,
-): Promise<void> {
-  return invoke("vibe_session_respond_approval", {
-    sessionId,
-    approvalId,
-    decision,
-    requireRoutine,
-  });
-}
-
-function invokeSetAccess(sessionId: string, access: VibeAccess): Promise<void> {
-  return invoke("vibe_session_set_access", { sessionId, access });
-}
-
-function invokeSetModelEffort(
-  sessionId: string,
-  model: string | undefined,
-  effort: string | undefined,
-): Promise<void> {
-  return invoke("vibe_session_set_model_effort", {
-    sessionId,
-    model: model ?? null,
-    effort: effort ?? null,
-  });
-}
-
-function invokeClose(sessionId: string): Promise<void> {
-  return invoke("vibe_session_close", { sessionId });
-}
-
-function invokeSteer(
-  sessionId: string,
-  text: string,
-  requireWorkspace?: boolean,
-): Promise<{ turn_id: string | null; steered: boolean }> {
-  return invoke("vibe_session_steer", {
-    sessionId,
-    text,
-    requireWorkspace: requireWorkspace ?? false,
-  });
-}
-
-function invokeSetCwd(sessionId: string, cwd: string): Promise<void> {
-  return invoke("vibe_session_set_cwd", { sessionId, cwd });
-}
-
-function invokeReview(
-  sessionId: string,
-  target: string,
-  requireWorkspace?: boolean,
-): Promise<{
-  status: string;
-  review: string | null;
-  review_thread_id: string;
-}> {
-  return invoke("vibe_session_review", {
-    sessionId,
-    target,
-    // C3: the detached review must not reuse a HUMAN-granted full-access
-    // profile under the Conductor (danger-full-access + approvalPolicy "never"
-    // = no approval to cancel). Every review caller is a Conductor path, so we
-    // pass the strict flag; the AUTHORITATIVE gate is Rust's
-    // `conductor_access_gate` on `session_review` (a full-access session
-    // refuses). Harmless if the backend confines review unconditionally.
-    requireWorkspace: requireWorkspace ?? false,
-  });
-}
 
 // ---- streaming state ----
 
@@ -762,13 +640,6 @@ function mirrorUsageHistory(sessionId: string): void {
  * restart the set is empty, so the first send resumes the persisted thread. */
 const liveBackends = new Set<string>();
 
-interface StartOpts {
-  projectDir: string;
-  model?: string;
-  effort?: string;
-  access: VibeAccess;
-}
-
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -853,7 +724,7 @@ export async function startSession(opts: StartSessionOpts): Promise<string> {
   };
   useVibe.getState().createSession(newSession);
   try {
-    const res = await invokeStart(id, { ...opts, access });
+    const res = await startNativeSession(id, { ...opts, access });
     liveBackends.add(id);
     useVibe.getState().setThreadId(id, res.thread_id);
     return id;
@@ -874,7 +745,7 @@ export async function resumeSession(sessionId: string): Promise<void> {
   const session = useVibe.getState().sessions[sessionId]?.session;
   if (!session) throw new Error(`unknown vibe session "${sessionId}"`);
   if (!session.threadId) throw new Error("this session has no thread to resume");
-  const res = await invokeResume(sessionId, session.threadId, {
+  const res = await resumeNativeSession(sessionId, session.threadId, {
     projectDir: session.projectDir,
     model: session.model,
     effort: session.effort,
@@ -998,7 +869,7 @@ async function deliverTurn(
   if (opts?.outputSchema) schemaTurns.set(sessionId, { turnId: null });
   try {
     await resumeSession(sessionId);
-    const res = await invokeSend(
+    const res = await sendNativeTurn(
       sessionId,
       trimmed,
       opts?.outputSchema,
@@ -1102,7 +973,11 @@ export async function steerMessageStrict(
   }
   ensureEvents();
   try {
-    const res = await invokeSteer(sessionId, trimmed, opts?.requireWorkspace);
+    const res = await steerNativeTurn(
+      sessionId,
+      trimmed,
+      opts?.requireWorkspace,
+    );
     // steered into the running turn — NOW mirror the text (confirmed)
     useVibe.getState().upsertItem(sessionId, {
       id: `user-${nanoid(8)}`,
@@ -1156,7 +1031,7 @@ export async function assignWorktreeToSession(
     );
   if (liveBackends.has(sessionId)) {
     // backend FIRST — the store commits only on its ack
-    await invokeSetCwd(sessionId, args.path);
+    await setNativeSessionCwd(sessionId, args.path);
   }
   useVibe.getState().assignWorktree(sessionId, {
     projectDir: args.path,
@@ -1183,7 +1058,11 @@ export async function reviewSession(
   const endInflight = beginInflight("review");
   try {
     await resumeSession(sessionId);
-    return await invokeReview(sessionId, target, opts.requireWorkspace);
+    return await reviewNativeSession(
+      sessionId,
+      target,
+      opts.requireWorkspace,
+    );
   } finally {
     endInflight();
   }
@@ -1209,7 +1088,7 @@ export async function sendMessage(
 /** Stop the session's running turn (its turn resolves as "interrupted"). */
 export function interrupt(sessionId: string): void {
   if (!liveBackends.has(sessionId)) return;
-  void invokeInterrupt(sessionId).catch(() => {});
+  void interruptNativeSession(sessionId).catch(() => {});
 }
 
 /** How long `compactSession` waits, AFTER the blocking Rust RPC returned,
@@ -1260,7 +1139,7 @@ export async function compactSession(
   });
   try {
     await resumeSession(sessionId);
-    await invokeCompact(sessionId); // blocks until the turn genuinely ended
+    await compactNativeSession(sessionId); // blocks until the turn genuinely ended
     // settle handshake: the terminal event was emitted before the RPC
     // resolved — wait (bounded) until the webview processed it, so the
     // busy-flip and the "compacted" outcome are recorded before we return
@@ -1336,7 +1215,7 @@ export async function respondApproval(
     .getState()
     .setApprovalStatus(sessionId, approvalId, DECISION_STATUS[decision], "human");
   try {
-    await invokeRespondApproval(sessionId, approvalId, decision, false);
+    await respondNativeApproval(sessionId, approvalId, decision, false);
   } catch (err) {
     warn(sessionId, `Couldn't answer the approval: ${errorText(err)}`);
     // revert the optimistic mark — Rust never recorded the decision, the
@@ -1360,7 +1239,7 @@ export async function respondApprovalStrict(
   approvalId: string,
   decision: VibeApprovalDecision,
 ): Promise<void> {
-  await invokeRespondApproval(sessionId, approvalId, decision, true);
+  await respondNativeApproval(sessionId, approvalId, decision, true);
   useVibe
     .getState()
     .setApprovalStatus(
@@ -1379,7 +1258,7 @@ export async function setAccess(
   useVibe.getState().setAccess(sessionId, access);
   if (liveBackends.has(sessionId)) {
     try {
-      await invokeSetAccess(sessionId, access);
+      await setNativeSessionAccess(sessionId, access);
     } catch (err) {
       warn(sessionId, `Couldn't change access: ${errorText(err)}`);
     }
@@ -1400,7 +1279,7 @@ export async function setModelEffort(
   useVibe.getState().setModelEffort(sessionId, { model, effort });
   if (liveBackends.has(sessionId)) {
     try {
-      await invokeSetModelEffort(sessionId, model, effort);
+      await setNativeSessionModelEffort(sessionId, model, effort);
     } catch (err) {
       warn(sessionId, `Couldn't change model/effort: ${errorText(err)}`);
     }
@@ -1411,7 +1290,7 @@ export async function setModelEffort(
  * Tear down one session's backend PROCESS + all controller-side per-session
  * maps — but NOT the store entry (the caller owns that). Shared by
  * closeSession (which drops the store entry after). The final usage mirror +
- * map deletes run before the invokeClose await while the entry still exists.
+ * map deletes run before the native close await while the entry still exists.
  */
 async function cleanupSessionBackend(sessionId: string): Promise<void> {
   // flush a pending accounting mirror before the entry disappears
@@ -1419,7 +1298,7 @@ async function cleanupSessionBackend(sessionId: string): Promise<void> {
   mirrorUsageHistory(sessionId);
   if (liveBackends.has(sessionId)) {
     try {
-      await invokeClose(sessionId);
+      await closeNativeSession(sessionId);
       liveBackends.delete(sessionId);
     } catch (error) {
       // Fail closed: removing the visible/store identity here would orphan a
