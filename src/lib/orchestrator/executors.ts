@@ -14,7 +14,6 @@ import { useSwarm } from "@/store";
 import type { NoteItem, VibeAccess } from "@/types";
 import { fetchGitInfo } from "@/lib/transport";
 import { useProjects } from "@/lib/projects/store";
-import { pushFleetEvent } from "@/lib/events";
 import { useVibe, type VibeSessionEntry } from "@/lib/vibe/session-store";
 import {
   // STRICT on purpose: the orchestrator must never report `delivered:true`
@@ -57,9 +56,7 @@ import {
   unwatchPr,
   watchPr,
 } from "@/lib/github/controller";
-import { useOrchestrator } from "./chat-store";
 import { isAutonomousTurnInFlight } from "./controller";
-import { isFlattenedChar } from "./triggers-core";
 import { withWorktreeBriefing } from "./briefing";
 import {
   AGENT_REPORT_SCHEMA,
@@ -70,7 +67,6 @@ import {
 } from "./report";
 import {
   fleetSummaryLine,
-  sessionSnapshot,
   worktreeOccupancy,
 } from "./snapshot";
 import { discoverProjects, projectDocs } from "./native";
@@ -96,362 +92,53 @@ import type {
   SpawnAgentsResult,
   ToolNoteItem,
 } from "./types";
+import {
+  allowedProjectNotePaths,
+  assertNoDoublePrompt,
+  fleetSessions,
+  notePromptDelivered,
+  orderedSessions,
+  requireProject,
+  requireSession,
+  takenAgentNames,
+  type ToolCallContext,
+} from "./executor-agents";
+import {
+  approvalLooksLikeGithubWrite,
+  gitBin,
+  githubEnabled,
+  guardOutwardGithub,
+  redactRemoteUrl,
+  requireGithub,
+  requirePrNumber,
+  resolveAgentAccess,
+  sanitizeAgentName,
+  validModelId,
+} from "./executor-guards";
+import {
+  findWorktreeEntry,
+  sessionsInPath,
+  withWorktreeLock,
+} from "./executor-worktrees";
 
-/**
- * Per-call context the bus passes alongside the args. `chatId` is the STORE
- * chat id of the orchestrator chat whose turn triggered the call (the bus
- * resolves the backend id) — null for dev-hook calls (`__orch.tool`), which
- * therefore never track touched sessions. `projectId` is the Conductor
- * instance's project — session resolution, worktrees, timers and plans are
- * all scoped on it; null = unscoped (dev-hook).
- */
-export interface ToolCallContext {
-  chatId: string | null;
-  projectId: string | null;
-}
+export type { ToolCallContext } from "./executor-agents";
+export { DOUBLE_PROMPT_WINDOW_MS, fleetSessions } from "./executor-agents";
+export {
+  approvalLooksLikeGithubWrite,
+  redactRemoteUrl,
+  resolveAgentAccess,
+  sanitizeAgentName,
+} from "./executor-guards";
 
 export type ToolExecutor = (
   args: Record<string, unknown>,
   ctx: ToolCallContext,
 ) => Promise<unknown>;
 
-// ---- write guards + touched-session tracking ----
-
-/** Two orchestrator prompts into the SAME session within this window error. */
-export const DOUBLE_PROMPT_WINDOW_MS = 2_000;
-
-/**
- * Last orchestrator prompt delivery per session id — across ALL chats and
- * including spawn_agents startup tasks (in-memory; the guard is about
- * accidental duplicates within seconds, not restarts).
- */
-const lastPromptDelivery = new Map<string, number>();
-
-/**
- * The duplicate-delivery guard. Since Phase 4 a BUSY session no longer
- * refuses — prompt_agent steers the running turn instead — so this guard is
- * the only precondition left.
- */
-function assertNoDoublePrompt(sessionId: string, name: string): void {
-  const last = lastPromptDelivery.get(sessionId);
-  if (last !== undefined && Date.now() - last < DOUBLE_PROMPT_WINDOW_MS) {
-    throw new Error(
-      `agent "${name}" (${sessionId}) already received an orchestrator prompt ${Date.now() - last} ms ago — this looks like a duplicate call; wait a moment and re-send only if it was intentional`,
-    );
-  }
-}
-
-/**
- * Record a delivered prompt: feeds the double-prompt guard, and — when the
- * call carries a chat context — the chat's touchedPanes (the activity
- * watcher only pings sessions recorded here). Every delivery also lands in
- * the Deck's fleet event feed (`▸ orch → session`).
- */
-function notePromptDelivered(
-  sessionId: string,
-  sessionName: string,
-  ctx: ToolCallContext,
-): void {
-  lastPromptDelivery.set(sessionId, Date.now());
-  if (ctx.chatId)
-    useOrchestrator
-      .getState()
-      .recordTouchedPane(ctx.chatId, sessionId, sessionName);
-  pushFleetEvent({ kind: "orch_prompt", sessionId, sessionName });
-}
-
-/** Ordered session entries (rail order), optionally scoped to one project. */
-function orderedSessions(projectId: string | null): VibeSessionEntry[] {
-  const v = useVibe.getState();
-  return v.order
-    .map((id) => v.sessions[id])
-    .filter((e): e is VibeSessionEntry => !!e)
-    .filter((e) => projectId === null || e.session.projectId === projectId);
-}
-
-/** The session snapshot shared by fleet_snapshot + the summary (scoped). */
-export function fleetSessions(projectId: string | null = null) {
-  const v = useVibe.getState();
-  return sessionSnapshot({ sessions: orderedSessions(projectId), busy: v.busy });
-}
-
-/**
- * Resolve an `agent` argument to its session entry WITHIN the call's project
- * scope, or fail listing every valid id. Accepts a raw session id, or a
- * session name / agent name (optionally `@`-prefixed, case-insensitive)
- * that is unique within the scope.
- */
-function requireSession(agent: unknown, ctx: ToolCallContext): VibeSessionEntry {
-  const scoped = orderedSessions(ctx.projectId);
-  if (typeof agent === "string" && agent.trim()) {
-    const byId = scoped.find((e) => e.session.id === agent);
-    if (byId) return byId;
-    // name resolution: "@Maya" / "maya" — unique within the project scope
-    const needle = agent.trim().replace(/^@/, "").toLowerCase();
-    const byName = scoped.filter(
-      (e) =>
-        e.session.name.toLowerCase() === needle ||
-        e.session.agentName.toLowerCase() === needle,
-    );
-    if (byName.length === 1) return byName[0];
-    if (byName.length > 1) {
-      throw new Error(
-        `ambiguous agent name ${JSON.stringify(String(agent))} — matches: ${byName
-          .map((e) => `${e.session.id} ("${e.session.name}")`)
-          .join(", ")}; use the id`,
-      );
-    }
-  }
-  const valid = scoped
-    .map((e) => `${e.session.id} ("${e.session.name}")`)
-    .join(", ");
-  throw new Error(
-    `unknown agent ${JSON.stringify(String(agent))} — valid agents${
-      ctx.projectId ? " in this project" : ""
-    }: ${valid || "(no agents)"}`,
-  );
-}
-
 function stripNotes(items: NoteItem[]): ToolNoteItem[] {
   return items.map((n) => ({ text: n.text, done: n.done }));
 }
 
-/**
- * The (trailing-slash-normalized) folder paths whose quick-notes THIS project
- * may see: its own project dir plus every path its sessions work in (session
- * cwds + worktree roots). Returns null when there is no project context
- * (dev-hook call) — the caller then exposes NO folder notes, only global.
- */
-function allowedProjectNotePaths(ctx: ToolCallContext): Set<string> | null {
-  if (!ctx.projectId) return null;
-  const norm = (p: string) => p.replace(/\/+$/, "");
-  const allowed = new Set<string>();
-  const dir = useProjects.getState().projects[ctx.projectId]?.dir?.trim();
-  if (dir) allowed.add(norm(dir));
-  for (const e of orderedSessions(ctx.projectId)) {
-    if (e.session.projectDir?.trim()) allowed.add(norm(e.session.projectDir));
-    if (e.session.worktree?.root) allowed.add(norm(e.session.worktree.root));
-  }
-  return allowed;
-}
-
-/** The Conductor's project record — required by project-scoped tools. */
-function requireProject(ctx: ToolCallContext): { id: string; dir: string } {
-  const projectId = ctx.projectId ?? "";
-  const dir = useProjects.getState().projects[projectId]?.dir?.trim() ?? "";
-  if (!projectId || !dir)
-    throw new Error(
-      "this tool needs a project context — no project folder available",
-    );
-  return { id: projectId, dir };
-}
-
-/** Names already used by sessions of the scope (collision set). */
-function takenAgentNames(projectId: string | null): string[] {
-  const taken: string[] = [];
-  for (const e of orderedSessions(projectId)) {
-    taken.push(e.session.agentName, e.session.name);
-  }
-  return taken;
-}
-
-function gitBin(): string | undefined {
-  return useSwarm.getState().settings.gitPath?.trim() || undefined;
-}
-
-/** The Settings master toggle of the GitHub integration (Phase 7). */
-function githubEnabled(): boolean {
-  return !!useSwarm.getState().settings.githubIntegration;
-}
-
-/**
- * Hard gate of every github tool except `github_status` (which reports the
- * state instead). The registry keeps the tools statically declared — this
- * runtime refusal is the enforceable gate (see the github section below).
- */
-function requireGithub(): void {
-  if (!githubEnabled())
-    throw new Error(
-      "GitHub integration is disabled (Settings → GitHub) — this tool is unavailable. Do not retry; if the user wants GitHub work, tell them to enable the integration.",
-    );
-}
-
-/**
- * Gate of the OUTWARD-FACING github writes (create_pr, comment_pr, and
- * review_pr when it POSTS): these push to origin / post on github.com on the
- * user's behalf. In an AUTONOMOUS turn (a fleet event, not a user message,
- * drove it) they must NOT run unless the user explicitly opted in
- * (Settings → autonomousGithubWrites, default off) — otherwise a
- * prompt-injected autonomous cascade could open/approve/comment on the user's
- * repo. A HUMAN-triggered turn (the user asked for it directly) stays allowed
- * under the normal master toggle. The Conductor keeps its ability to PROPOSE
- * the write and act on the user's next message — it only loses the ability to
- * fire it unattended.
- */
-function guardOutwardGithub(ctx: ToolCallContext, action: string): void {
-  if (!isAutonomousTurnInFlight(ctx.chatId)) return; // human-triggered — allowed
-  if (useSwarm.getState().settings.autonomousGithubWrites === true) return;
-  throw new Error(
-    `refused: ${action} posts to GitHub on the user's behalf and this is an AUTONOMOUS turn. Outward GitHub writes stay with the user unless they enable Settings → "Autonomous GitHub actions". Report what you would ${action} and let the user run it (or ask them to).`,
-  );
-}
-
-/**
- * Does an approval's command perform an OUTWARD GitHub write (push / PR /
- * release / issue mutation / `gh api`)? Used by `decide_approval` as the
- * TF5 defense-in-depth twin: in an autonomous turn with `autonomousGithubWrites`
- * off, the Conductor must not ACCEPT such an approval even if it somehow
- * reached it classified "routine" (the Rust classifier already marks these
- * destructive — this is belt and braces). Pure + exported for unit tests.
- * File-change approvals are never outward writes.
- */
-const GH_WRITE_COMMAND_RE =
-  /\bgit\s+push\b|\bgh\s+(?:pr\s+(?:create|comment|review|merge|close|edit|ready|reopen)|release\s+(?:create|edit|delete|upload)|issue\s+(?:create|comment|close|edit|reopen)|api)\b/i;
-
-/**
- * Strip shell quotes so the write detection sees the same tokens the Rust
- * tokenizer does: `gh 'pr' 'comment'` / `gh "pr" comment` must reduce to the
- * bare `gh pr comment` the regex matches — otherwise a quoted form Rust
- * accepts would slip past this defense-in-depth twin. Removes every `'`/`"`
- * (quotes never appear inside a real gh subcommand token) and collapses
- * whitespace. Over-flagging a read command only costs a human click; missing a
- * quoted write is the failure we must avoid.
- */
-function stripShellQuotes(text: string): string {
-  return text
-    .replace(/['"]/g, "")
-    .split(/\s+/)
-    .filter(Boolean)
-    .join(" ");
-}
-
-export function approvalLooksLikeGithubWrite(approval: {
-  approvalKind: "command" | "fileChange";
-  payload: Record<string, unknown>;
-}): boolean {
-  if (approval.approvalKind !== "command") return false;
-  const cmd = approval.payload?.command;
-  const text = Array.isArray(cmd)
-    ? cmd.map((c) => (typeof c === "string" ? c : "")).join(" ")
-    : typeof cmd === "string"
-      ? cmd
-      : "";
-  // test both the raw text and a quote-stripped, whitespace-normalized form so
-  // quoted subcommands (`gh 'pr' 'comment'`, `gh "pr" comment`) match too
-  return (
-    GH_WRITE_COMMAND_RE.test(text) ||
-    GH_WRITE_COMMAND_RE.test(stripShellQuotes(text))
-  );
-}
-
-/**
- * Strip any userinfo (`user:token@`) from a remote URL before it reaches the
- * model — a PAT embedded in an `origin` URL must never leak into a tool
- * result. Idempotent with the Rust-side redaction (git.rs); belt and braces.
- */
-export function redactRemoteUrl(url: string | null): string | null {
-  if (!url) return null;
-  return url.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@]*@/, "$1");
-}
-
-/** Validate a PR `number` argument. */
-function requirePrNumber(raw: unknown): number {
-  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0)
-    throw new Error("number must be a positive PR number (from list_prs)");
-  return raw;
-}
-
-/** Trailing-slash-insensitive path equality. */
-function samePath(a: string, b: string): boolean {
-  return a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
-}
-
-/** Sessions (ALL projects) working in `path` — cleanup/shared bookkeeping. */
-function sessionsInPath(path: string): VibeSessionEntry[] {
-  return orderedSessions(null).filter((e) =>
-    samePath(e.session.projectDir, path),
-  );
-}
-
-/** Resolve symlinks (macOS /tmp → /private/tmp) — falls back to the input. */
-function canonicalizePath(path: string): Promise<string> {
-  return invoke<string>("canonicalize_path", { path }).catch(() => path);
-}
-
-/**
- * Find one SwarmZ worktree entry by path, scoped to the CALLING Conductor's
- * project repo ONLY — a Conductor must never assign agents into or clean up
- * another project's worktrees, so the persisted cross-project registry is
- * deliberately NOT consulted. The model-supplied path is canonicalized
- * before matching (git reports canonical paths).
- */
-async function findWorktreeEntry(path: string, ctx: ToolCallContext) {
-  const { dir } = requireProject(ctx);
-  const canonical = await canonicalizePath(path);
-  const scan = await listWorktrees([dir], gitBin());
-  return (
-    scan.entries.find(
-      (e) => samePath(e.path, canonical) || samePath(e.path, path),
-    ) ?? null
-  );
-}
-
-/**
- * Per-worktree async mutex: cleanup, assignment and the shared occupancy /
- * status re-checks of ONE worktree path run strictly serialized, so a
- * cleanup can never interleave with a re-homing or a second cleanup between
- * its final checks and the removal. Keyed by canonical path.
- */
-const worktreeLocks = new Map<string, Promise<unknown>>();
-
-async function withWorktreeLock<T>(
-  path: string,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const key = (await canonicalizePath(path)).replace(/\/+$/, "");
-  const tail = worktreeLocks.get(key) ?? Promise.resolve();
-  const run = tail.then(fn, fn); // previous failures don't poison the queue
-  worktreeLocks.set(
-    key,
-    run.catch(() => {}),
-  );
-  return run;
-}
-
-// ---- spawn_agents ----
-
-const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/;
-
-/**
- * Resolve an agent's access for a CONDUCTOR-driven tool. The Conductor can
- * only ever grant "workspace" — "full" (danger-full-access + approvalPolicy
- * never = the guard bypassed) is human-only, set via the session access
- * toggle in the UI. The Rust registry drops "full" from the model-callable
- * schema; this is the defense-in-depth twin — if "full" reaches the executor
- * anyway it is REFUSED (never silently downgraded, so the model learns why).
- */
-export function resolveAgentAccess(raw: unknown): VibeAccess {
-  if (raw === "full")
-    throw new Error(
-      'access "full" (danger-full-access) is human-only — the Conductor can only use "workspace". If full access is truly needed, ask the user to grant it via the agent\'s access toggle.',
-    );
-  return "workspace";
-}
-
-/**
- * Single-line-sanitize a model-supplied agent name: control chars, the C1
- * range and the Unicode line/para separators collapse to spaces (an agent
- * name is interpolated into UNTRUSTED autonomous wires as «name» — a smuggled
- * newline must never fabricate a structural line), whitespace collapses, and
- * the result is length-capped. Empty after sanitizing = treat as "no name".
- */
-export function sanitizeAgentName(raw: string): string {
-  let out = "";
-  for (const c of raw) {
-    out += isFlattenedChar(c.charCodeAt(0)) ? " " : c;
-  }
-  return out.replace(/\s+/g, " ").trim().slice(0, 60);
-}
 
 /**
  * How long a shared lane's NEXT initial turn waits for the previous agent's
@@ -547,7 +234,7 @@ async function spawnOneAgent(
   const task = typeof spec.task === "string" ? spec.task.trim() : "";
   if (!task) throw new Error("task must not be empty");
   let model = typeof spec.model === "string" ? spec.model.trim() : "";
-  if (model && !MODEL_RE.test(model))
+  if (model && !validModelId(model))
     throw new Error(`invalid model "${model}" — letters, digits and . _ : / - only`);
   const effort =
     typeof spec.effort === "string" && spec.effort.trim()
@@ -1083,7 +770,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         args.model === undefined
           ? entry.session.model
           : String(args.model).trim() || undefined;
-      if (model && !MODEL_RE.test(model))
+      if (model && !validModelId(model))
         throw new Error(`invalid model "${model}"`);
       const effort =
         args.effort === undefined
