@@ -7,44 +7,84 @@ on:
       - '!v*.*.*.*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # ============================================================
-  # 1) Prepare release notes
+  # 1) Fail-closed source, version and release-notes preflight
   # ============================================================
-  # Reads the per-version changelog file + the static install footer
-  # and passes them as a single output. Aborts if the changelog file
-  # is missing - this way no release can accidentally ship with the
-  # previous description.
-  prepare-notes:
-    name: Prepare release notes
+  # A release is valid only when the pushed stable tag still points at the
+  # freshly fetched origin/main, every product manifest matches the tag and
+  # a non-placeholder per-version notes file exists. No build/signing secret
+  # is exposed before this job succeeds.
+  preflight:
+    name: Verify release source and metadata
     runs-on: ubuntu-latest
     outputs:
       body: ${{ steps.notes.outputs.body }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is current origin/main
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "::error::Release workflow must run from a tag, got ${GITHUB_REF_TYPE}."
+            exit 1
+          fi
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tag must be a stable vMAJOR.MINOR.PATCH tag without leading zeroes."
+            exit 1
+          fi
+          git fetch --force --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main
+          tag_sha="$(git rev-parse --verify 'HEAD^{commit}')"
+          main_sha="$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')"
+          if [[ "${tag_sha}" != "${GITHUB_SHA}" ]]; then
+            echo "::error::Checked-out tag commit ${tag_sha} differs from event SHA ${GITHUB_SHA}."
+            exit 1
+          fi
+          if [[ "${tag_sha}" != "${main_sha}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${tag_sha}) is not current origin/main (${main_sha})."
+            exit 1
+          fi
+          echo "source_sha=${tag_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Test release preflight
+        run: node --test .github/scripts/release-preflight.test.mjs
+
+      - name: Verify manifest versions and release notes
+        run: node .github/scripts/release-preflight.mjs "${GITHUB_REF_NAME}"
 
       - name: Build release body
         id: notes
+        shell: bash
         run: |
+          set -euo pipefail
           NOTES_FILE="docs/release-notes/${GITHUB_REF_NAME}.md"
           FOOTER_FILE="docs/release-notes/_install_footer.md"
-          if [ ! -f "$NOTES_FILE" ]; then
-            echo "::error::Missing $NOTES_FILE - create it before tagging (see AGENTS.md release checklist)."
-            exit 1
-          fi
-          if [ ! -f "$FOOTER_FILE" ]; then
-            echo "::error::Missing $FOOTER_FILE."
+          delimiter="SWARMZ_RELEASE_BODY_$(openssl rand -hex 16)"
+          if grep -Fqx "$delimiter" "$NOTES_FILE" "$FOOTER_FILE"; then
+            echo "::error::Generated release-body delimiter unexpectedly collides with source content."
             exit 1
           fi
           {
-            echo "body<<EOF_RELEASE_BODY"
+            echo "body<<${delimiter}"
             cat "$NOTES_FILE"
             echo
             cat "$FOOTER_FILE"
-            echo "EOF_RELEASE_BODY"
+            echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
   # ============================================================
@@ -56,11 +96,26 @@ jobs:
   # Gatekeeper workaround users need on first launch.
   build-macos:
     name: Build macOS (Apple Silicon)
-    needs: prepare-notes
+    needs: preflight
     runs-on: macos-26
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
+
+      - name: Verify pinned release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse --verify 'HEAD^{commit}')"
+          expected="${{ needs.preflight.outputs.source_sha }}"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::Build checkout ${actual} differs from verified release source ${expected}."
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -101,7 +156,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'SwarmZ ${{ github.ref_name }}'
-          releaseBody: ${{ needs.prepare-notes.outputs.body }}
+          releaseBody: ${{ needs.preflight.outputs.body }}
           releaseDraft: false
           prerelease: false
           args: --target aarch64-apple-darwin

@@ -4,9 +4,12 @@ mod explore;
 mod fsx;
 mod git;
 mod github;
+mod integration_native;
+mod mission_evidence;
 mod orchestrator;
 mod plans;
 mod projects;
+mod runtime_native;
 mod storefile;
 mod transcript;
 mod worktree;
@@ -64,22 +67,162 @@ async fn git_info(cwd: String, bin: Option<String>) -> Option<git::GitInfo> {
 }
 
 #[tauri::command]
+async fn mission_git_evidence(
+    cwd: String,
+    base_sha: Option<String>,
+    bin: Option<String>,
+) -> Result<mission_evidence::MissionGitEvidence, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        mission_evidence::collect(&cwd, base_sha.as_deref(), bin.as_deref())
+    })
+    .await
+    .map_err(|error| format!("mission evidence worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn integration_apply(
+    request: integration_native::IntegrationApplyRequest,
+) -> Result<integration_native::IntegrationApplyResult, String> {
+    tauri::async_runtime::spawn_blocking(move || integration_native::integration_apply(request))
+        .await
+        .map_err(|error| format!("integration worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn integration_rollback(
+    request: integration_native::IntegrationRollbackRequest,
+) -> Result<integration_native::IntegrationRollbackResult, String> {
+    tauri::async_runtime::spawn_blocking(move || integration_native::integration_rollback(request))
+        .await
+        .map_err(|error| format!("rollback worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn acceptance_command_run(
+    request: integration_native::AcceptanceCommandRequest,
+) -> Result<integration_native::AcceptanceCommandResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        integration_native::acceptance_command_run(request)
+    })
+    .await
+    .map_err(|error| format!("acceptance worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn acceptance_command_cancel(run_id: String) -> bool {
+    integration_native::acceptance_command_cancel(&run_id)
+}
+
+fn runtime_lease_root(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("runtime-services"))
+        .map_err(|error| format!("runtime lease directory is unavailable: {error}"))
+}
+
+#[tauri::command]
+async fn runtime_command_run(
+    request: runtime_native::RuntimeCommandRequest,
+) -> Result<runtime_native::RuntimeCommandResult, String> {
+    tauri::async_runtime::spawn_blocking(move || runtime_native::command_run(request))
+        .await
+        .map_err(|error| format!("runtime command worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn runtime_command_cancel(run_id: String) -> bool {
+    runtime_native::command_cancel(&run_id)
+}
+
+#[tauri::command]
+fn runtime_operations_in_flight() -> usize {
+    runtime_native::operations_in_flight()
+}
+
+#[tauri::command]
+async fn runtime_service_start(
+    app: AppHandle,
+    request: runtime_native::RuntimeServiceStartRequest,
+) -> Result<runtime_native::RuntimeServiceSnapshot, String> {
+    let leases = runtime_lease_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || runtime_native::service_start(&leases, request))
+        .await
+        .map_err(|error| format!("runtime service worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn runtime_service_stop(
+    app: AppHandle,
+    instance_id: String,
+    service_id: String,
+    project_root: String,
+) -> Result<bool, String> {
+    let leases = runtime_lease_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime_native::service_stop(&leases, &instance_id, &service_id, &project_root)
+    })
+    .await
+    .map_err(|error| format!("runtime service stop worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn runtime_service_list(
+    app: AppHandle,
+) -> Result<Vec<runtime_native::RuntimeServiceSnapshot>, String> {
+    let leases = runtime_lease_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || runtime_native::service_list(&leases))
+        .await
+        .map_err(|error| format!("runtime service list worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn runtime_service_reconcile(
+    app: AppHandle,
+) -> Result<runtime_native::RuntimeReconcileResult, String> {
+    let leases = runtime_lease_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || runtime_native::service_reconcile(&leases))
+        .await
+        .map_err(|error| format!("runtime reconcile worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn runtime_service_stop_all(
+    app: AppHandle,
+) -> Result<runtime_native::RuntimeReconcileResult, String> {
+    let leases = runtime_lease_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || runtime_native::service_stop_all(&leases))
+        .await
+        .map_err(|error| format!("runtime stop-all worker failed: {error}"))?
+}
+
+#[tauri::command]
 async fn worktree_add(
     cwd: String,
     branch: String,
     copy_env: bool,
+    base_sha: Option<String>,
     bin: Option<String>,
 ) -> Result<worktree::WorktreeInfo, String> {
     // git subprocesses + file copies — keep them off the async runtime's core threads
     tauri::async_runtime::spawn_blocking(move || {
-        worktree::add(&cwd, &branch, copy_env, bin.as_deref())
+        worktree::add(&cwd, &branch, copy_env, base_sha.as_deref(), bin.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-async fn worktree_status(path: String, bin: Option<String>) -> Result<worktree::WorktreeStatus, String> {
+async fn worktree_resolve_main_root(cwd: String, bin: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || worktree::resolve_main_root(&cwd, bin.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn worktree_status(
+    path: String,
+    bin: Option<String>,
+) -> Result<worktree::WorktreeStatus, String> {
     tauri::async_runtime::spawn_blocking(move || worktree::status(&path, bin.as_deref()))
         .await
         .map_err(|e| e.to_string())
@@ -101,7 +244,13 @@ async fn worktree_remove(
     bin: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        worktree::remove(&root, &path, &branch, force.unwrap_or(false), bin.as_deref())
+        worktree::remove(
+            &root,
+            &path,
+            &branch,
+            force.unwrap_or(false),
+            bin.as_deref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -150,6 +299,17 @@ async fn gh_pr_list(
     bin: Option<String>,
 ) -> Result<github::GhOutcome<Vec<github::GhPr>>, String> {
     tauri::async_runtime::spawn_blocking(move || github::pr_list(&dir, bin.as_deref()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Open and closed GitHub issues for read-only mission intake.
+#[tauri::command]
+async fn gh_issue_list(
+    dir: String,
+    bin: Option<String>,
+) -> Result<github::GhOutcome<Vec<github::GhIssue>>, String> {
+    tauri::async_runtime::spawn_blocking(move || github::issue_list(&dir, bin.as_deref()))
         .await
         .map_err(|e| e.to_string())
 }
@@ -325,23 +485,21 @@ async fn discover_projects(
 
 /// The tool catalog + the Conductor system instructions, both single-source
 /// in Rust. The catalog is handed to Codex as `dynamicTools` (and the
-/// instructions as `developerInstructions`). `persona` is the current
-/// Settings persona (None = the Maestro seed), `project` the Conductor's
-/// project context (None = no project block — dev hook); memory (global +
+/// instructions as `developerInstructions`). The Orchestrator identity is
+/// fixed; `project` is the Conductor's project context (None = no project
+/// block — dev hook); memory (global +
 /// project) is read fresh so every consumer compiles the SAME instructions
 /// from one source.
 #[tauri::command]
 async fn orchestrator_tools(
     app: AppHandle,
-    persona: Option<orchestrator::PersonaSpec>,
     project: Option<orchestrator::ProjectContext>,
 ) -> serde_json::Value {
-    let persona = persona.unwrap_or_default();
     let project = project.unwrap_or_default();
     let memory = orchestrator_memory_blocks(&app, &project.id).await;
     let models = orchestrator::model_catalog(&app).await.unwrap_or_default();
     serde_json::json!({
-        "instructions": orchestrator::build_instructions_with_models(&persona, &project, &memory, Some(&models)),
+        "instructions": orchestrator::build_instructions_with_models(&project, &memory, Some(&models)),
         "tools": orchestrator::tool_definitions(),
     })
 }
@@ -453,7 +611,9 @@ async fn orchestrator_run_tool(
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     if !cfg!(debug_assertions) {
-        return Err("orchestrator_run_tool is a dev-only hook and disabled in release builds".into());
+        return Err(
+            "orchestrator_run_tool is a dev-only hook and disabled in release builds".into(),
+        );
     }
     // dev-hook surface — no chat/project context (executors skip
     // touched-session tracking and resolve sessions unscoped)
@@ -481,10 +641,9 @@ fn orchestrator_tool_response(id: String, ok: bool, payload: serde_json::Value) 
 async fn orchestrator_chat_start(
     app: AppHandle,
     codex_path: Option<String>,
-    persona: Option<orchestrator::PersonaSpec>,
     project: Option<orchestrator::ProjectContext>,
 ) -> Result<serde_json::Value, String> {
-    orchestrator::chat_start(&app, codex_path, persona, project).await
+    orchestrator::chat_start(&app, codex_path, project).await
 }
 
 /// Send one user message; resolves with the final assistant text when the
@@ -523,10 +682,9 @@ async fn orchestrator_chat_compact(
 async fn orchestrator_chat_resume(
     app: AppHandle,
     thread_id: String,
-    persona: Option<orchestrator::PersonaSpec>,
     project: Option<orchestrator::ProjectContext>,
 ) -> Result<serde_json::Value, String> {
-    orchestrator::chat_resume(&app, &thread_id, persona, project).await
+    orchestrator::chat_resume(&app, &thread_id, project).await
 }
 
 /// Liveness + codex version + account summary. Never errors — spawn
@@ -695,6 +853,13 @@ async fn vibe_session_close(session_id: String) -> Result<(), String> {
     codex::sessions::session_close(&session_id).await
 }
 
+/// Real native process occupancy for scheduler admission. Persisted session
+/// rows and dead/reaped process slots do not consume this hard cap.
+#[tauri::command]
+async fn vibe_session_live_backend_count() -> usize {
+    codex::sessions::live_backend_count().await
+}
+
 /// Steer the session's RUNNING turn (turn/steer, race-safe via
 /// expectedTurnId). Errors when no turn runs — callers send normally then.
 /// `require_workspace: true` is the STRICT Conductor path (final hardening
@@ -785,10 +950,7 @@ async fn conductor_fs_list(
 }
 
 #[tauri::command]
-async fn conductor_fs_read(
-    project_dir: String,
-    path: String,
-) -> Result<explore::FsFile, String> {
+async fn conductor_fs_read(project_dir: String, path: String) -> Result<explore::FsFile, String> {
     tauri::async_runtime::spawn_blocking(move || explore::read(&project_dir, &path))
         .await
         .map_err(|e| e.to_string())?
@@ -818,13 +980,28 @@ pub fn run() {
             path_is_file,
             canonicalize_path,
             git_info,
+            mission_git_evidence,
+            integration_apply,
+            integration_rollback,
+            acceptance_command_run,
+            acceptance_command_cancel,
+            runtime_command_run,
+            runtime_command_cancel,
+            runtime_operations_in_flight,
+            runtime_service_start,
+            runtime_service_stop,
+            runtime_service_list,
+            runtime_service_reconcile,
+            runtime_service_stop_all,
             worktree_add,
+            worktree_resolve_main_root,
             worktree_status,
             worktree_remove,
             worktree_list,
             gh_auth_status,
             gh_repo_info,
             gh_pr_list,
+            gh_issue_list,
             gh_pr_view,
             gh_pr_create,
             gh_pr_comment,
@@ -859,6 +1036,7 @@ pub fn run() {
             vibe_session_set_access,
             vibe_session_set_model_effort,
             vibe_session_close,
+            vibe_session_live_backend_count,
             vibe_session_steer,
             vibe_session_set_cwd,
             vibe_session_review,
@@ -877,6 +1055,11 @@ pub fn run() {
             // prevent_exit() is a built-in no-op for the updater's restart
             // (RESTART_EXIT_CODE), so updates keep working.
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if code.is_none() {
+                    if let Ok(leases) = runtime_lease_root(app) {
+                        let _ = runtime_native::service_stop_all(&leases);
+                    }
+                }
                 if code.is_some() {
                     api.prevent_exit();
                     let _ = app.emit("app://quit-requested", ());

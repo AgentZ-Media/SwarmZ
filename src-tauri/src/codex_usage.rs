@@ -255,10 +255,7 @@ mod tests {
         write_session(&dir, "s.jsonl", &[&older, &newer], 10);
 
         let out = account_limits_in(&dir);
-        assert_eq!(
-            out.limits.unwrap().primary.unwrap().utilization,
-            Some(55.0)
-        );
+        assert_eq!(out.limits.unwrap().primary.unwrap().utilization, Some(55.0));
     }
 
     #[test]
@@ -268,16 +265,15 @@ mod tests {
         write_session(
             &dir,
             "newer-no-limits.jsonl",
-            &[r#"{"timestamp":"2026-07-07T10:00:00Z","type":"event_msg","payload":{"type":"task_started"}}"#],
+            &[
+                r#"{"timestamp":"2026-07-07T10:00:00Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            ],
             10,
         );
         write_session(&dir, "older-with-limits.jsonl", &[&data], 3600);
 
         let out = account_limits_in(&dir);
-        assert_eq!(
-            out.limits.unwrap().primary.unwrap().utilization,
-            Some(33.0)
-        );
+        assert_eq!(out.limits.unwrap().primary.unwrap().utilization, Some(33.0));
     }
 
     #[test]
@@ -298,10 +294,7 @@ mod tests {
 
         let out = account_limits_in(&dir);
         // the trailing garbage + empty rate_limits are skipped; the good line wins
-        assert_eq!(
-            out.limits.unwrap().primary.unwrap().utilization,
-            Some(12.0)
-        );
+        assert_eq!(out.limits.unwrap().primary.unwrap().utilization, Some(12.0));
     }
 
     #[test]

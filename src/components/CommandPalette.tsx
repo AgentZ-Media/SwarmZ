@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Command } from "cmdk";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { Search } from "lucide-react";
@@ -7,9 +7,10 @@ import { useVibe, type VibeSessionEntry } from "@/lib/vibe/session-store";
 import { activateProject, focusSession } from "@/lib/vibe/controller";
 import { useProjects, openProjectIds } from "@/lib/projects/store";
 import { vibeTriageEntries } from "@/lib/vibe/triage";
-import { hasPendingApproval } from "@/lib/vibe/ui";
+import { hasHumanAttention } from "@/lib/vibe/attention";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { pickDirectory } from "@/lib/transport";
+import { useMissions } from "@/lib/missions/store";
 import { cn, shortPath } from "@/lib/utils";
 
 /**
@@ -31,6 +32,14 @@ export function CommandPalette({
   const projectIds = projectIdsSig ? projectIdsSig.split("|") : [];
   const projects = useProjects((s) => s.projects);
   const activeProjectId = useProjects((s) => s.activeProjectId);
+  const missionSig = useMissions((state) => Object.values(state.projection.missions)
+    .filter((mission) => mission.projectId === activeProjectId)
+    .map((mission) => `${mission.id}:${mission.title}:${mission.status}:${mission.updatedAt}`)
+    .sort()
+    .join("|"));
+  const missions = useMemo(() => Object.values(useMissions.getState().projection.missions)
+    .filter((mission) => mission.projectId === activeProjectId)
+    .sort((a, b) => Number(a.status === "archived") - Number(b.status === "archived") || b.updatedAt - a.updatedAt), [activeProjectId, missionSig]);
 
   const [search, setSearch] = useState("");
 
@@ -44,7 +53,8 @@ export function CommandPalette({
     action();
   };
 
-  const waiting = vibeTriageEntries(useVibe.getState()).length;
+  const missionAttention = useMissions((state) => Object.values(state.projection.tasks).filter((task) => ["needs_human", "blocked", "failed"].includes(task.status)).length);
+  const waiting = vibeTriageEntries(useVibe.getState()).length + missionAttention;
 
   return (
     <DialogPrimitive.Root open={open} onOpenChange={setOpen}>
@@ -63,7 +73,7 @@ export function CommandPalette({
               <Command.Input
                 value={search}
                 onValueChange={setSearch}
-                placeholder="Jump to an agent or action…"
+                placeholder="Jump to a worker or action…"
                 className="h-11 w-full bg-transparent text-14 text-txt outline-none placeholder:text-fnt"
               />
               <kbd className="rounded-xs border border-line2 px-1 font-mono text-10 text-fnt">
@@ -122,7 +132,26 @@ export function CommandPalette({
                 </PaletteItem>
               </PaletteGroup>
 
-              <PaletteGroup heading="Agents">
+              {missions.length > 0 && (
+                <PaletteGroup heading="Missions">
+                  {missions.map((mission) => (
+                    <PaletteItem
+                      key={mission.id}
+                      value={`mission ${mission.title} ${mission.objective} ${mission.status}`}
+                      onSelect={() => run(() => {
+                        useVibeUi.getState().setSelectedMissionId(mission.id);
+                        useVibeUi.getState().setWorkspaceView("board");
+                      })}
+                    >
+                      <span className={cn("font-mono text-10", mission.status === "active" ? "text-acc" : mission.status === "succeeded" ? "text-ok" : "text-fnt")}>◆</span>
+                      <span className="truncate text-txt">{mission.title}</span>
+                      <span className="ml-auto font-mono text-10 uppercase text-fnt">{mission.status}</span>
+                    </PaletteItem>
+                  ))}
+                </PaletteGroup>
+              )}
+
+              <PaletteGroup heading="Workers">
                 {order.map((id) => {
                   const entry = sessions[id];
                   if (!entry) return null;
@@ -145,13 +174,21 @@ export function CommandPalette({
 
               <PaletteGroup heading="Actions">
                 <PaletteItem
+                  value="new mission task import plan"
+                  onSelect={() => run(() => useVibeUi.getState().setMissionCreateOpen(true))}
+                >
+                  <ActionDot />
+                  <span className="truncate text-txt">New mission</span>
+                  <Shortcut>⌘⇧M</Shortcut>
+                </PaletteItem>
+                <PaletteItem
                   value="new codex session native agent"
                   onSelect={() =>
                     run(() => useVibeUi.getState().setNewSessionOpen(true))
                   }
                 >
                   <ActionDot />
-                  <span className="truncate text-txt">New agent</span>
+                  <span className="truncate text-txt">New worker</span>
                   <Shortcut>⌘T</Shortcut>
                 </PaletteItem>
                 <PaletteItem
@@ -161,7 +198,7 @@ export function CommandPalette({
                   }
                 >
                   <ActionDot />
-                  <span className="truncate text-txt">Focus Conductor</span>
+                  <span className="truncate text-txt">Focus Orchestrator</span>
                   <Shortcut>⌘⇧O</Shortcut>
                 </PaletteItem>
                 <PaletteItem
@@ -172,22 +209,17 @@ export function CommandPalette({
                 >
                   <ActionDot />
                   <span className="truncate text-txt">
-                    Toggle Conductor sidebar
+                    Toggle Orchestrator sidebar
                   </span>
                   <Shortcut>⌘B</Shortcut>
                 </PaletteItem>
                 <PaletteItem
-                  value="next attention waiting session jump approval"
-                  onSelect={() =>
-                    run(() => {
-                      const entries = vibeTriageEntries(useVibe.getState());
-                      if (entries.length) focusSession(entries[0].id);
-                    })
-                  }
+                  value="attention inbox blocked mission worker approval"
+                  onSelect={() => run(() => useVibeUi.getState().setAttentionOpen(true))}
                 >
                   <ActionDot />
                   <span className="truncate text-txt">
-                    Jump to agent waiting for input
+                    Open attention inbox
                   </span>
                   {waiting > 0 && (
                     <span className="ml-1.5 rounded-xs bg-acc/15 px-1 font-mono text-10 tabular-nums text-acc">
@@ -291,7 +323,7 @@ function ActionDot() {
  * accent), faint for idle. */
 function SessionDot({ entry }: { entry: VibeSessionEntry }) {
   const busy = useVibe((s) => !!s.busy[entry.session.id]);
-  const needsYou = hasPendingApproval(entry);
+  const needsYou = hasHumanAttention(entry);
   return (
     <>
       <span

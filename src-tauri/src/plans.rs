@@ -90,7 +90,9 @@ pub fn is_valid_slug(slug: &str) -> bool {
         && slug.len() <= MAX_SLUG_LEN
         && !slug.starts_with('-')
         && !slug.ends_with('-')
-        && slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 use crate::fsx::DirHandle;
@@ -128,9 +130,11 @@ fn open_plans(project_dir: &str) -> Result<Option<DirHandle>, String> {
     match swarmz.is_regular_file("plans")? {
         None => Ok(None),
         Some(true) => Err("refusing: .swarmz/plans is not a directory".into()),
-        Some(false) => Ok(Some(swarmz.open_dir("plans").map_err(|e| {
-            format!("refusing the plans component (symlink?): {e}")
-        })?)),
+        Some(false) => {
+            Ok(Some(swarmz.open_dir("plans").map_err(|e| {
+                format!("refusing the plans component (symlink?): {e}")
+            })?))
+        }
     }
 }
 
@@ -174,69 +178,11 @@ fn read_bounded(dir: &DirHandle, name: &str, max: usize) -> Result<Option<String
 /// through no-follow handles, and the exclude file is replaced atomically
 /// via a fresh temp + rename — a planted symlink is never written through.
 fn ensure_excluded(project_dir: &str) {
-    let Ok(root) = open_project_root(project_dir) else {
-        return;
-    };
-    // `.git` must be a real directory (a worktree's `.git` FILE skips —
-    // plans always live in the main project root anyway)
-    let Ok(git) = root.open_dir(".git") else {
-        return;
-    };
-    let Ok(info) = git.ensure_dir("info") else {
-        return;
-    };
-    // bounded: an exclude file is small; one BEYOND the cap skips the
-    // rewrite entirely (final hardening F9 — a truncated-prefix rewrite
-    // would silently drop later exclude rules). An already-present entry
-    // needs no rewrite, so it passes either way.
-    const EXCLUDE_CAP: u64 = 1024 * 1024;
-    let (current, oversized) = match info.open_file("exclude") {
-        Ok(Some(file)) => {
-            let mut s = String::new();
-            match file.take(EXCLUDE_CAP + 1).read_to_string(&mut s) {
-                Ok(read) => {
-                    let over = read as u64 > EXCLUDE_CAP;
-                    (s, over)
-                }
-                Err(_) => return,
-            }
-        }
-        Ok(None) => (String::new(), false),
-        Err(_) => return, // symlinked/non-regular exclude — leave it alone
-    };
-    let has_entry = current.lines().any(|l| {
-        matches!(l.trim(), "/.swarmz/" | "/.swarmz" | ".swarmz/" | ".swarmz")
-    });
-    if has_entry {
-        return;
-    }
-    if oversized {
-        return; // F9: never rewrite a truncated prefix (best-effort skip)
-    }
-    let mut next = current;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str("# SwarmZ conductor plans\n/.swarmz/\n");
-    let tmp_name = format!(
-        ".exclude.tmp-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+    let _ = crate::fsx::ensure_git_exclude(
+        Path::new(project_dir),
+        &["/.swarmz/", "/.swarmz", ".swarmz/", ".swarmz"],
+        "# SwarmZ conductor plans\n/.swarmz/",
     );
-    let Ok(mut tmp) = info.create_new(&tmp_name) else {
-        return;
-    };
-    use std::io::Write;
-    if tmp.write_all(next.as_bytes()).is_err() {
-        let _ = info.unlink(&tmp_name);
-        return;
-    }
-    drop(tmp);
-    if info.rename(&tmp_name, "exclude").is_err() {
-        let _ = info.unlink(&tmp_name);
-    }
 }
 
 /// First `# ` heading of a file's head (bounded, no-follow through the
@@ -425,7 +371,9 @@ pub fn list(project_dir: &str) -> Result<Vec<PlanInfo>, String> {
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else { continue };
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
         let Some(stem) = name.strip_suffix(".md") else {
             continue;
         };
@@ -438,7 +386,9 @@ pub fn list(project_dir: &str) -> Result<Vec<PlanInfo>, String> {
             continue;
         }
         let path = dir_path.join(name);
-        let Ok(meta) = path.symlink_metadata() else { continue };
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
         out.push(PlanInfo {
             slug: stem.to_string(),
             title: read_title(&dir, name).unwrap_or_else(|| stem.to_string()),
@@ -495,7 +445,10 @@ mod tests {
 
     #[test]
     fn slugs_are_filesystem_safe_and_stable() {
-        assert_eq!(slugify("Checkout Rewrite — Phase 2!"), "checkout-rewrite-phase-2");
+        assert_eq!(
+            slugify("Checkout Rewrite — Phase 2!"),
+            "checkout-rewrite-phase-2"
+        );
         assert_eq!(slugify("  ../../etc/passwd  "), "etc-passwd");
         assert_eq!(slugify("...."), "plan");
         assert_eq!(slugify("Zoë's Plan"), "zo-s-plan");
@@ -526,7 +479,11 @@ mod tests {
         fs::write(project.join(".git/info/exclude"), &big).unwrap();
         write(&dir, "Big Exclude", "still writes\n").unwrap();
         let after = fs::read(project.join(".git/info/exclude")).unwrap();
-        assert_eq!(after.len(), big.len(), "the oversized exclude must stay untouched");
+        assert_eq!(
+            after.len(),
+            big.len(),
+            "the oversized exclude must stay untouched"
+        );
         assert!(!String::from_utf8_lossy(&after).contains(".swarmz"));
         fs::remove_dir_all(&project).ok();
     }
@@ -552,7 +509,10 @@ mod tests {
         // same title replaces
         write(&dir, "Checkout Rewrite", "# Checkout Rewrite\nv2\n").unwrap();
         assert_eq!(list(&dir).unwrap().len(), 1);
-        assert!(read(&dir, "checkout-rewrite").unwrap().content.contains("v2"));
+        assert!(read(&dir, "checkout-rewrite")
+            .unwrap()
+            .content
+            .contains("v2"));
         // no temp files left behind
         let leftovers: Vec<_> = fs::read_dir(project.join(".swarmz/plans"))
             .unwrap()

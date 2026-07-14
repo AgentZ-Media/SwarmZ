@@ -113,6 +113,8 @@ export interface QuitBlockers {
   reviews: number;
   /** git worktree add/remove operations in flight */
   worktreeOps: number;
+  /** sandboxed Runtime Environment commands/services; -1 = query failed */
+  runtimeOps: number;
 }
 
 // ---- Git worktrees ----
@@ -240,13 +242,6 @@ export interface AppSettings {
   /** default scan roots for the orchestrator's list_projects when the model passes none */
   orchestratorScanRoots?: string[];
   /**
-   * the orchestrator's persona (voice/self-image only — never its tools or
-   * safety rules, those are hard-wired in the operative core). Unset = the
-   * "Maestro" default seed; edited in Settings → Orchestrator. Only
-   * name/role/tone/principles reach the backend; emoji/accent are UI-only.
-   */
-  orchestratorPersona?: OrchestratorPersona;
-  /**
    * Phase 5 auto-review: when a conductor-tasked agent finishes a lane that
    * changed code, a detached codex review runs automatically BEFORE the
    * Conductor's agent-finished turn — the findings ride into that turn, so
@@ -300,25 +295,6 @@ export interface AppSettings {
    * autonomous cascade pushing/posting/approving on the user's repo.
    */
   autonomousGithubWrites?: boolean;
-}
-
-/**
- * The orchestrator persona. `name`/`role`/`tone`/`principles` are compiled
- * into the system instructions (Rust `build_instructions`); `emoji`/`accent`
- * are UI-only (Conductor card, panel header, composer placeholder).
- */
-export interface OrchestratorPersona {
-  name: string;
-  /** one-sentence self-image, compiled after "You are {name} — " */
-  role: string;
-  /** voice/directness, e.g. "Calm, precise, leading." */
-  tone: string;
-  /** 1–6 short principles */
-  principles: string[];
-  /** UI avatar emoji (Conductor dot / panel header) */
-  emoji?: string;
-  /** UI accent tint (optional dot color) */
-  accent?: string;
 }
 
 // ---- Quick notes ----
@@ -474,7 +450,7 @@ export interface PersistedOrchestratorChats {
 export type VibeAccess = "workspace" | "full";
 
 /** Who created a session: the human (dialog/palette) or the Conductor. */
-export type VibeSpawnedBy = "user" | "conductor";
+export type VibeSpawnedBy = "user" | "conductor" | "mission";
 
 /**
  * The git worktree a session's agent works in. Phase 2 only carries the
@@ -500,14 +476,15 @@ export interface VibeSessionWorktree {
  */
 export interface VibeSession {
   id: string;
-  /** display name — renamable; starts as the generated agent name */
+  /** display label — renamable; starts as the generated temporary lane label */
   name: string;
   /** owning project tab (`Project.id`) — the rail scopes on this */
   projectId: string;
   /**
-   * The generated agent identity (names.ts pool), collision-free per project
-   * and immutable — Phase 4 derives branch names from it (`swarm/maya-…`).
-   * Migrated sessions carry their old display name here.
+   * Stable operational lane label (legacy field name), collision-free per
+   * project. It is not a persona or reusable identity. Mission attempts will
+   * derive branches from task/attempt ids; migrated sessions retain their old
+   * display label for historical readability.
    */
   agentName: string;
   spawnedBy: VibeSpawnedBy;
@@ -566,6 +543,8 @@ export type VibeItem =
        * Undefined = a human message (or a pre-existing item).
        */
       via?: "conductor";
+      /** Durable backend turn binding (Mission evidence boundary). */
+      turnId?: string;
     }
   | {
       id: string;
@@ -583,6 +562,8 @@ export type VibeItem =
        * when the text still parses as a valid AgentReport.
        */
       report?: boolean;
+      /** Durable backend turn binding (Mission evidence boundary). */
+      turnId?: string;
     }
   | {
       id: string;
@@ -594,6 +575,8 @@ export type VibeItem =
       exitCode?: number | null;
       /** aggregatedOutput, capped */
       output: string;
+      /** Durable backend turn binding (Mission evidence boundary). */
+      turnId?: string;
     }
   | {
       id: string;

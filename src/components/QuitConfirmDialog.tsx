@@ -37,6 +37,7 @@ export function QuitConfirmDialog() {
   const ghWrites = quitConfirm?.ghWrites ?? 0;
   const reviews = quitConfirm?.reviews ?? 0;
   const worktreeOps = quitConfirm?.worktreeOps ?? 0;
+  const runtimeOps = quitConfirm?.runtimeOps ?? 0;
   const summary = quitConfirm
     ? summarizeBlockers(quitConfirm)
     : "Work is still running — quitting will interrupt it.";
@@ -75,7 +76,7 @@ export function QuitConfirmDialog() {
               className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt"
             >
               <span className="shrink-0 font-mono leading-none text-err">■</span>
-              <span className="truncate">Conductor · {name}</span>
+              <span className="truncate">Orchestrator · {name}</span>
               <span className="ml-auto pl-2 font-mono text-10 text-fnt">mid-turn</span>
             </li>
           ))}
@@ -84,8 +85,8 @@ export function QuitConfirmDialog() {
               <span className="shrink-0 font-mono leading-none text-err">■</span>
               <span className="truncate">
                 {claimedTimers === 1
-                  ? "A Conductor timer is firing right now — quitting drops it"
-                  : `${claimedTimers} Conductor timers are firing right now — quitting drops them`}
+                  ? "An Orchestrator timer is firing right now — quitting drops it"
+                  : `${claimedTimers} Orchestrator timers are firing right now — quitting drops them`}
               </span>
             </li>
           )}
@@ -127,13 +128,25 @@ export function QuitConfirmDialog() {
               </span>
             </li>
           )}
+          {runtimeOps !== 0 && (
+            <li className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt">
+              <span className="shrink-0 font-mono leading-none text-err">■</span>
+              <span className="truncate">
+                {runtimeOps < 0
+                  ? "Couldn't verify Runtime Environment processes — one may still be running"
+                  : runtimeOps === 1
+                    ? "A sandboxed Runtime Environment process is running"
+                    : `${runtimeOps} sandboxed Runtime Environment processes are running`}
+              </span>
+            </li>
+          )}
         </ul>
 
         {pendingTimers > 0 && (
           <p className="mb-4 text-11 text-fnt">
             {pendingTimers === 1
-              ? "1 Conductor timer is pending"
-              : `${pendingTimers} Conductor timers are pending`}{" "}
+              ? "1 Orchestrator timer is pending"
+              : `${pendingTimers} Orchestrator timers are pending`}{" "}
             — they persist and fire again on the next launch.
           </p>
         )}

@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useSwarm } from "@/store";
 import type {
   GhAuthStatus,
+  GhIssue,
   GhOutcome,
   GhPr,
   GhPrCreated,
@@ -28,6 +29,11 @@ export function fetchGhRepoInfo(dir: string): Promise<GhOutcome<GhRepoInfo>> {
 
 export function fetchGhPrList(dir: string): Promise<GhOutcome<GhPr[]>> {
   return invoke<GhOutcome<GhPr[]>>("gh_pr_list", { dir, bin: ghBin() });
+}
+
+/** Read-only: up to 500 open and closed issues in the project's repository. */
+export function fetchGhIssueList(dir: string): Promise<GhOutcome<GhIssue[]>> {
+  return invoke<GhOutcome<GhIssue[]>>("gh_issue_list", { dir, bin: ghBin() });
 }
 
 export function fetchGhPrView(

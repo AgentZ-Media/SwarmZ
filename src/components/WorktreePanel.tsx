@@ -225,7 +225,7 @@ function WorktreeRow({
 
       <div className="flex shrink-0 items-center gap-0.5">
         {!entry.missing && (
-          <Tip label={openSessionId ? "Jump to agent" : "Open in a new agent"}>
+          <Tip label={openSessionId ? "Jump to worker" : "Open in a new worker"}>
             <button
               onClick={onOpen}
               className="focus-ring flex h-6 w-6 items-center justify-center rounded-md text-fnt hover:bg-line2 hover:text-txt"

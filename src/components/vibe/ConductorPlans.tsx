@@ -27,7 +27,7 @@ export function ConductorPlansButton({ projectId }: { projectId: string | null }
   if (!IS_TAURI || !projectId) return null;
   return (
     <>
-      <Tip label="Conductor plans">
+      <Tip label="Orchestrator plans">
         <button
           onClick={() => setOpen(true)}
           className="focus-ring flex h-6 w-6 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt"
@@ -91,7 +91,7 @@ function PlansDialog({
             <FileText size={14} className="shrink-0 text-acc" />
           )}
           <DialogTitle className="min-w-0 flex-1 truncate text-14">
-            {selected ? selected.title : "Conductor plans"}
+            {selected ? selected.title : "Orchestrator plans"}
           </DialogTitle>
           {!selected && (
             <button
@@ -113,7 +113,7 @@ function PlansDialog({
             <p className="text-12 text-fnt">Loading plans…</p>
           ) : plans.length === 0 ? (
             <p className="max-w-sm text-12 leading-relaxed text-fnt">
-              No plan documents yet. When the Conductor writes a plan for this
+              No plan documents yet. When the Orchestrator writes a plan for this
               project (its `write_plan` tool), it appears here.
             </p>
           ) : (

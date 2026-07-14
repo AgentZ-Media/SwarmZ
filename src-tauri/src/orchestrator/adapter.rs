@@ -54,9 +54,7 @@ pub fn tool_call_response(result: &Result<Value, String>) -> Value {
 pub fn normalize_tool_args(args: Option<&Value>) -> Value {
     match args {
         None | Some(Value::Null) => json!({}),
-        Some(Value::String(s)) => {
-            serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({}))
-        }
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({})),
         Some(other) => other.clone(),
     }
 }
@@ -86,8 +84,14 @@ mod tests {
             assert!(spec["name"].is_string());
             assert!(spec["description"].is_string());
             assert_eq!(spec["inputSchema"]["type"], "object");
-            assert!(spec.get("timeout_ms").is_none(), "bus-internal field leaked");
-            assert!(spec.get("parameters").is_none(), "must be renamed to inputSchema");
+            assert!(
+                spec.get("timeout_ms").is_none(),
+                "bus-internal field leaked"
+            );
+            assert!(
+                spec.get("parameters").is_none(),
+                "must be renamed to inputSchema"
+            );
         }
         assert!(specs.iter().any(|s| s["name"] == "fleet_snapshot"));
     }

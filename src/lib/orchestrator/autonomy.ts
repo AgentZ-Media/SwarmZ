@@ -56,10 +56,8 @@ const budgets = new Map<string, ProjectBudget>();
  * Fail-closed latch for a persisted-budget LOAD FAILURE. When the
  * `autonomyBudgets` store key is unreadable (corrupt/IO error — as opposed to
  * genuinely absent) we cannot know whether a breaker was tripped, so autonomy
- * is paused GLOBALLY until a human takes the wheel. Only a real human message
- * (`noteHumanTurn`) clears it — the same authority that re-arms a per-project
- * breaker. A relaunch on a corrupt store therefore never runs an unattended
- * autonomous turn against un-known budget state.
+ * is paused GLOBALLY until a verified rehydrate/restart. A message in one
+ * project cannot prove the unknown budgets of every other project safe.
  */
 let budgetsUnavailable = false;
 
@@ -101,11 +99,23 @@ function notifyAutonomyChange(): void {
 // ---- persistence seam (the module stays store/tauri-free) ----
 
 let persistSink: (() => void) | null = null;
+let flushPersistSink: (() => Promise<void>) | null = null;
 
 /** Install the persist scheduler (store.ts) — called on every budget-state
  * mutation so the durable copy tracks the in-memory one. */
-export function registerAutonomyPersist(fn: (() => void) | null): void {
+export function registerAutonomyPersist(
+  fn: (() => void) | null,
+  flush?: (() => Promise<void>) | null,
+): void {
   persistSink = fn;
+  flushPersistSink = flush ?? null;
+}
+
+/** Durably persist a just-booked reservation before its autonomous side
+ * effect starts. Store wiring remains outside this pure budget module. */
+export async function persistAutonomyReservation(): Promise<boolean> {
+  await flushPersistSink?.();
+  return !budgetsUnavailable;
 }
 
 function markDirty(): void {
@@ -227,23 +237,13 @@ export function releaseAutonomousTurn(projectId: string, at: number): void {
  * is about volume, not lineage).
  */
 export function noteHumanTurn(projectId: string): void {
-  // a human is back in the loop — clear the global fail-closed latch too (a
-  // load-failure pause is lifted the moment a human takes the wheel)
-  let announce = false;
-  if (budgetsUnavailable) {
-    budgetsUnavailable = false;
-    announce = true;
-  }
   const b = budgets.get(projectId);
-  if (!b) {
-    if (announce) notifyAutonomyChange();
-    return;
-  }
+  if (!b) return;
   const wasTripped = b.tripped;
   const changed = wasTripped || b.consecutive !== 0;
   b.consecutive = 0;
   b.tripped = false;
-  if (wasTripped || announce) notifyAutonomyChange();
+  if (wasTripped) notifyAutonomyChange();
   if (changed) markDirty();
 }
 

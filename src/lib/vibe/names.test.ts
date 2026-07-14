@@ -6,12 +6,6 @@ import {
   pickAgentName,
 } from "./names";
 
-/** Deterministic rng from a fixed sequence (repeats the last value). */
-function seqRng(values: number[]): () => number {
-  let i = 0;
-  return () => values[Math.min(i++, values.length - 1)];
-}
-
 describe("AGENT_NAME_POOL", () => {
   it("has 120+ unique names", () => {
     expect(AGENT_NAME_POOL.length).toBeGreaterThanOrEqual(120);
@@ -29,16 +23,10 @@ describe("AGENT_NAME_POOL", () => {
 });
 
 describe("pickAgentName", () => {
-  it("is deterministic under an injected rng", () => {
-    expect(pickAgentName([], seqRng([0]))).toBe(AGENT_NAME_POOL[0]);
-    expect(pickAgentName([], seqRng([0.999999]))).toBe(
-      AGENT_NAME_POOL[AGENT_NAME_POOL.length - 1],
-    );
-    // same rng, same taken set → same result
-    const taken = ["Maya", "Kenji"];
-    expect(pickAgentName(taken, seqRng([0.42]))).toBe(
-      pickAgentName(taken, seqRng([0.42])),
-    );
+  it("always picks the lowest free operational lane", () => {
+    expect(pickAgentName([])).toBe(AGENT_NAME_POOL[0]);
+    expect(pickAgentName([AGENT_NAME_POOL[0]])).toBe(AGENT_NAME_POOL[1]);
+    expect(pickAgentName([AGENT_NAME_POOL[1]])).toBe(AGENT_NAME_POOL[0]);
   });
 
   it("never returns a taken name (case-insensitive, trimmed)", () => {
@@ -65,10 +53,10 @@ describe("pickAgentName", () => {
 
   it("suffixes with the lowest free number once the pool is exhausted", () => {
     const taken = [...AGENT_NAME_POOL];
-    const first = pickAgentName(taken, seqRng([0]));
+    const first = pickAgentName(taken);
     expect(first).toBe(`${AGENT_NAME_POOL[0]} 2`);
     taken.push(first);
-    expect(pickAgentName(taken, seqRng([0]))).toBe(`${AGENT_NAME_POOL[0]} 3`);
+    expect(pickAgentName(taken)).toBe(`${AGENT_NAME_POOL[0]} 3`);
   });
 });
 

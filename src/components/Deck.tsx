@@ -22,7 +22,8 @@ import { useSwarm } from "@/store";
 import { useGithub } from "@/lib/github/store";
 import { deckPrSignature } from "@/lib/github/core";
 import { openUrl } from "@/lib/transport";
-import { decayedSignal, hasPendingApproval } from "@/lib/vibe/ui";
+import { decayedSignal } from "@/lib/vibe/ui";
+import { hasHumanAttention } from "@/lib/vibe/attention";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { Tip } from "./ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -73,7 +74,7 @@ function useGlobalCounts() {
       const e = s.sessions[id];
       if (!e) continue;
       parts.push(
-        `${s.busy[id] ? 1 : 0}:${hasPendingApproval(e) ? 1 : 0}:${e.lastBusyEndAt ?? ""}`,
+        `${s.busy[id] ? 1 : 0}:${hasHumanAttention(e) ? 1 : 0}:${e.lastBusyEndAt ?? ""}`,
       );
     }
     return parts.join("|");
@@ -111,7 +112,7 @@ function FleetCounts() {
   const c = useGlobalCounts();
   return (
     <span className="flex shrink-0 items-center gap-2.5">
-      <Tip label="Agents working (all projects)">
+      <Tip label="Workers running (all projects)">
         <span
           tabIndex={0}
           className={cn(
@@ -136,7 +137,7 @@ function FleetCounts() {
           {c.finished}
         </span>
       </Tip>
-      <Tip label="Idle agents">
+      <Tip label="Idle workers">
         <span
           tabIndex={0}
           className="focus-ring flex items-center gap-1 rounded-xs text-fnt"
@@ -210,7 +211,7 @@ function TriageChip({ needsCount }: { needsCount: number }) {
   // unit) but faint and inert
   if (entries.length === 0) {
     return (
-      <Tip label="No agent waits on you">
+      <Tip label="No worker needs your input">
         <span
           tabIndex={0}
           className="focus-ring flex items-center gap-1 rounded-xs text-fnt"
@@ -244,7 +245,7 @@ function TriageChip({ needsCount }: { needsCount: number }) {
       <PopoverTrigger asChild>
         <button
           className="focus-ring flex h-5 shrink-0 items-center gap-1 rounded-xs font-semibold text-attn hover:bg-attn/10"
-          title={`${entries.length} agent${entries.length > 1 ? "s" : ""} need${entries.length > 1 ? "" : "s"} your input`}
+          title={`${entries.length} worker${entries.length > 1 ? "s" : ""} need${entries.length > 1 ? "" : "s"} your input`}
         >
           <span aria-hidden className="animate-zattn">
             ⚑
@@ -355,7 +356,7 @@ function EventChip({ event }: { event: FleetEvent }) {
         }
       }}
       disabled={!clickable}
-      title={isPr ? "Open PR on GitHub" : live ? "Open agent" : "Closed"}
+      title={isPr ? "Open PR on GitHub" : live ? "Open worker" : "Closed"}
       className={cn(
         "focus-ring flex min-w-0 shrink items-center gap-1 rounded-xs px-1 py-0.5",
         clickable ? "hover:bg-card" : "cursor-default",
@@ -582,12 +583,12 @@ function OrchestratorDot() {
         ? "bg-acc animate-zpulse"
         : "bg-fnt";
   const label = tripped
-    ? "Conductor — autonomy paused (budget exhausted; send a message to resume)"
+    ? "Orchestrator — autonomy paused (budget exhausted; send a message to resume)"
     : needsAttention
-      ? "Conductor — a chat needs attention"
+      ? "Orchestrator — a chat needs attention"
       : running
-        ? "Conductor — running"
-        : "Conductor — idle";
+        ? "Orchestrator — running"
+        : "Orchestrator — idle";
 
   return (
     <Tip label={`${label} (⌘⇧O)`}>

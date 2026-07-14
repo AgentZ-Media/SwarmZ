@@ -10,7 +10,7 @@ use crate::git::{git_bin, output_with_timeout};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Folder of every SwarmZ-managed worktree, directly under the repo root.
 const WORKTREES_DIR: &str = ".worktrees";
@@ -36,6 +36,35 @@ const SKIP_DIRS: &[&str] = &[
     ".gradle",
     ".DS_Store",
 ];
+
+/// Explicit environment-transfer manifest. Copying every untracked file was
+/// both surprising (keys, archives, databases) and unbounded. Only these
+/// conventional per-developer runtime files may cross into a worktree.
+const ENV_COPY_EXACT_NAMES: &[&str] = &[
+    ".env",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".tool-versions",
+    ".node-version",
+    ".python-version",
+    ".ruby-version",
+    ".java-version",
+    ".mise.toml",
+    "mise.local.toml",
+    ".swarmz-setup",
+    ".swarmz-setup.sh",
+    "setup.local.sh",
+    "bootstrap.local.sh",
+];
+const ENV_COPY_MAX_FILES: u64 = 128;
+const ENV_COPY_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const ENV_COPY_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const ENV_COPY_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn environment_manifest_allows(name: &str) -> bool {
+    ENV_COPY_EXACT_NAMES.contains(&name) || name.starts_with(".env.")
+}
 
 #[derive(Serialize, Clone, Debug)]
 pub struct WorktreeInfo {
@@ -97,11 +126,17 @@ fn run(bin: &str, cwd: &Path, args: &[&str]) -> Result<String, String> {
     // suppressed — `git worktree add` must never run a repo-controlled
     // `post-checkout`, `git update-ref` never a `reference-transaction`
     // hook, in the unsandboxed backend.
-    let out = output_with_timeout(
-        crate::git::git_command(bin, cwd).args(args),
-        Duration::from_secs(120),
-    )
-    .map_err(|e| format!("failed to run git: {e}"))?;
+    run_with_timeout(bin, cwd, args, Duration::from_secs(120))
+}
+
+fn run_with_timeout(
+    bin: &str,
+    cwd: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let out = output_with_timeout(crate::git::git_command(bin, cwd).args(args), timeout)
+        .map_err(|e| format!("failed to run git: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(if err.is_empty() {
@@ -131,6 +166,12 @@ fn main_root(bin: &str, cwd: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "not a regular git repository".into())
 }
 
+/// Read-only canonical main-checkout root used by durable Mission placement.
+pub fn resolve_main_root(cwd: &str, bin_override: Option<&str>) -> Result<String, String> {
+    let root = main_root(git_bin(bin_override), Path::new(cwd))?;
+    Ok(root.to_string_lossy().into_owned())
+}
+
 /// Make git ignore `.worktrees/` via the repo-local `.git/info/exclude` —
 /// same effect as a `.gitignore` entry, but never touches a tracked file.
 /// Anchored + no-follow (audit R4): `.git`/`info`/`exclude` are reached
@@ -138,65 +179,11 @@ fn main_root(bin: &str, cwd: &Path) -> Result<PathBuf, String> {
 /// a symlink planted anywhere on that chain refuses instead of redirecting
 /// the write to a host file.
 fn ensure_excluded(root: &Path) -> Result<(), String> {
-    use crate::fsx::DirHandle;
-    use std::io::{Read as _, Write as _};
-    let handle = DirHandle::open_root(root)?;
-    let git = handle
-        .open_dir(".git")
-        .map_err(|e| format!("refusing the .git component (symlink?): {e}"))?;
-    let info = git
-        .ensure_dir("info")
-        .map_err(|e| format!("refusing the .git/info component (symlink?): {e}"))?;
-    // bounded read — an exclude file is small; one BEYOND the cap refuses
-    // the rewrite entirely (final hardening F9: rewriting a truncated prefix
-    // would silently drop later exclude rules). An already-present entry
-    // needs no rewrite, so it passes either way.
-    const EXCLUDE_CAP: u64 = 1024 * 1024;
-    let (current, oversized) = match info.open_file("exclude") {
-        Ok(Some(file)) => {
-            let mut s = String::new();
-            let read = std::io::Read::take(file, EXCLUDE_CAP + 1)
-                .read_to_string(&mut s)
-                .map_err(|e| e.to_string())?;
-            (s, read as u64 > EXCLUDE_CAP)
-        }
-        Ok(None) => (String::new(), false),
-        Err(e) => return Err(format!("refusing the exclude file (symlink?): {e}")),
-    };
-    let has_entry = current.lines().any(|l| {
-        matches!(l.trim(), "/.worktrees/" | "/.worktrees" | ".worktrees/" | ".worktrees")
-    });
-    if has_entry {
-        return Ok(());
-    }
-    if oversized {
-        return Err(format!(
-            ".git/info/exclude is larger than {EXCLUDE_CAP} bytes — refusing to rewrite it (add the /.worktrees/ entry manually)"
-        ));
-    }
-    let mut next = current;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str("# SwarmZ worktrees\n/.worktrees/\n");
-    let tmp_name = format!(
-        ".exclude.tmp-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let mut tmp = info.create_new(&tmp_name)?;
-    if let Err(e) = tmp.write_all(next.as_bytes()) {
-        let _ = info.unlink(&tmp_name);
-        return Err(e.to_string());
-    }
-    drop(tmp);
-    if let Err(e) = info.rename(&tmp_name, "exclude") {
-        let _ = info.unlink(&tmp_name);
-        return Err(e);
-    }
-    Ok(())
+    crate::fsx::ensure_git_exclude(
+        root,
+        &["/.worktrees/", "/.worktrees", ".worktrees/", ".worktrees"],
+        "# SwarmZ worktrees\n/.worktrees/",
+    )
 }
 
 /// Worktree folder name from the branch: everything after the last `/`,
@@ -214,7 +201,11 @@ fn slug(branch: &str) -> String {
         })
         .collect();
     let s = s.trim_matches('-').to_string();
-    if s.is_empty() { "worktree".into() } else { s }
+    if s.is_empty() {
+        "worktree".into()
+    } else {
+        s
+    }
 }
 
 /// Open the chain of directory components below `start`, each hop no-follow
@@ -227,14 +218,18 @@ fn walk_chain(
 ) -> Result<crate::fsx::DirHandle, String> {
     let mut cur = start.try_clone()?;
     for d in dirs {
-        cur = if create { cur.ensure_dir(d)? } else { cur.open_dir(d)? };
+        cur = if create {
+            cur.ensure_dir(d)?
+        } else {
+            cur.open_dir(d)?
+        };
     }
     Ok(cur)
 }
 
-/// Copy every untracked file of the main repo into the worktree — `.env`s,
-/// local configs, keys — skipping the heavyweight cache/build dirs. This is
-/// what makes a fresh worktree "just work" like the main checkout.
+/// Copy only manifest-approved untracked runtime files into the worktree.
+/// The transfer has hard file/count/total/time budgets and writes destination
+/// files mode 0600. Symlinks and every non-regular entry are skipped.
 ///
 /// Audit C7: the copy is fd-ANCHORED on both sides. Every path component is
 /// opened NO-FOLLOW relative to the repo-root handle (sources) and the
@@ -248,9 +243,22 @@ fn walk_chain(
 /// one unreadable file must not fail the spawn.
 fn copy_environment(bin: &str, root: &Path, dest: &crate::fsx::DirHandle) -> u64 {
     use crate::fsx::{DirHandle, EntryKind};
-    // --others without --exclude-standard = ALL untracked files, including
-    // gitignored ones (which is the point: .env etc. are usually ignored)
-    let list = match run(bin, root, &["ls-files", "--others", "-z"]) {
+    use std::io::Read as _;
+    // Only ignored local files are eligible. An ordinary untracked source
+    // file may be unfinished user work and must never be cloned implicitly.
+    let started = Instant::now();
+    let list = match run_with_timeout(
+        bin,
+        root,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+        ENV_COPY_TIMEOUT,
+    ) {
         Ok(l) => l,
         Err(_) => return 0,
     };
@@ -258,15 +266,22 @@ fn copy_environment(bin: &str, root: &Path, dest: &crate::fsx::DirHandle) -> u64
         return 0;
     };
     let mut copied = 0u64;
+    let mut total_bytes = 0u64;
     for rel in list.split('\0').filter(|r| !r.is_empty()) {
-        let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+        if copied >= ENV_COPY_MAX_FILES || started.elapsed() >= ENV_COPY_TIMEOUT {
+            break;
+        }
+        let comps: Vec<&str> = rel
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
         let Some((leaf, dirs)) = comps.split_last() else {
             continue;
         };
-        if comps
-            .iter()
-            .any(|c| *c == ".." || SKIP_DIRS.contains(c))
-        {
+        if !environment_manifest_allows(leaf) {
+            continue;
+        }
+        if comps.iter().any(|c| *c == ".." || SKIP_DIRS.contains(c)) {
             continue;
         }
         let Ok(src_dir) = walk_chain(&src_root, dirs, false) else {
@@ -276,18 +291,65 @@ fn copy_environment(bin: &str, root: &Path, dest: &crate::fsx::DirHandle) -> u64
             continue;
         };
         let ok = match src_dir.kind(leaf) {
-            Ok(Some(EntryKind::Symlink)) => match src_dir.read_link(leaf) {
-                Ok(Some(target)) => dst_dir.symlink(&target, leaf).is_ok(),
-                _ => false,
-            },
             Ok(Some(EntryKind::File)) => match src_dir.open_file(leaf) {
-                Ok(Some(mut f)) => match dst_dir.create_new(leaf) {
-                    Ok(mut out) => std::io::copy(&mut f, &mut out).is_ok(),
-                    Err(_) => false,
-                },
+                Ok(Some(mut f)) => {
+                    let metadata = match f.metadata() {
+                        Ok(m) if m.is_file() => m,
+                        _ => continue,
+                    };
+                    let size = metadata.len();
+                    #[cfg(unix)]
+                    let destination_mode = {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        if metadata.permissions().mode() & 0o111 != 0 {
+                            0o700
+                        } else {
+                            0o600
+                        }
+                    };
+                    if size > ENV_COPY_MAX_FILE_BYTES
+                        || total_bytes.saturating_add(size) > ENV_COPY_MAX_TOTAL_BYTES
+                    {
+                        continue;
+                    }
+                    match dst_dir.create_new_with_mode(leaf, 0o600) {
+                        Ok(mut out) => {
+                            let remaining = ENV_COPY_MAX_FILE_BYTES
+                                .min(ENV_COPY_MAX_TOTAL_BYTES.saturating_sub(total_bytes));
+                            let transferred =
+                                std::io::copy(&mut f.by_ref().take(remaining + 1), &mut out);
+                            match transferred {
+                                Ok(n) if n <= remaining => {
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt as _;
+                                        if out
+                                            .set_permissions(fs::Permissions::from_mode(
+                                                destination_mode,
+                                            ))
+                                            .is_err()
+                                        {
+                                            drop(out);
+                                            let _ = dst_dir.unlink(leaf);
+                                            continue;
+                                        }
+                                    }
+                                    total_bytes = total_bytes.saturating_add(n);
+                                    true
+                                }
+                                _ => {
+                                    drop(out);
+                                    let _ = dst_dir.unlink(leaf);
+                                    false
+                                }
+                            }
+                        }
+                        Err(_) => false,
+                    }
+                }
                 _ => false,
             },
-            _ => false, // missing / dir / fifo / device → skip
+            _ => false,
         };
         if ok {
             copied += 1;
@@ -296,11 +358,14 @@ fn copy_environment(bin: &str, root: &Path, dest: &crate::fsx::DirHandle) -> u64
     copied
 }
 
-/// Create `<repo>/.worktrees/<slug>` on a new branch off the current HEAD.
+/// Create `<repo>/.worktrees/<slug>` on a new branch off an exact commit.
+/// `base_sha = None` preserves the interactive UI's current-HEAD behavior;
+/// durable Mission callers always provide their previously approved SHA.
 pub fn add(
     cwd: &str,
     branch: &str,
     copy_env: bool,
+    base_sha: Option<&str>,
     bin_override: Option<&str>,
 ) -> Result<WorktreeInfo, String> {
     let bin = git_bin(bin_override);
@@ -311,6 +376,26 @@ pub fn add(
     let root = main_root(bin, Path::new(cwd))?;
     run(bin, &root, &["check-ref-format", "--branch", branch])
         .map_err(|_| format!("\"{branch}\" is not a valid branch name"))?;
+    let approved_base = match base_sha {
+        Some(value) => {
+            let value = value.trim();
+            if !(40..=64).contains(&value.len())
+                || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("worktree base SHA is invalid".into());
+            }
+            let resolved = run(
+                bin,
+                &root,
+                &["rev-parse", "--verify", &format!("{value}^{{commit}}")],
+            )?;
+            if !resolved.eq_ignore_ascii_case(value) {
+                return Err("worktree base SHA must be a full exact commit id".into());
+            }
+            Some(resolved)
+        }
+        None => None,
+    };
 
     // audit R4 + final hardening F8: a symlinked `.worktrees` would redirect
     // the whole checkout (and the env copy — .env files included) to an
@@ -325,9 +410,9 @@ pub fn add(
     let container = root.join(WORKTREES_DIR);
     let container_handle = {
         let root_handle = crate::fsx::DirHandle::open_root(&root)?;
-        root_handle.ensure_dir(WORKTREES_DIR).map_err(|e| {
-            format!("refusing {}: {e}", container.display())
-        })?
+        root_handle
+            .ensure_dir(WORKTREES_DIR)
+            .map_err(|e| format!("refusing {}: {e}", container.display()))?
     };
     let slug_name = slug(branch);
     let path = container.join(&slug_name);
@@ -343,9 +428,11 @@ pub fn add(
     // `-b` creates it at the current HEAD, so that OID (captured BEFORE the
     // add) is the only tip the rollback may delete. A tip that moved in the
     // race window (a commit landing on the fresh branch) survives.
-    let expected_branch_oid = run(bin, &root, &["rev-parse", "--verify", "HEAD"])
-        .ok()
-        .filter(|s| !s.is_empty());
+    let expected_branch_oid = approved_base.clone().or_else(|| {
+        run(bin, &root, &["rev-parse", "--verify", "HEAD"])
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
     let rollback = |path_str: &str| {
         let _ = run(bin, &root, &["worktree", "remove", "--force", path_str]);
         let _ = run(bin, &root, &["worktree", "prune"]);
@@ -355,7 +442,11 @@ pub fn add(
     };
 
     let path_str = path.to_string_lossy().into_owned();
-    run(bin, &root, &["worktree", "add", "-b", branch, &path_str])?;
+    let mut add_args = vec!["worktree", "add", "-b", branch, &path_str];
+    if let Some(base) = approved_base.as_deref() {
+        add_args.push(base);
+    }
+    run(bin, &root, &add_args)?;
 
     // F8 post-add verification through the ANCHORED handle: the checkout
     // must exist as a real directory under the container fd opened above —
@@ -394,7 +485,9 @@ pub fn add(
         }
         Err(e) => {
             rollback(&path_str);
-            return Err(format!("refusing: could not verify the created worktree: {e}"));
+            return Err(format!(
+                "refusing: could not verify the created worktree: {e}"
+            ));
         }
     }
 
@@ -523,7 +616,14 @@ pub fn status(path: &str, bin_override: Option<&str>) -> WorktreeStatus {
         None => run(
             bin,
             p,
-            &["rev-list", "--count", "HEAD", "--not", "--branches", "--remotes"],
+            &[
+                "rev-list",
+                "--count",
+                "HEAD",
+                "--not",
+                "--branches",
+                "--remotes",
+            ],
         )
         .ok()
         .and_then(|s| s.parse().ok()),
@@ -642,7 +742,11 @@ pub fn remove(
 
     if Path::new(&registered_path).exists() {
         if force {
-            run(bin, &root_p, &["worktree", "remove", "--force", &registered_path])?;
+            run(
+                bin,
+                &root_p,
+                &["worktree", "remove", "--force", &registered_path],
+            )?;
         } else {
             // final re-check + removal in ONE call — unknown status = refusal
             let st = status(&registered_path, bin_override);
@@ -766,532 +870,5 @@ pub fn list(roots: &[String], bin_override: Option<&str>) -> WorktreeScan {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Throwaway repo with one commit, a gitignored .env and a node_modules dir.
-    fn temp_repo() -> PathBuf {
-        // timestamp + counter: parallel tests can start in the same clock
-        // tick, and a shared dir makes them destroy each other's fixtures
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "swarmz-wt-test-{}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        // git reports canonical paths (macOS /tmp is a symlink) — match that
-        let dir = dir.canonicalize().unwrap();
-        let git = |args: &[&str]| run(git_bin(None), &dir, args).unwrap();
-        git(&["init", "-q", "-b", "main"]);
-        git(&["config", "user.email", "t@t"]);
-        git(&["config", "user.name", "t"]);
-        fs::write(dir.join("a.txt"), "hi").unwrap();
-        fs::write(dir.join(".gitignore"), ".env\n").unwrap();
-        fs::write(dir.join(".env"), "SECRET=1").unwrap();
-        fs::create_dir_all(dir.join("node_modules")).unwrap();
-        fs::write(dir.join("node_modules/big.js"), "x").unwrap();
-        git(&["add", "a.txt", ".gitignore"]);
-        git(&["commit", "-qm", "init"]);
-        dir
-    }
-
-    #[test]
-    fn add_status_remove_roundtrip() {
-        let repo = temp_repo();
-        let cwd = repo.to_string_lossy().into_owned();
-
-        let info = add(&cwd, "test/brave-falcon-7341", true, None).unwrap();
-        assert_eq!(info.root, cwd);
-        assert!(info.path.ends_with(".worktrees/brave-falcon-7341"));
-        // env copied, heavyweights skipped
-        assert!(Path::new(&info.path).join(".env").exists());
-        assert!(!Path::new(&info.path).join("node_modules").exists());
-        // .worktrees is excluded locally, main repo stays clean
-        assert!(fs::read_to_string(repo.join(".git/info/exclude"))
-            .unwrap()
-            .contains("/.worktrees/"));
-
-        // fresh worktree: nothing to lose (the copied .env is gitignored)
-        let st = status(&info.path, None);
-        assert!(st.exists && !st.dirty && st.ahead == 0);
-
-        // dirty tracked file → dirty; own commit → ahead
-        fs::write(Path::new(&info.path).join("a.txt"), "changed").unwrap();
-        assert!(status(&info.path, None).dirty);
-        run(git_bin(None), Path::new(&info.path), &["commit", "-qam", "wt"]).unwrap();
-        let st = status(&info.path, None);
-        assert!(!st.dirty && st.ahead == 1);
-
-        // list finds it under the repo root and reports the root as scanned
-        let scan = list(std::slice::from_ref(&cwd), None);
-        assert_eq!(scan.scanned, vec![cwd.clone()]);
-        assert_eq!(scan.entries.len(), 1);
-        assert_eq!(scan.entries[0].branch, "test/brave-falcon-7341");
-        assert_eq!(scan.entries[0].ahead, 1);
-
-        // the GATED removal refuses local-only work…
-        let err = remove(&cwd, &info.path, &info.branch, false, None).unwrap_err();
-        assert!(err.contains("local-only commit"), "{err}");
-        assert!(Path::new(&info.path).exists());
-        // …force deletes folder + branch even with local-only work
-        remove(&cwd, &info.path, &info.branch, true, None).unwrap();
-        assert!(!Path::new(&info.path).exists());
-        assert!(run(
-            git_bin(None),
-            &repo,
-            &["rev-parse", "--verify", "refs/heads/test/brave-falcon-7341"],
-        )
-        .is_err());
-        assert!(list(&[cwd], None).entries.is_empty());
-
-        fs::remove_dir_all(&repo).ok();
-    }
-
-    #[test]
-    fn gated_remove_refuses_dirt_and_unknown_state() {
-        let repo = temp_repo();
-        let cwd = repo.to_string_lossy().into_owned();
-        let info = add(&cwd, "test/gated", true, None).unwrap();
-
-        // dirty tracked file → the gated removal refuses, force succeeds
-        fs::write(Path::new(&info.path).join("a.txt"), "changed").unwrap();
-        let err = remove(&cwd, &info.path, &info.branch, false, None).unwrap_err();
-        assert!(err.contains("uncommitted"), "{err}");
-        assert!(Path::new(&info.path).exists());
-
-        // clean again → the gated removal passes (the copied gitignored .env
-        // does NOT block a non-force `git worktree remove`)
-        fs::write(Path::new(&info.path).join("a.txt"), "hi").unwrap();
-        assert!(Path::new(&info.path).join(".env").exists());
-        remove(&cwd, &info.path, &info.branch, false, None).unwrap();
-        assert!(!Path::new(&info.path).exists());
-
-        // hand-deleted folder + local-only commits → gated refuses branch -D
-        let info2 = add(&cwd, "test/gated2", false, None).unwrap();
-        fs::write(Path::new(&info2.path).join("a.txt"), "wt").unwrap();
-        run(git_bin(None), Path::new(&info2.path), &["commit", "-qam", "wt"]).unwrap();
-        fs::remove_dir_all(&info2.path).unwrap();
-        let err = remove(&cwd, &info2.path, &info2.branch, false, None).unwrap_err();
-        assert!(err.contains("local-only"), "{err}");
-        assert!(run(
-            git_bin(None),
-            &repo,
-            &["rev-parse", "--verify", "refs/heads/test/gated2"],
-        )
-        .is_ok(), "the branch must survive the refused gated cleanup");
-
-        fs::remove_dir_all(&repo).ok();
-    }
-
-    #[test]
-    fn status_marks_uncomputable_ahead_as_unknown() {
-        // a plain directory that is NOT a git repo: dirty (can't read) and
-        // ahead unknown — the gates must refuse, never treat this as clean
-        let dir = std::env::temp_dir().join(format!("swarmz-wt-nogit-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let st = status(&dir.to_string_lossy(), None);
-        assert!(st.exists);
-        assert!(st.dirty, "unreadable state must count as dirty");
-        assert!(st.ahead_unknown, "uncomputable ahead must be flagged");
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn unscannable_root_is_not_reported_as_scanned() {
-        let scan = list(&["/nonexistent/swarmz-test-root".into()], None);
-        assert!(scan.entries.is_empty());
-        assert!(scan.scanned.is_empty());
-    }
-
-    #[test]
-    fn missing_folder_still_reports_local_only_commits_as_ahead() {
-        let repo = temp_repo();
-        let cwd = repo.to_string_lossy().into_owned();
-        let info = add(&cwd, "test/orphan", false, None).unwrap();
-        // commit in the worktree, then delete the folder by hand — the
-        // branch now holds a commit nothing else reaches
-        fs::write(Path::new(&info.path).join("a.txt"), "wt change").unwrap();
-        run(git_bin(None), Path::new(&info.path), &["commit", "-qam", "wt"]).unwrap();
-        fs::remove_dir_all(&info.path).unwrap();
-
-        let scan = list(std::slice::from_ref(&cwd), None);
-        assert_eq!(scan.entries.len(), 1);
-        let entry = &scan.entries[0];
-        assert!(entry.missing);
-        // the panel uses ahead > 0 as its "risky, two-step confirm" gate —
-        // a hand-deleted folder must not turn branch deletion into one click
-        assert_eq!(entry.ahead, 1);
-
-        fs::remove_dir_all(&repo).ok();
-    }
-
-    #[test]
-    fn add_from_inside_a_worktree_targets_the_main_repo() {
-        let repo = temp_repo();
-        let cwd = repo.to_string_lossy().into_owned();
-        let first = add(&cwd, "test/one", false, None).unwrap();
-        // splitting from a worktree pane passes the root, but be safe anyway
-        let second = add(&first.path, "test/two", false, None).unwrap();
-        assert_eq!(second.root, cwd);
-        assert!(second.path.starts_with(&cwd));
-        fs::remove_dir_all(&repo).ok();
-    }
-
-    /// Audit R5 (frozen): the raw remove surface cannot be steered at
-    /// foreign paths or branches — confinement to `<root>/.worktrees`, git
-    /// as the identity source, caller branch cross-checked.
-    #[test]
-    fn remove_refuses_foreign_paths_and_branch_spoofing() {
-        let repo = temp_repo();
-        let cwd = repo.to_string_lossy().into_owned();
-        let info = add(&cwd, "test/confined", false, None).unwrap();
-
-        // (a) paths outside .worktrees refuse — even with force
-        for target in [
-            cwd.as_str(),                       // the repo itself
-            "/tmp",                             // arbitrary host folder
-            "/",                                // root
-            repo.join("src").to_string_lossy().as_ref(),
-        ] {
-            let err = remove(&cwd, target, "whatever", true, None).unwrap_err();
-            assert!(err.contains("refused"), "{target}: {err}");
-        }
-        // traversal out of .worktrees refuses too
-        let sneaky = format!("{}/.worktrees/../..", cwd);
-        assert!(remove(&cwd, &sneaky, "x", true, None).is_err());
-
-        // (b) an in-container path git does NOT list refuses
-        let fake = repo.join(".worktrees/never-created");
-        let err = remove(&cwd, &fake.to_string_lossy(), "x", true, None).unwrap_err();
-        assert!(err.contains("no worktree"), "{err}");
-
-        // (c) branch spoofing: the caller naming a FOREIGN branch refuses,
-        //     and `main` survives untouched
-        let err = remove(&cwd, &info.path, "main", true, None).unwrap_err();
-        assert!(err.contains("branch mismatch"), "{err}");
-        assert!(run(git_bin(None), &repo, &["rev-parse", "--verify", "refs/heads/main"]).is_ok());
-        assert!(Path::new(&info.path).exists(), "the worktree must survive the refusals");
-
-        // (d) the honest call (matching or empty branch) still works
-        remove(&cwd, &info.path, "", true, None).unwrap();
-        assert!(!Path::new(&info.path).exists());
-        assert!(
-            run(git_bin(None), &repo, &["rev-parse", "--verify", "refs/heads/test/confined"]).is_err(),
-            "the derived branch is deleted with the worktree"
-        );
-
-        fs::remove_dir_all(&repo).ok();
-    }
-
-    /// Audit C7 (frozen): the env copy is fd-anchored — an escaping symlink
-    /// planted among the untracked files is recreated as a SYMLINK (its
-    /// target string copied verbatim), never followed to copy foreign
-    /// content INTO the worktree, and the destination write goes through the
-    /// verified worktree handle. A regular untracked file copies normally.
-    #[test]
-    #[cfg(unix)]
-    fn env_copy_is_anchored_and_never_follows_symlinks() {
-        let repo = temp_repo();
-        let cwd = repo.to_string_lossy().into_owned();
-        // an out-of-tree secret and an in-tree UNTRACKED symlink to it
-        let outside = std::env::temp_dir().join(format!("swarmz-c7-out-{}", std::process::id()));
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(outside.join("secret"), "s3cr3t").unwrap();
-        std::os::unix::fs::symlink(outside.join("secret"), repo.join("link-to-secret")).unwrap();
-        // a normal untracked (gitignored) env file — must copy
-        fs::write(repo.join(".env.local"), "TOKEN=xyz").unwrap();
-
-        let info = add(&cwd, "test/c7-anchored", true, None).unwrap();
-        let dest = Path::new(&info.path);
-        // the symlink was recreated AS a symlink — not resolved into a copy
-        let copied_link = dest.join("link-to-secret");
-        let meta = fs::symlink_metadata(&copied_link).unwrap();
-        assert!(
-            meta.file_type().is_symlink(),
-            "an untracked symlink must be recreated as a symlink, never followed"
-        );
-        assert_eq!(
-            fs::read_link(&copied_link).unwrap(),
-            outside.join("secret"),
-            "the target string is copied verbatim"
-        );
-        // the regular untracked file copied through
-        assert_eq!(
-            fs::read_to_string(dest.join(".env.local")).unwrap(),
-            "TOKEN=xyz"
-        );
-        fs::remove_dir_all(&repo).ok();
-        fs::remove_dir_all(&outside).ok();
-    }
-
-    /// Audit R4 (frozen): a symlinked `.worktrees` container refuses the add
-    /// — the checkout and env copy must never be redirected to a host folder.
-    #[test]
-    fn add_refuses_a_symlinked_worktrees_container() {
-        let repo = temp_repo();
-        let cwd = repo.to_string_lossy().into_owned();
-        let outside = std::env::temp_dir().join(format!("swarmz-wt-out-{}", std::process::id()));
-        fs::create_dir_all(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, repo.join(".worktrees")).unwrap();
-        let err = add(&cwd, "test/redirected", true, None).unwrap_err();
-        assert!(err.contains("symlink"), "{err}");
-        fs::remove_dir_all(&repo).ok();
-        fs::remove_dir_all(&outside).ok();
-    }
-
-    /// Audits C5+C7 (frozen): the concurrent-attacker simulation. A git
-    /// wrapper swaps `.worktrees` for a symlink to a foreign folder right
-    /// AFTER `git worktree add` succeeded — and lands a racing commit on the
-    /// fresh branch. The add must refuse (the post-add identity
-    /// re-verification against the ANCHORED container handle catches the
-    /// swap — the pathname now resolves into the evil target), NO env file
-    /// may have crossed the swapped path, and the rollback's branch deletion
-    /// is transactional — the racing commit survives (C5).
-    #[test]
-    #[cfg(unix)]
-    fn add_refuses_swap_after_checkout_and_rollback_is_transactional() {
-        use std::os::unix::fs::PermissionsExt;
-        let repo = temp_repo();
-        let cwd = repo.to_string_lossy().into_owned();
-        let root = repo.to_string_lossy().into_owned();
-        let scratch = std::env::temp_dir().join(format!(
-            "swarmz-c7-swap-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&scratch).unwrap();
-        let evil = scratch.join("evil-target");
-        fs::create_dir_all(&evil).unwrap();
-        // a would-be exfil sink inside evil — if any env copy crossed the
-        // swapped path it would land here
-        let marker = scratch.join("swapped");
-        let real = git_bin(None);
-        let branch = "test/swapped";
-        let evil_s = evil.to_string_lossy().into_owned();
-        let marker_s = marker.to_string_lossy().into_owned();
-        // an untracked env file the copy WOULD move if the add didn't refuse
-        fs::write(repo.join(".env.local"), "TOKEN=xyz").unwrap();
-        let wrapper = scratch.join("git-wrapper.sh");
-        // the wrapper passes everything through to real git; on the FIRST
-        // `worktree add` it runs it, then swaps `.worktrees` for a symlink to
-        // `evil` and lands a racing commit on the new branch (moving its tip)
-        let script = format!(
-            "#!/bin/sh\n\
-             REAL='{real}'\n\
-             for a in \"$@\"; do\n\
-             \x20 if [ \"$a\" = add ]; then IS_ADD=1; fi\n\
-             done\n\
-             \"$REAL\" \"$@\"\n\
-             RC=$?\n\
-             if [ \"$IS_ADD\" = 1 ] && [ ! -f '{marker_s}' ]; then\n\
-             \x20 : > '{marker_s}'\n\
-             \x20 mv '{root}/.worktrees' '{root}/.wt-moved'\n\
-             \x20 ln -s '{evil_s}' '{root}/.worktrees'\n\
-             \x20 WT='{root}/.wt-moved/swapped'\n\
-             \x20 echo racing > \"$WT/a.txt\"\n\
-             \x20 \"$REAL\" -C \"$WT\" commit -qam racing\n\
-             fi\n\
-             exit $RC\n"
-        );
-        fs::write(&wrapper, script).unwrap();
-        let mut perm = fs::metadata(&wrapper).unwrap().permissions();
-        perm.set_mode(0o755);
-        fs::set_permissions(&wrapper, perm).unwrap();
-
-        let err = add(&cwd, branch, true, Some(&wrapper.to_string_lossy())).unwrap_err();
-        assert!(err.contains("redirected"), "{err}");
-        // C7: no env file crossed into the evil target
-        assert!(
-            !evil.join("swapped/.env.local").exists() && !evil.join(".env.local").exists(),
-            "an env file was copied through the swapped path"
-        );
-        // C5: the racing commit survives — the transactional rollback delete
-        // (expected-OID = HEAD before the add) refused because the branch tip
-        // moved. The branch still exists and holds the racing commit.
-        let tip = branch_oid(real, &repo, branch);
-        assert!(
-            tip.is_some(),
-            "the rollback must not delete a branch whose tip moved (racing commit lost)"
-        );
-        // restore a sane .worktrees for cleanup, then drop everything
-        let _ = fs::remove_file(repo.join(".worktrees"));
-        fs::remove_dir_all(&repo).ok();
-        fs::remove_dir_all(&scratch).ok();
-    }
-
-    /// Final hardening F3 (frozen): the branch deletion is transactional —
-    /// a tip that MOVED after the OID capture (the race: another process
-    /// lands a commit between the ahead re-check and the delete) survives;
-    /// only the expected OID deletes.
-    #[test]
-    fn branch_delete_is_transactional_against_oid_movement() {
-        let repo = temp_repo();
-        let bin = git_bin(None);
-        let g = |args: &[&str]| run(bin, &repo, args).unwrap();
-        g(&["branch", "swarm/txn"]);
-        let oid_a = branch_oid(bin, &repo, "swarm/txn").expect("branch tip");
-        // the race: a fresh commit moves the branch tip after the capture
-        fs::write(repo.join("a.txt"), "moved").unwrap();
-        g(&["add", "a.txt"]);
-        g(&["commit", "-qm", "race commit"]);
-        g(&["branch", "-f", "swarm/txn", "HEAD"]);
-        let oid_b = branch_oid(bin, &repo, "swarm/txn").expect("moved tip");
-        assert_ne!(oid_a, oid_b, "the tip must have moved");
-        // deleting against the STALE oid fails — the branch (and the new
-        // commit) survive
-        assert!(
-            delete_branch_transactional(bin, &repo, "swarm/txn", &oid_a).is_err(),
-            "a moved tip must refuse the delete"
-        );
-        assert_eq!(
-            branch_oid(bin, &repo, "swarm/txn").as_deref(),
-            Some(oid_b.as_str()),
-            "the branch with the racing commit must survive"
-        );
-        // against the CURRENT oid the delete goes through
-        delete_branch_transactional(bin, &repo, "swarm/txn", &oid_b).unwrap();
-        assert!(branch_oid(bin, &repo, "swarm/txn").is_none());
-        fs::remove_dir_all(&repo).ok();
-    }
-
-    /// F3 companion: a branch checked out ANYWHERE (worktree or the main
-    /// checkout) is never deleted — `update-ref -d` would not protect that
-    /// the way `branch -D` did, so the transactional path re-checks it.
-    #[test]
-    fn branch_delete_refuses_checked_out_branches() {
-        let repo = temp_repo();
-        let bin = git_bin(None);
-        let cwd = repo.to_string_lossy().into_owned();
-        let info = add(&cwd, "test/checkedout", false, None).unwrap();
-        let oid = branch_oid(bin, &repo, &info.branch).expect("worktree branch tip");
-        let err = delete_branch_transactional(bin, &repo, &info.branch, &oid).unwrap_err();
-        assert!(err.contains("checked out"), "{err}");
-        assert!(branch_oid(bin, &repo, &info.branch).is_some(), "branch survives");
-        // the main checkout's branch refuses too
-        let main_oid = branch_oid(bin, &repo, "main").expect("main tip");
-        assert!(delete_branch_transactional(bin, &repo, "main", &main_oid).is_err());
-        assert!(branch_oid(bin, &repo, "main").is_some());
-        fs::remove_dir_all(&repo).ok();
-    }
-
-    /// Final hardening F9 (frozen): an exclude file beyond the bounded-read
-    /// cap refuses the rewrite — a truncated-prefix rewrite would silently
-    /// drop later exclude rules (potentially exposing ignored secrets).
-    #[test]
-    fn oversized_exclude_refuses_rewrite() {
-        let repo = temp_repo();
-        let cwd = repo.to_string_lossy().into_owned();
-        // an entry-less exclude just beyond 1 MiB
-        let big = format!("# padding\n{}\n", "x".repeat(1024 * 1024));
-        fs::write(repo.join(".git/info/exclude"), &big).unwrap();
-        let err = add(&cwd, "test/too-big", false, None).unwrap_err();
-        assert!(err.contains("refusing to rewrite"), "{err}");
-        // the exclude file was NOT truncated
-        assert_eq!(
-            fs::metadata(repo.join(".git/info/exclude")).unwrap().len(),
-            big.len() as u64,
-            "the oversized exclude must stay untouched"
-        );
-        // an oversized exclude that ALREADY has the entry needs no rewrite —
-        // the add passes
-        let big_with_entry = format!("/.worktrees/\n{}\n", "x".repeat(1024 * 1024));
-        fs::write(repo.join(".git/info/exclude"), &big_with_entry).unwrap();
-        add(&cwd, "test/big-but-present", false, None).unwrap();
-        fs::remove_dir_all(&repo).ok();
-    }
-
-    /// Audit C1 (frozen): the backend's own git NEVER executes repository-
-    /// controlled code. The chain this closes: a repo sets `core.hooksPath`
-    /// at a TRACKED folder (husky style), a workspace agent edits the hook
-    /// body (a plain sandbox-permitted file edit), and an autonomous
-    /// `create_worktree` would then run `post-checkout` UNSANDBOXED in the
-    /// Tauri backend; `git status` would run a configured `core.fsmonitor`
-    /// hook; the branch cleanup would run `reference-transaction`. With the
-    /// `git_command` suppressions none of them ever fires.
-    #[test]
-    #[cfg(unix)]
-    fn backend_git_never_fires_repo_hooks() {
-        use std::os::unix::fs::PermissionsExt;
-        let repo = temp_repo();
-        let cwd = repo.to_string_lossy().into_owned();
-        let marker = repo.join("HOOK_FIRED");
-        let hook_body = format!("#!/bin/sh\n: > \"{}\"\n", marker.display());
-        // hooks in BOTH the default dir and a husky-style tracked hooksPath
-        let tracked_hooks = repo.join("hooks");
-        for dir in [repo.join(".git/hooks"), tracked_hooks.clone()] {
-            fs::create_dir_all(&dir).unwrap();
-            for name in [
-                "post-checkout",
-                "post-commit",
-                "pre-push",
-                "reference-transaction",
-                "post-index-change",
-            ] {
-                let p = dir.join(name);
-                fs::write(&p, &hook_body).unwrap();
-                let mut perm = fs::metadata(&p).unwrap().permissions();
-                perm.set_mode(0o755);
-                fs::set_permissions(&p, perm).unwrap();
-            }
-        }
-        let git_raw = |args: &[&str]| {
-            // RAW git, deliberately WITHOUT the suppressions — the positive
-            // control and the config setup
-            let out = std::process::Command::new(git_bin(None))
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "raw git {args:?} failed");
-        };
-        git_raw(&["config", "core.hooksPath", "hooks"]);
-        // positive control: without suppression the fixture DOES fire —
-        // otherwise this test would prove nothing
-        git_raw(&["commit", "--allow-empty", "-qm", "control"]);
-        assert!(
-            marker.exists(),
-            "fixture broken: the raw-git positive control did not fire the hook"
-        );
-        fs::remove_file(&marker).unwrap();
-        // a repo-config fsmonitor "hook" (the `git status` execution vector)
-        git_raw(&[
-            "config",
-            "core.fsmonitor",
-            &tracked_hooks.join("post-checkout").to_string_lossy(),
-        ]);
-
-        // the suppressed surface: worktree add (post-checkout), status
-        // (fsmonitor), gated remove incl. transactional branch delete
-        // (reference-transaction) — none may fire a hook. copy_env=false so
-        // the untracked `hooks/` fixture doesn't dirty the worktree; the
-        // status query still exercises the fsmonitor vector.
-        let info = add(&cwd, "test/hooks-suppressed", false, None).unwrap();
-        let st = status(&info.path, None);
-        assert!(st.exists && st.ahead == 0, "{st:?}");
-        remove(&cwd, &info.path, &info.branch, false, None).unwrap();
-        assert!(
-            !marker.exists(),
-            "a repository-controlled hook ran inside the unsandboxed backend"
-        );
-        fs::remove_dir_all(&repo).ok();
-    }
-
-    #[test]
-    fn invalid_branch_and_duplicate_folder_are_rejected() {
-        let repo = temp_repo();
-        let cwd = repo.to_string_lossy().into_owned();
-        assert!(add(&cwd, "bad..name", false, None).is_err());
-        add(&cwd, "test/dup", false, None).unwrap();
-        // same slug → same folder → must refuse, not clobber
-        assert!(add(&cwd, "other/dup", false, None).is_err());
-        fs::remove_dir_all(&repo).ok();
-    }
-}
+#[path = "worktree/tests.rs"]
+mod tests;

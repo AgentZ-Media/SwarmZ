@@ -9,7 +9,8 @@ import {
   redactRemoteUrl,
   resolveAgentAccess,
   sanitizeAgentName,
-} from "./executors";
+  validModelId,
+} from "./executor-guards";
 
 describe("resolveAgentAccess (T1)", () => {
   it("refuses full access — the Conductor can only grant workspace", () => {
@@ -34,6 +35,16 @@ describe("sanitizeAgentName (T6)", () => {
   it("collapses whitespace, trims and length-caps", () => {
     expect(sanitizeAgentName("  Aria   Bright  ")).toBe("Aria Bright");
     expect(sanitizeAgentName("x".repeat(200)).length).toBe(60);
+  });
+});
+
+describe("model id validation", () => {
+  it("preserves the executor's exact allowlist", () => {
+    expect(validModelId("gpt-5.4-codex")).toBe(true);
+    expect(validModelId("provider/model:v2")).toBe(true);
+    expect(validModelId("../model")).toBe(false);
+    expect(validModelId("model with spaces")).toBe(false);
+    expect(validModelId("--flag")).toBe(false);
   });
 });
 

@@ -183,7 +183,10 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("unknown tool"), "unexpected error: {err}");
-        assert!(err.contains("fleet_snapshot"), "should list valid tools: {err}");
+        assert!(
+            err.contains("fleet_snapshot"),
+            "should list valid tools: {err}"
+        );
         assert_eq!(pending.len(), 0);
     }
 

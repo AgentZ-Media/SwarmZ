@@ -13,6 +13,10 @@
 import { create } from "zustand";
 import { nanoid } from "nanoid";
 import { loadOrchestratorChats, saveOrchestratorChats } from "@/lib/transport";
+import {
+  createPersistenceCoordinator,
+  type HydrationStatus,
+} from "@/lib/persistence/coordinator";
 import { useProjects } from "@/lib/projects/store";
 import { useVibe } from "@/lib/vibe/session-store";
 import type {
@@ -67,10 +71,6 @@ export interface OrchestratorMessagePatch {
   paneRefs?: OrchestratorPaneRef[];
 }
 
-// Chats stream store patches every ~80 ms — batch the (whole-file) disk
-// writes a bit wider than usual.
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
-
 function snapshot(): PersistedOrchestratorChats {
   const s = useOrchestrator.getState();
   return {
@@ -81,25 +81,20 @@ function snapshot(): PersistedOrchestratorChats {
   };
 }
 
+const persistence = createPersistenceCoordinator({
+  name: "orchestratorChats",
+  debounceMs: 800,
+  snapshot,
+  save: saveOrchestratorChats,
+});
+
 function schedulePersist() {
-  if (persistTimer) return;
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    void saveOrchestratorChats(snapshot());
-  }, 800);
+  persistence.schedule();
 }
 
 /** Write the pending debounce NOW — called from flushAllPersists at quit. */
 export async function flushOrchestratorPersist(): Promise<void> {
-  if (persistTimer) {
-    clearTimeout(persistTimer);
-    persistTimer = null;
-  }
-  try {
-    await saveOrchestratorChats(snapshot());
-  } catch {
-    /* never block quitting on a failed write */
-  }
+  await persistence.flush();
 }
 
 export interface OrchestratorState {
@@ -114,6 +109,10 @@ export interface OrchestratorState {
   tokenUsage: Record<string, VibeTokenUsage>;
   /** codex app-server availability, checked on first stage open (in-memory) */
   status: OrchestratorChatStatus | null;
+  /** Explicit restore health; a failed read permanently gates writes. */
+  hydrated: boolean;
+  hydrateStatus: HydrationStatus;
+  hydrateError: string | null;
 
   /**
    * Create a chat FOR ONE PROJECT (reusing that project's empty one) and
@@ -152,6 +151,8 @@ export interface OrchestratorState {
   setChatTitle: (chatId: string, title: string) => void;
   /** append a message (stamps id + timestamp, enforces the message cap) */
   appendMessage: (chatId: string, msg: NewOrchestratorMessage) => string;
+  /** rollback a visible message whose backend turn definitively never began */
+  removeMessage: (chatId: string, messageId: string) => void;
   patchMessage: (
     chatId: string,
     messageId: string,
@@ -168,6 +169,11 @@ export interface OrchestratorState {
   ) => void;
   /** mark the chat's undelivered pings delivered and return them (in order) */
   takePendingPings: (chatId: string) => OrchestratorPingRecord[];
+  /** put an undelivered batch back after a definitive pre-start failure */
+  restorePendingPings: (
+    chatId: string,
+    pings: OrchestratorPingRecord[],
+  ) => void;
 }
 
 /**
@@ -195,6 +201,9 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
   busy: {},
   tokenUsage: {},
   status: null,
+  hydrated: false,
+  hydrateStatus: "pending",
+  hydrateError: null,
 
   newChat: (projectId, model, effort) => {
     const s = get();
@@ -345,6 +354,25 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
     return id;
   },
 
+  removeMessage: (chatId, messageId) => {
+    const s = get();
+    const chat = s.chats.find((c) => c.id === chatId);
+    if (!chat?.messages.some((message) => message.id === messageId)) return;
+    set({
+      chats: s.chats.map((candidate) =>
+        candidate.id === chatId
+          ? {
+              ...candidate,
+              messages: candidate.messages.filter(
+                (message) => message.id !== messageId,
+              ),
+            }
+          : candidate,
+      ),
+    });
+    schedulePersist();
+  },
+
   patchMessage: (chatId, messageId, patch) => {
     const s = get();
     const chat = s.chats.find((c) => c.id === chatId);
@@ -424,6 +452,31 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
     });
     schedulePersist();
     return undelivered;
+  },
+
+  restorePendingPings: (chatId, pings) => {
+    if (pings.length === 0) return;
+    const keys = new Set(
+      pings.map((ping) => `${ping.paneId}|${ping.activity}|${ping.at}`),
+    );
+    const s = get();
+    const chat = s.chats.find((candidate) => candidate.id === chatId);
+    if (!chat) return;
+    set({
+      chats: s.chats.map((candidate) =>
+        candidate.id === chatId
+          ? {
+              ...candidate,
+              pendingPings: candidate.pendingPings.map((ping) =>
+                keys.has(`${ping.paneId}|${ping.activity}|${ping.at}`)
+                  ? { ...ping, delivered: false }
+                  : ping,
+              ),
+            }
+          : candidate,
+      ),
+    });
+    schedulePersist();
   },
 }));
 
@@ -637,10 +690,23 @@ export async function hydrateOrchestratorChats(
   let data: PersistedOrchestratorChats | null = null;
   try {
     data = await loadOrchestratorChats();
-  } catch {
+  } catch (error) {
+    persistence.hydrationFailed(error);
+    useOrchestrator.setState({
+      hydrateStatus: "failed",
+      hydrateError: error instanceof Error ? error.message : String(error),
+    });
     return;
   }
-  if (!data) return;
+  if (!data) {
+    useOrchestrator.setState({
+      hydrated: true,
+      hydrateStatus: "ready",
+      hydrateError: null,
+    });
+    persistence.hydrationSucceeded();
+    return;
+  }
   const chats: OrchestratorChat[] = [];
   for (const raw of Array.isArray(data.chats) ? data.chats : []) {
     try {
@@ -782,7 +848,11 @@ export async function hydrateOrchestratorChats(
   useOrchestrator.setState({
     chats: collapsed.chats,
     activeByProject: collapsed.activeByProject,
+    hydrated: true,
+    hydrateStatus: "ready",
+    hydrateError: null,
   });
+  persistence.hydrationSucceeded();
   // unassigned chats heal as soon as projects (re)appear
   if (collapsed.chats.some((c) => c.projectId === "")) startHealWatcher();
   // persist the migrated/cleaned list so the on-disk state heals immediately

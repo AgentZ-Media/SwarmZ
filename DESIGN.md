@@ -90,7 +90,7 @@ never a full-surface fill.
 |---|---|---|
 | `--txt` | `#e9eaee` | primary copy, names, headings |
 | `--mut` | `#9da0ab` | secondary copy, chat meta, mini-feed |
-| `--fnt` | `#62646f` | tertiary: placeholders, section labels, paths, tickers, idle dots |
+| `--fnt` | `#858892` | tertiary: placeholders, section labels, paths, tickers, idle dots; AA-readable on app surfaces |
 
 ### Semantics & diff
 
@@ -106,6 +106,11 @@ Tailwind utilities exist for every token: `bg-panel`, `bg-pop`, `border-line`,
 `border-line2`, `text-txt`, `text-mut`, `text-fnt`, `bg-acc`, `text-attn`,
 `text-ok`, `text-warn`, `text-err`, `text-add`, `text-del`, `bg-acc-700`, …
 Never hard-code hex values in components.
+
+Small text on solid accent or destructive CTAs always uses `text-bg`
+(`bg-acc text-bg` / `bg-err text-bg`) for WCAG-AA contrast. White is reserved
+for icon-only foregrounds on those fills, where the non-text 3:1 threshold is
+met; it must not be reused for labels.
 
 ## Spacing
 
@@ -222,7 +227,8 @@ accent stops, strings ok-tinted, functions warm, comments `--fnt`), and the
 structural `--diffs-*-override` variables pin the +/- washes to `--add`/
 `--del` at 11 % / 26 % emphasis, scoped to `.vibe-diff`. The engine is
 `shiki-js` (pure-JS RegExp — no Oniguruma WASM, the WKWebView-safe choice);
-highlighting runs in pierre's 2-worker pool mounted once in `VibeLayer`.
+highlighting is lazy-loaded with the first expanded diff; all mounted diff
+providers resolve to pierre's shared 2-worker singleton pool.
 Changing `--acc` re-themes diffs automatically. Never theme by patching the
 library — only through these variables.
 

@@ -9,7 +9,7 @@ import {
 } from "@/lib/vibe/controller";
 import { approvalCommand } from "@/lib/vibe/ui";
 import { splitUnifiedDiff } from "@/lib/vibe/diff";
-import { changeToPatchText } from "@/lib/vibe/diff-pierre";
+import { changeToPatchText } from "@/lib/vibe/diff-patch";
 import { cn } from "@/lib/utils";
 import type { VibeFileChange, VibeItem } from "@/types";
 import { CompactDiffPreview } from "./DiffCard";
@@ -92,7 +92,7 @@ function MessageComposer({ sessionId }: { sessionId: string }) {
             send();
           }
         }}
-        placeholder="Message this agent…"
+        placeholder="Message this worker…"
         className="min-h-5 flex-1 select-text resize-none bg-transparent text-13 leading-relaxed text-txt placeholder:text-fnt focus:outline-none"
       />
       {busy ? (
@@ -222,7 +222,7 @@ function ApprovalTakeover({
         <button
           onClick={() => respond("accept")}
           disabled={responding}
-          className="focus-ring rounded-md bg-acc px-4 py-1.5 font-mono text-11 font-bold text-white hover:brightness-110 disabled:opacity-40"
+          className="focus-ring rounded-md bg-acc px-4 py-1.5 font-mono text-11 font-bold text-bg hover:brightness-110 disabled:opacity-40"
         >
           Allow <span className="opacity-70">↵</span>
         </button>

@@ -1,6 +1,5 @@
-import { memo, useMemo, useState } from "react";
+import { lazy, memo, Suspense, useMemo, useState } from "react";
 import { ChevronRight } from "lucide-react";
-import { FileDiff } from "@pierre/diffs/react";
 import {
   capDiff,
   changeKind,
@@ -9,11 +8,7 @@ import {
   type ChangeKind,
   type ParsedFile,
 } from "@/lib/vibe/diff";
-import {
-  changeToPatchText,
-  DIFF_OPTIONS,
-  toFileDiff,
-} from "@/lib/vibe/diff-pierre";
+import { changeToPatchText } from "@/lib/vibe/diff-patch";
 import { cn } from "@/lib/utils";
 import type { VibeFileChange } from "@/types";
 
@@ -36,19 +31,27 @@ const BODY_MAX = "max-h-[460px]";
 // An unparseable patch falls back to a plain <pre> of the raw text.
 // ---------------------------------------------------------------------------
 
+const HighlightedDiffBody = lazy(() =>
+  import("./HighlightedDiffBody").then((module) => ({
+    default: module.HighlightedDiffBody,
+  })),
+);
+
 const DiffBody = memo(function DiffBody({ patchText }: { patchText: string }) {
-  const meta = useMemo(() => toFileDiff(patchText), [patchText]);
-  if (!meta) {
-    return (
-      <pre className="max-h-64 select-text overflow-auto px-3 py-2 font-mono text-11 leading-[1.7] text-mut">
-        {patchText}
-      </pre>
-    );
-  }
+  const plain = (
+    <pre
+      className={cn(
+        "select-text overflow-auto px-3 py-2 font-mono text-11 leading-[1.7] text-mut",
+        BODY_MAX,
+      )}
+    >
+      {patchText}
+    </pre>
+  );
   return (
-    <div className={cn("vibe-diff overflow-auto", BODY_MAX)}>
-      <FileDiff fileDiff={meta} options={DIFF_OPTIONS} />
-    </div>
+    <Suspense fallback={plain}>
+      <HighlightedDiffBody patchText={patchText} bodyClassName={BODY_MAX} />
+    </Suspense>
   );
 });
 

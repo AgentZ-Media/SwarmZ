@@ -21,6 +21,9 @@ import type {
   UsageHistoryEntry,
 } from "@/types";
 import type { Backend } from "./backend-types";
+import type { PersistedMissions } from "@/lib/missions/types";
+import type { PersistedMissionOutbox } from "@/lib/missions/outbox";
+import type { PersistedRuntimeEnvironments } from "@/lib/runtime/core";
 
 const store = new LazyStore("swarmz.json");
 
@@ -41,15 +44,14 @@ export const tauriBackend: Backend = {
     return granted;
   },
   notify: async (title, body) => {
+    if (!(await isPermissionGranted())) {
+      throw new Error("Native notification permission is not granted");
+    }
     sendNotification({ title, body });
   },
 
   loadQuickNotes: async () => {
-    try {
-      return (await store.get<QuickNotesData>("quickNotes")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<QuickNotesData>("quickNotes")) ?? null;
   },
   saveQuickNotes: async (data) => {
     await store.set("quickNotes", data);
@@ -57,14 +59,9 @@ export const tauriBackend: Backend = {
   },
 
   loadOrchestratorChats: async () => {
-    try {
-      return (
-        (await store.get<PersistedOrchestratorChats>("orchestratorChats")) ??
-        null
-      );
-    } catch {
-      return null;
-    }
+    return (
+      (await store.get<PersistedOrchestratorChats>("orchestratorChats")) ?? null
+    );
   },
   saveOrchestratorChats: async (data) => {
     await store.set("orchestratorChats", data);
@@ -72,11 +69,7 @@ export const tauriBackend: Backend = {
   },
 
   loadVibeSessions: async () => {
-    try {
-      return (await store.get<PersistedVibeSessions>("vibeSessions")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<PersistedVibeSessions>("vibeSessions")) ?? null;
   },
   saveVibeSessions: async (data) => {
     await store.set("vibeSessions", data);
@@ -84,11 +77,7 @@ export const tauriBackend: Backend = {
   },
 
   loadProjects: async () => {
-    try {
-      return (await store.get<PersistedProjects>("projects")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<PersistedProjects>("projects")) ?? null;
   },
   saveProjects: async (data) => {
     await store.set("projects", data);
@@ -107,6 +96,33 @@ export const tauriBackend: Backend = {
   },
   saveAutonomyBudgets: async (data) => {
     await store.set("autonomyBudgets", data);
+    await store.save();
+  },
+
+  loadMissions: async () => {
+    // A read failure must throw. The mission store then remains write-gated;
+    // unreadable durable work must never be replaced by an empty event log.
+    return (await store.get<PersistedMissions>("missions")) ?? null;
+  },
+  saveMissions: async (data) => {
+    await store.set("missions", data);
+    await store.save();
+  },
+
+  loadMissionOutbox: async () => {
+    // Unknown outbox state must throw so startup dispatch remains fail-closed.
+    return (await store.get<PersistedMissionOutbox>("missionOutbox")) ?? null;
+  },
+  saveMissionOutbox: async (data) => {
+    await store.set("missionOutbox", data);
+    await store.save();
+  },
+
+  loadRuntimeEnvironments: async () => {
+    return (await store.get<PersistedRuntimeEnvironments>("runtimeEnvironments")) ?? null;
+  },
+  saveRuntimeEnvironments: async (data) => {
+    await store.set("runtimeEnvironments", data);
     await store.save();
   },
 
@@ -134,11 +150,7 @@ export const tauriBackend: Backend = {
   },
 
   loadUsageHistory: async () => {
-    try {
-      return (await store.get<UsageHistoryEntry[]>("usageHistory")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<UsageHistoryEntry[]>("usageHistory")) ?? null;
   },
   saveUsageHistory: async (entries) => {
     await store.set("usageHistory", entries);
@@ -146,11 +158,7 @@ export const tauriBackend: Backend = {
   },
 
   loadSettings: async () => {
-    try {
-      return (await store.get<AppSettings>("settings")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<AppSettings>("settings")) ?? null;
   },
   saveSettings: async (settings) => {
     await store.set("settings", settings);
@@ -158,11 +166,7 @@ export const tauriBackend: Backend = {
   },
 
   loadSchemaVersion: async () => {
-    try {
-      return (await store.get<number>("schemaVersion")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<number>("schemaVersion")) ?? null;
   },
   saveSchemaVersion: async (version) => {
     await store.set("schemaVersion", version);

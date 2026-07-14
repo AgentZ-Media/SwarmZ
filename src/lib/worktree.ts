@@ -62,6 +62,8 @@ export async function addWorktree(args: {
   cwd: string;
   branch: string;
   copyEnv: boolean;
+  /** Exact commit for durable callers; omitted interactive worktrees use current HEAD. */
+  baseSha?: string;
   gitBin?: string;
 }): Promise<WorktreeInfo> {
   // a git write outside any busy flag — visible to the quit guard
@@ -71,11 +73,17 @@ export async function addWorktree(args: {
       cwd: args.cwd,
       branch: args.branch,
       copyEnv: args.copyEnv,
+      baseSha: args.baseSha,
       bin: args.gitBin,
     });
   } finally {
     endInflight();
   }
+}
+
+/** Canonical main checkout root for a repo subdirectory or another worktree. */
+export function resolveWorktreeMainRoot(cwd: string, gitBin?: string): Promise<string> {
+  return invoke<string>("worktree_resolve_main_root", { cwd, bin: gitBin });
 }
 
 /** Would closing this worktree lose work? (dirty files / local-only commits) */

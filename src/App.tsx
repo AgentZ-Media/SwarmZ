@@ -1,16 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { TitleBar } from "./components/TitleBar";
 import { VibeLayer } from "./components/vibe/VibeLayer";
 import { Deck } from "./components/Deck";
 import { Toasts } from "./components/Toasts";
-import { CommandPalette } from "./components/CommandPalette";
 import { QuitConfirmDialog } from "./components/QuitConfirmDialog";
 import { CloseWorktreeDialog } from "./components/CloseWorktreeDialog";
-import { SettingsDialog } from "./components/SettingsDialog";
-import { QuickNotesPanel } from "./components/QuickNotesPanel";
-import { UsageDashboard } from "./components/UsageDashboard";
-import { GitHubPanel } from "./components/GitHubPanel";
 import { useSwarm } from "./store";
 import { useVibe } from "./lib/vibe/session-store";
 import { hasPendingApproval } from "./lib/vibe/ui";
@@ -31,13 +26,50 @@ import {
 } from "./lib/orchestrator/timers";
 import { registerAutonomousRunner } from "./lib/orchestrator/triggers";
 import { startGithubController } from "./lib/github/controller";
-import { vibeTriageEntries } from "./lib/vibe/triage";
 import {
   activateProjectByIndex,
   closeSession,
-  focusSession,
 } from "./lib/vibe/controller";
 import { ensureNotifyPermission, notify } from "./lib/transport";
+import { startMissionController } from "./lib/missions/controller";
+import { startMissionSchedules } from "./lib/missions/schedules";
+import { startMissionOutboxCompaction } from "./lib/missions/outbox-compaction";
+import { useProjects } from "./lib/projects/store";
+import { startIntegrationController } from "./lib/integration/controller";
+
+// Optional surfaces are sizeable and closed on a normal launch. Keep them out
+// of the startup graph; after first use they remain mounted so Radix can finish
+// close animations and restore focus correctly.
+const CommandPalette = lazy(() =>
+  import("./components/CommandPalette").then((module) => ({
+    default: module.CommandPalette,
+  })),
+);
+const SettingsDialog = lazy(() =>
+  import("./components/SettingsDialog").then((module) => ({
+    default: module.SettingsDialog,
+  })),
+);
+const QuickNotesPanel = lazy(() =>
+  import("./components/QuickNotesPanel").then((module) => ({
+    default: module.QuickNotesPanel,
+  })),
+);
+const UsageDashboard = lazy(() =>
+  import("./components/UsageDashboard").then((module) => ({
+    default: module.UsageDashboard,
+  })),
+);
+const GitHubPanel = lazy(() =>
+  import("./components/GitHubPanel").then((module) => ({
+    default: module.GitHubPanel,
+  })),
+);
+const RuntimeEnvironmentsPanel = lazy(() =>
+  import("./components/RuntimeEnvironmentsPanel").then((module) => ({
+    default: module.RuntimeEnvironmentsPanel,
+  })),
+);
 
 // dev-only orchestrator smoke-test hook (`window.__orch`) — the DEV guard
 // makes production builds drop the import entirely
@@ -49,6 +81,21 @@ export default function App() {
   const hydrate = useSwarm((s) => s.hydrate);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [runtimeOpen, setRuntimeOpen] = useState(false);
+  const activeProjectId = useProjects((state) => state.activeProjectId);
+  const activeProjectDir = useProjects((state) =>
+    state.activeProjectId ? state.projects[state.activeProjectId]?.dir ?? null : null,
+  );
+  const paletteOpen = useSwarm((s) => s.paletteOpen);
+  const dashboardOpen = useSwarm((s) => s.dashboardOpen);
+  const notesOpen = useSwarm((s) => s.notesOpen);
+  const githubOpen = useSwarm((s) => s.githubOpen);
+  const paletteRequested = useLoadOnce(paletteOpen);
+  const settingsRequested = useLoadOnce(settingsOpen);
+  const dashboardRequested = useLoadOnce(dashboardOpen);
+  const notesRequested = useLoadOnce(notesOpen);
+  const githubRequested = useLoadOnce(githubOpen);
+  const runtimeRequested = useLoadOnce(runtimeOpen);
   const notifyGranted = useRef(false);
   const prevPending = useRef<Set<string>>(new Set());
 
@@ -78,6 +125,14 @@ export default function App() {
     // GitHub integration (Phase 7): repo/PR detection, the Rust write-gate
     // sync, the PR watcher and its pr-changed → ticker/autonomy routing
     const stopGithub = startGithubController();
+    // Durable Mission scheduler: remains fail-closed until missions, outbox
+    // and session stores hydrate; owns only temporary one-assignment workers.
+    const stopMissions = startMissionController();
+    const stopMissionSchedules = startMissionSchedules();
+    const stopMissionOutboxCompaction = startMissionOutboxCompaction();
+    // Integration trains consume only independently verified attempt commits
+    // and execute combined regression behind the durable outbox boundary.
+    const stopIntegration = startIntegrationController();
     return () => {
       updates.stopBackgroundPolling();
       stopLimits();
@@ -85,6 +140,10 @@ export default function App() {
       stopOrchestratorBus();
       stopVibePings();
       stopGithub();
+      stopMissions();
+      stopMissionSchedules();
+      stopMissionOutboxCompaction();
+      stopIntegration();
     };
   }, [hydrate]);
 
@@ -186,6 +245,10 @@ export default function App() {
         // new native Codex agent
         e.preventDefault();
         useVibeUi.getState().setNewSessionOpen(true);
+      } else if (k === "m" && e.shiftKey) {
+        // mission intake is intentionally distinct from the low-level worker
+        e.preventDefault();
+        useVibeUi.getState().setMissionCreateOpen(true);
       } else if (k === "b") {
         // ⌘B — toggle the Conductor sidebar
         e.preventDefault();
@@ -195,10 +258,9 @@ export default function App() {
         e.preventDefault();
         useVibeUi.getState().showConductor();
       } else if (k === "a" && e.shiftKey) {
-        // jump to the oldest session waiting on the human
+        // unified queue: mission blockers and live worker approvals
         e.preventDefault();
-        const entries = vibeTriageEntries(useVibe.getState());
-        if (entries.length) focusSession(entries[0].id);
+        useVibeUi.getState().setAttentionOpen(true);
       } else if (k === "n") {
         // quick notes drawer (closing while open is handled in the dialog branch)
         e.preventDefault();
@@ -233,7 +295,10 @@ export default function App() {
   return (
     <TooltipProvider delayDuration={300}>
       <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg">
-        <TitleBar onOpenSettings={() => setSettingsOpen(true)} />
+        <TitleBar
+          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenRuntime={() => setRuntimeOpen(true)}
+        />
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="relative min-h-0 min-w-0 flex-1">
             <VibeLayer />
@@ -246,11 +311,81 @@ export default function App() {
       <Toasts />
       <QuitConfirmDialog />
       <CloseWorktreeDialog />
-      <CommandPalette onOpenSettings={() => setSettingsOpen(true)} />
-      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
-      <UsageDashboard />
-      <QuickNotesPanel />
-      <GitHubPanel />
+      {paletteRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening search" />}>
+          <CommandPalette onOpenSettings={() => setSettingsOpen(true)} />
+        </Suspense>
+      )}
+      {settingsRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening settings" />}>
+          <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+        </Suspense>
+      )}
+      {dashboardRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening usage" side />}>
+          <UsageDashboard />
+        </Suspense>
+      )}
+      {notesRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening notes" side />}>
+          <QuickNotesPanel />
+        </Suspense>
+      )}
+      {githubRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening GitHub" side />}>
+          <GitHubPanel />
+        </Suspense>
+      )}
+      {runtimeRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening runtimes" side />}>
+          <RuntimeEnvironmentsPanel
+            open={runtimeOpen}
+            onOpenChange={setRuntimeOpen}
+            projectId={activeProjectId}
+            projectDir={activeProjectDir}
+          />
+        </Suspense>
+      )}
     </TooltipProvider>
+  );
+}
+
+/** Request a lazy surface on first open, then keep it mounted permanently. */
+function useLoadOnce(open: boolean): boolean {
+  const [requested, setRequested] = useState(open);
+  useEffect(() => {
+    if (open) setRequested(true);
+  }, [open]);
+  return requested || open;
+}
+
+/** Branded, non-empty first-load state for optional dialogs and drawers. */
+function SurfaceLoading({
+  label,
+  side = false,
+}: {
+  label: string;
+  side?: boolean;
+}) {
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={label}
+      className="fixed inset-0 z-50 flex bg-black/45"
+    >
+      <div
+        role="status"
+        aria-live="polite"
+        className={
+          side
+            ? "ml-auto flex h-full w-[min(92vw,32rem)] items-center justify-center border-l border-line bg-panel"
+            : "m-auto flex h-24 w-[min(88vw,28rem)] items-center justify-center rounded-xl border border-line bg-panel shadow-2xl"
+        }
+      >
+        <span aria-hidden className="mr-2 h-2 w-2 animate-pulse rounded-full bg-acc" />
+        <span className="font-mono text-12 text-mut">{label}…</span>
+      </div>
+    </div>
   );
 }

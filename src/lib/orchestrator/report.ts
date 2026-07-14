@@ -222,22 +222,33 @@ export function renderReportLines(report: AgentReport): string {
 // consumption then only matches THAT turn's finish, so a stale completion
 // racing the registration can't eat the mark meant for the fresh turn.
 
-const expecting = new Map<string, { turnId: string | null }>();
+interface ReportExpectation {
+  token: string;
+  turnId: string | null;
+}
+
+const expecting = new Map<string, ReportExpectation[]>();
+let expectationSequence = 0;
 
 /** Mark a session BEFORE the schema-constrained send: its next finished turn
  * carries a schema-forced report. */
-export function noteReportExpected(sessionId: string): void {
-  expecting.set(sessionId, { turnId: null });
+export function noteReportExpected(sessionId: string): string {
+  const token = `report-${++expectationSequence}`;
+  const entries = expecting.get(sessionId) ?? [];
+  expecting.set(sessionId, [...entries, { token, turnId: null }]);
+  return token;
 }
 
 /** Bind the expectation to the acked turn id (post-send). No-op when the
  * expectation is gone (consumed by a racing finish / cleared). */
 export function bindReportExpectation(
   sessionId: string,
+  token: string,
   turnId: string | null,
 ): void {
-  const e = expecting.get(sessionId);
-  if (e && turnId) e.turnId = turnId;
+  if (!turnId) return;
+  const entry = expecting.get(sessionId)?.find((value) => value.token === token);
+  if (entry) entry.turnId = turnId;
 }
 
 /**
@@ -250,19 +261,33 @@ export function takeReportExpectation(
   sessionId: string,
   turnId: string | null = null,
 ): boolean {
-  const e = expecting.get(sessionId);
-  if (!e) return false;
-  if (e.turnId !== null && turnId !== null && e.turnId !== turnId) return false;
-  expecting.delete(sessionId);
+  const entries = expecting.get(sessionId);
+  if (!entries?.length) return false;
+  const index = turnId === null
+    ? 0
+    : entries.findIndex((entry) => entry.turnId === turnId);
+  // A bound completion can never consume an unbound/newer expectation.
+  if (index < 0) return false;
+  entries.splice(index, 1);
+  if (entries.length === 0) expecting.delete(sessionId);
   return true;
 }
 
 /** Drop a session's expectation (session closed / send failed / steered). */
-export function clearReportExpectation(sessionId: string): void {
-  expecting.delete(sessionId);
+export function clearReportExpectation(sessionId: string, token?: string): void {
+  if (!token) {
+    expecting.delete(sessionId);
+    return;
+  }
+  const entries = expecting.get(sessionId);
+  if (!entries) return;
+  const retained = entries.filter((entry) => entry.token !== token);
+  if (retained.length > 0) expecting.set(sessionId, retained);
+  else expecting.delete(sessionId);
 }
 
 /** Test seam. */
 export function resetReportExpectations(): void {
   expecting.clear();
+  expectationSequence = 0;
 }

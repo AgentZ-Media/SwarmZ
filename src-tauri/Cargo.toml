@@ -1,8 +1,8 @@
 [package]
 name = "swarmz"
-version = "1.0.3"
-description = "A Tauri App"
-authors = ["you"]
+version = "1.1.0"
+description = "Native macOS Mission Control for durable Codex engineering swarms"
+authors = ["AgentZ Media"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -43,6 +43,8 @@ libc = "0.2"
 # servers — SwarmZ disables them per spawned app-server (codex/host.rs;
 # already in the tree via tauri)
 toml = "0.9"
+# Independent Mission evidence hashes (canonical git diff bytes).
+sha2 = "0.10"
 
 [dev-dependencies]
 # async unit tests for the orchestrator bus (#[tokio::test])

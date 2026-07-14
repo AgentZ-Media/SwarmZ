@@ -26,9 +26,9 @@ import {
   commandExit,
   decayedSignal,
   diffStats,
-  hasPendingApproval,
   shortAge,
 } from "@/lib/vibe/ui";
+import { hasHumanAttention } from "@/lib/vibe/attention";
 import { changeStats } from "@/lib/vibe/diff";
 import { reportForItem } from "@/lib/vibe/report-item";
 import { cn, folderName } from "@/lib/utils";
@@ -56,7 +56,7 @@ function useFleetRows(): {
       if (!e) continue;
       if (activeProjectId && e.session.projectId !== activeProjectId) continue;
       parts.push(
-        `${id}:${s.busy[id] ? 1 : 0}:${hasPendingApproval(e) ? 1 : 0}:${e.lastBusyEndAt ?? ""}`,
+        `${id}:${s.busy[id] ? 1 : 0}:${hasHumanAttention(e) ? 1 : 0}:${e.lastBusyEndAt ?? ""}`,
       );
     }
     return parts.join("|");
@@ -116,7 +116,7 @@ export function FleetGrid() {
           onClick={() => setNewSessionOpen(true)}
           className="focus-ring ml-auto flex h-7 items-center gap-1.5 rounded-md border border-dashed border-line2 px-3 text-12 text-fnt hover:border-fnt hover:text-mut"
         >
-          <Plus size={11} /> agent
+          <Plus size={11} /> worker
         </button>
       </div>
 
@@ -149,17 +149,17 @@ function EmptyState({
     <div className="col-span-full flex flex-col items-center gap-3 py-20 text-center">
       <p className="max-w-xs text-12 leading-normal text-fnt">
         {filtered
-          ? "No agents match this filter."
+          ? "No workers match this filter."
           : hasProject
-            ? "No agents in this project yet — spin one up, or ask the Conductor to split the work."
-            : "Open a project to run agents on it."}
+            ? "No workers in this project yet — start one, or ask the Orchestrator to split the work."
+            : "Open a project to run workers on it."}
       </p>
       {!filtered && hasProject && (
         <button
           onClick={onNew}
-          className="focus-ring flex h-8 items-center gap-1.5 rounded-md bg-acc px-4 text-12 font-semibold text-white hover:brightness-110"
+          className="focus-ring flex h-8 items-center gap-1.5 rounded-md bg-acc px-4 text-12 font-semibold text-bg hover:brightness-110"
         >
-          <Plus size={12} /> New agent
+          <Plus size={12} /> New worker
         </button>
       )}
     </div>
@@ -192,7 +192,7 @@ function FilterChips({
           <button
             key={f.key}
             onClick={() => setFilter(f.key)}
-            title={f.key === "all" ? "All agents" : f.key}
+            title={f.key === "all" ? "All workers" : f.key}
             className={cn(
               "focus-ring flex h-[26px] items-center gap-1.5 rounded-sm px-3 font-mono text-12 tabular-nums",
               on ? "bg-pop font-semibold text-txt" : "text-fnt hover:text-mut",
@@ -280,7 +280,7 @@ const AgentCard = memo(function AgentCard({
       {/* mini window header */}
       <div
         onClick={() => open()}
-        title="Expand agent"
+        title="Expand worker"
         className="flex shrink-0 cursor-default items-center gap-2 border-b border-line py-1.5 pl-3 pr-2 hover:bg-pop"
       >
         <span
@@ -294,8 +294,8 @@ const AgentCard = memo(function AgentCard({
             </span>
             {fromConductor && (
               <span
-                aria-label="Spawned by the Conductor"
-                title="Spawned by the Conductor"
+                aria-label="Started by the Orchestrator"
+                title="Started by the Orchestrator"
                 className="shrink-0 rounded-sm border border-acc/35 bg-acc/10 px-1 font-mono text-10 font-semibold leading-none text-acc/90"
               >
                 //
@@ -326,14 +326,14 @@ const AgentCard = memo(function AgentCard({
           )}
           <button
             onClick={open}
-            title="Expand agent"
+            title="Expand worker"
             className="focus-ring flex h-[26px] w-[26px] items-center justify-center rounded-sm text-fnt hover:bg-line hover:text-txt"
           >
             <Maximize2 size={12} />
           </button>
           <button
             onClick={onClose}
-            title="Close agent"
+            title="Close worker"
             className="focus-ring flex h-[26px] w-[26px] items-center justify-center rounded-sm text-fnt hover:bg-err/15 hover:text-err"
           >
             <X size={12} />
@@ -375,7 +375,7 @@ function MiniFeed({
     >
       {itemIds.length === 0 && (
         <p className="text-11 leading-normal text-fnt">
-          Fresh agent — send a prompt below or route one via the Conductor.
+          Fresh worker — send an assignment below or route one via the Orchestrator.
         </p>
       )}
       {itemIds.map((iid) => (

@@ -10,6 +10,7 @@ const empty: QuitBlockers = {
   ghWrites: 0,
   reviews: 0,
   worktreeOps: 0,
+  runtimeOps: 0,
 };
 
 describe("hasHardBlocker", () => {
@@ -42,6 +43,11 @@ describe("hasHardBlocker", () => {
   it("detached reviews and worktree git ops each block", () => {
     expect(hasHardBlocker({ ...empty, reviews: 1 })).toBe(true);
     expect(hasHardBlocker({ ...empty, worktreeOps: 2 })).toBe(true);
+  });
+
+  it("runtime processes and an unknown runtime state block fail closed", () => {
+    expect(hasHardBlocker({ ...empty, runtimeOps: 1 })).toBe(true);
+    expect(hasHardBlocker({ ...empty, runtimeOps: -1 })).toBe(true);
   });
 });
 

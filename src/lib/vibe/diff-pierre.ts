@@ -1,16 +1,16 @@
 // @pierre/diffs adapter (Phase 6, plan 5a) — everything engine-specific for
 // the diff rendering lives here so the numbers layer (`diff.ts`) stays pure
-// and engine-independent, and a rollback to @git-diff-view would touch only
-// this file + DiffCard.tsx.
+// and engine-independent, and a renderer swap stays confined to this file +
+// HighlightedDiffBody.tsx.
 //
 // Engine decisions (WKWebView de-risking, deliberate):
 //   · `preferredHighlighter: "shiki-js"` — Shiki's JavaScript RegExp engine,
 //     NO Oniguruma WASM. WKWebView has bitten us with WASM/worker edge cases
 //     before; the JS engine trades a little grammar fidelity for a pure-JS
 //     path that works everywhere the webview runs.
-//   · Highlighting runs in pierre's own worker pool (2 workers, mounted once
-//     in VibeLayer via WorkerPoolContextProvider) — the virtualized feed
-//     never janks on a big diff, same contract as the old diff-worker.
+//   · Highlighting is lazy-loaded with the first expanded diff. The providers
+//     beside each renderer resolve to pierre's shared 2-worker singleton, so
+//     the virtualized feed never janks and rows never spawn their own pool.
 //   · The theme is a Shiki css-variables theme ("swarmz") — every token
 //     color resolves from `--diffs-*` custom properties defined in
 //     styles.css against the SwarmZ palette (accent/txt/ok/warn/fnt), so a
@@ -24,8 +24,8 @@ import {
   type FileDiffMetadata,
 } from "@pierre/diffs";
 import type { FileDiffProps } from "@pierre/diffs/react";
-import type { VibeFileChange } from "@/types";
-import { changeKind, diffHash } from "./diff";
+import { diffHash } from "./diff";
+export { changeToPatchText, hasFileHeader } from "./diff-patch";
 
 /** The registered Shiki css-variables theme name (see styles.css tokens). */
 export const SWARMZ_DIFF_THEME = "swarmz";
@@ -119,50 +119,4 @@ export function toFileDiff(patchText: string): FileDiffMetadata | null {
     if (oldest !== undefined) parseCache.delete(oldest);
   }
   return meta;
-}
-
-/**
- * True when a per-file unified diff chunk already carries file headers.
- * Only the PREAMBLE (everything before the first `@@` hunk header) counts:
- * a hunk-body line like `--- separator` (a deleted `-- separator` content
- * line) must never be mistaken for a file header, or the headers would not
- * be synthesized and pierre would fall back to raw `<pre>` text. A header is
- * a `diff --git ` line OR an adjacent `--- ` / `+++ ` pair in the preamble.
- * Exported for the unit test.
- */
-export function hasFileHeader(diff: string): boolean {
-  const lines = diff.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.startsWith("@@")) return false; // hunk body reached — no headers
-    if (line.startsWith("diff --git ")) return true;
-    if (line.startsWith("--- ") && lines[i + 1]?.startsWith("+++ ")) return true;
-  }
-  return false;
-}
-
-/**
- * Patch text for one fileChange change. A kind "add" carries the RAW new file
- * content (session-store live-verified), so it becomes a synthesized all-add
- * patch (an EMPTY new file becomes the git-canonical header-only patch — git
- * writes no hunk for it, and `@@ -0,0 +1,0 @@` is no valid hunk);
- * update/delete pass their unified diff through (headers added when the
- * chunk starts at `@@`).
- */
-export function changeToPatchText(change: VibeFileChange): string {
-  const raw = change.diff ?? "";
-  if (changeKind(change.kind) === "add") {
-    const body = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
-    const lines = body.length ? body.split("\n") : [];
-    if (lines.length === 0) return `--- /dev/null\n+++ b/${change.path}\n`;
-    return (
-      `--- /dev/null\n+++ b/${change.path}\n@@ -0,0 +1,${lines.length} @@\n` +
-      lines.map((l) => `+${l}`).join("\n") +
-      "\n"
-    );
-  }
-  if (!hasFileHeader(raw)) {
-    return `--- a/${change.path}\n+++ b/${change.path}\n${raw}`;
-  }
-  return raw;
 }

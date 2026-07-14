@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart3,
+  Box,
   Download,
   FolderOpen,
   GitPullRequest,
@@ -9,19 +10,19 @@ import {
   Search,
   Settings,
   StickyNote,
+  Workflow,
   X,
 } from "lucide-react";
 import { useSwarm } from "@/store";
 import { useProjects, openProjectIds } from "@/lib/projects/store";
 import { useVibe } from "@/lib/vibe/session-store";
-import { hasPendingApproval } from "@/lib/vibe/ui";
+import { hasHumanAttention } from "@/lib/vibe/attention";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import {
   activateProject,
-  focusSession,
   requestCloseProject,
 } from "@/lib/vibe/controller";
-import { vibeTriageEntries } from "@/lib/vibe/triage";
+import { useAttentionCount } from "@/lib/attention/use-attention";
 import { discoverProjects } from "@/lib/orchestrator/native";
 import { useUpdates } from "@/lib/updates";
 import { WorktreesButton } from "./WorktreePanel";
@@ -42,7 +43,13 @@ import type { ProjectEntry } from "@/lib/orchestrator/types";
 const BAR_BTN =
   "no-drag focus-ring flex h-8 w-8 items-center justify-center rounded-md text-mut hover:bg-card hover:text-txt";
 
-export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
+export function TitleBar({
+  onOpenSettings,
+  onOpenRuntime,
+}: {
+  onOpenSettings: () => void;
+  onOpenRuntime: () => void;
+}) {
   const setDashboardOpen = useSwarm((s) => s.setDashboardOpen);
   const dashboardOpen = useSwarm((s) => s.dashboardOpen);
   const notesOpen = useSwarm((s) => s.notesOpen);
@@ -64,8 +71,13 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
       style={{ paddingLeft: IS_TAURI ? 80 : 16 }}
     >
       {/* Conductor sidebar toggle (⌘B) */}
-      <Tip label={conductorOpen ? "Collapse the Conductor (⌘B)" : "Open the Conductor (⌘B)"}>
-        <button onClick={toggleConductor} className={BAR_BTN}>
+      <Tip label={conductorOpen ? "Collapse the Orchestrator (⌘B)" : "Open the Orchestrator (⌘B)"}>
+        <button
+          onClick={toggleConductor}
+          className={BAR_BTN}
+          aria-label={conductorOpen ? "Collapse the Orchestrator" : "Open the Orchestrator"}
+          aria-pressed={conductorOpen}
+        >
           <PanelLeft
             size={16}
             className={cn(!conductorOpen && "opacity-40")}
@@ -109,6 +121,8 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
           <button
             onClick={() => setDashboardOpen(!dashboardOpen)}
             className={cn(BAR_BTN, dashboardOpen && "bg-card text-txt")}
+            aria-label="Usage dashboard"
+            aria-pressed={dashboardOpen}
           >
             <BarChart3 size={15} />
           </button>
@@ -118,6 +132,8 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
           <button
             onClick={() => setNotesOpen(!notesOpen)}
             className={cn(BAR_BTN, notesOpen && "bg-card text-txt")}
+            aria-label="Quick notes"
+            aria-pressed={notesOpen}
           >
             <StickyNote size={15} />
           </button>
@@ -126,20 +142,26 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
         {/* appears only once at least one git worktree exists */}
         <WorktreesButton />
 
+        <Tip label="Runtime environments">
+          <button onClick={onOpenRuntime} className={BAR_BTN} aria-label="Runtime environments">
+            <Box size={15} />
+          </button>
+        </Tip>
+
         <GitHubButton />
 
         <Tip label="Settings (⌘,)">
-          <button onClick={onOpenSettings} className={BAR_BTN}>
+          <button onClick={onOpenSettings} className={BAR_BTN} aria-label="Settings">
             <Settings size={15} />
           </button>
         </Tip>
 
-        <Tip label="New agent (⌘T)">
+        <Tip label="New mission">
           <button
-            onClick={() => useVibeUi.getState().setNewSessionOpen(true)}
-            className="no-drag focus-ring ml-1 flex h-8 items-center gap-1.5 rounded-md bg-acc px-3 text-12 font-semibold text-white hover:brightness-110"
+            onClick={() => useVibeUi.getState().setMissionCreateOpen(true)}
+            className="no-drag focus-ring ml-1 flex h-8 items-center gap-1.5 rounded-md bg-acc px-3 text-12 font-semibold text-bg hover:brightness-110"
           >
-            <Plus size={13} strokeWidth={2.8} /> New agent
+            <Workflow size={13} strokeWidth={2.5} /> New mission
           </button>
         </Tip>
       </div>
@@ -157,6 +179,8 @@ function GitHubButton() {
       <button
         onClick={() => setGithubOpen(!githubOpen)}
         className={cn(BAR_BTN, githubOpen && "bg-card text-txt")}
+        aria-label="GitHub repository and pull requests"
+        aria-pressed={githubOpen}
       >
         <GitPullRequest size={15} />
       </button>
@@ -169,18 +193,17 @@ function GitHubButton() {
  * human. Click = jump to the oldest waiting session (same routing as ⌘⇧A).
  */
 function NeedsYouPill() {
-  // primitive count — vibeTriageEntries builds fresh arrays, so only its
-  // length may leave the selector (AGENTS.md)
-  const count = useVibe((s) => vibeTriageEntries(s).length);
+  // Exact same row projection as the inbox: workers, mission tasks, blocked
+  // integration trains and actionable GitHub PR/CI failures cannot drift.
+  const count = useAttentionCount();
   if (count === 0) return null;
   const jump = () => {
-    const entries = vibeTriageEntries(useVibe.getState());
-    if (entries.length) focusSession(entries[0].id);
+    useVibeUi.getState().setAttentionOpen(true);
   };
   return (
     <button
       onClick={jump}
-      title="Jump to the next agent that needs you (⌘⇧A)"
+      title="Open the attention inbox (⌘⇧A)"
       className="no-drag focus-ring mr-1 flex h-8 items-center gap-1.5 rounded-md border border-attn/30 bg-attn/10 px-3 font-mono text-12 font-semibold text-attn hover:bg-attn/15"
     >
       <span aria-hidden className="animate-zattn">
@@ -239,7 +262,7 @@ function useProjectStats(id: string) {
     let n = 0;
     for (const sid of s.order) {
       const e = s.sessions[sid];
-      if (e && e.session.projectId === id && hasPendingApproval(e)) n++;
+      if (e && e.session.projectId === id && hasHumanAttention(e)) n++;
     }
     return n;
   });
@@ -386,7 +409,7 @@ function ProjectTab({
           {stats.attn > 0 && (
             <span
               className="font-mono text-10 font-semibold tabular-nums text-attn"
-              title={`${stats.attn} agent${stats.attn > 1 ? "s" : ""} need${stats.attn > 1 ? "" : "s"} your input`}
+              title={`${stats.attn} worker${stats.attn > 1 ? "s" : ""} need${stats.attn > 1 ? "" : "s"} your input`}
             >
               ⚑{stats.attn}
             </span>
@@ -403,9 +426,10 @@ function ProjectTab({
         }}
         onMouseDown={(e) => e.stopPropagation()}
         title="Close project tab (sessions are kept)"
-        className="focus-ring pointer-events-none flex h-4 w-4 shrink-0 items-center justify-center rounded-xs text-fnt opacity-0 hover:bg-err/15 hover:text-err focus-visible:opacity-100 group-hover/tab:pointer-events-auto group-hover/tab:opacity-100"
+        aria-label={`Close ${name} project tab`}
+        className="focus-ring pointer-events-none flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-fnt opacity-0 hover:bg-err/15 hover:text-err focus-visible:opacity-100 group-hover/tab:pointer-events-auto group-hover/tab:opacity-100"
       >
-        <X size={10} />
+        <X size={11} />
       </button>
     </div>
   );

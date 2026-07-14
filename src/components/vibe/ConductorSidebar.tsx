@@ -32,7 +32,7 @@ import {
 import { useConductorTimers } from "@/lib/orchestrator/timers";
 import { useProjects } from "@/lib/projects/store";
 import { useVibe } from "@/lib/vibe/session-store";
-import { sendMessage as vibeSend } from "@/lib/vibe/controller";
+import { sendMessageStrict as vibeSend } from "@/lib/vibe/controller";
 import {
   mentionQuery,
   parseSessionMention,
@@ -43,18 +43,25 @@ import {
   ChatSwitcher,
   MessageList,
 } from "@/components/orchestrator/ChatView";
-import { useSwarm } from "@/store";
-import { effectivePersona } from "@/lib/orchestrator/persona";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { ConductorPlansButton } from "./ConductorPlans";
 import { cn } from "@/lib/utils";
+import {
+  conductorDraftKey,
+  readConductorDraft,
+  writeConductorDraft,
+} from "@/lib/orchestrator/composer-drafts";
 
 const MAX_ROWS_PX = 168; // ~6 lines
+const SIDEBAR_MIN_WIDTH = 300;
 
 export function ConductorSidebar() {
   const open = useVibeUi((s) => s.conductorOpen);
   const width = useVibeUi((s) => s.conductorWidth);
   const setWidth = useVibeUi((s) => s.setConductorWidth);
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof window === "undefined" ? 1440 : window.innerWidth,
+  );
   const projectId = useProjects((s) => s.activeProjectId);
   const activeChatId = useOrchestrator((s) =>
     projectId ? activeChatIdFor(s, projectId) : null,
@@ -70,6 +77,26 @@ export function ConductorSidebar() {
     if (open && projectId && !activeChatId) createChat(projectId);
   }, [open, projectId, activeChatId]);
 
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // Keep enough room for a real fleet card even when an old wide sidebar
+  // value survives a window resize. At the 900 px app minimum this caps the
+  // lead at 378 px instead of letting a 680 px preference crush the stage.
+  const responsiveMaxWidth = Math.max(
+    SIDEBAR_MIN_WIDTH,
+    viewportWidth < 1050
+      ? Math.floor(viewportWidth * 0.42)
+      : Math.min(680, viewportWidth - 520),
+  );
+  const visibleWidth = Math.max(
+    SIDEBAR_MIN_WIDTH,
+    Math.min(width, responsiveMaxWidth),
+  );
+
   // drag-to-resize: window listeners for the duration of one drag. Cleanup is
   // CENTRALIZED and re-entrant — mouseup, window blur (⌘-tab mid-drag) and
   // unmount all end the drag, so no listener or body cursor/userSelect ever
@@ -80,10 +107,13 @@ export function ConductorSidebar() {
     e.preventDefault();
     endDragRef.current?.();
     const startX = e.clientX;
-    const startW = width;
+    const startW = visibleWidth;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
-    const onMove = (ev: MouseEvent) => setWidth(startW + ev.clientX - startX);
+    const onMove = (ev: MouseEvent) =>
+      setWidth(
+        Math.min(responsiveMaxWidth, startW + ev.clientX - startX),
+      );
     const endDrag = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", endDrag);
@@ -98,13 +128,36 @@ export function ConductorSidebar() {
     endDragRef.current = endDrag;
   };
 
+  const resizeWithKeyboard = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 40 : 16;
+    let nextWidth: number | null = null;
+    switch (event.key) {
+      case "ArrowLeft":
+        nextWidth = visibleWidth - step;
+        break;
+      case "ArrowRight":
+        nextWidth = visibleWidth + step;
+        break;
+      case "Home":
+        nextWidth = SIDEBAR_MIN_WIDTH;
+        break;
+      case "End":
+        nextWidth = responsiveMaxWidth;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    setWidth(Math.max(SIDEBAR_MIN_WIDTH, Math.min(responsiveMaxWidth, nextWidth)));
+  };
+
   if (!open) return null;
 
   return (
     <>
       <div
         className="relative flex shrink-0 flex-col overflow-hidden border-r border-line bg-panel"
-        style={{ width }}
+        style={{ width: visibleWidth }}
       >
         {/* decorative accent halo above the header */}
         <div className="conductor-glow pointer-events-none absolute -top-[70px] left-1/2 h-[180px] w-[380px] -translate-x-1/2" />
@@ -122,8 +175,17 @@ export function ConductorSidebar() {
       {/* resize handle (straddles the border) */}
       <div
         onMouseDown={startResize}
-        title="Drag to resize"
-        className="relative z-20 -mx-[3px] w-[7px] shrink-0 cursor-col-resize hover:bg-[linear-gradient(90deg,transparent,color-mix(in_srgb,var(--acc)_30%,transparent),transparent)]"
+        onKeyDown={resizeWithKeyboard}
+        role="separator"
+        aria-label="Resize Orchestrator sidebar"
+        aria-orientation="vertical"
+        aria-valuemin={SIDEBAR_MIN_WIDTH}
+        aria-valuemax={responsiveMaxWidth}
+        aria-valuenow={Math.round(visibleWidth)}
+        aria-valuetext={`${Math.round(visibleWidth)} pixels wide`}
+        tabIndex={0}
+        title="Drag or use arrow keys to resize"
+        className="focus-ring relative z-20 -mx-[3px] w-[7px] shrink-0 cursor-col-resize hover:bg-[linear-gradient(90deg,transparent,color-mix(in_srgb,var(--acc)_30%,transparent),transparent)] focus-visible:bg-acc/25"
       />
     </>
   );
@@ -134,7 +196,7 @@ function NoProjectNotice({ hasProject }: { hasProject: boolean }) {
   return (
     <div className="flex flex-1 items-center justify-center px-6">
       <p className="max-w-64 text-center text-12 leading-normal text-mut">
-        Open a project to talk to its Conductor — every project tab has its
+        Open a project to talk to its Orchestrator — every project tab has its
         own.
       </p>
     </div>
@@ -213,7 +275,6 @@ function ConductorHeader({
   projectId: string | null;
 }) {
   const busy = useOrchestrator((s) => (chatId ? !!s.busy[chatId] : false));
-  const persona = useSwarm((s) => effectivePersona(s.settings.orchestratorPersona));
   return (
     <div className="relative flex h-12 shrink-0 items-center gap-2 border-b border-line px-4">
       <span
@@ -227,7 +288,7 @@ function ConductorHeader({
         //
       </span>
       <span className="-ml-1 min-w-0 truncate text-14 font-semibold tracking-[-0.01em] text-txt">
-        {persona.name}
+        Orchestrator
       </span>
       {busy && (
         <span className="animate-zcaret shrink-0 font-mono text-10 text-acc">
@@ -267,13 +328,19 @@ function ConductorComposer({
   projectId: string | null;
 }) {
   const busy = useOrchestrator((s) => (chatId ? !!s.busy[chatId] : false));
-  const personaName = useSwarm(
-    (s) => effectivePersona(s.settings.orchestratorPersona).name,
-  );
-  const [text, setText] = useState("");
+  const draftKey = conductorDraftKey(projectId, chatId);
+  const [text, setText] = useState(() => readConductorDraft(draftKey));
   // transient composer feedback (e.g. "@agent is mid-turn") — cleared on edit
   const [notice, setNotice] = useState<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+
+  // A draft belongs to its exact project/chat destination. Switching tabs or
+  // chats restores that destination's own text instead of carrying a brief
+  // across project boundaries and accidentally sending it to the wrong lead.
+  useEffect(() => {
+    setText(readConductorDraft(draftKey));
+    setNotice(null);
+  }, [draftKey]);
 
   // primitive signature (joined scoped id:name pairs — the NAME is part of it
   // so a rename refreshes the popover, never offering a stale `@oldname` that
@@ -322,7 +389,7 @@ function ConductorComposer({
     taRef.current?.focus();
   };
 
-  const send = () => {
+  const send = async () => {
     const t = text.trim();
     if (!t) return;
     // resolve against the LIVE session list of THIS project (names may have
@@ -345,17 +412,35 @@ function ConductorComposer({
       // (sendMessage would swallow the strict-path rejection), same guard as
       // the grid's mini composer
       if (useVibe.getState().busy[mention.sessionId]) {
-        setNotice(`«${mention.matched}» is mid-turn — your message stays here; send again when the agent is idle.`);
+        setNotice(`«${mention.matched}» is mid-turn — your message stays here; send again when the worker is idle.`);
         return;
       }
-      void vibeSend(mention.sessionId, mention.body);
-      setText("");
+      try {
+        await vibeSend(mention.sessionId, mention.body);
+        writeConductorDraft(draftKey, "");
+        setText("");
+      } catch (error) {
+        setNotice(
+          error instanceof Error
+            ? error.message
+            : "The worker could not accept this message.",
+        );
+      }
       return;
     }
     const id = chatId ?? createChat(projectId ?? undefined);
     if (!id) return; // no project open — nothing to send to
-    void orchestratorSend(id, t);
-    setText("");
+    try {
+      await orchestratorSend(id, t);
+      writeConductorDraft(draftKey, "");
+      setText("");
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : "The Orchestrator could not accept this message.",
+      );
+    }
   };
 
   return (
@@ -365,7 +450,7 @@ function ConductorComposer({
         // overlay (z-20) and all modal chrome (z-30+)
         <div className="animate-zfadeup absolute bottom-full left-3.5 z-10 mb-2 w-64 overflow-hidden rounded-xl border border-line2 bg-pop p-1.5 shadow-pop">
           <div className="px-2 py-1 font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
-            Message an agent directly
+            Message a worker directly
           </div>
           {suggestions.map((c) => (
             <button
@@ -397,16 +482,18 @@ function ConductorComposer({
           value={text}
           rows={1}
           onChange={(e) => {
-            setText(e.target.value);
+            const next = e.target.value;
+            writeConductorDraft(draftKey, next);
+            setText(next);
             if (notice) setNotice(null);
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              send();
+              void send();
             }
           }}
-          placeholder={`Direct the fleet — message ${personaName}, or @agent for one directly…`}
+          placeholder="Direct the fleet — message Orchestrator, or @agent for one directly…"
           className="min-h-5 flex-1 select-text resize-none bg-transparent text-13 leading-relaxed text-txt placeholder:text-fnt focus:outline-none"
         />
         {busy && chatId ? (
@@ -419,7 +506,7 @@ function ConductorComposer({
           </button>
         ) : (
           <button
-            onClick={send}
+            onClick={() => void send()}
             title="Send (↵)"
             className={cn(
               "focus-ring flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-acc text-white hover:brightness-110",

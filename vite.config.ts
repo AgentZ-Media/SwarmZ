@@ -23,6 +23,26 @@ export default defineConfig(async () => ({
   worker: {
     format: "es" as const,
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // React is a stable, shared runtime used by the initial shell and all
+        // lazy surfaces. Giving it its own cacheable chunk keeps application
+        // changes from invalidating the framework payload and prevents the
+        // main index chunk from growing back past the reviewable-size guard.
+        // Feature libraries intentionally stay with their owning lazy chunk.
+        manualChunks(id) {
+          if (
+            id.includes("/node_modules/react/") ||
+            id.includes("/node_modules/react-dom/") ||
+            id.includes("/node_modules/scheduler/")
+          ) {
+            return "react-runtime";
+          }
+        },
+      },
+    },
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

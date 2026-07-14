@@ -24,6 +24,12 @@ import { TurnDiffFiles } from "./vibe/DiffCard";
 import { openUrl } from "@/lib/transport";
 import { Tip } from "./ui/tooltip";
 import { cn } from "@/lib/utils";
+import {
+  Dialog,
+  DialogDescription,
+  DialogTitle,
+  DrawerContent,
+} from "./ui/dialog";
 
 /**
  * The GitHub panel (Phase 7) — a right-side drawer (Quick-Notes pattern) over
@@ -54,36 +60,13 @@ export function GitHubPanel() {
       void refreshProjectGithub(activeProjectId, { force: true });
   }, [open, activeProjectId]);
 
-  // Escape closes (capture, so window-level handlers don't also react) —
-  // unless a real dialog is stacked above the drawer
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      if (
-        document.querySelector('[role="dialog"]:not([aria-label="GitHub"])')
-      )
-        return;
-      e.stopPropagation();
-      setOpen(false);
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [open, setOpen]);
-
-  if (!open) return null;
-
   return (
-    <>
-      <div
-        className="animate-zoverlay fixed inset-0 z-30 bg-[rgba(5,5,8,0.55)] backdrop-blur-[2px]"
-        onClick={() => setOpen(false)}
-      />
-      <div
-        role="dialog"
-        aria-label="GitHub"
-        className="animate-ztoast fixed right-0 top-0 z-40 flex h-full w-[560px] max-w-[92vw] flex-col border-l border-line2 bg-panel shadow-modal outline-none"
-      >
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DrawerContent className="w-[560px]">
+        <DialogTitle className="sr-only">GitHub</DialogTitle>
+        <DialogDescription className="sr-only">
+          Pull requests and repository status for the active project.
+        </DialogDescription>
         <PanelHeader onClose={() => setOpen(false)} projectId={activeProjectId} />
         {activeProjectId === null ? (
           <EmptyState line="Open a project to see its GitHub context." />
@@ -97,8 +80,8 @@ export function GitHubPanel() {
           />
         )}
         <PanelFooter />
-      </div>
-    </>
+      </DrawerContent>
+    </Dialog>
   );
 }
 
@@ -172,6 +155,7 @@ function PanelHeader({
       <Tip label="Refresh">
         <button
           onClick={refresh}
+          aria-label="Refresh GitHub data"
           className="focus-ring flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt"
         >
           <RefreshCw size={12} className={refreshing ? "animate-spin" : ""} />
@@ -180,6 +164,7 @@ function PanelHeader({
       <button
         onClick={onClose}
         title="Close (⎋)"
+        aria-label="Close GitHub"
         className="focus-ring flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt"
       >
         <X size={13} />
@@ -194,7 +179,7 @@ function PanelFooter() {
   return (
     <div className="shrink-0 border-t border-line px-4 py-2 text-11 leading-relaxed text-fnt">
       Read-only view. Enable the GitHub integration in Settings → GitHub to
-      give the Conductor its PR tools, the watcher and the Deck indicator.
+      give the Orchestrator its PR tools, the watcher and the Deck indicator.
     </div>
   );
 }
@@ -309,7 +294,7 @@ function PrAgentButtons({ projectId, pr }: { projectId: string; pr: GhPr }) {
   return (
     <div className="flex min-w-0 flex-col gap-1">
       <div className="flex items-center gap-1.5">
-        <Tip label="Spawn an agent that reviews this PR and reports its findings">
+        <Tip label="Start a temporary worker to review this PR and report its findings">
           <button
             onClick={() => void spawn("review")}
             disabled={spawning !== null}
@@ -319,7 +304,7 @@ function PrAgentButtons({ projectId, pr }: { projectId: string; pr: GhPr }) {
             {spawning === "review" ? "starting…" : "Review"}
           </button>
         </Tip>
-        <Tip label="Spawn an agent that reviews this PR and, if it holds up, merges it — the merge command still asks for your approval">
+        <Tip label="Start a temporary worker to review this PR and, if it holds up, propose the merge — merging still asks for your approval">
           <button
             onClick={() => void spawn("review_merge")}
             disabled={spawning !== null}
@@ -422,7 +407,7 @@ function PrList({
                   {pr.title}
                 </span>
                 {(watched ?? []).includes(pr.number) && (
-                  <Tip label="The Conductor watches this PR">
+                  <Tip label="The Orchestrator watches this PR">
                     <span
                       tabIndex={0}
                       className="focus-ring shrink-0 rounded-xs font-mono text-10 text-acc"
@@ -530,7 +515,11 @@ function PrDetail({
       ) : !detail ? (
         <EmptyState line="Loading PR…" />
       ) : (
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        <div
+          className="min-h-0 flex-1 overflow-y-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-acc/40"
+          tabIndex={0}
+          aria-label="Pull request details and diff"
+        >
           <div className="flex flex-col gap-2 border-b border-line px-4 py-3">
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="font-mono text-10 text-fnt">
@@ -554,7 +543,7 @@ function PrDetail({
             </div>
             <PrAgentButtons projectId={projectId} pr={detail} />
             {detail.body && (
-              <p className="max-h-40 overflow-y-auto whitespace-pre-wrap text-12 leading-relaxed text-mut">
+              <p className="whitespace-pre-wrap text-12 leading-relaxed text-mut">
                 {detail.body}
               </p>
             )}

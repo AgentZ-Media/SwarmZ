@@ -10,6 +10,7 @@ import {
   latchAutonomyUnavailable,
   noteAutonomousTurn,
   noteHumanTurn,
+  persistAutonomyReservation,
   registerAutonomyPersist,
   releaseAutonomousTurn,
   resetAutonomyBudgets,
@@ -196,6 +197,19 @@ describe("autonomy budget", () => {
     expect(dirty).toBe(before + 2);
   });
 
+  it("offers a write-through seam for a reservation before dispatch", async () => {
+    const calls: string[] = [];
+    registerAutonomyPersist(
+      () => calls.push("dirty"),
+      async () => {
+        calls.push("flush");
+      },
+    );
+    noteAutonomousTurn("p", T0);
+    expect(await persistAutonomyReservation()).toBe(true);
+    expect(calls).toEqual(["dirty", "flush"]);
+  });
+
   it("breaker-state changes notify subscribers (trip + re-arm)", () => {
     // Phase 5: the Deck's orch dot reads the latched state via
     // useSyncExternalStore — trip and re-arm must both notify
@@ -241,23 +255,23 @@ describe("fail-closed load-failure latch (T3)", () => {
     expect(checkAutonomyBudget("other", T0 + 2).ok).toBe(false);
   });
 
-  it("only a human message clears the latch", () => {
+  it("a project-local human message cannot clear globally unknown state", () => {
     latchAutonomyUnavailable();
     expect(checkAutonomyBudget("p", T0).ok).toBe(false);
     noteHumanTurn("p");
-    expect(autonomyUnavailable()).toBe(false);
-    expect(checkAutonomyBudget("p", T0 + 1).ok).toBe(true);
+    expect(autonomyUnavailable()).toBe(true);
+    expect(checkAutonomyBudget("p", T0 + 1).ok).toBe(false);
   });
 
-  it("notifies subscribers on latch and on the human-cleared un-latch", () => {
+  it("notifies subscribers on latch but not on an unrelated human turn", () => {
     let notified = 0;
     const unsub = subscribeAutonomy(() => notified++);
     latchAutonomyUnavailable();
     expect(notified).toBe(1);
     latchAutonomyUnavailable(); // idempotent — no second notify
     expect(notified).toBe(1);
-    noteHumanTurn("fresh-project"); // clears the global latch even with no budget
-    expect(notified).toBe(2);
+    noteHumanTurn("fresh-project");
+    expect(notified).toBe(1);
     unsub();
   });
 
@@ -384,8 +398,8 @@ describe("present-but-invalid persisted budgets fail closed (TF6)", () => {
     latchAutonomyUnavailable();
     expect(autonomyTripped("p")).toBe(true);
     expect(autonomyTripped("any-other")).toBe(true);
-    noteHumanTurn("p"); // a human clears the global latch
-    expect(autonomyTripped("p")).toBe(false);
+    noteHumanTurn("p");
+    expect(autonomyTripped("p")).toBe(true);
   });
 
   it("a well-formed empty envelope hydrates cleanly (no false latch)", () => {

@@ -185,7 +185,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                                 // this enum server-side, so a Conductor call asking for "full"
                                 // is refused before any session starts.
                                 "access": { "type": "string", "enum": ["workspace"], "description": "sandbox level — always the workspace sandbox; full access can only be granted by the human in the UI" },
-                                "name": { "type": "string", "description": "agent name (default: auto from the pool)" },
+                                "name": { "type": "string", "description": "temporary task-lane label (default: neutral auto-generated lane name; this is not a reusable persona)" },
                                 "expect_report": { "type": "boolean", "description": "true = the agent must end its task turn with a machine-readable status report (done, summary, files_changed, tests_pass, needs_human, question, followups) — set it for implementation tasks whose completion you will judge; the report reaches you with the agent-finished notice" }
                             },
                             "required": ["task", "worktree"]
@@ -640,7 +640,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("one of"), "unexpected error: {err}");
-        let err = validate_args(&config, &json!({ "agent": "maya", "access": "full" })).unwrap_err();
+        let err =
+            validate_args(&config, &json!({ "agent": "maya", "access": "full" })).unwrap_err();
         assert!(err.contains("one of"), "unexpected error: {err}");
         // …while "workspace" (and omitting access) keeps working
         assert!(validate_args(
@@ -669,7 +670,11 @@ mod tests {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
         assert!(names.contains(&"remember"));
-        assert_eq!(defs.len(), EXPECTED_TOOLS.len() + 1, "unexpected tool count");
+        assert_eq!(
+            defs.len(),
+            EXPECTED_TOOLS.len() + 1,
+            "unexpected tool count"
+        );
         // serializable — this exact shape is handed to Codex dynamicTools
         let json = serde_json::to_value(&defs).expect("serialize");
         for def in json.as_array().unwrap() {
@@ -683,7 +688,10 @@ mod tests {
     #[test]
     fn pane_era_tool_names_are_gone() {
         for legacy in ["create_panes", "prompt_pane", "read_transcript"] {
-            assert!(find_tool(legacy).is_none(), "legacy tool {legacy} still present");
+            assert!(
+                find_tool(legacy).is_none(),
+                "legacy tool {legacy} still present"
+            );
         }
     }
 
@@ -802,19 +810,49 @@ mod tests {
 
     #[test]
     fn timeouts_match_the_work_behind_the_tool() {
-        assert_eq!(find_tool("spawn_agents").unwrap().timeout_ms, SPAWN_AGENTS_TIMEOUT_MS);
-        assert_eq!(find_tool("review_agent").unwrap().timeout_ms, REVIEW_TIMEOUT_MS);
-        assert_eq!(find_tool("create_worktree").unwrap().timeout_ms, WORKTREE_TIMEOUT_MS);
-        assert_eq!(find_tool("cleanup_worktree").unwrap().timeout_ms, WORKTREE_TIMEOUT_MS);
-        assert_eq!(find_tool("prompt_agent").unwrap().timeout_ms, PROMPT_TIMEOUT_MS);
-        assert_eq!(find_tool("fleet_snapshot").unwrap().timeout_ms, DEFAULT_TIMEOUT_MS);
+        assert_eq!(
+            find_tool("spawn_agents").unwrap().timeout_ms,
+            SPAWN_AGENTS_TIMEOUT_MS
+        );
+        assert_eq!(
+            find_tool("review_agent").unwrap().timeout_ms,
+            REVIEW_TIMEOUT_MS
+        );
+        assert_eq!(
+            find_tool("create_worktree").unwrap().timeout_ms,
+            WORKTREE_TIMEOUT_MS
+        );
+        assert_eq!(
+            find_tool("cleanup_worktree").unwrap().timeout_ms,
+            WORKTREE_TIMEOUT_MS
+        );
+        assert_eq!(
+            find_tool("prompt_agent").unwrap().timeout_ms,
+            PROMPT_TIMEOUT_MS
+        );
+        assert_eq!(
+            find_tool("fleet_snapshot").unwrap().timeout_ms,
+            DEFAULT_TIMEOUT_MS
+        );
         // GitHub: network reads, a push-heavy create, a full review turn
-        assert_eq!(find_tool("github_status").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+        assert_eq!(
+            find_tool("github_status").unwrap().timeout_ms,
+            GITHUB_TIMEOUT_MS
+        );
         assert_eq!(find_tool("list_prs").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
         assert_eq!(find_tool("read_pr").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
-        assert_eq!(find_tool("create_pr").unwrap().timeout_ms, CREATE_PR_TIMEOUT_MS);
-        assert_eq!(find_tool("review_pr").unwrap().timeout_ms, REVIEW_PR_TIMEOUT_MS);
-        assert_eq!(find_tool("comment_pr").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+        assert_eq!(
+            find_tool("create_pr").unwrap().timeout_ms,
+            CREATE_PR_TIMEOUT_MS
+        );
+        assert_eq!(
+            find_tool("review_pr").unwrap().timeout_ms,
+            REVIEW_PR_TIMEOUT_MS
+        );
+        assert_eq!(
+            find_tool("comment_pr").unwrap().timeout_ms,
+            GITHUB_TIMEOUT_MS
+        );
         assert_eq!(find_tool("watch_pr").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
     }
 
@@ -838,9 +876,12 @@ mod tests {
         .is_ok());
 
         let def = find_tool("review_pr").unwrap();
-        assert!(validate_args(&def, &json!({ "number": 3, "post": true, "action": "approve" })).is_ok());
-        let err =
-            validate_args(&def, &json!({ "number": 3, "action": "merge" })).unwrap_err();
+        assert!(validate_args(
+            &def,
+            &json!({ "number": 3, "post": true, "action": "approve" })
+        )
+        .is_ok());
+        let err = validate_args(&def, &json!({ "number": 3, "action": "merge" })).unwrap_err();
         assert!(err.contains("one of"), "unexpected error: {err}");
 
         let def = find_tool("comment_pr").unwrap();

@@ -20,7 +20,12 @@ import {
   saveSettings,
   saveUsageHistory,
 } from "@/lib/transport";
-import { DEAD_STORE_KEYS, planSchemaMigration } from "@/lib/schema-version";
+import {
+  DEAD_STORE_KEYS,
+  migrateSettingsV3,
+  planSchemaMigration,
+} from "@/lib/schema-version";
+import { createPersistenceCoordinator } from "@/lib/persistence/coordinator";
 import type {
   AppSettings,
   NoteItem,
@@ -56,21 +61,37 @@ import {
   registerAutonomyPersist,
   serializeAutonomyBudgets,
 } from "@/lib/orchestrator/autonomy";
+import {
+  flushMissionsPersist,
+  hydrateMissions,
+} from "@/lib/missions/store";
+import {
+  flushMissionOutboxPersist,
+  hydrateMissionOutbox,
+} from "@/lib/missions/outbox-store";
+import {
+  flushRuntimeEnvironmentsPersist,
+  hydrateRuntimeEnvironments,
+} from "@/lib/runtime/store";
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
 
-// Usage refreshes can arrive in bursts — batch disk writes.
-let persistHistoryTimer: ReturnType<typeof setTimeout> | null = null;
+function usageHistorySnapshot(): UsageHistoryEntry[] {
+  return Object.values(useSwarm.getState().usageHistory)
+    .sort((a, b) => b.last_updated - a.last_updated)
+    .slice(0, MAX_HISTORY_ENTRIES);
+}
+
+const usageHistoryPersistence = createPersistenceCoordinator({
+  name: "usageHistory",
+  debounceMs: 1_500,
+  snapshot: usageHistorySnapshot,
+  save: saveUsageHistory,
+});
+
 function schedulePersistHistory() {
-  if (persistHistoryTimer) return;
-  persistHistoryTimer = setTimeout(() => {
-    persistHistoryTimer = null;
-    const entries = Object.values(useSwarm.getState().usageHistory)
-      .sort((a, b) => b.last_updated - a.last_updated)
-      .slice(0, MAX_HISTORY_ENTRIES);
-    void saveUsageHistory(entries);
-  }, 1500);
+  usageHistoryPersistence.schedule();
 }
 
 // ---- autonomy-budget persistence (the pure module registers a dirty sink;
@@ -143,35 +164,30 @@ async function flushAutonomyPersist(): Promise<void> {
 
 // Registered at module init — every budget mutation (reserve/release/trip/
 // human re-arm) marks the slice dirty so a relaunch sees the same state.
-registerAutonomyPersist(scheduleAutonomyPersist);
+registerAutonomyPersist(scheduleAutonomyPersist, flushAutonomyPersist);
 
 // ---- settings + quick-notes persistence ----
-//
-// Both save on every mutation (no debounce), but the writes are SERIALIZED
-// on per-slice chains so `flushAllPersists` can JOIN them at quit — a quit
-// right after a change must not race the webview teardown against an
-// in-flight write. The chains snapshot at write time (latest state wins) and
-// never write on their own at quit, so a failed hydrate can never be
-// clobbered by an empty quit-save.
 
-let settingsWriteChain: Promise<void> = Promise.resolve();
-function persistSettings(): Promise<void> {
-  settingsWriteChain = settingsWriteChain
-    .then(() => saveSettings(useSwarm.getState().settings))
-    .catch(() => {
-      /* never block quitting on a failed write */
-    });
-  return settingsWriteChain;
+const settingsPersistence = createPersistenceCoordinator({
+  name: "settings",
+  debounceMs: 0,
+  snapshot: () => useSwarm.getState().settings,
+  save: saveSettings,
+});
+
+function persistSettings(): void {
+  settingsPersistence.schedule();
 }
 
-let quickNotesWriteChain: Promise<void> = Promise.resolve();
-function persistQuickNotes(): Promise<void> {
-  quickNotesWriteChain = quickNotesWriteChain
-    .then(() => saveQuickNotes(useSwarm.getState().quickNotes))
-    .catch(() => {
-      /* never block quitting on a failed write */
-    });
-  return quickNotesWriteChain;
+const quickNotesPersistence = createPersistenceCoordinator({
+  name: "quickNotes",
+  debounceMs: 0,
+  snapshot: () => useSwarm.getState().quickNotes,
+  save: saveQuickNotes,
+});
+
+function persistQuickNotes(): void {
+  quickNotesPersistence.schedule();
 }
 
 /**
@@ -179,25 +195,12 @@ function persistQuickNotes(): Promise<void> {
  * Called from lib/quit.ts before the window closes.
  */
 export async function flushAllPersists(): Promise<void> {
-  if (persistHistoryTimer) {
-    clearTimeout(persistHistoryTimer);
-    persistHistoryTimer = null;
-  }
-  const s = useSwarm.getState();
   // allSettled, not all: one failed write must never abandon the others
   // mid-flight (quit would proceed while they still race the teardown)
   await Promise.allSettled([
-    saveUsageHistory(
-      Object.values(s.usageHistory)
-        .sort((a, b) => b.last_updated - a.last_updated)
-        .slice(0, MAX_HISTORY_ENTRIES),
-    ),
-    // settings + quick notes persist on every mutation — join their write
-    // chains so a quit right after a change still lands the latest snapshot
-    // (the chains never mint a write of their own, so a failed hydrate is
-    // never clobbered by an empty quit-save)
-    settingsWriteChain,
-    quickNotesWriteChain,
+    usageHistoryPersistence.flush(),
+    settingsPersistence.flush(),
+    quickNotesPersistence.flush(),
     // the orchestrator chats keep their own debounced slice
     flushOrchestratorPersist(),
     // the vibe sessions keep their own debounced slice
@@ -206,6 +209,12 @@ export async function flushAllPersists(): Promise<void> {
     flushProjectsPersist(),
     // the conductor timers keep their own debounced slice
     flushConductorTimersPersist(),
+    // durable Mission Control event log
+    flushMissionsPersist(),
+    // write-ahead Mission Control side effects and claims
+    flushMissionOutboxPersist(),
+    // project-scoped reproducible runtime contracts
+    flushRuntimeEnvironmentsPersist(),
     // the autonomy budgets keep their own debounced slice
     flushAutonomyPersist(),
   ]);
@@ -331,25 +340,41 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       // a valid current-or-newer version is left untouched. The storefile.rs
       // rescue path stays version-agnostic. The per-slice VALUE migration
       // (sessions → projects) runs tolerantly in the slice hydrators below.
-      const plan = planSchemaMigration(await loadSchemaVersion());
-      if (plan.cleanupDeadKeys) await deleteStoreKeys([...DEAD_STORE_KEYS]);
-      if (plan.stampVersion !== null) await saveSchemaVersion(plan.stampVersion);
+      const schemaPlan = planSchemaMigration(await loadSchemaVersion());
+      if (schemaPlan.cleanupDeadKeys)
+        await deleteStoreKeys([...DEAD_STORE_KEYS]);
+      if (schemaPlan.stampVersion !== null)
+        await saveSchemaVersion(schemaPlan.stampVersion);
     } catch {
       /* ignore */
     }
     try {
       const settings = await loadSettings();
       if (settings) {
+        // Idempotent and intentionally independent of the version read: even
+        // if the stamp is missing/newer, the removed key must never re-enter
+        // live settings. Unknown CURRENT fields are preserved by the helper.
+        const migrated = migrateSettingsV3(
+          settings as AppSettings & Record<string, unknown>,
+        );
+        const currentSettings = migrated.settings as AppSettings;
         // Ultra is a multi-agent mode, not a single-turn effort in SwarmZ.
         // Drop stale persisted values before they can reach a chat/session.
         const safeSettings =
-          settings.orchestratorCodexEffort?.trim().toLowerCase() === "ultra"
-            ? { ...settings, orchestratorCodexEffort: undefined }
-            : settings;
+          currentSettings.orchestratorCodexEffort?.trim().toLowerCase() ===
+          "ultra"
+            ? { ...currentSettings, orchestratorCodexEffort: undefined }
+            : currentSettings;
         set({ settings: safeSettings });
+        settingsPersistence.hydrationSucceeded();
+        // Schema v3 removes the obsolete persona payload durably while
+        // retaining every current setting and all separately stored memory.
+        if (migrated.removedLegacyPersona) settingsPersistence.schedule();
+      } else {
+        settingsPersistence.hydrationSucceeded();
       }
-    } catch {
-      /* ignore */
+    } catch (error) {
+      settingsPersistence.hydrationFailed(error);
     }
     try {
       const history = await loadUsageHistory();
@@ -360,8 +385,9 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         }
         set({ usageHistory: map });
       }
-    } catch {
-      /* ignore */
+      usageHistoryPersistence.hydrationSucceeded();
+    } catch (error) {
+      usageHistoryPersistence.hydrationFailed(error);
     }
     try {
       const notes = await loadQuickNotes();
@@ -370,8 +396,9 @@ export const useSwarm = create<SwarmState>((set, get) => ({
           quickNotes: { global: notes.global ?? [], folders: notes.folders ?? {} },
         });
       }
-    } catch {
-      /* ignore */
+      quickNotesPersistence.hydrationSucceeded();
+    } catch (error) {
+      quickNotesPersistence.hydrationFailed(error);
     }
     try {
       // autonomy budgets — FIRST, before the project hydration: every
@@ -405,6 +432,29 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       await hydrateVibeSessions();
     } catch {
       migrationReady = false;
+    }
+    try {
+      // Mission projections reference project ids but are otherwise
+      // self-contained. Hydrate before chats/timers so recovered work is
+      // visible to every later orchestration surface in this app run.
+      await hydrateMissions();
+    } catch {
+      /* per-slice fail-closed health is exposed by the mission store */
+    }
+    try {
+      // Side-effect dispatch must remain paused until both the event log and
+      // its write-ahead outbox are independently known. The outbox hydrates
+      // immediately after missions so startup reconcile sees one stable pair.
+      await hydrateMissionOutbox();
+    } catch {
+      /* the outbox store exposes its fail-closed hydration state */
+    }
+    try {
+      // Runtime contracts resolve against project ids and are required before
+      // any mission attempt may opt into a configured environment.
+      await hydrateRuntimeEnvironments();
+    } catch {
+      /* runtime execution remains unavailable until its slice hydrates */
     }
     // both hydrators also SWALLOW load failures internally (per-slice
     // tolerance) — their `hydrated` flags are the authoritative success
@@ -462,7 +512,11 @@ export const useSwarm = create<SwarmState>((set, get) => ({
 
   clearUsageHistory: () => {
     set({ usageHistory: {} });
-    void saveUsageHistory([]);
+    // Stay on the same serialized coordinator chain as incremental writes.
+    // A direct save here could race an older in-flight snapshot and resurrect
+    // history the user explicitly cleared.
+    schedulePersistHistory();
+    void usageHistoryPersistence.flush();
   },
 
   refreshWorktrees: async () => {

@@ -1,0 +1,816 @@
+import { nanoid } from "nanoid";
+import { create } from "zustand";
+import { loadMissions, saveMissions } from "@/lib/transport";
+import {
+  createPersistenceCoordinator,
+  type HydrationStatus,
+} from "@/lib/persistence/coordinator";
+import {
+  emptyMissionProjection,
+  nextMissionRevision,
+  reduceMissionEvent,
+  replayMissionEvents,
+} from "./core";
+import { migratePersistedMissions, serializeMissionEvents } from "./serialization";
+import { useMissionOutbox } from "./outbox-store";
+import { missionOutboxAuditArtifacts } from "./outbox-audit";
+import type {
+  AttemptStatus,
+  IntegrationTrain,
+  IntegrationTrainEntry,
+  Mission,
+  MissionArtifact,
+  MissionDependency,
+  MissionBudget,
+  MissionEvent,
+  MissionEventPayload,
+  MissionPolicy,
+  MissionProjection,
+  MissionTask,
+  MissionTaskInput,
+  QualityGate,
+  QualityGateStatus,
+  TaskAttempt,
+} from "./types";
+
+export const DEFAULT_MISSION_POLICY: MissionPolicy = {
+  maxParallelAttempts: 8,
+  stopOnCriticalFailure: true,
+  requireQualityGates: true,
+  integrationMode: "train",
+  networkAuthority: "deny",
+  githubAuthority: "deny",
+  allowedTools: ["workspace_sandbox"],
+  qualityCommands: [],
+  stopOnRegression: "needs_human",
+  stopOnConflict: "pause_mission",
+  runtimeEnvironment: null,
+};
+
+export const DEFAULT_MISSION_BUDGET: MissionBudget = {
+  maxAttemptsTotal: null,
+  maxActiveMinutes: null,
+  maxTokens: null,
+  maxCostUsd: null,
+};
+
+export interface MissionCommandMeta {
+  actor?: MissionEvent["actor"];
+  idempotencyKey?: string;
+  occurredAt?: number;
+  eventId?: string;
+}
+
+export interface CreateMissionInput {
+  id?: string;
+  projectId: string;
+  title: string;
+  objective: string;
+  policy?: Partial<MissionPolicy>;
+  budget?: Partial<MissionBudget>;
+}
+
+export type AddMissionTaskInput = Omit<
+  MissionTaskInput,
+  "missionId" | "createdAt"
+> & { createdAt?: number };
+
+type TaskPatch = Extract<
+  MissionEventPayload,
+  { type: "task.updated" }
+>["data"]["patch"];
+
+export interface MissionsState {
+  projection: MissionProjection;
+  events: MissionEvent[];
+  hydrated: boolean;
+  hydrateStatus: HydrationStatus;
+  hydrateError: string | null;
+
+  hydrate: () => Promise<void>;
+  appendEvent: (event: MissionEvent) => boolean;
+  appendEvents: (events: readonly MissionEvent[]) => number;
+  createMission: (input: CreateMissionInput, meta?: MissionCommandMeta) => string;
+  createMissionWithTasks: (
+    input: CreateMissionInput,
+    tasks: readonly AddMissionTaskInput[],
+    meta?: MissionCommandMeta,
+  ) => { missionId: string; taskIds: string[] };
+  addTask: (missionId: string, task: AddMissionTaskInput, meta?: MissionCommandMeta) => string;
+  addTasks: (missionId: string, tasks: readonly AddMissionTaskInput[], meta?: MissionCommandMeta) => string[];
+  updateTask: (missionId: string, taskId: string, patch: TaskPatch, meta?: MissionCommandMeta) => void;
+  updateTasks: (missionId: string, updates: readonly { taskId: string; patch: TaskPatch }[], meta?: MissionCommandMeta) => void;
+  activateMission: (missionId: string, meta?: MissionCommandMeta) => void;
+  pauseMission: (missionId: string, meta?: MissionCommandMeta) => void;
+  cancelMission: (missionId: string, meta?: MissionCommandMeta) => void;
+  archiveMission: (missionId: string, meta?: MissionCommandMeta) => void;
+  pauseTask: (missionId: string, taskId: string, meta?: MissionCommandMeta) => void;
+  resumeTask: (missionId: string, taskId: string, meta?: MissionCommandMeta) => void;
+  archiveTask: (missionId: string, taskId: string, meta?: MissionCommandMeta) => void;
+  requeueTask: (
+    missionId: string,
+    taskId: string,
+    afterAttemptId: string,
+    instruction: string,
+    options?: { extendAttemptLimit?: boolean },
+    meta?: MissionCommandMeta,
+  ) => void;
+  createAttempt: (
+    missionId: string,
+    taskId: string,
+    input?: { id?: string; sessionId?: string | null; workerLabel?: string | null; candidateBatchId?: string | null },
+    meta?: MissionCommandMeta,
+  ) => string;
+  settleAttempt: (
+    missionId: string,
+    attemptId: string,
+    input: {
+      status: Exclude<AttemptStatus, "queued" | "running">;
+      summary?: string | null;
+      error?: string | null;
+      report?: Record<string, unknown> | null;
+    },
+    meta?: MissionCommandMeta,
+  ) => void;
+  recordArtifact: (
+    missionId: string,
+    input: Omit<MissionArtifact, "id" | "missionId" | "createdAt"> & {
+      id?: string;
+      createdAt?: number;
+    },
+    meta?: MissionCommandMeta,
+  ) => string;
+  addQualityGate: (
+    missionId: string,
+    input: Omit<
+      QualityGate,
+      "id" | "missionId" | "status" | "details" | "artifactIds" | "createdAt" | "updatedAt"
+    > & { id?: string; createdAt?: number },
+    meta?: MissionCommandMeta,
+  ) => string;
+  settleQualityGate: (
+    missionId: string,
+    gateId: string,
+    input: {
+      status: Exclude<QualityGateStatus, "pending" | "running">;
+      details?: string | null;
+      artifactIds?: string[];
+    },
+    meta?: MissionCommandMeta,
+  ) => void;
+  settleQualityGates: (
+    missionId: string,
+    results: readonly {
+      gateId: string;
+      status: Exclude<QualityGateStatus, "pending" | "running">;
+      details?: string | null;
+      artifactIds?: string[];
+    }[],
+    meta?: MissionCommandMeta,
+  ) => void;
+  createIntegrationTrain: (
+    missionId: string,
+    input: Omit<IntegrationTrain, "id" | "missionId" | "createdAt" | "updatedAt"> & {
+      id?: string;
+    },
+    meta?: MissionCommandMeta,
+  ) => string;
+  updateIntegrationTrain: (
+    missionId: string,
+    trainId: string,
+    patch: { status?: IntegrationTrain["status"]; entries?: IntegrationTrainEntry[] },
+    meta?: MissionCommandMeta,
+  ) => void;
+  requestCandidateBatch: (
+    missionId: string,
+    taskId: string,
+    input: { count: number; instruction: string; minimumEvidenceCount?: number; minimumScoreMargin?: number; extendAttemptBudget?: boolean },
+    meta?: MissionCommandMeta,
+  ) => string;
+  selectCandidate: (missionId: string, batchId: string, attemptId: string, meta?: MissionCommandMeta) => void;
+  overrideCandidate: (missionId: string, batchId: string, attemptId: string, reason: string, meta?: MissionCommandMeta) => void;
+  createSchedule: (missionId: string, note: string, at: number, meta?: MissionCommandMeta) => string;
+  cancelSchedule: (missionId: string, scheduleId: string, meta?: MissionCommandMeta) => void;
+  claimSchedule: (missionId: string, scheduleId: string, meta?: MissionCommandMeta) => void;
+  failScheduleDelivery: (
+    missionId: string,
+    scheduleId: string,
+    error: string,
+    nextAttemptAt: number,
+    meta?: MissionCommandMeta,
+  ) => void;
+  fireSchedule: (missionId: string, scheduleId: string, meta?: MissionCommandMeta) => void;
+}
+
+function snapshot() {
+  return serializeMissionEvents(useMissions.getState().events);
+}
+
+const persistence = createPersistenceCoordinator({
+  name: "missions",
+  debounceMs: 100,
+  snapshot,
+  save: saveMissions,
+});
+
+function assertWritable(state: MissionsState): void {
+  if (state.hydrateStatus !== "ready") {
+    throw new Error("Mission Control storage is not safely hydrated");
+  }
+}
+
+function makeEvent(
+  projection: MissionProjection,
+  missionId: string,
+  payload: MissionEventPayload,
+  meta: MissionCommandMeta = {},
+): MissionEvent {
+  return {
+    ...payload,
+    eventId: meta.eventId ?? nanoid(16),
+    missionId,
+    revision: nextMissionRevision(projection, missionId),
+    occurredAt: meta.occurredAt ?? Date.now(),
+    actor: meta.actor ?? "human",
+    ...(meta.idempotencyKey ? { idempotencyKey: meta.idempotencyKey } : {}),
+  } as MissionEvent;
+}
+
+function appendPayloads(
+  get: () => MissionsState,
+  set: (patch: Partial<MissionsState>) => void,
+  missionId: string,
+  payloads: readonly MissionEventPayload[],
+  meta: MissionCommandMeta = {},
+): MissionEvent[] {
+  const state = get();
+  assertWritable(state);
+  let projection = state.projection;
+  const appended: MissionEvent[] = [];
+  for (let index = 0; index < payloads.length; index += 1) {
+    const perEventMeta: MissionCommandMeta = {
+      ...meta,
+      // A bulk command gets stable, non-colliding keys while preserving the
+      // caller's command-level idempotency namespace.
+      ...(meta.idempotencyKey
+        ? { idempotencyKey: `${meta.idempotencyKey}:${index}` }
+        : {}),
+      ...(meta.eventId ? { eventId: `${meta.eventId}:${index}` } : {}),
+    };
+    const event = makeEvent(projection, missionId, payloads[index], perEventMeta);
+    const next = reduceMissionEvent(projection, event);
+    if (next !== projection) appended.push(event);
+    projection = next;
+  }
+  if (appended.length > 0) {
+    set({ projection, events: [...state.events, ...appended] });
+    persistence.schedule();
+  }
+  return appended;
+}
+
+function orderTaskBatch(
+  projection: MissionProjection,
+  missionId: string,
+  inputs: readonly AddMissionTaskInput[],
+  ids: readonly string[],
+): Array<{ input: AddMissionTaskInput; id: string }> {
+  const pending = new Map<string, { input: AddMissionTaskInput; id: string }>();
+  inputs.forEach((input, index) => {
+    const id = ids[index];
+    if (pending.has(id) || projection.tasks[id]) {
+      throw new Error(`duplicate task id in batch: ${id}`);
+    }
+    pending.set(id, { input, id });
+  });
+  const available = new Set(
+    Object.values(projection.tasks)
+      .filter((task) => task.missionId === missionId)
+      .map((task) => task.id),
+  );
+  const ordered: Array<{ input: AddMissionTaskInput; id: string }> = [];
+  while (pending.size > 0) {
+    let progressed = false;
+    for (const [id, item] of pending) {
+      if (item.input.dependencyIds.every((dependencyId) => available.has(dependencyId))) {
+        ordered.push(item);
+        available.add(id);
+        pending.delete(id);
+        progressed = true;
+      }
+    }
+    if (!progressed) {
+      const unresolved = [...pending.values()].flatMap(({ input }) =>
+        input.dependencyIds.filter((id) => !available.has(id)),
+      );
+      throw new Error(
+        `task batch has an unknown or cyclic dependency: ${unresolved.join(", ")}`,
+      );
+    }
+  }
+  return ordered;
+}
+
+export const useMissions = create<MissionsState>((set, get) => ({
+  projection: emptyMissionProjection(),
+  events: [],
+  hydrated: false,
+  hydrateStatus: "pending",
+  hydrateError: null,
+
+  hydrate: async () => {
+    try {
+      const persisted = migratePersistedMissions(await loadMissions());
+      const projection = replayMissionEvents(persisted.events);
+      set({
+        projection,
+        events: persisted.events,
+        hydrated: true,
+        hydrateStatus: "ready",
+        hydrateError: null,
+      });
+      persistence.hydrationSucceeded();
+      // v1 is normalized by migration; scheduling writes the v2 envelope.
+      persistence.schedule();
+    } catch (error) {
+      persistence.hydrationFailed(error);
+      set({
+        hydrated: false,
+        hydrateStatus: "failed",
+        hydrateError: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+
+  appendEvent: (event) => {
+    const state = get();
+    assertWritable(state);
+    const projection = reduceMissionEvent(state.projection, event);
+    if (projection === state.projection) return false;
+    set({ projection, events: [...state.events, event] });
+    persistence.schedule();
+    return true;
+  },
+
+  appendEvents: (events) => {
+    const state = get();
+    assertWritable(state);
+    let projection = state.projection;
+    const accepted: MissionEvent[] = [];
+    for (const event of events) {
+      const next = reduceMissionEvent(projection, event);
+      if (next !== projection) accepted.push(event);
+      projection = next;
+    }
+    if (accepted.length) {
+      set({ projection, events: [...state.events, ...accepted] });
+      persistence.schedule();
+    }
+    return accepted.length;
+  },
+
+  createMission: (input, meta) => {
+    const id = input.id ?? nanoid(12);
+    const policy = { ...DEFAULT_MISSION_POLICY, ...input.policy };
+    appendPayloads(get, set, id, [
+      {
+        type: "mission.created",
+        data: {
+          projectId: input.projectId,
+          title: input.title,
+          objective: input.objective,
+          policy: {
+            ...policy,
+            runtimeEnvironment: policy.runtimeEnvironment
+              ? { ...policy.runtimeEnvironment }
+              : null,
+          },
+          budget: { ...DEFAULT_MISSION_BUDGET, ...input.budget },
+          createdAt: meta?.occurredAt ?? Date.now(),
+        },
+      },
+    ], meta);
+    return id;
+  },
+
+  createMissionWithTasks: (input, inputs, meta) => {
+    const missionId = input.id ?? nanoid(12);
+    const at = meta?.occurredAt ?? Date.now();
+    const taskIds = inputs.map((task) => task.id || nanoid(12));
+    // Validate and topologically order the complete batch before reducing a
+    // single event. `appendPayloads` commits only after every reducer step
+    // succeeds, so an unknown root/dependency/invariant can never leave an
+    // empty draft Mission behind.
+    const ordered = orderTaskBatch(get().projection, missionId, inputs, taskIds);
+    const policy = { ...DEFAULT_MISSION_POLICY, ...input.policy };
+    appendPayloads(get, set, missionId, [
+      {
+        type: "mission.created",
+        data: {
+          projectId: input.projectId,
+          title: input.title,
+          objective: input.objective,
+          policy: {
+            ...policy,
+            runtimeEnvironment: policy.runtimeEnvironment
+              ? { ...policy.runtimeEnvironment }
+              : null,
+          },
+          budget: { ...DEFAULT_MISSION_BUDGET, ...input.budget },
+          createdAt: at,
+        },
+      },
+      ...ordered.map(({ input: task, id }) => ({
+        type: "task.added" as const,
+        data: {
+          ...task,
+          id,
+          missionId,
+          createdAt: task.createdAt ?? at,
+        },
+      })),
+      { type: "mission.activated" as const, data: { activatedAt: at } },
+    ], { ...meta, actor: "human", occurredAt: at });
+    return { missionId, taskIds };
+  },
+
+  addTask: (missionId, input, meta) => {
+    const id = input.id || nanoid(12);
+    appendPayloads(get, set, missionId, [{
+      type: "task.added",
+      data: {
+        ...input,
+        id,
+        missionId,
+        createdAt: input.createdAt ?? meta?.occurredAt ?? Date.now(),
+      },
+    }], meta);
+    return id;
+  },
+
+  addTasks: (missionId, inputs, meta) => {
+    const at = meta?.occurredAt ?? Date.now();
+    const ids = inputs.map((input) => input.id || nanoid(12));
+    const ordered = orderTaskBatch(get().projection, missionId, inputs, ids);
+    appendPayloads(
+      get,
+      set,
+      missionId,
+      ordered.map(({ input, id }) => ({
+        type: "task.added" as const,
+        data: {
+          ...input,
+          id,
+          missionId,
+          createdAt: input.createdAt ?? at,
+        },
+      })),
+      { ...meta, occurredAt: at },
+    );
+    return ids;
+  },
+
+  updateTask: (missionId, taskId, patch, meta) => {
+    appendPayloads(get, set, missionId, [{
+      type: "task.updated",
+      data: { taskId, patch, updatedAt: meta?.occurredAt ?? Date.now() },
+    }], meta);
+  },
+
+  updateTasks: (missionId, updates, meta) => {
+    const at = meta?.occurredAt ?? Date.now();
+    appendPayloads(get, set, missionId, updates.map(({ taskId, patch }) => ({
+      type: "task.updated" as const,
+      data: { taskId, patch, updatedAt: at },
+    })), { ...meta, occurredAt: at });
+  },
+
+  activateMission: (missionId, meta) => {
+    const mission = get().projection.missions[missionId];
+    if (!mission) throw new Error("mission is unknown");
+    const at = meta?.occurredAt ?? Date.now();
+    appendPayloads(get, set, missionId, [
+      mission.pausedAt !== null
+        ? { type: "mission.resumed", data: { resumedAt: at } }
+        : { type: "mission.activated", data: { activatedAt: at } },
+    ], meta);
+  },
+  pauseMission: (missionId, meta) => {
+    appendPayloads(get, set, missionId, [{ type: "mission.paused", data: { pausedAt: meta?.occurredAt ?? Date.now() } }], meta);
+  },
+  cancelMission: (missionId, meta) => {
+    const at = meta?.occurredAt ?? Date.now();
+    const reminders = Object.values(get().projection.schedules)
+      .filter((item) => item.missionId === missionId && item.cancelledAt === null && item.claimedAt === null);
+    appendPayloads(get, set, missionId, [
+      ...reminders.map((item) => ({ type: "schedule.cancelled" as const, data: { scheduleId: item.id, cancelledAt: at } })),
+      { type: "mission.cancelled" as const, data: { cancelledAt: at } },
+    ], { ...meta, occurredAt: at });
+  },
+  archiveMission: (missionId, meta) => {
+    const at = meta?.occurredAt ?? Date.now();
+    const outbox = useMissionOutbox.getState();
+    if (outbox.hydrateStatus !== "ready" || outbox.snapshot.hydration !== "ready") {
+      throw new Error("Mission cannot be archived until its outbox audit is safely hydrated");
+    }
+    const unsettled = Object.values(outbox.snapshot.records)
+      .filter((record) => record.missionId === missionId && record.status !== "delivered");
+    if (unsettled.length > 0) {
+      const summary = [...new Set(unsettled.map((record) => record.status))].sort().join(", ");
+      throw new Error(`Mission cannot be archived with ${unsettled.length} unsettled outbox operation(s): ${summary}`);
+    }
+    const auditArtifacts = missionOutboxAuditArtifacts(
+      missionId,
+      get().projection,
+      outbox.snapshot,
+      at,
+      `oa-${nanoid(12)}`,
+    );
+    const reminders = Object.values(get().projection.schedules)
+      .filter((item) => item.missionId === missionId && item.cancelledAt === null && item.claimedAt === null);
+    appendPayloads(get, set, missionId, [
+      ...reminders.map((item) => ({ type: "schedule.cancelled" as const, data: { scheduleId: item.id, cancelledAt: at } })),
+      ...auditArtifacts.map((artifact) => ({ type: "artifact.recorded" as const, data: artifact })),
+      { type: "mission.archived" as const, data: { archivedAt: at } },
+    ], { ...meta, occurredAt: at });
+  },
+  pauseTask: (missionId, taskId, meta) => {
+    appendPayloads(get, set, missionId, [{ type: "task.paused", data: { taskId, pausedAt: meta?.occurredAt ?? Date.now() } }], meta);
+  },
+  resumeTask: (missionId, taskId, meta) => {
+    appendPayloads(get, set, missionId, [{ type: "task.resumed", data: { taskId, resumedAt: meta?.occurredAt ?? Date.now() } }], meta);
+  },
+  archiveTask: (missionId, taskId, meta) => {
+    appendPayloads(get, set, missionId, [{ type: "task.archived", data: { taskId, archivedAt: meta?.occurredAt ?? Date.now() } }], meta);
+  },
+  requeueTask: (missionId, taskId, afterAttemptId, instruction, options, meta) => {
+    const mission = get().projection.missions[missionId];
+    if (!mission) throw new Error("mission is unknown");
+    const task = get().projection.tasks[taskId];
+    if (!task || task.missionId !== missionId) throw new Error("task is unknown");
+    const exhausted = task.attemptIds.length >= task.maxAttempts;
+    if (exhausted && (!options?.extendAttemptLimit || task.maxAttempts >= 20)) {
+      throw new Error(task.maxAttempts >= 20
+        ? "task retry hard cap (20) is exhausted"
+        : "task retry budget is exhausted; explicit attempt-limit extension is required");
+    }
+    const at = meta?.occurredAt ?? Date.now();
+    appendPayloads(get, set, missionId, [
+      ...(exhausted ? [{
+        type: "task.updated" as const,
+        data: {
+          taskId,
+          patch: { maxAttempts: task.maxAttempts + 1 },
+          updatedAt: at,
+        },
+      }] : []),
+      {
+        type: "task.requeued",
+        data: { taskId, afterAttemptId, instruction, requeuedAt: at },
+      },
+      mission.pausedAt !== null
+        ? { type: "mission.resumed", data: { resumedAt: at } }
+        : { type: "mission.activated", data: { activatedAt: at } },
+    ], { ...meta, actor: "human", occurredAt: at });
+  },
+
+  createAttempt: (missionId, taskId, input, meta) => {
+    const id = input?.id ?? nanoid(14);
+    appendPayloads(get, set, missionId, [{
+      type: "attempt.started",
+      data: {
+        id,
+        taskId,
+        candidateBatchId: input?.candidateBatchId ?? null,
+        sessionId: input?.sessionId ?? null,
+        workerLabel: input?.workerLabel ?? null,
+        startedAt: meta?.occurredAt ?? Date.now(),
+      },
+    }], meta);
+    return id;
+  },
+
+  settleAttempt: (missionId, attemptId, input, meta) => {
+    appendPayloads(get, set, missionId, [{
+      type: "attempt.finished",
+      data: {
+        attemptId,
+        ...input,
+        finishedAt: meta?.occurredAt ?? Date.now(),
+      },
+    }], meta);
+  },
+
+  recordArtifact: (missionId, input, meta) => {
+    const id = input.id ?? nanoid(14);
+    appendPayloads(get, set, missionId, [{
+      type: "artifact.recorded",
+      data: {
+        ...input,
+        id,
+        missionId,
+        createdAt: input.createdAt ?? meta?.occurredAt ?? Date.now(),
+      },
+    }], meta);
+    return id;
+  },
+
+  addQualityGate: (missionId, input, meta) => {
+    const id = input.id ?? nanoid(14);
+    appendPayloads(get, set, missionId, [{
+      type: "quality_gate.added",
+      data: {
+        ...input,
+        id,
+        missionId,
+        createdAt: input.createdAt ?? meta?.occurredAt ?? Date.now(),
+      },
+    }], meta);
+    return id;
+  },
+
+  settleQualityGate: (missionId, gateId, input, meta) => {
+    appendPayloads(get, set, missionId, [{
+      type: "quality_gate.resulted",
+      data: {
+        gateId,
+        ...input,
+        updatedAt: meta?.occurredAt ?? Date.now(),
+      },
+    }], meta);
+  },
+
+  settleQualityGates: (missionId, results, meta) => {
+    const at = meta?.occurredAt ?? Date.now();
+    appendPayloads(get, set, missionId, results.map(({ gateId, ...input }) => ({
+      type: "quality_gate.resulted" as const,
+      data: { gateId, ...input, updatedAt: at },
+    })), { ...meta, occurredAt: at });
+  },
+
+  createIntegrationTrain: (missionId, input, meta) => {
+    const id = input.id ?? nanoid(14);
+    const at = meta?.occurredAt ?? Date.now();
+    appendPayloads(get, set, missionId, [{
+      type: "integration_train.created",
+      data: {
+        ...input,
+        id,
+        missionId,
+        createdAt: at,
+        updatedAt: at,
+      },
+    }], meta);
+    return id;
+  },
+
+  updateIntegrationTrain: (missionId, trainId, patch, meta) => {
+    appendPayloads(get, set, missionId, [{
+      type: "integration_train.updated",
+      data: {
+        trainId,
+        ...patch,
+        updatedAt: meta?.occurredAt ?? Date.now(),
+      },
+    }], meta);
+  },
+  requestCandidateBatch: (missionId, taskId, input, meta) => {
+    const mission = get().projection.missions[missionId];
+    const task = get().projection.tasks[taskId];
+    if (!mission || !task || task.missionId !== missionId) throw new Error("task is unknown");
+    const alreadyIntegrated = Object.values(get().projection.integrationTrains)
+      .some((train) => train.missionId === missionId &&
+        train.entries.some((entry) => entry.taskId === taskId && entry.status === "integrated"));
+    if (alreadyIntegrated) {
+      throw new Error("candidate comparison is locked after this task was integrated; create a follow-up task instead");
+    }
+    const needed = task.attemptIds.length + input.count;
+    if (needed > 20) throw new Error("candidate attempts exceed the hard cap of 20");
+    if (needed > task.maxAttempts && !input.extendAttemptBudget) {
+      throw new Error("candidate attempts need an explicit attempt-budget extension");
+    }
+    const at = meta?.occurredAt ?? Date.now();
+    const id = nanoid(14);
+    appendPayloads(get, set, missionId, [
+      ...(needed > task.maxAttempts ? [{
+        type: "task.updated" as const,
+        data: { taskId, patch: { maxAttempts: needed }, updatedAt: at },
+      }] : []),
+      {
+        type: "candidate_batch.requested" as const,
+        data: {
+          id,
+          missionId,
+          taskId,
+          count: input.count,
+          instruction: input.instruction,
+          minimumEvidenceCount: input.minimumEvidenceCount ?? 1,
+          minimumScoreMargin: input.minimumScoreMargin ?? 10,
+          requestedAt: at,
+        },
+      },
+      mission.pausedAt !== null
+        ? { type: "mission.resumed" as const, data: { resumedAt: at } }
+        : { type: "mission.activated" as const, data: { activatedAt: at } },
+    ], { ...meta, actor: "human", occurredAt: at });
+    return id;
+  },
+  selectCandidate: (missionId, batchId, attemptId, meta) => {
+    appendPayloads(get, set, missionId, [{
+      type: "candidate_batch.selected",
+      data: { batchId, attemptId, selectedAt: meta?.occurredAt ?? Date.now() },
+    }], { ...meta, actor: "human" });
+  },
+  overrideCandidate: (missionId, batchId, attemptId, reason, meta) => {
+    appendPayloads(get, set, missionId, [{
+      type: "candidate_batch.overridden",
+      data: { batchId, attemptId, reason, selectedAt: meta?.occurredAt ?? Date.now() },
+    }], { ...meta, actor: "human" });
+  },
+  createSchedule: (missionId, note, at, meta) => {
+    const mission = get().projection.missions[missionId];
+    if (!mission) throw new Error("mission is unknown");
+    const id = `msch-${nanoid(10)}`;
+    const createdAt = meta?.occurredAt ?? Date.now();
+    appendPayloads(get, set, missionId, [{
+      type: "schedule.created",
+      data: {
+        id,
+        missionId,
+        projectId: mission.projectId,
+        note,
+        at,
+        createdAt,
+        cancelledAt: null,
+        claimedAt: null,
+        firedAt: null,
+        deliveryAttempts: 0,
+        lastDeliveryError: null,
+        nextAttemptAt: null,
+      },
+    }], { ...meta, actor: "human", occurredAt: createdAt });
+    return id;
+  },
+  cancelSchedule: (missionId, scheduleId, meta) => {
+    appendPayloads(get, set, missionId, [{ type: "schedule.cancelled", data: { scheduleId, cancelledAt: meta?.occurredAt ?? Date.now() } }], { ...meta, actor: "human" });
+  },
+  claimSchedule: (missionId, scheduleId, meta) => {
+    appendPayloads(get, set, missionId, [{ type: "schedule.claimed", data: { scheduleId, claimedAt: meta?.occurredAt ?? Date.now() } }], { ...meta, actor: "system" });
+  },
+  failScheduleDelivery: (missionId, scheduleId, error, nextAttemptAt, meta) => {
+    const failedAt = meta?.occurredAt ?? Date.now();
+    appendPayloads(get, set, missionId, [{
+      type: "schedule.delivery_failed",
+      data: { scheduleId, failedAt, error, nextAttemptAt },
+    }], { ...meta, actor: "system", occurredAt: failedAt });
+  },
+  fireSchedule: (missionId, scheduleId, meta) => {
+    appendPayloads(get, set, missionId, [{ type: "schedule.fired", data: { scheduleId, firedAt: meta?.occurredAt ?? Date.now() } }], { ...meta, actor: "system" });
+  },
+}));
+
+export async function hydrateMissions(): Promise<void> {
+  await useMissions.getState().hydrate();
+}
+
+export async function flushMissionsPersist(): Promise<void> {
+  await persistence.flush();
+}
+
+export function missionById(state: MissionsState, missionId: string): Mission | null {
+  return state.projection.missions[missionId] ?? null;
+}
+
+export function tasksForMission(state: MissionsState, missionId: string): MissionTask[] {
+  const mission = state.projection.missions[missionId];
+  return mission
+    ? mission.taskIds.map((id) => state.projection.tasks[id]).filter((task): task is MissionTask => !!task)
+    : [];
+}
+
+export function readyTasksForMission(state: MissionsState, missionId: string): MissionTask[] {
+  return tasksForMission(state, missionId)
+    .filter((task) => task.status === "ready")
+    .sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+}
+
+export function dependenciesForTask(
+  state: MissionsState,
+  taskId: string,
+): MissionDependency[] {
+  return Object.values(state.projection.dependencies)
+    .filter((dependency) => dependency.taskId === taskId)
+    .sort((a, b) => a.dependsOnTaskId.localeCompare(b.dependsOnTaskId));
+}
+
+export function attemptsForTask(state: MissionsState, taskId: string): TaskAttempt[] {
+  const task = state.projection.tasks[taskId];
+  return task
+    ? task.attemptIds.map((id) => state.projection.attempts[id]).filter((attempt): attempt is TaskAttempt => !!attempt)
+    : [];
+}
+
+export function currentAttemptForTask(state: MissionsState, taskId: string): TaskAttempt | null {
+  const attempts = attemptsForTask(state, taskId);
+  return attempts[attempts.length - 1] ?? null;
+}

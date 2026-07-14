@@ -15,6 +15,10 @@
 
 import { create } from "zustand";
 import { loadVibeSessions, saveVibeSessions } from "@/lib/transport";
+import {
+  createPersistenceCoordinator,
+  type HydrationStatus,
+} from "@/lib/persistence/coordinator";
 import { useProjects } from "@/lib/projects/store";
 import type { MigratableSession } from "@/lib/projects/core";
 import type {
@@ -33,12 +37,23 @@ import type {
 
 /** Per-session item cap — oldest items drop first (display + persistence). */
 export const MAX_ITEMS = 500;
-/** Session cap PER PROJECT — a project's oldest sessions are dropped first. */
+/**
+ * Soft UI/archive threshold retained for compatibility. It is deliberately
+ * NOT a destructive storage cap: large missions may legitimately exceed it,
+ * and only an explicit archive/delete flow may discard a session.
+ */
 export const MAX_SESSIONS_PER_PROJECT = 30;
 /** Live command output cap held in memory (per command item). */
 export const OUTPUT_CAP = 64 * 1024;
 /** Command output cap written to disk (per item) — smaller than the live one. */
 export const PERSIST_OUTPUT_CAP = 8 * 1024;
+
+export type VibeTurnOutcome =
+  | "completed"
+  | "failed"
+  | "interrupted"
+  | "exited"
+  | "compacted";
 
 /** Keep the tail of an over-long string on a code-point boundary. */
 function capTail(s: string, max: number): string {
@@ -63,6 +78,9 @@ export interface VibeSessionEntry {
   /** epoch ms the session last left busy → idle; powers the ephemeral
    * "✓ finished · Xm ago" moment in the rail (transient, never persisted) */
   lastBusyEndAt: number | null;
+  /** Explicit outcome of the last turn. Busy/idle is transport state and must
+   * never be interpreted as success. Transient; the transcript is durable. */
+  lastTurnOutcome?: VibeTurnOutcome | null;
 }
 
 /** A new session before the store fills in the transient fields. */
@@ -71,7 +89,7 @@ export interface NewVibeSession {
   name: string;
   /** owning project tab — resolved by the controller (never empty) */
   projectId: string;
-  /** the generated agent identity (defaults to `name` when omitted) */
+  /** stable temporary lane label (legacy field name; defaults to `name`) */
   agentName?: string;
   spawnedBy?: VibeSpawnedBy;
   worktree?: VibeSessionWorktree | null;
@@ -81,9 +99,6 @@ export interface NewVibeSession {
   access: VibeAccess;
   threadId?: string | null;
 }
-
-// Sessions stream item patches during turns — batch disk writes ~800 ms.
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
 function persistOneItem(item: VibeItem): VibeItem {
   // never persist a live-streaming caret; cap command output smaller on disk
@@ -123,25 +138,20 @@ function snapshot(): PersistedVibeSessions {
   };
 }
 
+const persistence = createPersistenceCoordinator({
+  name: "vibeSessions",
+  debounceMs: 800,
+  snapshot,
+  save: saveVibeSessions,
+});
+
 function schedulePersist() {
-  if (persistTimer) return;
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    void saveVibeSessions(snapshot());
-  }, 800);
+  persistence.schedule();
 }
 
 /** Write the pending debounce NOW — called from flushAllPersists at quit. */
 export async function flushVibePersist(): Promise<void> {
-  if (persistTimer) {
-    clearTimeout(persistTimer);
-    persistTimer = null;
-  }
-  try {
-    await saveVibeSessions(snapshot());
-  } catch {
-    /* never block quitting on a failed write */
-  }
+  await persistence.flush();
 }
 
 export interface VibeState {
@@ -159,6 +169,9 @@ export interface VibeState {
    * chat→project migration resolves touched sessions against this store and
    * must not run before/without it. In-memory, never persisted. */
   hydrated: boolean;
+  /** Explicit read health. `failed` keeps persistence write-gated. */
+  hydrateStatus: HydrationStatus;
+  hydrateError: string | null;
 
   setActive: (id: string | null) => void;
 
@@ -187,6 +200,7 @@ export interface VibeState {
 
   // ---- turn state (controller) ----
   setBusy: (id: string, busy: boolean) => void;
+  setTurnOutcome: (id: string, outcome: VibeTurnOutcome) => void;
   setTurnId: (id: string, turnId: string | null) => void;
   setDiff: (id: string, diff: string) => void;
   setPlan: (
@@ -212,53 +226,22 @@ export interface VibeState {
 }
 
 /**
- * Enforce the per-project session cap on a newest-first id order: each
- * project keeps its newest MAX_SESSIONS_PER_PROJECT sessions. Ids without a
- * live entry drop out too.
+ * Keep a valid newest-first order without destructively truncating a project.
+ * Session history is mission evidence; capacity is enforced by the scheduler,
+ * not by deleting an arbitrary old/live lane during admission.
  */
-function capPerProject(
+function validSessionOrder(
   order: string[],
   sessions: Record<string, VibeSessionEntry>,
 ): string[] {
-  const counts = new Map<string, number>();
   const kept: string[] = [];
+  const seen = new Set<string>();
   for (const id of order) {
-    const e = sessions[id];
-    if (!e) continue;
-    const n = (counts.get(e.session.projectId) ?? 0) + 1;
-    counts.set(e.session.projectId, n);
-    if (n <= MAX_SESSIONS_PER_PROJECT) kept.push(id);
+    if (!sessions[id] || seen.has(id)) continue;
+    seen.add(id);
+    kept.push(id);
   }
   return kept;
-}
-
-/**
- * Backend cleanup sink for sessions the per-project cap EVICTS. Registered by
- * the controller (a store→controller import would be a cycle — same
- * registration pattern as the timer/autonomy sinks). The store removes the
- * evicted entry from its OWN state; this sink ends the Rust child process and
- * drops the controller's per-session maps (liveBackends / streams /
- * lastTurnOutcomes / schemaTurns / compacting / usage-mirror timers) — without
- * it the process and those maps leak on every eviction. Called with the
- * entries STILL PRESENT in the store so the sink can flush final usage
- * accounting before they vanish.
- */
-let evictionSink: ((ids: string[]) => void) | null = null;
-
-/** Install the eviction sink (controller.ts, at module load). */
-export function registerSessionEvictionSink(
-  fn: ((ids: string[]) => void) | null,
-): void {
-  evictionSink = fn;
-}
-
-function notifyEvicted(ids: string[]): void {
-  if (!ids.length || !evictionSink) return;
-  try {
-    evictionSink(ids);
-  } catch {
-    /* a broken sink must never break a store update */
-  }
 }
 
 /** Replace one session entry immutably, only touching that entry's reference. */
@@ -279,6 +262,8 @@ export const useVibe = create<VibeState>((set, get) => ({
   activeIdByProject: {},
   busy: {},
   hydrated: false,
+  hydrateStatus: "pending",
+  hydrateError: null,
 
   setActive: (id) => {
     const state = get();
@@ -325,16 +310,12 @@ export const useVibe = create<VibeState>((set, get) => ({
       plan: null,
       tokenUsage: null,
       lastBusyEndAt: null,
+      lastTurnOutcome: null,
     };
-    // newest first — the PER-PROJECT cap drops that project's oldest sessions
+    // Newest first. Admission is non-destructive: no unrelated session is
+    // removed before this session's backend start has succeeded.
     const sessions = { ...state.sessions, [s.id]: entry };
-    const order = capPerProject([s.id, ...state.order], sessions);
-    const evicted = state.order.filter((oid) => !order.includes(oid));
-    // close the evicted sessions' backends BEFORE removing them from state —
-    // the sink reads the live entry to flush final usage accounting, then
-    // ends the Rust process + controller maps (the real per-eviction leak fix)
-    if (evicted.length) notifyEvicted(evicted);
-    for (const oid of evicted) delete sessions[oid];
+    const order = validSessionOrder([s.id, ...state.order], sessions);
     set({
       sessions,
       order,
@@ -457,15 +438,39 @@ export const useVibe = create<VibeState>((set, get) => ({
     const prev = !!state.busy[id];
     if (prev === busy) return;
     const next: Partial<VibeState> = { busy: { ...state.busy, [id]: busy } };
-    // just left busy → stamp the ephemeral "finished" moment (transient)
+    // Starting a new turn clears the previous outcome/finished decay.
+    if (!prev && busy) {
+      const patch = withEntry(state, id, (e) => ({
+        ...e,
+        lastTurnOutcome: null,
+        lastBusyEndAt: null,
+      }));
+      if (patch) next.sessions = patch.sessions;
+    }
+    // Only a real completed outcome earns the ephemeral green "finished"
+    // moment. Failed/interrupted/exited/compaction all land neutral.
     if (prev && !busy) {
       const patch = withEntry(state, id, (e) => ({
         ...e,
-        lastBusyEndAt: Date.now(),
+        lastBusyEndAt:
+          e.lastTurnOutcome === "completed" ? Date.now() : null,
       }));
       if (patch) next.sessions = patch.sessions;
     }
     set(next);
+  },
+
+  setTurnOutcome: (id, lastTurnOutcome) => {
+    const patch = withEntry(get(), id, (e) => ({
+      ...e,
+      lastTurnOutcome,
+      // A late process-exited/failed event can arrive after the completed
+      // busy→idle transition. Revoke green immediately instead of leaving a
+      // stale success signal for five minutes.
+      lastBusyEndAt:
+        lastTurnOutcome === "completed" ? e.lastBusyEndAt : null,
+    }));
+    if (patch) set(patch); // transient — transcript carries durable evidence
   },
 
   setTurnId: (id, turnId) => {
@@ -603,7 +608,10 @@ function sanitizeSession(raw: unknown): VibeSession | null {
       typeof s.agentName === "string" && s.agentName.trim()
         ? s.agentName
         : name,
-    spawnedBy: s.spawnedBy === "conductor" ? "conductor" : "user",
+    spawnedBy:
+      s.spawnedBy === "conductor" || s.spawnedBy === "mission"
+        ? s.spawnedBy
+        : "user",
     worktree: sanitizeWorktree(s.worktree),
     projectDir: s.projectDir,
     ...(typeof s.model === "string" && s.model ? { model: s.model } : {}),
@@ -667,6 +675,7 @@ function sanitizeItem(raw: unknown): VibeItem | null {
         kind: "user",
         text,
         ...(m.via === "conductor" ? { via: "conductor" as const } : {}),
+        ...(typeof m.turnId === "string" ? { turnId: m.turnId } : {}),
       };
     case "warning":
     case "notice": // compaction dividers survive restarts
@@ -681,6 +690,7 @@ function sanitizeItem(raw: unknown): VibeItem | null {
         ...(typeof m.phase === "string" ? { phase: m.phase } : {}),
         // the report stamp survives restarts — the card keeps rendering
         ...(m.report === true ? { report: true } : {}),
+        ...(typeof m.turnId === "string" ? { turnId: m.turnId } : {}),
       };
     case "command":
       return {
@@ -695,6 +705,7 @@ function sanitizeItem(raw: unknown): VibeItem | null {
             ? (m.exitCode as number | null)
             : null,
         output: typeof m.output === "string" ? m.output : "",
+        ...(typeof m.turnId === "string" ? { turnId: m.turnId } : {}),
       };
     case "fileChange":
       return {
@@ -773,13 +784,23 @@ export async function hydrateVibeSessions(): Promise<void> {
   let data: PersistedVibeSessions | null = null;
   try {
     data = await loadVibeSessions();
-  } catch {
+  } catch (error) {
     // load failed — `hydrated` stays false, downstream migrations skip
+    persistence.hydrationFailed(error);
+    useVibe.setState({
+      hydrateStatus: "failed",
+      hydrateError: error instanceof Error ? error.message : String(error),
+    });
     return;
   }
   if (!data) {
     // fresh install: nothing persisted IS a successful hydration
-    useVibe.setState({ hydrated: true });
+    useVibe.setState({
+      hydrated: true,
+      hydrateStatus: "ready",
+      hydrateError: null,
+    });
+    persistence.hydrationSucceeded();
     return;
   }
   const sessions: Record<string, VibeSessionEntry> = Object.create(null);
@@ -808,6 +829,7 @@ export async function hydrateVibeSessions(): Promise<void> {
         plan: null,
         tokenUsage: null,
         lastBusyEndAt: null,
+        lastTurnOutcome: null,
       };
       order.push(session.id);
     } catch {
@@ -848,22 +870,12 @@ export async function hydrateVibeSessions(): Promise<void> {
   );
   for (const id of Object.keys(state.sessions))
     mergedSessions[id] = state.sessions[id];
-  const mergedOrder = capPerProject(
+  const mergedOrder = validSessionOrder(
     state.order.length
       ? [...state.order, ...order.filter((id) => !state.sessions[id])]
       : order,
     mergedSessions,
   );
-  // drop anything beyond the per-project cap — a LIVE pre-hydrate session
-  // dropped here (rare: live picks are newest, so normally kept) still needs
-  // its backend torn down, so route the eviction through the sink too
-  const evictedOnHydrate: string[] = [];
-  for (const id of Object.keys(mergedSessions))
-    if (!mergedOrder.includes(id)) {
-      delete mergedSessions[id];
-      evictedOnHydrate.push(id);
-    }
-  if (evictedOnHydrate.length) notifyEvicted(evictedOnHydrate);
   // per-project selection map: only entries whose session survived AND still
   // belongs to that project; live (pre-hydrate) picks win
   const activeIdByProject: Record<string, string> = Object.create(null);
@@ -891,7 +903,10 @@ export async function hydrateVibeSessions(): Promise<void> {
         ? data.activeId
         : (mergedOrder[0] ?? null)),
     hydrated: true,
+    hydrateStatus: "ready",
+    hydrateError: null,
   });
+  persistence.hydrationSucceeded();
   // the one-time migration result must survive a quit without further edits
   if (migrated || (data.version ?? 1) < 2) schedulePersist();
 }

@@ -10,6 +10,12 @@ import {
   prettyModel,
 } from "@/lib/utils";
 import type { ModelUsage, UsageHistoryEntry } from "@/types";
+import {
+  Dialog,
+  DialogDescription,
+  DialogTitle,
+  DrawerContent,
+} from "./ui/dialog";
 
 function aggregate(sources: UsageHistoryEntry[]) {
   const models = new Map<string, ModelUsage>();
@@ -104,26 +110,6 @@ export function UsageDashboard() {
   const setOpen = useSwarm((s) => s.setDashboardOpen);
   const usageHistory = useSwarm((s) => s.usageHistory);
   const clearUsageHistory = useSwarm((s) => s.clearUsageHistory);
-  const panelRef = useRef<HTMLDivElement>(null);
-
-  // Escape closes the drawer; capture + stopPropagation so window-level
-  // handlers don't react to the same press
-  useEffect(() => {
-    if (!open) return;
-    panelRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      // a real dialog stacked above the drawer (Settings via the title bar)
-      // owns Escape — don't steal it and close the drawer underneath
-      if (document.querySelector('[role="dialog"]:not([aria-label="Usage"])'))
-        return;
-      e.stopPropagation();
-      setOpen(false);
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [open, setOpen]);
-
   const historyEntries = useMemo(
     () =>
       Object.values(usageHistory)
@@ -134,33 +120,22 @@ export function UsageDashboard() {
   );
   const agg = useMemo(() => aggregate(historyEntries), [historyEntries]);
 
-  if (!open) return null;
-
   const maxModelCost = Math.max(1, ...agg.byModel.map((m) => m.cost_usd), 1);
 
   return (
-    <>
-      <div
-        className="animate-zoverlay fixed inset-0 z-30 bg-[rgba(5,5,8,0.55)] backdrop-blur-[2px]"
-        onClick={() => setOpen(false)}
-      />
-      <div
-        ref={panelRef}
-        role="dialog"
-        aria-label="Usage"
-        tabIndex={-1}
-        className="animate-ztoast fixed right-0 top-0 z-40 flex h-full w-[420px] flex-col border-l border-line2 bg-panel shadow-modal outline-none"
-      >
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DrawerContent className="w-[420px]">
         <div className="flex items-center justify-between border-b border-line px-4 py-3">
           <div>
-            <h2 className="text-14 font-semibold tracking-[-0.01em]">Usage</h2>
-            <p className="text-11 text-fnt">
+            <DialogTitle className="text-14">Usage</DialogTitle>
+            <DialogDescription className="text-11">
               All time · recorded Codex history (new entries return with the
               Phase-2 session accounting)
-            </p>
+            </DialogDescription>
           </div>
           <button
             onClick={() => setOpen(false)}
+            aria-label="Close Usage"
             className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt"
           >
             <X size={16} />
@@ -249,8 +224,8 @@ export function UsageDashboard() {
             <HistoryList entries={historyEntries} onClear={clearUsageHistory} />
           </div>
         </ScrollArea>
-      </div>
-    </>
+      </DrawerContent>
+    </Dialog>
   );
 }
 

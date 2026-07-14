@@ -10,6 +10,10 @@
 import { create } from "zustand";
 import { nanoid } from "nanoid";
 import { loadConductorTimers, saveConductorTimers } from "@/lib/transport";
+import {
+  createPersistenceCoordinator,
+  type HydrationStatus,
+} from "@/lib/persistence/coordinator";
 import { useProjects } from "@/lib/projects/store";
 import type { ConductorTimer, PersistedConductorTimers } from "@/types";
 import {
@@ -75,36 +79,55 @@ const MAX_BUSY_RETRIES = 20;
 interface TimersState {
   /** pending timers, all projects (small — capped per project) */
   timers: ConductorTimer[];
+  hydrated: boolean;
+  hydrateStatus: HydrationStatus;
+  hydrateError: string | null;
 }
 
-export const useConductorTimers = create<TimersState>(() => ({ timers: [] }));
-
-// Timer mutations are rare — persist with a short debounce.
-let persistTimerHandle: ReturnType<typeof setTimeout> | null = null;
+export const useConductorTimers = create<TimersState>(() => ({
+  timers: [],
+  hydrated: false,
+  hydrateStatus: "pending",
+  hydrateError: null,
+}));
 
 function snapshot(): PersistedConductorTimers {
   return { version: 1, timers: useConductorTimers.getState().timers };
 }
 
+const persistence = createPersistenceCoordinator({
+  name: "conductorTimers",
+  debounceMs: 300,
+  snapshot,
+  save: saveConductorTimers,
+});
+
 function schedulePersist() {
-  if (persistTimerHandle) return;
-  persistTimerHandle = setTimeout(() => {
-    persistTimerHandle = null;
-    void saveConductorTimers(snapshot());
-  }, 300);
+  persistence.schedule();
+}
+
+function requireDurableTimerStore(): void {
+  const state = useConductorTimers.getState();
+  const health = persistence.health();
+  if (state.hydrateStatus !== "ready" || health.hydration !== "ready") {
+    throw new Error(
+      state.hydrateError
+        ? `timer store unavailable: ${state.hydrateError}`
+        : "timer store is not ready yet",
+    );
+  }
+}
+
+function assertTimerWriteSucceeded(action: string): void {
+  const health = persistence.health();
+  if (health.write === "failed") {
+    throw new Error(`${action} could not be saved durably`);
+  }
 }
 
 /** Write the pending debounce NOW — called from flushAllPersists at quit. */
 export async function flushConductorTimersPersist(): Promise<void> {
-  if (persistTimerHandle) {
-    clearTimeout(persistTimerHandle);
-    persistTimerHandle = null;
-  }
-  try {
-    await saveConductorTimers(snapshot());
-  } catch {
-    /* never block quitting on a failed write */
-  }
+  await persistence.flush();
 }
 
 // ---- wakeups ----
@@ -160,6 +183,7 @@ function setFiredAt(id: string, firedAt: number | undefined): void {
         : t,
     ),
   });
+  schedulePersist();
 }
 
 /**
@@ -199,6 +223,10 @@ async function fireTimer(timer: ConductorTimer, missed: boolean): Promise<void> 
           // durable claim, flushed BEFORE the side effect
           setFiredAt(timer.id, Date.now());
           await flushConductorTimersPersist();
+          const health = persistence.health();
+          if (health.hydration !== "ready" || health.write === "failed") {
+            throw new Error("timer claim could not be persisted durably");
+          }
           return true;
         };
         outcome = await deliveryFn(timer.projectId, timer.note, missed, claim);
@@ -211,11 +239,21 @@ async function fireTimer(timer: ConductorTimer, missed: boolean): Promise<void> 
     if (outcome === "retry") {
       // nothing was delivered — release the durable claim
       setFiredAt(timer.id, undefined);
-      schedulePersist();
+      await flushConductorTimersPersist();
+      if (persistence.health().write === "failed") {
+        // The durable store may still contain the claim. Keep the in-memory
+        // state conservative too: a crash must drop rather than double-fire.
+        setFiredAt(timer.id, Date.now());
+        noticeFn?.(
+          timer.projectId,
+          `⏰ Timer retry paused because its durable claim could not be released: ${timer.note}`,
+        );
+        return;
+      }
       const n = (retryCounts.get(timer.id) ?? 0) + 1;
       if (n >= MAX_BUSY_RETRIES) {
         retryCounts.delete(timer.id);
-        removeTimerInternal(timer.id);
+        await removeTimerInternal(timer.id);
         noticeFn?.(
           timer.projectId,
           `⏰ Timer expired undelivered after ${MAX_BUSY_RETRIES} attempts: ${timer.note}`,
@@ -238,18 +276,19 @@ async function fireTimer(timer: ConductorTimer, missed: boolean): Promise<void> 
     }
     // delivered or dropped — the timer is done
     retryCounts.delete(timer.id);
-    removeTimerInternal(timer.id);
+    await removeTimerInternal(timer.id);
   } finally {
     firing.delete(timer.id);
   }
 }
 
-function removeTimerInternal(id: string) {
+async function removeTimerInternal(id: string): Promise<void> {
   clearWake(id);
   const s = useConductorTimers.getState();
   if (!s.timers.some((t) => t.id === id)) return;
   useConductorTimers.setState({ timers: s.timers.filter((t) => t.id !== id) });
   schedulePersist();
+  await flushConductorTimersPersist();
 }
 
 // ---- public surface (the timer tools + hydrate) ----
@@ -258,11 +297,12 @@ function removeTimerInternal(id: string) {
  * Create one timer (the `set_timer` executor). `at` is the resolved absolute
  * fire time (timers-core `resolveFireAt`). Enforces the per-project cap.
  */
-export function createTimer(
+export async function createTimer(
   projectId: string,
   note: string,
   at: number,
-): ConductorTimer {
+): Promise<ConductorTimer> {
+  requireDurableTimerStore();
   const trimmed = note.trim().slice(0, MAX_NOTE_CHARS);
   if (!trimmed) throw new Error("note must not be empty");
   const s = useConductorTimers.getState();
@@ -281,6 +321,20 @@ export function createTimer(
   };
   useConductorTimers.setState({ timers: [...s.timers, timer] });
   schedulePersist();
+  await flushConductorTimersPersist();
+  try {
+    assertTimerWriteSucceeded("timer creation");
+  } catch (error) {
+    // Do not expose an in-memory-only timer as successfully created.
+    useConductorTimers.setState({
+      timers: useConductorTimers
+        .getState()
+        .timers.filter((candidate) => candidate.id !== timer.id),
+    });
+    schedulePersist();
+    await flushConductorTimersPersist();
+    throw error;
+  }
   armWake(timer);
   return timer;
 }
@@ -297,7 +351,11 @@ export function listTimers(projectId: string): ConductorTimer[] {
  * Cancel one timer by id, scoped to the calling project (a Conductor can
  * never cancel another project's timers). Returns the cancelled timer.
  */
-export function cancelTimer(projectId: string, timerId: string): ConductorTimer {
+export async function cancelTimer(
+  projectId: string,
+  timerId: string,
+): Promise<ConductorTimer> {
+  requireDurableTimerStore();
   const timer = useConductorTimers
     .getState()
     .timers.find((t) => t.id === timerId && t.projectId === projectId);
@@ -306,7 +364,20 @@ export function cancelTimer(projectId: string, timerId: string): ConductorTimer 
       `no pending timer "${timerId}" in this project (see list_timers)`,
     );
   }
-  removeTimerInternal(timerId);
+  await removeTimerInternal(timerId);
+  try {
+    assertTimerWriteSucceeded("timer cancellation");
+  } catch (error) {
+    // Preserve the timer when its cancellation cannot be made durable.
+    const current = useConductorTimers.getState();
+    if (!current.timers.some((candidate) => candidate.id === timer.id)) {
+      useConductorTimers.setState({ timers: [...current.timers, timer] });
+      schedulePersist();
+      await flushConductorTimersPersist();
+      armWake(timer);
+    }
+    throw error;
+  }
   return timer;
 }
 
@@ -332,10 +403,23 @@ export async function hydrateConductorTimers(): Promise<void> {
   let data: PersistedConductorTimers | null = null;
   try {
     data = await loadConductorTimers();
-  } catch {
+  } catch (error) {
+    persistence.hydrationFailed(error);
+    useConductorTimers.setState({
+      hydrateStatus: "failed",
+      hydrateError: error instanceof Error ? error.message : String(error),
+    });
     return; // unreadable store — keep whatever is in memory, persist nothing
   }
-  if (!data) return;
+  if (!data) {
+    useConductorTimers.setState({
+      hydrated: true,
+      hydrateStatus: "ready",
+      hydrateError: null,
+    });
+    persistence.hydrationSucceeded();
+    return;
+  }
   const projectsState = useProjects.getState();
   const sanitized = sanitizeTimers(data.timers);
   const claimed = sanitized.filter((t) => t.firedAt !== undefined);
@@ -348,7 +432,13 @@ export async function hydrateConductorTimers(): Promise<void> {
     ...existing,
     ...timers.filter((t) => !existing.some((x) => x.id === t.id)),
   ];
-  useConductorTimers.setState({ timers: merged });
+  useConductorTimers.setState({
+    timers: merged,
+    hydrated: true,
+    hydrateStatus: "ready",
+    hydrateError: null,
+  });
+  persistence.hydrationSucceeded();
   const { due, future } = splitDue(merged, Date.now());
   for (const t of future) armWake(t);
   for (const t of due) void fireTimer(t, true);
