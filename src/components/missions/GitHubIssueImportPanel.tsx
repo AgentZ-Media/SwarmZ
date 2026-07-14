@@ -331,7 +331,7 @@ function IssueRow({
           <p className="min-w-0 flex-1 text-12 font-medium leading-snug text-txt">{issue.title}</p>
           <span
             className={cn(
-              "flex shrink-0 items-center gap-1 rounded-sm border px-1.5 py-0.5 font-mono text-9 uppercase",
+              "flex shrink-0 items-center gap-1 rounded-sm border px-1.5 py-0.5 font-mono text-10 uppercase",
               issue.state === "OPEN"
                 ? "border-ok/30 bg-ok/10 text-ok"
                 : "border-line2 bg-panel text-fnt",
@@ -348,13 +348,13 @@ function IssueRow({
             {issue.labels.slice(0, 8).map((label) => (
               <span
                 key={label}
-                className="max-w-36 truncate rounded-sm border border-line2 bg-panel px-1.5 py-0.5 font-mono text-9 text-fnt"
+                className="max-w-36 truncate rounded-sm border border-line2 bg-panel px-1.5 py-0.5 font-mono text-10 text-fnt"
               >
                 {label}
               </span>
             ))}
             {issue.labels.length > 8 && (
-              <span className="font-mono text-9 text-fnt">+{issue.labels.length - 8}</span>
+              <span className="font-mono text-10 text-fnt">+{issue.labels.length - 8}</span>
             )}
           </div>
         )}

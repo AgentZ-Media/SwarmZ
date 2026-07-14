@@ -8,10 +8,14 @@ export const DialogTrigger = DialogPrimitive.Trigger;
 export const DialogClose = DialogPrimitive.Close;
 export const Drawer = DialogPrimitive.Root;
 
+type DialogContentProps = React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
+  showClose?: boolean;
+};
+
 export const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content>
->(({ className, children, ...props }, ref) => (
+  DialogContentProps
+>(({ className, children, showClose = true, ...props }, ref) => (
   <DialogPrimitive.Portal>
     <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-[rgba(5,5,8,0.6)] backdrop-blur-[3px] data-[state=open]:animate-zoverlay" />
     <DialogPrimitive.Content
@@ -23,12 +27,14 @@ export const DialogContent = React.forwardRef<
       {...props}
     >
       {children}
-      <DialogPrimitive.Close
-        aria-label="Close dialog"
-        className="no-drag absolute right-4 top-4 rounded-xs text-fnt transition-colors hover:text-txt focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-acc/80"
-      >
-        <X size={16} />
-      </DialogPrimitive.Close>
+      {showClose && (
+        <DialogPrimitive.Close
+          aria-label="Close dialog"
+          className="no-drag absolute right-4 top-4 rounded-xs text-fnt transition-colors hover:text-txt focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-acc/80"
+        >
+          <X size={16} />
+        </DialogPrimitive.Close>
+      )}
     </DialogPrimitive.Content>
   </DialogPrimitive.Portal>
 ));

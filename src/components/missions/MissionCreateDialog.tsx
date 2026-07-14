@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, FileInput, GitBranch, X } from "lucide-react";
+import { AlertTriangle, FileInput, GitBranch, Server, X } from "lucide-react";
 import { nanoid } from "nanoid";
 import { importTasks } from "@/lib/intake/task-import";
 import { useMissions } from "@/lib/missions/store";
@@ -9,6 +9,10 @@ import { useVibeUi } from "@/lib/vibe/ui-store";
 import { BUILTIN_PLAYBOOKS } from "@/lib/playbooks/builtins";
 import { expandPlaybook } from "@/lib/playbooks";
 import { GitHubIssueImportPanel } from "./GitHubIssueImportPanel";
+import { useRuntimeEnvironments } from "@/lib/runtime/store";
+import { bindingForRuntimeSpec } from "@/lib/missions/runtime-binding";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import { parseApprovedArgv } from "@/lib/integration/controller-core";
 
 const EXAMPLE = `[AUTH] Fix authentication race P0 @security
   Done when: concurrent refresh requests share one token exchange
@@ -44,6 +48,11 @@ export function MissionCreateDialog() {
   const [maxMinutes, setMaxMinutes] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [githubImportOpen, setGithubImportOpen] = useState(false);
+  const [runtimeEnvironmentId, setRuntimeEnvironmentId] = useState<string | null>(null);
+  const runtimeByProject = useRuntimeEnvironments((state) => state.byProject);
+  const selectedRuntimeByProject = useRuntimeEnvironments((state) => state.selectedByProject);
+  const runtimeHydrated = useRuntimeEnvironments((state) => state.hydrated);
+  const runtimeSpecs = activeProjectId ? runtimeByProject[activeProjectId] ?? [] : [];
   const titleRef = useRef<HTMLInputElement>(null);
   const parsed = useMemo(() => importTasks(input), [input]);
 
@@ -88,18 +97,18 @@ export function MissionCreateDialog() {
 
   useEffect(() => {
     if (!open) return;
-    const timer = window.setTimeout(() => titleRef.current?.focus(), 0);
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.clearTimeout(timer);
-      window.removeEventListener("keydown", onKey);
-    };
+    return () => setError(null);
   }, [open]);
 
-  if (!open) return null;
+  useEffect(() => {
+    if (!open || !activeProjectId) return;
+    const preferred = selectedRuntimeByProject[activeProjectId] ?? null;
+    setRuntimeEnvironmentId(
+      preferred && (runtimeByProject[activeProjectId] ?? []).some((spec) => spec.id === preferred)
+        ? preferred
+        : null,
+    );
+  }, [activeProjectId, open, runtimeByProject, selectedRuntimeByProject]);
 
   const create = () => {
     try {
@@ -116,10 +125,24 @@ export function MissionCreateDialog() {
       if (commands.length > 20 || commands.some((command) => command.length > 1_000)) {
         throw new Error("Use at most 20 verification commands, each below 1,000 characters.");
       }
+      commands.forEach((command, index) => {
+        try {
+          parseApprovedArgv(command);
+        } catch (cause) {
+          const detail = cause instanceof Error ? cause.message : String(cause);
+          throw new Error(`Verification command ${index + 1} is not valid argv: ${detail}`);
+        }
+      });
       const tokenBudget = maxTokens.trim() ? Number(maxTokens) : null;
       const minuteBudget = maxMinutes.trim() ? Number(maxMinutes) : null;
       if (tokenBudget !== null && (!Number.isSafeInteger(tokenBudget) || tokenBudget < 1)) throw new Error("Token budget must be a positive integer.");
       if (minuteBudget !== null && (!Number.isFinite(minuteBudget) || minuteBudget <= 0)) throw new Error("Time budget must be positive.");
+      const runtimeSpec = runtimeEnvironmentId
+        ? runtimeSpecs.find((spec) => spec.id === runtimeEnvironmentId)
+        : null;
+      if (runtimeEnvironmentId && (!runtimeHydrated || !runtimeSpec)) {
+        throw new Error("The selected Runtime Environment is not safely available.");
+      }
       const missionId = store.createMission({
         projectId: activeProjectId,
         title: title.trim(),
@@ -130,6 +153,7 @@ export function MissionCreateDialog() {
           githubAuthority,
           qualityCommands: commands,
           allowedTools: ["workspace_sandbox"],
+          runtimeEnvironment: runtimeSpec ? bindingForRuntimeSpec(runtimeSpec) : null,
         },
         budget: { maxTokens: tokenBudget, maxActiveMinutes: minuteBudget },
       });
@@ -198,27 +222,26 @@ export function MissionCreateDialog() {
   };
 
   return (
-    <div
-      className="fixed inset-0 z-[70] flex items-center justify-center bg-black/60 p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="create-mission-title"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) close();
-      }}
-    >
-      <div className="flex max-h-[min(860px,92vh)] w-[min(920px,96vw)] flex-col overflow-hidden rounded-xl border border-line2 bg-panel shadow-2xl">
-        <div className="flex h-14 shrink-0 items-center border-b border-line px-5">
+    <Dialog open={open} onOpenChange={(nextOpen) => { if (!nextOpen) close(); }}>
+      <DialogContent
+        showClose={false}
+        className="flex max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] max-w-[920px] flex-col overflow-hidden rounded-xl bg-panel p-0"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          titleRef.current?.focus();
+        }}
+      >
+        <div className="flex h-12 shrink-0 items-center border-b border-line px-5">
           <div>
-            <h2 id="create-mission-title" className="text-15 font-semibold text-txt">New mission</h2>
-            <p className="mt-0.5 text-11 text-fnt">Import up to 500 tasks; dependencies become a schedulable DAG.</p>
+            <DialogTitle className="text-16">New mission</DialogTitle>
+            <DialogDescription className="mt-0.5 text-11">Import up to 500 tasks; dependencies become a schedulable DAG.</DialogDescription>
           </div>
           <button onClick={close} aria-label="Close" className="focus-ring ml-auto flex h-8 w-8 items-center justify-center rounded-md text-mut hover:bg-card hover:text-txt">
             <X size={15} />
           </button>
         </div>
 
-        <div className="grid min-h-0 flex-1 gap-5 overflow-y-auto p-5 md:grid-cols-[minmax(0,1fr)_280px]">
+        <div className="grid min-h-0 flex-1 gap-5 overflow-y-auto p-4 lg:grid-cols-[minmax(0,1fr)_280px] lg:p-5">
           <div className="space-y-4">
             <label className="block text-11 font-medium uppercase tracking-[0.08em] text-fnt">
               Start from a playbook
@@ -235,9 +258,9 @@ export function MissionCreateDialog() {
               Outcome
               <textarea value={objective} onChange={(event) => setObjective(event.target.value)} maxLength={3000} rows={3} placeholder="What must be true when this mission is complete?" className="focus-ring mt-1.5 w-full resize-y rounded-md border border-line2 bg-card px-3 py-2 text-13 normal-case leading-relaxed tracking-normal text-txt placeholder:text-fnt" />
             </label>
-            <label className="block text-11 font-medium uppercase tracking-[0.08em] text-fnt">
-              <span className="flex items-center justify-between gap-3">
-                <span>Task list · Markdown, plain text, CSV or JSON</span>
+            <div>
+              <div className="flex items-center justify-between gap-3 text-11 font-medium uppercase tracking-[0.08em] text-fnt">
+                <label htmlFor="mission-task-list">Task list · Markdown, plain text, CSV or JSON</label>
                 <button
                   type="button"
                   onClick={() => setGithubImportOpen((value) => !value)}
@@ -246,9 +269,9 @@ export function MissionCreateDialog() {
                 >
                   <GitBranch size={11} /> {githubImportOpen ? "Hide GitHub" : "Import issues"}
                 </button>
-              </span>
-              <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={12} spellCheck={false} className="focus-ring mt-1.5 w-full resize-y rounded-md border border-line2 bg-bg px-3 py-2 font-mono text-12 normal-case leading-relaxed tracking-normal text-txt" />
-            </label>
+              </div>
+              <textarea id="mission-task-list" value={input} onChange={(event) => setInput(event.target.value)} rows={12} spellCheck={false} className="focus-ring mt-1.5 w-full resize-y rounded-md border border-line2 bg-bg px-3 py-2 font-mono text-12 normal-case leading-relaxed tracking-normal text-txt" />
+            </div>
             {githubImportOpen && (
               <GitHubIssueImportPanel
                 projectDir={activeProjectDir}
@@ -265,7 +288,7 @@ export function MissionCreateDialog() {
           <aside className="space-y-4">
             <div className="border-b border-line pb-4">
               <div className="flex items-center gap-2 text-12 font-semibold text-txt"><FileInput size={14} className="text-acc" /> Intake preview</div>
-              <div className="mt-3 flex items-baseline gap-2"><span className="font-mono text-24 font-semibold text-txt">{parsed.tasks.length}</span><span className="text-12 text-mut">tasks · {parsed.source}</span></div>
+              <div className="mt-3 flex items-baseline gap-2"><span className="font-mono text-16 font-semibold text-txt">{parsed.tasks.length}</span><span className="text-12 text-mut">tasks · {parsed.source}</span></div>
               <p className="mt-1 font-mono text-10 text-fnt">Use label <span className="text-mut">root:project-name</span> in JSON/CSV for multi-root work.</p>
               <div className="mt-2 max-h-36 overflow-y-auto text-11 leading-relaxed text-fnt">
                 {parsed.tasks.slice(0, 8).map((task, index) => <div key={`${task.title}-${index}`} className="truncate py-0.5"><span className="mr-1.5 font-mono text-acc">{index + 1}</span>{task.title}</div>)}
@@ -278,13 +301,33 @@ export function MissionCreateDialog() {
             </label>
             <div className="border-t border-line pt-4">
               <p className="text-11 font-medium uppercase tracking-[0.08em] text-fnt">Execution envelope</p>
-              <div className="mt-2 grid grid-cols-2 gap-2">
+              <label className="mt-2 block text-10 text-fnt">
+                <span className="flex items-center gap-1.5"><Server size={11} /> Runtime Environment</span>
+                <select
+                  value={runtimeEnvironmentId ?? ""}
+                  onChange={(event) => setRuntimeEnvironmentId(event.target.value || null)}
+                  disabled={!runtimeHydrated}
+                  className="focus-ring mt-1 h-8 w-full rounded-md border border-line2 bg-card px-2 font-mono text-10 text-txt disabled:cursor-not-allowed disabled:text-fnt"
+                >
+                  <option value="">None · sandbox only</option>
+                  {runtimeSpecs.map((spec) => (
+                    <option key={spec.id} value={spec.id} disabled={spec.secrets.length > 0}>
+                      {spec.name}{spec.secrets.length > 0 ? " · secrets unavailable to Mission workers" : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="mt-1 text-10 leading-normal text-fnt">
+                The approved spec fingerprint is frozen. Setup and cleanup must be marked retry-safe. Mission workers never receive secret bindings.
+              </p>
+              <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
                 <label className="text-10 text-fnt">Worker network<select value={networkAuthority} disabled className="mt-1 h-8 w-full cursor-not-allowed rounded-md border border-line2 bg-card px-2 font-mono text-10 text-fnt"><option value="deny">Sandbox denied</option></select></label>
                 <label className="text-10 text-fnt">Worker GitHub<select value={githubAuthority} disabled className="mt-1 h-8 w-full cursor-not-allowed rounded-md border border-line2 bg-card px-2 font-mono text-10 text-fnt"><option value="deny">Native gate only</option></select></label>
                 <label className="text-10 text-fnt">Token cap<input value={maxTokens} onChange={(event) => setMaxTokens(event.target.value.replace(/\D/g, ""))} inputMode="numeric" placeholder="unlimited" className="focus-ring mt-1 h-8 w-full rounded-md border border-line2 bg-card px-2 font-mono text-10 text-txt placeholder:text-fnt" /></label>
                 <label className="text-10 text-fnt">Active minutes<input value={maxMinutes} onChange={(event) => setMaxMinutes(event.target.value.replace(/[^0-9.]/g, ""))} inputMode="decimal" placeholder="unlimited" className="focus-ring mt-1 h-8 w-full rounded-md border border-line2 bg-card px-2 font-mono text-10 text-txt placeholder:text-fnt" /></label>
               </div>
-              <label className="mt-3 block text-10 text-fnt">Independent verification commands<textarea value={qualityCommands} onChange={(event) => setQualityCommands(event.target.value)} rows={3} placeholder={"pnpm test\npnpm build"} className="focus-ring mt-1 w-full resize-y rounded-md border border-line2 bg-card px-2 py-1.5 font-mono text-10 leading-relaxed text-txt placeholder:text-fnt" /></label>
+              <label className="mt-3 block text-10 text-fnt">Independent verification commands · one argv command per line<textarea value={qualityCommands} onChange={(event) => setQualityCommands(event.target.value)} rows={3} placeholder={"pnpm test\npnpm build"} className="focus-ring mt-1 w-full resize-y rounded-md border border-line2 bg-card px-2 py-1.5 font-mono text-10 leading-relaxed text-txt placeholder:text-fnt" /></label>
+              <p className="mt-1 text-10 leading-normal text-fnt">Commands run directly without a shell. Operators such as &amp;&amp;, pipes, redirects and substitutions are rejected before activation.</p>
               <p className="mt-2 text-10 leading-normal text-fnt">Autonomous lanes never receive ambient credentials. GitHub mutations stay behind SwarmZ&apos;s native human approval gate.</p>
             </div>
             <p className="text-11 leading-relaxed text-fnt">The scheduler also respects global limits, dependencies, file locks, budgets and quality gates. Workers are temporary execution lanes; only the Orchestrator keeps memory.</p>
@@ -292,13 +335,13 @@ export function MissionCreateDialog() {
           </aside>
         </div>
 
-        <div className="flex shrink-0 items-center gap-3 border-t border-line px-5 py-3">
-          {error && <p role="alert" className="mr-auto text-11 text-err">{error}</p>}
-          {!error && <p className="mr-auto text-11 text-fnt">Your click approves exactly this scope and envelope revision.</p>}
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-line px-4 py-3 lg:px-5">
+          {error && <p role="alert" aria-live="assertive" className="min-w-full flex-1 break-words text-11 text-err sm:min-w-0">{error}</p>}
+          {!error && <p className="min-w-full flex-1 text-11 text-fnt sm:min-w-0">Your click approves exactly this scope and envelope revision.</p>}
           <button onClick={close} className="focus-ring h-8 rounded-md px-3 text-12 text-mut hover:bg-card hover:text-txt">Cancel</button>
           <button onClick={create} disabled={!activeProjectId || parsed.tasks.length === 0 || hydrateStatus !== "ready"} className="focus-ring h-8 rounded-md bg-acc px-4 text-12 font-semibold text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">Approve &amp; start</button>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }

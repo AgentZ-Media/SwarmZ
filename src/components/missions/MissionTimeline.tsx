@@ -23,6 +23,14 @@ const EVENT_LABEL: Record<MissionEvent["type"], string> = {
   "quality_gate.resulted": "Quality gate completed",
   "integration_train.created": "Integration train created",
   "integration_train.updated": "Integration train updated",
+  "candidate_batch.requested": "Candidate run approved",
+  "candidate_batch.selected": "Candidate selected",
+  "candidate_batch.overridden": "Candidate selection overridden",
+  "schedule.created": "Reminder scheduled",
+  "schedule.cancelled": "Reminder cancelled",
+  "schedule.claimed": "Reminder claimed",
+  "schedule.delivery_failed": "Reminder delivery failed",
+  "schedule.fired": "Reminder delivered",
 };
 
 export function MissionTimeline({ missionId }: { missionId: string }) {
@@ -70,11 +78,11 @@ function TimelineRow({ event }: { event: MissionEvent }) {
       <span aria-hidden className="absolute -left-[25px] top-4 h-2 w-2 rounded-full border border-line2 bg-panel" />
       <div className="flex items-center gap-2">
         <span className="text-12 font-medium text-txt">{EVENT_LABEL[event.type]}</span>
-        <span className="rounded-sm border border-line px-1.5 py-0.5 font-mono text-9 uppercase text-fnt">{event.actor}</span>
+        <span className="rounded-sm border border-line px-1.5 py-0.5 font-mono text-10 uppercase text-fnt">{event.actor}</span>
         <time className="ml-auto font-mono text-10 tabular-nums text-fnt">{new Date(event.occurredAt).toLocaleString()}</time>
       </div>
       <p className="mt-1 truncate text-11 text-mut">{taskTitle ?? (event.type.startsWith("mission.") ? "Mission lifecycle" : event.type)}</p>
-      <p className="mt-1 font-mono text-9 text-fnt">revision {event.revision} · {event.eventId}</p>
+      <p className="mt-1 break-all font-mono text-10 text-fnt">revision {event.revision} · {event.eventId}</p>
     </li>
   );
 }

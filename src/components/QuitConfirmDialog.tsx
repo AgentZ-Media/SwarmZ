@@ -37,6 +37,7 @@ export function QuitConfirmDialog() {
   const ghWrites = quitConfirm?.ghWrites ?? 0;
   const reviews = quitConfirm?.reviews ?? 0;
   const worktreeOps = quitConfirm?.worktreeOps ?? 0;
+  const runtimeOps = quitConfirm?.runtimeOps ?? 0;
   const summary = quitConfirm
     ? summarizeBlockers(quitConfirm)
     : "Work is still running — quitting will interrupt it.";
@@ -124,6 +125,18 @@ export function QuitConfirmDialog() {
                 {worktreeOps === 1
                   ? "A worktree operation (git) is running"
                   : `${worktreeOps} worktree operations (git) are running`}
+              </span>
+            </li>
+          )}
+          {runtimeOps !== 0 && (
+            <li className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt">
+              <span className="shrink-0 font-mono leading-none text-err">■</span>
+              <span className="truncate">
+                {runtimeOps < 0
+                  ? "Couldn't verify Runtime Environment processes — one may still be running"
+                  : runtimeOps === 1
+                    ? "A sandboxed Runtime Environment process is running"
+                    : `${runtimeOps} sandboxed Runtime Environment processes are running`}
               </span>
             </li>
           )}

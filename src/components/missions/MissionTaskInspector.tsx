@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import {
   Archive,
   ChevronRight,
@@ -20,6 +20,7 @@ import { openUrl } from "@/lib/transport";
 import { focusSession } from "@/lib/vibe/controller";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { cn } from "@/lib/utils";
+import { CandidateAttemptsPanel } from "./CandidateAttemptsPanel";
 
 export interface MissionTaskInspectorProps {
   className?: string;
@@ -52,20 +53,10 @@ export function MissionTaskInspector({
   const [actionError, setActionError] = useState<string | null>(null);
   const [retryInstruction, setRetryInstruction] = useState("");
   const [extendAttemptLimit, setExtendAttemptLimit] = useState(false);
-  const closeRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     setActionError(null);
     setRetryInstruction("");
     setExtendAttemptLimit(false);
-  }, [selectedTaskId]);
-  useEffect(() => {
-    if (!selectedTaskId) return;
-    closeRef.current?.focus();
-    const close = (event: KeyboardEvent) => {
-      if (event.key === "Escape") useVibeUi.getState().setSelectedMissionTaskId(null);
-    };
-    window.addEventListener("keydown", close);
-    return () => window.removeEventListener("keydown", close);
   }, [selectedTaskId]);
 
   if (hydrateStatus === "failed") {
@@ -195,7 +186,6 @@ export function MissionTaskInspector({
           </div>
         </div>
         <button
-          ref={closeRef}
           type="button"
           onClick={() => useVibeUi.getState().setSelectedMissionTaskId(null)}
           aria-label="Close task inspector"
@@ -304,6 +294,7 @@ export function MissionTaskInspector({
               ))}
             </div>
           )}
+          <CandidateAttemptsPanel taskId={task.id} />
         </InspectorSection>
 
         <div

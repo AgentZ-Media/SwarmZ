@@ -58,6 +58,7 @@ function newCommand(id: string): RuntimeCommandSpec {
     timeoutMs: 120_000,
     maxOutputBytes: 262_144,
     continueOnFailure: false,
+    idempotent: false,
   };
 }
 
@@ -125,8 +126,10 @@ export function RuntimeEnvironmentsPanel({
     [draft],
   );
   const projectServices = useMemo(
-    () => services.filter((service) => !projectDir || service.projectRoot === projectDir),
-    [projectDir, services],
+    () => services.filter((service) =>
+      !projectId || service.ownerProjectId === projectId || service.mainRoot === projectDir,
+    ),
+    [projectDir, projectId, services],
   );
 
   const createEnvironment = async () => {
@@ -198,10 +201,10 @@ export function RuntimeEnvironmentsPanel({
         ) : hydrateError ? (
           <EmptyState text={`Runtime configuration is unavailable: ${hydrateError}`} tone="error" />
         ) : !hydrated ? (
-          <EmptyState text="Loading runtime environments…" />
+          <EmptyState text="Loading runtime environments…" tone="loading" />
         ) : (
-          <div className="flex min-h-0 flex-1">
-            <aside className="flex w-52 shrink-0 flex-col border-r border-line bg-panel">
+          <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
+            <aside className="flex max-h-48 w-full shrink-0 flex-col border-b border-line bg-panel sm:max-h-none sm:w-52 sm:border-b-0 sm:border-r">
               <div className="flex items-center justify-between px-3 py-2.5">
                 <span className="font-mono text-10 uppercase tracking-[.1em] text-fnt">
                   Configurations
@@ -209,7 +212,7 @@ export function RuntimeEnvironmentsPanel({
                 <button
                   onClick={() => void createEnvironment()}
                   className="focus-ring flex h-6 w-6 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-acc"
-                  title="New environment"
+                  aria-label="Create runtime environment"
                 >
                   <Plus size={13} />
                 </button>
@@ -228,6 +231,7 @@ export function RuntimeEnvironmentsPanel({
                     <button
                       key={spec.id}
                       onClick={() => void select(projectId, spec.id)}
+                      aria-pressed={selectedId === spec.id}
                       className={cn(
                         "focus-ring w-full rounded-lg border px-2.5 py-2 text-left",
                         selectedId === spec.id
@@ -250,7 +254,11 @@ export function RuntimeEnvironmentsPanel({
                   refreshing={refreshing}
                   refresh={() => void refreshServices()}
                   stop={async (service) => {
-                    await stopRuntimeService(service.instanceId, service.serviceId);
+                    await stopRuntimeService(
+                      service.instanceId,
+                      service.serviceId,
+                      service.projectRoot,
+                    );
                     await refreshServices();
                   }}
                 />
@@ -284,10 +292,10 @@ export function RuntimeEnvironmentsPanel({
         )}
 
         {draft && projectId && (
-          <div className="flex shrink-0 items-center gap-3 border-t border-line bg-panel px-4 py-2.5">
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-line bg-panel px-4 py-2.5">
             <div className="min-w-0 flex-1">
               {error ? (
-                <p className="truncate text-11 text-err">{error}</p>
+                <p role="alert" aria-live="assertive" className="break-words text-11 text-err">{error}</p>
               ) : validation.valid ? (
                 <p className="flex items-center gap-1.5 text-11 text-ok">
                   <Check size={12} /> Ready to save · no secret values stored
@@ -316,11 +324,15 @@ export function RuntimeEnvironmentsPanel({
   );
 }
 
-function EmptyState({ text, tone }: { text: string; tone?: "error" }) {
+function EmptyState({ text, tone }: { text: string; tone?: "error" | "loading" }) {
   return (
-    <div className="flex min-h-0 flex-1 items-center justify-center p-8">
+    <div
+      role={tone === "error" ? "alert" : tone === "loading" ? "status" : undefined}
+      aria-live={tone ? (tone === "error" ? "assertive" : "polite") : undefined}
+      className="flex min-h-0 flex-1 items-center justify-center p-8"
+    >
       <div className="max-w-sm text-center">
-        <Box size={24} className={cn("mx-auto mb-3", tone === "error" ? "text-err" : "text-fnt")} />
+        <Box size={24} className={cn("mx-auto mb-3", tone === "error" ? "text-err" : "text-fnt")} aria-hidden />
         <p className={cn("text-12", tone === "error" ? "text-err" : "text-fnt")}>{text}</p>
       </div>
     </div>
@@ -352,14 +364,14 @@ function IdentityEditor({ draft, update, idLocked }: { draft: RuntimeEnvironment
   return (
     <section className="space-y-3">
       <SectionTitle icon={<Box size={14} />} title="Environment" detail="A reusable, project-scoped runtime contract for Mission attempts." />
-      <div className="grid grid-cols-2 gap-3 rounded-xl border border-line bg-card p-3">
+      <div className="grid grid-cols-1 gap-3 rounded-xl border border-line bg-card p-3 sm:grid-cols-2">
         <Field label="Display name">
           <input className={inputClass} value={draft.name} onChange={(event) => update({ ...draft, name: event.target.value })} />
         </Field>
         <Field label="Stable ID">
           <input className={inputClass} value={draft.id} disabled={idLocked} title={idLocked ? "Stable after creation" : undefined} onChange={(event) => update({ ...draft, id: event.target.value })} />
         </Field>
-        <div className="col-span-2">
+        <div className="sm:col-span-2">
           <Field label="Database namespace prefix">
             <div className="relative">
               <Database size={12} className="absolute left-2.5 top-2.5 text-fnt" />
@@ -431,7 +443,7 @@ function CommandEditor({ command, onChange, remove }: { command: RuntimeCommandS
           onChange={(event) => onChange({ ...command, argv: event.target.value.split("\n") })}
         />
       </Field>
-      <div className="mt-3 grid grid-cols-3 gap-2">
+      <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
         <Field label="Relative cwd">
           <input className={inputClass} value={command.cwdRelative} onChange={(event) => onChange({ ...command, cwdRelative: event.target.value })} />
         </Field>
@@ -442,10 +454,16 @@ function CommandEditor({ command, onChange, remove }: { command: RuntimeCommandS
           <input className={inputClass} type="number" value={command.maxOutputBytes} onChange={(event) => onChange({ ...command, maxOutputBytes: Number(event.target.value) })} />
         </Field>
       </div>
-      <label className="mt-3 flex items-center gap-2 text-11 text-mut">
-        <input type="checkbox" checked={command.continueOnFailure} onChange={(event) => onChange({ ...command, continueOnFailure: event.target.checked })} />
-        Continue after failure
-      </label>
+      <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2">
+        <label className="flex items-center gap-2 text-11 text-mut">
+          <input type="checkbox" checked={command.continueOnFailure} onChange={(event) => onChange({ ...command, continueOnFailure: event.target.checked })} />
+          Continue after failure
+        </label>
+        <label className="flex items-center gap-2 text-11 text-mut" title="Required for Mission setup and cleanup so crash recovery may safely retry the exact command.">
+          <input type="checkbox" checked={command.idempotent === true} onChange={(event) => onChange({ ...command, idempotent: event.target.checked })} />
+          Safe to retry after crash
+        </label>
+      </div>
     </div>
   );
 }
@@ -462,10 +480,10 @@ function ServicesEditor({ draft, update }: { draft: RuntimeEnvironmentSpec; upda
       </div>
       {draft.services.map((service, index) => (
         <div key={`${service.id}:${index}`} className="rounded-xl border border-line bg-card p-3">
-          <div className="grid grid-cols-[1fr_1fr_32px] gap-2">
-            <input className={inputClass} value={service.label} placeholder="API" onChange={(event) => change(draft.services.map((item, i) => (i === index ? { ...service, label: event.target.value } : item)))} />
-            <input className={inputClass} value={service.id} placeholder="api" onChange={(event) => change(draft.services.map((item, i) => (i === index ? { ...service, id: event.target.value } : item)))} />
-            <button className="focus-ring flex h-8 w-8 items-center justify-center rounded-md text-fnt hover:bg-err/10 hover:text-err" onClick={() => change(draft.services.filter((_, i) => i !== index))}>
+          <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_32px] gap-2">
+            <input aria-label={`Service ${index + 1} label`} className={inputClass} value={service.label} placeholder="API" onChange={(event) => change(draft.services.map((item, i) => (i === index ? { ...service, label: event.target.value } : item)))} />
+            <input aria-label={`Service ${index + 1} stable ID`} className={inputClass} value={service.id} placeholder="api" onChange={(event) => change(draft.services.map((item, i) => (i === index ? { ...service, id: event.target.value } : item)))} />
+            <button aria-label={`Remove service ${service.label || index + 1}`} className="focus-ring flex h-8 w-8 items-center justify-center rounded-md text-fnt hover:bg-err/10 hover:text-err" onClick={() => change(draft.services.filter((_, i) => i !== index))}>
               <Trash2 size={12} />
             </button>
           </div>
@@ -489,12 +507,14 @@ function ServicesEditor({ draft, update }: { draft: RuntimeEnvironmentSpec; upda
             {service.ports.map((port, portIndex) => (
               <div key={`${port.env}:${portIndex}`} className="grid grid-cols-[1fr_1fr_32px] gap-2">
                 <input
+                  aria-label={`Port ${portIndex + 1} environment variable`}
                   className={inputClass}
                   value={port.env}
                   placeholder="API_PORT"
                   onChange={(event) => change(draft.services.map((item, i) => i === index ? { ...service, ports: service.ports.map((entry, j) => j === portIndex ? { ...entry, env: event.target.value } : entry) } : item))}
                 />
                 <input
+                  aria-label={`Port ${portIndex + 1} preferred port`}
                   className={inputClass}
                   type="number"
                   value={port.preferred ?? ""}
@@ -534,17 +554,17 @@ function SecretsEditor({ draft, update }: { draft: RuntimeEnvironmentSpec; updat
         </Button>
       </div>
       {draft.secrets.map((secret, index) => (
-        <div key={`${secret.targetEnv}:${index}`} className="grid grid-cols-[1fr_120px_1.4fr_32px] gap-2 rounded-xl border border-line bg-card p-3">
-          <input className={inputClass} value={secret.targetEnv} placeholder="TARGET_ENV" onChange={(event) => change(draft.secrets.map((item, i) => (i === index ? { ...secret, targetEnv: event.target.value } : item)))} />
-          <select className={inputClass} value={secret.source} onChange={(event) => change(draft.secrets.map((item, i) => (i === index ? { ...secret, source: event.target.value as RuntimeSecretBinding["source"] } : item)))}>
+        <div key={`${secret.targetEnv}:${index}`} className="grid grid-cols-[minmax(0,1fr)_32px] gap-2 rounded-xl border border-line bg-card p-3 sm:grid-cols-[1fr_120px_1.4fr_32px]">
+          <input aria-label={`Secret ${index + 1} target environment variable`} className={inputClass} value={secret.targetEnv} placeholder="TARGET_ENV" onChange={(event) => change(draft.secrets.map((item, i) => (i === index ? { ...secret, targetEnv: event.target.value } : item)))} />
+          <select aria-label={`Secret ${index + 1} source type`} className={`${inputClass} max-sm:col-start-1`} value={secret.source} onChange={(event) => change(draft.secrets.map((item, i) => (i === index ? { ...secret, source: event.target.value as RuntimeSecretBinding["source"] } : item)))}>
             <option value="host_env">Host env</option>
             <option value="keychain">Keychain</option>
           </select>
-          <input className={inputClass} value={secret.sourceKey} placeholder={secret.source === "host_env" ? "HOST_API_TOKEN" : "swarmz/api-token"} onChange={(event) => change(draft.secrets.map((item, i) => (i === index ? { ...secret, sourceKey: event.target.value } : item)))} />
-          <button className="focus-ring flex h-8 w-8 items-center justify-center rounded-md text-fnt hover:bg-err/10 hover:text-err" onClick={() => change(draft.secrets.filter((_, i) => i !== index))}>
+          <input aria-label={`Secret ${index + 1} source key`} className={`${inputClass} max-sm:col-start-1`} value={secret.sourceKey} placeholder={secret.source === "host_env" ? "HOST_API_TOKEN" : "swarmz/api-token"} onChange={(event) => change(draft.secrets.map((item, i) => (i === index ? { ...secret, sourceKey: event.target.value } : item)))} />
+          <button aria-label={`Remove secret reference ${secret.targetEnv || index + 1}`} className="focus-ring flex h-8 w-8 max-sm:col-start-2 max-sm:row-start-1 items-center justify-center rounded-md text-fnt hover:bg-err/10 hover:text-err" onClick={() => change(draft.secrets.filter((_, i) => i !== index))}>
             <Trash2 size={12} />
           </button>
-          <label className="col-span-4 flex items-center gap-2 text-11 text-mut">
+          <label className="col-span-2 flex items-center gap-2 text-11 text-mut sm:col-span-4">
             <input type="checkbox" checked={secret.required} onChange={(event) => change(draft.secrets.map((item, i) => (i === index ? { ...secret, required: event.target.checked } : item)))} />
             Required before runtime start
           </label>
@@ -571,13 +591,14 @@ function LiveServices({ services, refreshing, refresh, stop }: { services: Runti
           {services.map((service) => (
             <div key={`${service.instanceId}:${service.serviceId}`} className="rounded-md border border-line bg-card p-2">
               <div className="flex items-center gap-1.5">
-                <span className={cn("h-1.5 w-1.5 rounded-full", service.state === "running" ? "bg-ok" : service.state === "orphaned" ? "bg-warn" : "bg-fnt")} />
+                <span className={cn("h-1.5 w-1.5 rounded-full", service.state === "running" ? "bg-ok" : service.state === "orphaned" ? "bg-warn" : "bg-fnt")} aria-hidden />
+                <span className="sr-only">{service.state}</span>
                 <span className="min-w-0 flex-1 truncate font-mono text-10 text-mut">{service.serviceId}</span>
                 <button className="focus-ring text-fnt hover:text-err" onClick={() => void stop(service)} aria-label={`Stop ${service.serviceId}`}>
                   <Square size={10} />
                 </button>
               </div>
-              <div className="mt-1 truncate font-mono text-9 text-fnt">
+              <div className="mt-1 truncate font-mono text-10 text-fnt">
                 {Object.entries(service.ports).map(([name, port]) => `${name}=${port}`).join(" · ") || service.state}
               </div>
             </div>

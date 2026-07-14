@@ -88,9 +88,9 @@ function TaskRow({ task }: { task: MissionTask }) {
       <div className="flex items-start gap-2">
         <span aria-hidden className={cn("mt-0.5 w-3 shrink-0 font-mono text-10", status.color)}>{status.shape}</span>
         <span className="line-clamp-2 text-11 font-medium leading-[1.35] text-txt">{task.title}</span>
-        <span className={cn("ml-auto shrink-0 font-mono text-9", task.priority >= 80 ? "text-attn" : "text-fnt")}>P{Math.max(0, Math.min(3, 3 - Math.floor(task.priority / 26)))}</span>
+        <span className={cn("ml-auto shrink-0 font-mono text-10", task.priority >= 80 ? "text-attn" : "text-fnt")}>P{Math.max(0, Math.min(3, 3 - Math.floor(task.priority / 26)))}</span>
       </div>
-      <div className="mt-2 flex items-center gap-2 pl-5 font-mono text-9 text-fnt">
+      <div className="mt-2 flex items-center gap-2 pl-5 font-mono text-10 text-fnt">
         <span className={status.color}>{status.label}</span>
         {task.dependencyIds.length > 0 && <span title={`${task.dependencyIds.length} dependencies`} className="flex items-center gap-0.5"><GitBranch size={9} />{task.dependencyIds.length}</span>}
         {task.qualityGateIds.length > 0 && <span title="Quality gates" className={cn("flex items-center gap-0.5", gatePassed ? "text-ok" : "text-fnt")}><ShieldCheck size={9} />{task.qualityGateIds.length}</span>}
