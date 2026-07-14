@@ -2,17 +2,21 @@
 // (timer fires + routine-approval escalations — the Phase-5 event loop will
 // build on this same seam). Pure module, unit-tested.
 //
-// Why a HARD cap: every autonomous approval decision resumes the agent's
+// Why a DEFAULT-ON cap: every autonomous approval decision resumes the agent's
 // turn, which can raise the next approval, which escalates into the next
 // autonomous turn — a prompt-injected agent could keep that loop spinning
 // forever (e.g. endless `git fetch` requests). The per-approval dedupe and
 // the 5-second gap in controller.ts only slow such a cascade down; this
 // registry CAPS it per project:
 //
-//   MAX_CONSECUTIVE_AUTONOMOUS_TURNS (5) — autonomous turns since the last
+//   MAX_CONSECUTIVE_AUTONOMOUS_TURNS (5 by default) — autonomous turns since the last
 //     HUMAN message in the project (the cascade-depth / lineage cap)
-//   MAX_AUTONOMOUS_TURNS_PER_WINDOW (20) per AUTONOMY_WINDOW_MS (1 h) —
+//   MAX_AUTONOMOUS_TURNS_PER_WINDOW (20 by default) per AUTONOMY_WINDOW_MS (1 h) —
 //     the rolling-rate cap, human activity or not
+//
+// Both limits and the master switch are human-owned app settings. Disabling
+// the budget explicitly clears the counters/latches and bypasses accounting;
+// enabling it again starts from a clean budget with the configured limits.
 //
 // Exhausting either cap TRIPS the breaker: it latches until a human sends a
 // message in the project ("nach Erschöpfung MUSS ein Mensch fortsetzen").
@@ -40,6 +44,23 @@ export const AUTONOMY_WINDOW_MS = 60 * 60 * 1000;
 export const MAX_AUTONOMOUS_TURNS_PER_WINDOW = 20;
 /** Max autonomous turns per project since the last human message. */
 export const MAX_CONSECUTIVE_AUTONOMOUS_TURNS = 5;
+/** Settings bounds: enough headroom for deliberate high-volume use; OFF is unlimited. */
+export const MIN_AUTONOMY_BUDGET_LIMIT = 1;
+export const MAX_AUTONOMY_BUDGET_LIMIT = 1000;
+
+export interface AutonomyBudgetConfig {
+  enabled: boolean;
+  maxConsecutive: number;
+  maxPerHour: number;
+}
+
+const DEFAULT_AUTONOMY_BUDGET_CONFIG: AutonomyBudgetConfig = {
+  enabled: true,
+  maxConsecutive: MAX_CONSECUTIVE_AUTONOMOUS_TURNS,
+  maxPerHour: MAX_AUTONOMOUS_TURNS_PER_WINDOW,
+};
+
+let autonomyBudgetConfig = { ...DEFAULT_AUTONOMY_BUDGET_CONFIG };
 
 interface ProjectBudget {
   /** fire timestamps inside the rolling window (pruned on every check) */
@@ -63,6 +84,7 @@ let budgetsUnavailable = false;
 
 /** Latch autonomy off globally after a persisted-budget read failure. */
 export function latchAutonomyUnavailable(): void {
+  if (!autonomyBudgetConfig.enabled) return;
   if (budgetsUnavailable) return;
   budgetsUnavailable = true;
   notifyAutonomyChange();
@@ -114,6 +136,7 @@ export function registerAutonomyPersist(
 /** Durably persist a just-booked reservation before its autonomous side
  * effect starts. Store wiring remains outside this pure budget module. */
 export async function persistAutonomyReservation(): Promise<boolean> {
+  if (!autonomyBudgetConfig.enabled) return true;
   await flushPersistSink?.();
   return !budgetsUnavailable;
 }
@@ -124,6 +147,75 @@ function markDirty(): void {
   } catch {
     /* a broken sink never breaks the budget */
   }
+}
+
+/** Sanitize persisted/user-entered limits at the pure budget boundary. */
+export function normalizeAutonomyBudgetLimit(
+  value: unknown,
+  fallback: number,
+): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.min(
+    MAX_AUTONOMY_BUDGET_LIMIT,
+    Math.max(MIN_AUTONOMY_BUDGET_LIMIT, Math.floor(value)),
+  );
+}
+
+/**
+ * Apply the human-owned settings snapshot. Missing/invalid fields retain the
+ * safe 5/20 defaults. Turning the budget off is an explicit reset: stale
+ * counters, trips and a prior unavailable latch must not reappear when it is
+ * enabled again. Changing a limit re-evaluates existing counters on the next
+ * check instead of leaving an obsolete trip latched.
+ */
+export function configureAutonomyBudget(
+  config: Partial<AutonomyBudgetConfig>,
+): void {
+  const next: AutonomyBudgetConfig = {
+    enabled: config.enabled !== false,
+    maxConsecutive: normalizeAutonomyBudgetLimit(
+      config.maxConsecutive,
+      MAX_CONSECUTIVE_AUTONOMOUS_TURNS,
+    ),
+    maxPerHour: normalizeAutonomyBudgetLimit(
+      config.maxPerHour,
+      MAX_AUTONOMOUS_TURNS_PER_WINDOW,
+    ),
+  };
+  const previous = autonomyBudgetConfig;
+  const enabledChanged = previous.enabled !== next.enabled;
+  const limitsChanged =
+    previous.maxConsecutive !== next.maxConsecutive ||
+    previous.maxPerHour !== next.maxPerHour;
+  autonomyBudgetConfig = next;
+
+  if (!next.enabled) {
+    if (enabledChanged || budgets.size > 0 || budgetsUnavailable) {
+      budgets.clear();
+      budgetsUnavailable = false;
+      notifyAutonomyChange();
+      markDirty();
+    }
+    return;
+  }
+
+  if (previous.enabled && limitsChanged) {
+    let rearmed = false;
+    for (const budget of budgets.values()) {
+      if (!budget.tripped) continue;
+      budget.tripped = false;
+      rearmed = true;
+    }
+    if (rearmed) {
+      notifyAutonomyChange();
+      markDirty();
+    }
+  }
+}
+
+/** Current normalized configuration (a copy; callers cannot mutate it). */
+export function getAutonomyBudgetConfig(): AutonomyBudgetConfig {
+  return { ...autonomyBudgetConfig };
 }
 
 function budgetOf(projectId: string): ProjectBudget {
@@ -157,6 +249,7 @@ export function checkAutonomyBudget(
   projectId: string,
   now: number = Date.now(),
 ): AutonomyVerdict {
+  if (!autonomyBudgetConfig.enabled) return { ok: true };
   // fail-closed: a persisted-budget read failure pauses autonomy everywhere
   // until a human message clears it (we don't know what breakers were tripped)
   if (budgetsUnavailable) {
@@ -176,24 +269,24 @@ export function checkAutonomyBudget(
       reason: "the autonomy circuit breaker is open — a human message resets it",
     };
   }
-  if (b.consecutive >= MAX_CONSECUTIVE_AUTONOMOUS_TURNS) {
+  if (b.consecutive >= autonomyBudgetConfig.maxConsecutive) {
     b.tripped = true;
     notifyAutonomyChange();
     markDirty();
     return {
       ok: false,
       freshTrip: true,
-      reason: `${b.consecutive} autonomous turns ran since your last message (cap ${MAX_CONSECUTIVE_AUTONOMOUS_TURNS})`,
+      reason: `${b.consecutive} autonomous turns ran since your last message (cap ${autonomyBudgetConfig.maxConsecutive})`,
     };
   }
-  if (b.firedAt.length >= MAX_AUTONOMOUS_TURNS_PER_WINDOW) {
+  if (b.firedAt.length >= autonomyBudgetConfig.maxPerHour) {
     b.tripped = true;
     notifyAutonomyChange();
     markDirty();
     return {
       ok: false,
       freshTrip: true,
-      reason: `${b.firedAt.length} autonomous turns ran within the last hour (cap ${MAX_AUTONOMOUS_TURNS_PER_WINDOW})`,
+      reason: `${b.firedAt.length} autonomous turns ran within the last hour (cap ${autonomyBudgetConfig.maxPerHour})`,
     };
   }
   return { ok: true };
@@ -210,6 +303,7 @@ export function noteAutonomousTurn(
   projectId: string,
   now: number = Date.now(),
 ): void {
+  if (!autonomyBudgetConfig.enabled) return;
   const b = budgetOf(projectId);
   prune(b, now);
   b.firedAt.push(now);
@@ -223,6 +317,7 @@ export function noteAutonomousTurn(
  * `at` is the timestamp the reservation was made with.
  */
 export function releaseAutonomousTurn(projectId: string, at: number): void {
+  if (!autonomyBudgetConfig.enabled) return;
   const b = budgets.get(projectId);
   if (!b) return;
   const idx = b.firedAt.lastIndexOf(at);
@@ -256,6 +351,7 @@ export function noteHumanTurn(projectId: string): void {
  * indicator still dark. Either state means "autonomy is not running here".
  */
 export function autonomyTripped(projectId: string): boolean {
+  if (!autonomyBudgetConfig.enabled) return false;
   if (budgetsUnavailable) return true;
   return budgets.get(projectId)?.tripped ?? false;
 }
@@ -272,6 +368,7 @@ export function serializeAutonomyBudgets(
   now: number = Date.now(),
 ): PersistedAutonomyBudgets {
   const projects: Record<string, PersistedAutonomyBudget> = {};
+  if (!autonomyBudgetConfig.enabled) return { version: 1, projects };
   for (const [projectId, b] of budgets) {
     prune(b, now);
     if (!b.tripped && b.consecutive === 0 && b.firedAt.length === 0) continue;
@@ -354,6 +451,10 @@ export function hydrateAutonomyBudgets(
   data: unknown,
   now: number = Date.now(),
 ): void {
+  if (!autonomyBudgetConfig.enabled) {
+    if (data !== null && data !== undefined) markDirty();
+    return;
+  }
   // genuinely absent — fresh install, no restriction
   if (data === null || data === undefined) return;
   // present but not the expected envelope → fail closed
@@ -390,5 +491,6 @@ export function hydrateAutonomyBudgets(
 export function resetAutonomyBudgets(): void {
   budgets.clear();
   budgetsUnavailable = false;
+  autonomyBudgetConfig = { ...DEFAULT_AUTONOMY_BUDGET_CONFIG };
   notifyAutonomyChange();
 }

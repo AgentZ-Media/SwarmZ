@@ -476,7 +476,9 @@ function ApprovalRow({
         <div
           className={cn(
             "flex items-center gap-1.5 border-t border-line px-3 py-1.5 font-mono text-11",
-            item.status === "accepted" || item.status === "acceptedForSession"
+            item.status === "accepted" ||
+              item.status === "acceptedForSession" ||
+              item.status === "acceptedAlways"
               ? "text-ok"
               : "text-fnt",
           )}
@@ -492,6 +494,22 @@ function ApprovalRow({
               ⟐ Orchestrator{item.escalation === "routine" ? " · routine" : ""}
             </span>
           )}
+          {item.decidedBy === "rule" && (
+            <span
+              className="ml-auto shrink-0 rounded-sm border border-ok/35 bg-ok/10 px-1.5 py-px text-10 text-ok"
+              title="Approved automatically by a persistent command rule you created in Settings."
+            >
+              always allowed
+            </span>
+          )}
+          {item.decidedBy === "lanePolicy" && (
+            <span
+              className="ml-auto shrink-0 rounded-sm border border-acc/35 bg-acc/10 px-1.5 py-px text-10 text-acc"
+              title="Approved by the branch-scoped Commit/Push policy for this Orchestrator worktree."
+            >
+              lane Git policy
+            </span>
+          )}
         </div>
       )}
     </div>
@@ -504,6 +522,8 @@ function resolvedLabel(status: string): string {
       return "✓ approved";
     case "acceptedForSession":
       return "✓ approved for the session";
+    case "acceptedAlways":
+      return "✓ always allowed";
     case "declined":
       return "× declined";
     case "cancelled":

@@ -253,6 +253,7 @@ export const githubExecutors: ExecutorFamily<GithubTool> = {
     const base = detail.base_ref || "main";
     const result = await reviewSession(entry.session.id, `branch:${base}`, {
       requireWorkspace: true,
+      source: "github",
     });
     const reviewText =
       result.review ?? "(the review returned no findings text)";

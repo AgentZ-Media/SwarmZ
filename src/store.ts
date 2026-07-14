@@ -26,7 +26,14 @@ import {
   planSchemaMigration,
 } from "@/lib/schema-version";
 import { createPersistenceCoordinator } from "@/lib/persistence/coordinator";
+import {
+  MAX_APPROVAL_RULES,
+  normalizeApprovalRules,
+  syncNativeApprovalRules,
+  validApprovalPattern,
+} from "@/lib/approval-rules";
 import type {
+  ApprovalRule,
   AppSettings,
   NoteItem,
   QuickNotesData,
@@ -56,11 +63,16 @@ import {
   hydrateConductorTimers,
 } from "@/lib/orchestrator/timers";
 import {
+  configureAutonomyBudget,
   hydrateAutonomyBudgets,
   latchAutonomyUnavailable,
   registerAutonomyPersist,
   serializeAutonomyBudgets,
 } from "@/lib/orchestrator/autonomy";
+import {
+  normalizeReviewIterationCounters,
+  normalizeReviewIterationLimit,
+} from "@/lib/orchestrator/review-policy";
 import {
   flushMissionsPersist,
   hydrateMissions,
@@ -73,6 +85,14 @@ import {
   flushRuntimeEnvironmentsPersist,
   hydrateRuntimeEnvironments,
 } from "@/lib/runtime/store";
+
+function applyAutonomySettings(settings: AppSettings): void {
+  configureAutonomyBudget({
+    enabled: settings.autonomyBudgetEnabled !== false,
+    maxConsecutive: settings.autonomyMaxConsecutiveTurns,
+    maxPerHour: settings.autonomyMaxTurnsPerHour,
+  });
+}
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
@@ -179,6 +199,15 @@ function persistSettings(): void {
   settingsPersistence.schedule();
 }
 
+const activeReviewLanes = new Set<string>();
+let approvalRuleWriteQueue: Promise<void> = Promise.resolve();
+
+function enqueueApprovalRuleWrite(write: () => Promise<void>): Promise<void> {
+  const next = approvalRuleWriteQueue.then(write, write);
+  approvalRuleWriteQueue = next.catch(() => undefined);
+  return next;
+}
+
 const quickNotesPersistence = createPersistenceCoordinator({
   name: "quickNotes",
   debounceMs: 0,
@@ -271,6 +300,17 @@ export interface SwarmState {
 
   /** merge + persist app preferences (Settings dialog) */
   updateSettings: (patch: Partial<AppSettings>) => void;
+  /** Native-first update for security-sensitive persistent command rules. */
+  setApprovalRules: (rules: ApprovalRule[]) => Promise<void>;
+  addApprovalRule: (pattern: string[]) => Promise<void>;
+  updateApprovalRule: (id: string, pattern: string[]) => Promise<void>;
+  removeApprovalRule: (id: string) => Promise<void>;
+  /** Durable counter + transient single-flight claim for one feature lane. */
+  claimReviewIteration: (
+    laneKey: string,
+    maxIterations: number,
+  ) => { allowed: boolean; count: number; reason?: "active" | "limit" };
+  releaseReviewIteration: (laneKey: string) => void;
 
   /** open/close the quit warning (running-work blockers; null = dismissed) */
   setQuitConfirm: (blockers: QuitBlockers | null) => void;
@@ -360,11 +400,21 @@ export const useSwarm = create<SwarmState>((set, get) => ({
         const currentSettings = migrated.settings as AppSettings;
         // Ultra is a multi-agent mode, not a single-turn effort in SwarmZ.
         // Drop stale persisted values before they can reach a chat/session.
+        const normalizedSettings: AppSettings = {
+          ...currentSettings,
+          approvalRules: normalizeApprovalRules(currentSettings.approvalRules),
+          reviewIterationCounts: normalizeReviewIterationCounters(
+            currentSettings.reviewIterationCounts,
+          ),
+        };
         const safeSettings =
-          currentSettings.orchestratorCodexEffort?.trim().toLowerCase() ===
+          normalizedSettings.orchestratorCodexEffort?.trim().toLowerCase() ===
           "ultra"
-            ? { ...currentSettings, orchestratorCodexEffort: undefined }
-            : currentSettings;
+            ? { ...normalizedSettings, orchestratorCodexEffort: undefined }
+            : normalizedSettings;
+        applyAutonomySettings(safeSettings);
+        if (IS_TAURI)
+          await syncNativeApprovalRules(safeSettings.approvalRules ?? []);
         set({ settings: safeSettings });
         settingsPersistence.hydrationSucceeded();
         // Schema v3 removes the obsolete persona payload durably while
@@ -482,9 +532,114 @@ export const useSwarm = create<SwarmState>((set, get) => ({
   },
 
   updateSettings: (patch) => {
-    const settings = { ...get().settings, ...patch };
+    const { approvalRules, ...ordinaryPatch } = patch;
+    if (approvalRules !== undefined) {
+      void get()
+        .setApprovalRules(approvalRules)
+        .catch((error) =>
+          console.error("[approvals] failed to update persistent rules:", error),
+        );
+    }
+    const settings = {
+      ...get().settings,
+      ...ordinaryPatch,
+    };
+    applyAutonomySettings(settings);
     set({ settings });
     void persistSettings();
+  },
+
+  setApprovalRules: (rules) =>
+    enqueueApprovalRuleWrite(async () => {
+      const approvalRules = normalizeApprovalRules(rules);
+      if (IS_TAURI) await syncNativeApprovalRules(approvalRules);
+      set({ settings: { ...get().settings, approvalRules } });
+      persistSettings();
+    }),
+
+  addApprovalRule: (pattern) =>
+    enqueueApprovalRuleWrite(async () => {
+      if (!validApprovalPattern(pattern))
+        throw new Error("the persistent command rule is malformed");
+      const current = normalizeApprovalRules(get().settings.approvalRules);
+      const key = JSON.stringify(pattern);
+      if (current.some((rule) => JSON.stringify(rule.pattern) === key)) return;
+      if (current.length >= MAX_APPROVAL_RULES) {
+        throw new Error(
+          `the ${MAX_APPROVAL_RULES}-rule limit is reached; delete or edit a rule in Settings first`,
+        );
+      }
+      const approvalRules = [
+        ...current,
+        { id: nanoid(12), pattern: [...pattern], createdAt: Date.now() },
+      ];
+      if (IS_TAURI) await syncNativeApprovalRules(approvalRules);
+      set({ settings: { ...get().settings, approvalRules } });
+      persistSettings();
+    }),
+
+  updateApprovalRule: (id, pattern) =>
+    enqueueApprovalRuleWrite(async () => {
+      if (!validApprovalPattern(pattern))
+        throw new Error("the persistent command rule is malformed");
+      const current = normalizeApprovalRules(get().settings.approvalRules);
+      if (!current.some((rule) => rule.id === id))
+        throw new Error("the command rule no longer exists");
+      const key = JSON.stringify(pattern);
+      if (
+        current.some(
+          (rule) => rule.id !== id && JSON.stringify(rule.pattern) === key,
+        )
+      )
+        throw new Error("an identical command rule already exists");
+      const approvalRules = current.map((rule) =>
+        rule.id === id ? { ...rule, pattern: [...pattern] } : rule,
+      );
+      if (IS_TAURI) await syncNativeApprovalRules(approvalRules);
+      set({ settings: { ...get().settings, approvalRules } });
+      persistSettings();
+    }),
+
+  removeApprovalRule: (id) =>
+    enqueueApprovalRuleWrite(async () => {
+      const current = normalizeApprovalRules(get().settings.approvalRules);
+      const approvalRules = current.filter((rule) => rule.id !== id);
+      if (approvalRules.length === current.length) return;
+      if (IS_TAURI) await syncNativeApprovalRules(approvalRules);
+      set({ settings: { ...get().settings, approvalRules } });
+      persistSettings();
+    }),
+
+  claimReviewIteration: (laneKey, rawMaxIterations) => {
+    const maxIterations = normalizeReviewIterationLimit(rawMaxIterations);
+    const counters = normalizeReviewIterationCounters(
+      get().settings.reviewIterationCounts,
+    );
+    const current =
+      counters.find((counter) => counter.laneKey === laneKey)?.count ?? 0;
+    if (activeReviewLanes.has(laneKey)) {
+      return { allowed: false, count: current, reason: "active" };
+    }
+    if (current >= maxIterations) {
+      return { allowed: false, count: current, reason: "limit" };
+    }
+    activeReviewLanes.add(laneKey);
+    const next = [
+      { laneKey, count: current + 1, updatedAt: Date.now() },
+      ...counters.filter((counter) => counter.laneKey !== laneKey),
+    ];
+    set({
+      settings: {
+        ...get().settings,
+        reviewIterationCounts: normalizeReviewIterationCounters(next),
+      },
+    });
+    persistSettings();
+    return { allowed: true, count: current + 1 };
+  },
+
+  releaseReviewIteration: (laneKey) => {
+    activeReviewLanes.delete(laneKey);
   },
 
   setQuitConfirm: (blockers) => set({ quitConfirm: blockers }),

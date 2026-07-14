@@ -50,19 +50,24 @@ export function SettingsToggleCard({
   sub,
   checked,
   onChange,
+  children,
 }: {
   title: string;
   sub: string;
   checked: boolean;
   onChange: (value: boolean) => void;
+  children?: ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 rounded-lg border border-line bg-card p-3">
-      <div className="min-w-0">
-        <div className="text-13 font-medium text-txt">{title}</div>
-        <div className="mt-0.5 text-11 leading-relaxed text-fnt">{sub}</div>
+    <div className="rounded-lg border border-line bg-card p-3">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-13 font-medium text-txt">{title}</div>
+          <div className="mt-0.5 text-11 leading-relaxed text-fnt">{sub}</div>
+        </div>
+        <Switch checked={checked} onCheckedChange={onChange} label={title} />
       </div>
-      <Switch checked={checked} onCheckedChange={onChange} label={title} />
+      {children}
     </div>
   );
 }

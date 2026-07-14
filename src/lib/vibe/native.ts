@@ -88,6 +88,13 @@ export function setNativeSessionAccess(
   return invoke("vibe_session_set_access", { sessionId, access });
 }
 
+export function setNativeSessionLaneGit(
+  sessionId: string,
+  branch: string | null,
+): Promise<void> {
+  return invoke("vibe_session_set_lane_git", { sessionId, branch });
+}
+
 export function setNativeSessionModelEffort(
   sessionId: string,
   model: string | undefined,
@@ -130,6 +137,7 @@ export function setNativeSessionCwd(
 export function reviewNativeSession(
   sessionId: string,
   target: string,
+  reviewLaneId: string,
   requireWorkspace?: boolean,
 ): Promise<{
   status: string;
@@ -139,6 +147,7 @@ export function reviewNativeSession(
   return invoke("vibe_session_review", {
     sessionId,
     target,
+    reviewLaneId,
     requireWorkspace: requireWorkspace ?? false,
   });
 }

@@ -34,9 +34,11 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot};
 
+use super::approval::lane_git_action;
 use super::host::{self, Connection, EventSink, ProcessHost, Responder, ThreadEvent};
 
 /// commandExecution `aggregatedOutput` is capped before it crosses to the
@@ -184,6 +186,157 @@ struct PendingApproval {
 static SESSIONS: Lazy<Mutex<HashMap<String, SessionState>>> = Lazy::new(Mutex::default);
 
 static APPROVAL_SEQ: AtomicU64 = AtomicU64::new(0);
+static APPROVAL_RULES: Lazy<Mutex<Vec<Vec<String>>>> = Lazy::new(Mutex::default);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LaneGitGrant {
+    cwd: PathBuf,
+    git_dir: PathBuf,
+    branch: String,
+}
+
+static LANE_GIT_GRANTS: Lazy<Mutex<HashMap<String, LaneGitGrant>>> = Lazy::new(Mutex::default);
+
+const MAX_APPROVAL_RULES: usize = 64;
+const MAX_APPROVAL_RULE_TOKENS: usize = 24;
+const MAX_APPROVAL_RULE_TOKEN_BYTES: usize = 256;
+
+fn validate_approval_rule(pattern: &[String]) -> bool {
+    !pattern.is_empty()
+        && pattern.len() <= MAX_APPROVAL_RULE_TOKENS
+        && pattern.iter().all(|token| {
+            !token.is_empty()
+                && token.len() <= MAX_APPROVAL_RULE_TOKEN_BYTES
+                && !token.chars().any(char::is_control)
+        })
+}
+
+/// Replace the SwarmZ-scoped persistent command rules mirrored from Settings.
+/// Codex remains responsible for proposing the token prefix; Rust accepts only
+/// bounded exact arrays and matches those arrays at approval arrival.
+pub fn set_approval_rules(mut rules: Vec<Vec<String>>) -> Result<(), String> {
+    if rules.len() > MAX_APPROVAL_RULES {
+        return Err(format!(
+            "at most {MAX_APPROVAL_RULES} approval rules are allowed"
+        ));
+    }
+    if rules.iter().any(|rule| !validate_approval_rule(rule)) {
+        return Err("an approval rule is empty, oversized or contains control characters".into());
+    }
+    rules.sort();
+    rules.dedup();
+    *APPROVAL_RULES.lock() = rules;
+    Ok(())
+}
+
+fn trusted_execpolicy_amendment(params: &Value) -> Option<Vec<String>> {
+    let raw = params.get("proposedExecpolicyAmendment")?.as_array()?;
+    let pattern: Vec<String> = raw
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
+        .collect::<Option<_>>()?;
+    if !validate_approval_rule(&pattern) {
+        return None;
+    }
+    let advertised = params
+        .get("availableDecisions")?
+        .as_array()?
+        .iter()
+        .any(|decision| {
+            decision
+                .pointer("/acceptWithExecpolicyAmendment/execpolicy_amendment")
+                .and_then(Value::as_array)
+                .map(|candidate| candidate == raw)
+                .unwrap_or(false)
+        });
+    advertised.then_some(pattern)
+}
+
+fn approval_rule_matches(pattern: &[String]) -> bool {
+    APPROVAL_RULES
+        .lock()
+        .iter()
+        .any(|rule| rule.as_slice() == pattern)
+}
+
+fn verified_lane_git_grant(cwd: &str, raw_branch: &str) -> Option<LaneGitGrant> {
+    let branch = raw_branch.trim();
+    if !branch.starts_with("swarm/") || branch.len() > 160 {
+        return None;
+    }
+    let cwd_path = Path::new(cwd).canonicalize().ok()?;
+    let worktree_container = cwd_path.parent()?;
+    if worktree_container.file_name()?.to_str()? != ".worktrees" {
+        return None;
+    }
+    let repo_root = worktree_container.parent()?.canonicalize().ok()?;
+    let main_git_dir = repo_root.join(".git").canonicalize().ok()?;
+    let dot_git = cwd_path.join(".git");
+    let metadata = std::fs::symlink_metadata(&dot_git).ok()?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return None; // a linked worktree has a real .git pointer file
+    }
+    let pointer = std::fs::read_to_string(&dot_git).ok()?;
+    let raw_git_dir = pointer.trim().strip_prefix("gitdir:")?.trim();
+    let git_dir_path = PathBuf::from(raw_git_dir);
+    let git_dir = if git_dir_path.is_absolute() {
+        git_dir_path
+    } else {
+        cwd_path.join(git_dir_path)
+    }
+    .canonicalize()
+    .ok()?;
+    let worktrees_dir = git_dir.parent()?;
+    if worktrees_dir.file_name()?.to_str()? != "worktrees" {
+        return None;
+    }
+    if worktrees_dir.parent()? != main_git_dir {
+        return None;
+    }
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    (head.trim() == format!("ref: refs/heads/{branch}")).then(|| LaneGitGrant {
+        cwd: cwd_path,
+        git_dir,
+        branch: branch.to_string(),
+    })
+}
+
+fn lane_git_request_action(
+    session_cwd: &str,
+    params: &Value,
+    grant: &LaneGitGrant,
+) -> Option<&'static str> {
+    let verified = verified_lane_git_grant(session_cwd, &grant.branch)?;
+    if &verified != grant {
+        return None;
+    }
+    let request_cwd = params
+        .get("cwd")?
+        .as_str()
+        .and_then(|raw| Path::new(raw).canonicalize().ok())?;
+    if request_cwd != grant.cwd {
+        return None;
+    }
+    lane_git_action(params, &grant.branch)
+}
+
+pub fn set_lane_git_branch(session_id: &str, branch: Option<String>) -> Result<(), String> {
+    let cwd = SESSIONS
+        .lock()
+        .get(session_id)
+        .map(|state| state.profile.cwd.clone())
+        .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
+    let mut grants = LANE_GIT_GRANTS.lock();
+    if let Some(raw) = branch {
+        let verified = verified_lane_git_grant(&cwd, &raw).ok_or(
+            "lane Git authority requires a live swarm/* linked worktree on that exact branch",
+        )?;
+        grants.insert(session_id.to_string(), verified);
+    } else {
+        grants.remove(session_id);
+    }
+    Ok(())
+}
 
 /// Number of process slots that are alive right now. Registry entries and
 /// persisted thread history are deliberately not capacity: a closed/crashed
@@ -462,11 +615,12 @@ fn handle_server_request(
         Some(kind) => {
             // the session's trusted cwd first (classification touches the
             // filesystem — never under the lock)
-            let Some(cwd) = SESSIONS
-                .lock()
-                .get(session_id)
-                .map(|st| st.profile.cwd.clone())
-            else {
+            let Some((cwd, lane_grant)) = SESSIONS.lock().get(session_id).map(|st| {
+                (
+                    st.profile.cwd.clone(),
+                    LANE_GIT_GRANTS.lock().get(session_id).cloned(),
+                )
+            }) else {
                 // session vanished mid-request — must still answer or the
                 // server hangs on the blocked RPC
                 responder.ok(&json!({ "decision": "cancel" }));
@@ -490,6 +644,21 @@ fn handle_server_request(
             // off — a difference marks it for the live re-check on respond)
             let gh_write_gated = escalation == "routine"
                 && classify_approval(kind, &params, &cwd, false) == "destructive";
+            let always_amendment = if kind == "command" {
+                trusted_execpolicy_amendment(&params)
+            } else {
+                None
+            };
+            let matched_rule = always_amendment
+                .as_deref()
+                .map(approval_rule_matches)
+                .unwrap_or(false);
+            let matched_lane_policy = lane_grant
+                .as_ref()
+                .and_then(|grant| lane_git_request_action(&cwd, &params, grant))
+                .is_some();
+            let auto_approved = matched_rule || matched_lane_policy;
+            let mut responder = Some(responder);
             let approval_id = {
                 let mut sessions = SESSIONS.lock();
                 // re-check the generation UNDER the lock — the session may
@@ -498,7 +667,9 @@ fn handle_server_request(
                     .get_mut(session_id)
                     .filter(|st| st.generation == generation)
                 else {
-                    responder.ok(&json!({ "decision": "cancel" }));
+                    if let Some(responder) = responder.take() {
+                        responder.ok(&json!({ "decision": "cancel" }));
+                    }
                     return;
                 };
                 st.approval_counter += 1;
@@ -507,14 +678,16 @@ fn handle_server_request(
                     st.approval_counter,
                     APPROVAL_SEQ.fetch_add(1, Ordering::Relaxed)
                 );
-                st.pending_approvals.insert(
-                    approval_id.clone(),
-                    PendingApproval {
-                        responder,
-                        escalation,
-                        gh_write_gated,
-                    },
-                );
+                if !auto_approved {
+                    st.pending_approvals.insert(
+                        approval_id.clone(),
+                        PendingApproval {
+                            responder: responder.take().expect("pending responder"),
+                            escalation,
+                            gh_write_gated,
+                        },
+                    );
+                }
                 approval_id
             };
             emit_session_event(
@@ -523,8 +696,24 @@ fn handle_server_request(
                 "approval_request",
                 // pass the request params through verbatim (itemId, reason,
                 // command/cwd, availableDecisions, …) — the UI reads them
-                json!({ "approval_id": approval_id, "kind": kind, "escalation": escalation, "request": params }),
+                json!({
+                    "approval_id": approval_id,
+                    "kind": kind,
+                    "escalation": escalation,
+                    "can_always_allow": always_amendment.is_some(),
+                    "auto_decision": if matched_rule {
+                        Value::String("rule".into())
+                    } else if matched_lane_policy {
+                        Value::String("lanePolicy".into())
+                    } else {
+                        Value::Null
+                    },
+                    "request": params,
+                }),
             );
+            if let Some(responder) = responder {
+                responder.ok(&json!({ "decision": "accept" }));
+            }
         }
         None => {
             responder.error(-32601, "not supported by SwarmZ vibe sessions");
@@ -1420,11 +1609,56 @@ fn review_target(target: &str) -> Result<Value, String> {
 /// could cancel) must never be reused by an autonomous review. A
 /// full-access session refuses via `conductor_access_gate`, checked against
 /// the live profile BEFORE anything runs.
+#[cfg(test)]
 pub async fn session_review(
     session_id: &str,
     target: &str,
     require_workspace: bool,
 ) -> Result<Value, String> {
+    session_review_inner(session_id, target, require_workspace, |_| {}).await
+}
+
+/// Production review path: surface the lane only after `review/start` has
+/// acknowledged the detached thread id. The core stays callback-driven so
+/// native unit tests do not need an AppHandle.
+pub async fn session_review_visible(
+    app: &AppHandle,
+    session_id: &str,
+    target: &str,
+    require_workspace: bool,
+    review_id: &str,
+) -> Result<Value, String> {
+    let app = app.clone();
+    let review_id = review_id.to_string();
+    let event_session_id = session_id.to_string();
+    session_review_inner(
+        session_id,
+        target,
+        require_workspace,
+        move |review_thread_id| {
+            let _ = app.emit(
+                "vibe://review-event",
+                json!({
+                    "kind": "started",
+                    "review_id": review_id,
+                    "session_id": event_session_id,
+                    "review_thread_id": review_thread_id,
+                }),
+            );
+        },
+    )
+    .await
+}
+
+async fn session_review_inner<F>(
+    session_id: &str,
+    target: &str,
+    require_workspace: bool,
+    on_started: F,
+) -> Result<Value, String>
+where
+    F: FnOnce(&str),
+{
     let target = review_target(target)?;
     let (host, thread_id, generation, profile) = {
         let sessions = SESSIONS.lock();
@@ -1473,10 +1707,12 @@ pub async fn session_review(
         .and_then(|v| v.as_str())
         .ok_or("review/start: no reviewThreadId in response")?
         .to_string();
-
     // collect the review thread's outcome on a temporary route
     let (tx, mut rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
     conn.register_thread(&review_tid, tx);
+    // The route must exist before Fleet visibility: a very fast review may
+    // emit its terminal notification immediately after review/start.
+    on_started(&review_tid);
     let mut review_text: Option<String> = None;
     let mut last_message: Option<String> = None;
     let mut status = "timeout".to_string();
@@ -1676,8 +1912,10 @@ fn refuse_ultra_effort(effort: Option<&str>) -> Result<(), String> {
 /// this close, so evicted sessions can no longer accumulate child processes.
 pub async fn session_close(session_id: &str) -> Result<(), String> {
     let Some(mut st) = SESSIONS.lock().remove(session_id) else {
+        LANE_GIT_GRANTS.lock().remove(session_id);
         return Ok(()); // already gone — idempotent
     };
+    LANE_GIT_GRANTS.lock().remove(session_id);
     // best-effort interrupt the live turn
     if let (Some(thread_id), Some(turn_id)) = (st.thread_id.clone(), st.current_turn_id.clone()) {
         if let Some(conn) = st.host.alive().await {

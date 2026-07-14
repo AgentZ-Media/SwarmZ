@@ -82,12 +82,13 @@ describe("native vibe session boundary", () => {
       review_thread_id: "review-1",
     });
 
-    await reviewNativeSession("session-1", "branch:main", true);
+    await reviewNativeSession("session-1", "branch:main", "review-1", true);
 
     expect(invoke).toHaveBeenCalledWith("vibe_session_review", {
-      sessionId: "session-1",
-      target: "branch:main",
-      requireWorkspace: true,
+        sessionId: "session-1",
+        target: "branch:main",
+        reviewLaneId: "review-1",
+        requireWorkspace: true,
     });
   });
 

@@ -221,7 +221,7 @@ export interface VibeState {
     id: string,
     approvalId: string,
     status: VibeApprovalStatus,
-    decidedBy?: "conductor" | "human",
+    decidedBy?: "conductor" | "human" | "rule" | "lanePolicy",
   ) => void;
 }
 
@@ -740,6 +740,7 @@ function sanitizeItem(raw: unknown): VibeItem | null {
       const status: VibeApprovalStatus =
         rawStatus === "accepted" ||
         rawStatus === "acceptedForSession" ||
+        rawStatus === "acceptedAlways" ||
         rawStatus === "declined"
           ? rawStatus
           : "cancelled";
@@ -754,8 +755,14 @@ function sanitizeItem(raw: unknown): VibeItem | null {
           ? { escalation: m.escalation }
           : {}),
         // attribution survives hydration (who decided a resolved approval)
-        ...(m.decidedBy === "conductor" || m.decidedBy === "human"
+        ...(m.decidedBy === "conductor" ||
+        m.decidedBy === "human" ||
+        m.decidedBy === "rule" ||
+        m.decidedBy === "lanePolicy"
           ? { decidedBy: m.decidedBy }
+          : {}),
+        ...(typeof m.canAlwaysAllow === "boolean"
+          ? { canAlwaysAllow: m.canAlwaysAllow }
           : {}),
         payload:
           m.payload && typeof m.payload === "object"

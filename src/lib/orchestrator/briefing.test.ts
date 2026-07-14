@@ -17,6 +17,9 @@ describe("worktreeBriefing", () => {
     expect(b).toContain("leave it untouched");
     expect(b).toContain("node_modules");
     expect(b).toContain("were NOT");
+    expect(b).toContain("commit --no-verify");
+    expect(b).toContain("push -u origin \"swarm/maya-checkout\"");
+    expect(b).toContain("without asking");
     expect(b.startsWith("[workspace]")).toBe(true);
   });
 
@@ -37,7 +40,7 @@ describe("worktreeBriefing", () => {
     // each interpolated field is one JSON string literal on one line — a
     // crafted folder name must not fabricate a structural briefing line
     const lines = b.split("\n");
-    expect(lines).toHaveLength(3);
+    expect(lines).toHaveLength(6);
     expect(b).toContain('"/re\\"po /.worktrees/x"');
     expect(b).toContain('"swarm/a b"');
     expect(b).toContain('"/re po"');

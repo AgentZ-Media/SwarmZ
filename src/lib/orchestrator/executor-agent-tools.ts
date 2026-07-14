@@ -14,6 +14,8 @@ import {
   waitForSessionIdle,
 } from "@/lib/vibe/controller";
 import { pickAgentName, branchSlugForAgent } from "@/lib/vibe/names";
+import { resolveSpawnEffort } from "@/lib/orchestrator/agent-effort";
+import { reviewLaneKey, reviewLoopConfig } from "./review-policy";
 import { addWorktree, removeWorktree } from "@/lib/worktree";
 import { isAutonomousTurnInFlight } from "./controller";
 import { withWorktreeBriefing } from "./briefing";
@@ -189,10 +191,10 @@ async function spawnOneAgent(
   let model = typeof spec.model === "string" ? spec.model.trim() : "";
   if (model && !validModelId(model))
     throw new Error(`invalid model "${model}" — letters, digits and . _ : / - only`);
-  const effort =
-    typeof spec.effort === "string" && spec.effort.trim()
-      ? spec.effort.trim()
-      : "medium"; // swarm default: sub-agents run medium unless chosen otherwise
+  const effort = resolveSpawnEffort(
+    spec.effort,
+    spec.critical_reasoning === true,
+  );
   if (effort.toLowerCase() === "ultra")
     throw new Error(
       'effort "ultra" is unavailable in SwarmZ — Ultra is a multi-agent mode, not a single-agent reasoning level',
@@ -556,10 +558,17 @@ export const agentExecutors: ExecutorFamily<AgentTool> = {
           : String(args.model).trim() || undefined;
       if (model && !validModelId(model))
         throw new Error(`invalid model "${model}"`);
+      const requestedEffort =
+        args.effort === undefined ? null : String(args.effort).trim();
       const effort =
-        args.effort === undefined
+        requestedEffort === null
           ? entry.session.effort
-          : String(args.effort).trim() || undefined;
+          : requestedEffort
+            ? resolveSpawnEffort(
+                requestedEffort,
+                args.critical_reasoning === true,
+              )
+            : undefined;
       if (effort?.toLowerCase() === "ultra")
         throw new Error(
           'effort "ultra" is unavailable in SwarmZ — Ultra is a multi-agent mode, not a single-agent reasoning level',
@@ -595,21 +604,80 @@ export const agentExecutors: ExecutorFamily<AgentTool> = {
   },
 
   review_agent: async (args, ctx) => {
-    const entry = requireSession(args.agent, ctx);
+    const reviewConfig = reviewLoopConfig(useSwarm.getState().settings);
+    if (!reviewConfig.enabled) {
+      throw new Error(
+        "the automated code-review loop is disabled in Settings; report the verified implementation without starting a review",
+      );
+    }
     const target = typeof args.target === "string" ? args.target : "uncommitted";
-    // C3: the Conductor must not launder a HUMAN-granted full-access session
-    // through a detached review — pass the strict flag (Rust's
-    // `conductor_access_gate` is authoritative).
-    const res = await reviewSession(entry.session.id, target, {
-      requireWorkspace: true,
-    });
-    return {
-      agent: { id: entry.session.id, name: entry.session.name },
-      cwd: entry.session.projectDir,
-      target: target || "uncommitted",
-      status: res.status,
-      review: res.review ?? "(the review returned no findings text)",
-    };
+    const plural = Array.isArray(args.agents);
+    if (plural && args.agent !== undefined)
+      throw new Error("pass agent or agents, not both");
+    const requested: unknown[] = plural
+      ? (args.agents as unknown[])
+      : [args.agent];
+    if (requested.length < 1 || requested.length > 8)
+      throw new Error("review_agent needs 1–8 agents");
+    const entries = requested.map((agent) => requireSession(agent, ctx));
+    const unique = new Set(entries.map((entry) => entry.session.id));
+    if (unique.size !== entries.length)
+      throw new Error("review_agent agents must be unique");
+    const featureLanes = new Set(
+      entries.map((entry) => reviewLaneKey(entry.session)),
+    );
+    if (featureLanes.size !== entries.length) {
+      throw new Error(
+        "review_agent cannot review the same worktree twice in one batch",
+      );
+    }
+
+    const reviews = await Promise.all(
+      entries.map(async (entry) => {
+        const laneKey = reviewLaneKey(entry.session);
+        let claimed = false;
+        try {
+          const claim = useSwarm
+            .getState()
+            .claimReviewIteration(
+              laneKey,
+              reviewConfig.maxIterations,
+            );
+          if (!claim.allowed) {
+            throw new Error(
+              claim.reason === "active"
+                ? "a review is already running for this worktree; wait for that visible Fleet lane instead of starting a duplicate"
+                : `review loop reached its ${reviewConfig.maxIterations}-iteration limit for this worktree; report remaining findings without creating another review or worktree`,
+            );
+          }
+          claimed = true;
+          // C3: the Conductor must not launder a HUMAN-granted full-access
+          // session through a detached review. Rust is authoritative.
+          const res = await reviewSession(entry.session.id, target, {
+            requireWorkspace: true,
+            source: "orchestrator",
+          });
+          return {
+            agent: { id: entry.session.id, name: entry.session.name },
+            cwd: entry.session.projectDir,
+            target: target || "uncommitted",
+            status: res.status,
+            review: res.review ?? "(the review returned no findings text)",
+          };
+        } catch (error) {
+          return {
+            agent: { id: entry.session.id, name: entry.session.name },
+            cwd: entry.session.projectDir,
+            target: target || "uncommitted",
+            status: "failed",
+            error: error instanceof Error ? error.message : String(error),
+          };
+        } finally {
+          if (claimed) useSwarm.getState().releaseReviewIteration(laneKey);
+        }
+      }),
+    );
+    return plural ? { reviews } : reviews[0];
   },
 
   decide_approval: async (args, ctx) => {

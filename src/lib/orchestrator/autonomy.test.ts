@@ -6,10 +6,13 @@ import {
   autonomyTripped,
   autonomyUnavailable,
   checkAutonomyBudget,
+  configureAutonomyBudget,
+  getAutonomyBudgetConfig,
   hydrateAutonomyBudgets,
   latchAutonomyUnavailable,
   noteAutonomousTurn,
   noteHumanTurn,
+  normalizeAutonomyBudgetLimit,
   persistAutonomyReservation,
   registerAutonomyPersist,
   releaseAutonomousTurn,
@@ -24,6 +27,65 @@ beforeEach(() => resetAutonomyBudgets());
 afterEach(() => registerAutonomyPersist(null));
 
 describe("autonomy budget", () => {
+  it("uses the safe 5/20 defaults and normalizes configured limits", () => {
+    expect(getAutonomyBudgetConfig()).toEqual({
+      enabled: true,
+      maxConsecutive: 5,
+      maxPerHour: 20,
+    });
+    expect(normalizeAutonomyBudgetLimit(0, 5)).toBe(1);
+    expect(normalizeAutonomyBudgetLimit(42.9, 5)).toBe(42);
+    expect(normalizeAutonomyBudgetLimit(10_000, 5)).toBe(1000);
+    expect(normalizeAutonomyBudgetLimit(Number.NaN, 5)).toBe(5);
+  });
+
+  it("honors custom consecutive and hourly caps", () => {
+    configureAutonomyBudget({ maxConsecutive: 2, maxPerHour: 3 });
+    noteAutonomousTurn("p", T0);
+    noteAutonomousTurn("p", T0 + 1);
+    const consecutive = checkAutonomyBudget("p", T0 + 2);
+    expect(consecutive.ok).toBe(false);
+    if (!consecutive.ok) expect(consecutive.reason).toContain("cap 2");
+
+    resetAutonomyBudgets();
+    configureAutonomyBudget({ maxConsecutive: 10, maxPerHour: 2 });
+    noteAutonomousTurn("p", T0);
+    noteHumanTurn("p");
+    noteAutonomousTurn("p", T0 + 1);
+    noteHumanTurn("p");
+    const hourly = checkAutonomyBudget("p", T0 + 2);
+    expect(hourly.ok).toBe(false);
+    if (!hourly.ok) expect(hourly.reason).toContain("cap 2");
+  });
+
+  it("can be disabled completely and re-enabled with a clean budget", async () => {
+    for (let i = 0; i < MAX_CONSECUTIVE_AUTONOMOUS_TURNS; i++) {
+      noteAutonomousTurn("p", T0 + i);
+    }
+    expect(checkAutonomyBudget("p", T0 + 10).ok).toBe(false);
+
+    configureAutonomyBudget({ enabled: false });
+    expect(checkAutonomyBudget("p", T0 + 11).ok).toBe(true);
+    expect(autonomyTripped("p")).toBe(false);
+    expect(serializeAutonomyBudgets(T0 + 12).projects).toEqual({});
+    expect(await persistAutonomyReservation()).toBe(true);
+    hydrateAutonomyBudgets("corrupt while explicitly disabled");
+    expect(autonomyUnavailable()).toBe(false);
+
+    configureAutonomyBudget({ enabled: true });
+    expect(checkAutonomyBudget("p", T0 + 13).ok).toBe(true);
+  });
+
+  it("re-evaluates an obsolete trip when the human changes a limit", () => {
+    for (let i = 0; i < MAX_CONSECUTIVE_AUTONOMOUS_TURNS; i++) {
+      noteAutonomousTurn("p", T0 + i);
+    }
+    expect(checkAutonomyBudget("p", T0 + 10).ok).toBe(false);
+    configureAutonomyBudget({ maxConsecutive: 6, maxPerHour: 20 });
+    expect(autonomyTripped("p")).toBe(false);
+    expect(checkAutonomyBudget("p", T0 + 11).ok).toBe(true);
+  });
+
   it("allows turns under both caps", () => {
     for (let i = 0; i < MAX_CONSECUTIVE_AUTONOMOUS_TURNS - 1; i++) {
       expect(checkAutonomyBudget("p", T0 + i).ok).toBe(true);

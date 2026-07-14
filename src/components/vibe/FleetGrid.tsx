@@ -10,9 +10,10 @@
 // mini-feed line selects only ITS item by id (identity-preserved store).
 
 import { memo, useEffect, useMemo, useState } from "react";
-import { Maximize2, Plus, X } from "lucide-react";
+import { Maximize2, Plus, SearchCheck, X } from "lucide-react";
 import { useVibe } from "@/lib/vibe/session-store";
 import { useVibeUi, type FleetFilter } from "@/lib/vibe/ui-store";
+import { useReviewLanes } from "@/lib/vibe/review-lane-store";
 import {
   closeSession,
   focusSession,
@@ -104,8 +105,41 @@ export function FleetGrid() {
   const filter = useVibeUi((s) => s.fleetFilter);
   const setNewSessionOpen = useVibeUi((s) => s.setNewSessionOpen);
   const hasProject = useProjects((s) => !!s.activeProjectId);
-  const { rows, counts } = useFleetRows();
+  const activeProjectId = useProjects((s) => s.activeProjectId);
+  const { rows, counts: workerCounts } = useFleetRows();
+  const reviewSig = useReviewLanes((state) => {
+    const parts: string[] = [];
+    for (const id of state.order) {
+      const lane = state.lanes[id];
+      if (!lane || lane.projectId !== activeProjectId) continue;
+      parts.push(`${id}:${lane.status}`);
+    }
+    return parts.join("|");
+  });
+  const reviews = useMemo(
+    () =>
+      reviewSig
+        ? reviewSig.split("|").map((part) => {
+            const [id, status] = part.split(":");
+            return {
+              id,
+              state: status === "running" ? ("working" as const) : ("finished" as const),
+            };
+          })
+        : [],
+    [reviewSig],
+  );
+  const counts = useMemo(() => {
+    const next = { ...workerCounts };
+    for (const review of reviews) {
+      next[review.state] += 1;
+      next.all += 1;
+    }
+    return next;
+  }, [reviews, workerCounts]);
   const shown = filter === "all" ? rows : rows.filter((r) => r.state === filter);
+  const shownReviews =
+    filter === "all" ? reviews : reviews.filter((review) => review.state === filter);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -126,10 +160,13 @@ export function FleetGrid() {
       </div>
 
       <div className="dot-grid grid min-h-0 flex-1 grid-cols-[repeat(auto-fill,minmax(272px,1fr))] auto-rows-max content-start gap-3 overflow-y-auto p-4">
+        {shownReviews.map((review) => (
+          <ReviewCard key={review.id} id={review.id} />
+        ))}
         {shown.map((r) => (
           <AgentCard key={r.id} id={r.id} state={r.state} />
         ))}
-        {shown.length === 0 && (
+        {shown.length === 0 && shownReviews.length === 0 && (
           <EmptyState
             filtered={rows.length > 0}
             hasProject={hasProject}
@@ -138,6 +175,73 @@ export function FleetGrid() {
         )}
       </div>
     </div>
+  );
+}
+
+function ReviewCard({ id }: { id: string }) {
+  const lane = useReviewLanes((state) => state.lanes[id]);
+  const dismiss = useReviewLanes((state) => state.dismiss);
+  if (!lane) return null;
+
+  const running = lane.status === "running";
+  const failed = lane.status === "failed";
+  const detail = failed ? lane.error : lane.review;
+  const source =
+    lane.source === "auto"
+      ? "automatic"
+      : lane.source === "github"
+        ? "pull request"
+        : lane.source === "mission"
+          ? "mission gate"
+          : "Orchestrator";
+
+  return (
+    <article
+      className={cn(
+        "relative min-h-[190px] overflow-hidden rounded-xl border bg-card p-3",
+        failed ? "border-err/45" : running ? "border-acc/45" : "border-line",
+      )}
+    >
+      {running && <div aria-hidden className="activity-line absolute inset-x-0 top-0" />}
+      <div className="flex items-start gap-2">
+        <span
+          className={cn(
+            "mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-pop",
+            failed ? "text-err" : running ? "text-acc" : "text-ok",
+          )}
+        >
+          <SearchCheck size={15} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-13 font-semibold text-txt">
+            Code review · {lane.agentName}
+          </div>
+          <div className="mt-0.5 truncate font-mono text-10 text-fnt">
+            {source} · {lane.target}
+          </div>
+        </div>
+        {!running && (
+          <button
+            onClick={() => dismiss(id)}
+            title="Dismiss review lane"
+            className="focus-ring rounded-sm p-1 text-fnt hover:bg-pop hover:text-mut"
+          >
+            <X size={12} />
+          </button>
+        )}
+      </div>
+      <div
+        className={cn(
+          "mt-4 font-mono text-11",
+          failed ? "text-err" : running ? "text-acc" : "text-ok",
+        )}
+      >
+        {failed ? "× review failed" : running ? "▸ reviewing…" : "✓ review complete"}
+      </div>
+      <p className="mt-2 line-clamp-4 whitespace-pre-wrap text-12 leading-relaxed text-mut">
+        {detail ?? (running ? "Inspecting the lane in a detached Codex review." : "Review completed without a text report.")}
+      </p>
+    </article>
   );
 }
 

@@ -58,7 +58,8 @@ Built with **React 19 + TypeScript + Tailwind v4** on Tauri 2 (Rust). Dark mode 
   Orchestrator turns. A persisted circuit breaker caps runaway cascades.
 - 🌳 **Git worktrees, managed** — worktrees carry live dirty/ahead state,
   reveal/open actions and safe cleanup that never silently force-removes work.
-- ✅ **Approvals stay human** — session approvals surface as cards in the composer. The Conductor gets a *fast lane* for genuinely routine approvals, but the classifier is **fail-closed and Rust-anchored**: any shell metasyntax, interpreter, foreign path, delete or rename is destructive and stays human-only, enforced server-side. In doubt, always the human.
+- ✅ **Approvals stay yours** — session approvals surface as cards in the composer. “Always allow” stores a bounded Codex-proposed command rule that you can edit or delete in Settings; Orchestrator worktrees additionally receive a Rust-verified commit/push lane for their own `swarm/*` branch. Everything else remains fail-closed and human-controlled.
+- 🔎 **Reviews are opt-in and bounded** — the automated review/fix loop is off by default. Settings can enable it with a hard per-worktree iteration limit; review lanes are visible in Fleet, independent worktrees review in parallel, and findings stay in the original feature worktree.
 - 🐙 **GitHub, opt-in and local-only** — SwarmZ reads and (optionally) manages a project's GitHub context over your locally installed **`gh` CLI**. There is **no OAuth, no login flow, and no token ever touches SwarmZ**. Read-only detection and the PR panel work always; a single Settings toggle (default off) arms the Conductor's PR tools, the write gate, PR-approval routing and a PR watcher. Deliberately **no merge/close** command anywhere — merging stays yours.
 - 🗂️ **Fleet grid + focus stage** — live worker cards show status, branch,
   diff, feed and approvals; focus expands one lane. `@lane` in the Orchestrator

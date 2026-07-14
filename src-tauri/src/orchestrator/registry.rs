@@ -164,7 +164,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         // ---- agents ----
         ToolDefinition {
             name: "spawn_agents",
-            description: "Bring in 1–8 new agents for this project. Each entry: a task (submitted as the agent's first order — write it self-contained), a worktree placement (\"new\" = a fresh git worktree on an own branch, \"shared:<agentName>\" = work in an EXISTING agent's worktree, \"none\" = directly in the project folder — for ONE read/analysis lane), and optional model/effort/access/name overrides. IMPORTANT: a batch with several independent agents must use \"new\" for each; several \"none\" entries are refused before any agent is created because they cannot run concurrently in the same checkout. Names are picked automatically (collision-free). The result distinguishes created windows from backend-acknowledged initial tasks; never claim an agent is working unless its delivery is \"started\". Per-entry errors do not abort the batch.",
+            description: "Bring in 1–8 new agents for this project. Each entry: a task (submitted as the agent's first order — write it self-contained), a worktree placement (\"new\" = a fresh git worktree on an own branch, \"shared:<agentName>\" = join an EXISTING agent's worktree, \"none\" = directly in the project folder — for ONE read/analysis lane), and optional model/effort/access/name overrides. Reasoning defaults to high; xhigh/max are normalized back to high unless critical_reasoning is true for genuinely system-critical work. IMPORTANT: independent agents use \"new\" and run concurrently; several \"none\" entries are refused. Names are collision-free. A result is started only after native acknowledgement; per-entry errors do not abort the batch.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -178,7 +178,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                                 "task": { "type": "string", "description": "the agent's first order — self-contained: context + goal + boundaries" },
                                 "worktree": { "type": "string", "description": "\"new\" | \"shared:<agentName>\" | \"none\" — where the agent works" },
                                 "model": { "type": "string", "description": "exact `model` value from list_models; OMIT for the user's Codex configuration" },
-                                "effort": { "type": "string", "description": "reasoning effort advertised for the selected model by list_models; OMIT for SwarmZ medium" },
+                                "effort": { "type": "string", "description": "reasoning effort advertised for the selected model by list_models; omit for SwarmZ high" },
+                                "critical_reasoning": { "type": "boolean", "description": "true only for system-critical security/auth/payment/cryptography/irreversible-migration work; permits xhigh/max instead of capping them to high" },
                                 // SECURITY (audit R1): "full" (danger-full-access, approvals off)
                                 // is deliberately NOT model-callable — only the human can grant
                                 // it via the session's access toggle. The bus validates against
@@ -232,13 +233,14 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "set_agent_config",
-            description: "Retune an agent mid-session: model, reasoning effort and/or access level. Takes effect from the agent's next turn. Pass only the fields to change; an empty string clears model/effort back to the default.",
+            description: "Retune an agent mid-session: model, reasoning effort and/or access level. Takes effect from the next turn. Reasoning is capped at high unless critical_reasoning explicitly marks genuinely system-critical work. Empty string clears model/effort.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "agent": agent_param(),
                     "model": { "type": "string", "description": "exact `model` value from list_models (\"\" clears the override)" },
                     "effort": { "type": "string", "description": "effort advertised for the selected model by list_models (\"\" clears the override)" },
+                    "critical_reasoning": { "type": "boolean", "description": "true only for system-critical auth/payment/cryptography/irreversible-migration work; permits xhigh/max" },
                     // SECURITY (audit R1): no "full" here either — see spawn_agents.
                     // The Conductor may re-confine an agent to workspace, never widen it.
                     "access": { "type": "string", "enum": ["workspace"], "description": "sandbox level — always the workspace sandbox; full access can only be granted by the human in the UI" }
@@ -249,14 +251,14 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "review_agent",
-            description: "Run a native codex code review over an agent's work (a detached review thread — the agent itself is not disturbed). target: \"uncommitted\" (default — the agent's working tree) | \"branch:<base>\" (diff against a base branch) | \"commit:<sha>\". Returns the structured review report (prioritized findings with file:line references). Use it before reporting an agent's work as done.",
+            description: "Run opt-in detached native Codex reviews without disturbing the workers. Settings must enable the review loop; its per-worktree iteration cap is enforced. Pass either agent for one lane or agents for 1–8 independent worktrees; multi-lane reviews start concurrently and return one result per lane. target: \"uncommitted\" (default) | \"branch:<base>\" | \"commit:<sha>\". Each review is visible as its own temporary Fleet lane. Review findings must be fixed in the same worktree.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "agent": agent_param(),
+                    "agents": { "type": "array", "items": agent_param(), "minItems": 1, "maxItems": 8, "description": "independent agents to review concurrently (use instead of agent)" },
                     "target": { "type": "string", "description": "\"uncommitted\" (default) | \"branch:<base>\" | \"commit:<sha>\"" }
-                },
-                "required": ["agent"]
+                }
             }),
             timeout_ms: REVIEW_TIMEOUT_MS,
         },
@@ -854,6 +856,20 @@ mod tests {
             GITHUB_TIMEOUT_MS
         );
         assert_eq!(find_tool("watch_pr").unwrap().timeout_ms, GITHUB_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn review_agent_accepts_one_lane_or_a_parallel_lane_batch() {
+        let def = find_tool("review_agent").unwrap();
+        assert!(validate_args(&def, &json!({ "agent": "Maya", "target": "uncommitted" })).is_ok());
+        assert!(validate_args(
+            &def,
+            &json!({ "agents": ["Maya", "Noa"], "target": "branch:main" })
+        )
+        .is_ok());
+        let nine: Vec<Value> = (0..9).map(|i| json!(format!("agent-{i}"))).collect();
+        let err = validate_args(&def, &json!({ "agents": nine })).unwrap_err();
+        assert!(err.contains("at most 8"), "unexpected error: {err}");
     }
 
     #[test]

@@ -124,6 +124,7 @@ export async function recordIndependentReview(
     try {
       const result = await reviewSession(attempt.sessionId, `commit:${evidence.head_sha}`, {
         requireWorkspace: true,
+        source: "mission",
       });
       reviewThreadId = result.review_thread_id;
       const text = result.review?.slice(0, 4_000) ?? "Detached review returned no findings";

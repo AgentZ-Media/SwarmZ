@@ -5,6 +5,7 @@ import {
 } from "./settings/ConductorSettingsSection";
 import { GithubSettingsSection } from "./settings/GithubSettingsSection";
 import { AppearanceSettingsSection } from "./settings/AppearanceSettingsSection";
+import { ApprovalSettingsSection } from "./settings/ApprovalSettingsSection";
 import {
   MemorySettingsSection,
   PathsSettingsSection,
@@ -35,6 +36,7 @@ export function SettingsDialog({
           <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 py-5">
             <ConductorSettingsSection />
             <AutonomySettingsSection />
+            <ApprovalSettingsSection />
             <GithubSettingsSection />
             <AppearanceSettingsSection />
             <MemorySettingsSection />

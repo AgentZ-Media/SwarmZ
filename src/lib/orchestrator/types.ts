@@ -190,8 +190,10 @@ export interface SpawnAgentSpec {
   worktree: string;
   /** codex model id; omit = the default */
   model?: string;
-  /** reasoning effort (open string — catalog-driven); omit = medium */
+  /** reasoning effort (open string — catalog-driven); omit = high */
   effort?: string;
+  /** allows xhigh/max only for explicitly system-critical work */
+  critical_reasoning?: boolean;
   access?: "workspace" | "full";
   name?: string;
   /** Phase 5: the task turn ends with a machine-readable status report

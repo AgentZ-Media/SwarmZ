@@ -29,6 +29,7 @@ import {
 } from "./triggers-core";
 import { hasOpenPrForBranch } from "@/lib/github/core";
 import { useGithub } from "@/lib/github/store";
+import { reviewLaneKey, reviewLoopConfig } from "./review-policy";
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -283,10 +284,25 @@ function maybeEnqueueFinishTrigger(sessionId: string, projectId: string): void {
       if (!watcherState.isCurrentGeneration(sessionId, gen)) return; // superseded
       const fresh = useVibe.getState().sessions[sessionId];
       if (!fresh || useVibe.getState().busy[sessionId]) return;
-      if (!useSwarm.getState().settings.autoReviewFinishedLanes) return;
+      const reviewConfig = reviewLoopConfig(useSwarm.getState().settings);
+      if (!reviewConfig.enabled) return;
       if (review) return; // memoized across retries
       const diffLine = diffLineFromStats(diffStats(fresh.diff));
       if (!diffLine) return;
+      const laneKey = reviewLaneKey(fresh.session);
+      const claim = useSwarm
+        .getState()
+        .claimReviewIteration(laneKey, reviewConfig.maxIterations);
+      if (!claim.allowed) {
+        review = {
+          status: "skipped",
+          text:
+            claim.reason === "active"
+              ? "A review is already running for this worktree. Do not start a duplicate."
+              : `Review loop stopped at its ${reviewConfig.maxIterations}-iteration worktree limit. Report remaining work without starting another review or a new worktree.`,
+        };
+        return;
+      }
       try {
         // C3: the autonomous auto-review is a Conductor-driven detached review —
         // a full-access lane must not be driven through it (Rust's
@@ -294,6 +310,7 @@ function maybeEnqueueFinishTrigger(sessionId: string, projectId: string): void {
         // isn't auto-reviewed, recorded as a failed review below).
         const res = await reviewSession(sessionId, "uncommitted", {
           requireWorkspace: true,
+          source: "auto",
         });
         review = {
           status: res.status,
@@ -301,6 +318,8 @@ function maybeEnqueueFinishTrigger(sessionId: string, projectId: string): void {
         };
       } catch (err) {
         review = { status: "failed", text: errorText(err) };
+      } finally {
+        useSwarm.getState().releaseReviewIteration(laneKey);
       }
     },
     build: async () => {

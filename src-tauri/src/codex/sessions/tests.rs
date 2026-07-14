@@ -1,6 +1,7 @@
 use super::*;
 use crate::codex::approval::{
-    command_is_routine, file_changes_within, normalized_head, tokenize_strict, unwrap_shell_strict,
+    command_is_routine, file_changes_within, lane_git_action, normalized_head, tokenize_strict,
+    unwrap_shell_strict,
 };
 use crate::codex::protocol::{parse_line, Incoming};
 use crate::fsx::path_within;
@@ -27,6 +28,112 @@ const FIX_TURN_INTERRUPTED: &str = r#"{"method":"turn/completed","params":{"thre
 const FIX_TURN_FAILED: &str = r#"{"method":"turn/completed","params":{"threadId":"t","turn":{"id":"tn","status":"failed","error":{"message":"context window exceeded"}}}}"#;
 const FIX_TURN_STARTED: &str = r#"{"method":"turn/started","params":{"threadId":"t","turn":{"id":"tn","status":"inProgress"}}}"#;
 const FIX_CMD_APPROVAL: &str = r#"{"method":"item/commandExecution/requestApproval","id":0,"params":{"threadId":"t","turnId":"tn","itemId":"call_3","reason":"allow touch?","command":"/bin/zsh -lc 'touch x'","cwd":"/tmp","availableDecisions":["accept","cancel"]}}"#;
+
+#[test]
+fn persistent_approval_rules_require_the_exact_codex_advertisement() {
+    set_approval_rules(vec![vec!["pnpm".into(), "test".into()]]).unwrap();
+    let params = json!({
+        "proposedExecpolicyAmendment": ["pnpm", "test"],
+        "availableDecisions": [
+            { "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": ["pnpm", "test"]
+            }}
+        ]
+    });
+    let trusted = trusted_execpolicy_amendment(&params).unwrap();
+    assert_eq!(trusted, vec!["pnpm", "test"]);
+    assert!(approval_rule_matches(&trusted));
+
+    let mismatch = json!({
+        "proposedExecpolicyAmendment": ["pnpm", "test"],
+        "availableDecisions": [
+            { "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": ["pnpm", "build"]
+            }}
+        ]
+    });
+    assert!(trusted_execpolicy_amendment(&mismatch).is_none());
+    set_approval_rules(vec![]).unwrap();
+}
+
+#[test]
+fn lane_git_policy_accepts_only_safe_commit_and_exact_branch_push() {
+    let branch = "swarm/maya-feature";
+    let commit = json!({
+        "command": "git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat -c protocol.allow=never -c commit.gpgSign=false commit --no-verify -m 'finish feature'"
+    });
+    assert_eq!(lane_git_action(&commit, branch), Some("commit"));
+    let amend = json!({
+        "command": "git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat -c protocol.allow=never -c commit.gpgSign=false commit --no-verify --amend -m rewrite"
+    });
+    assert_eq!(lane_git_action(&amend, branch), None);
+    let editor = json!({
+        "command": "git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat -c protocol.allow=never -c commit.gpgSign=false commit --no-verify --edit -m rewrite"
+    });
+    assert_eq!(lane_git_action(&editor, branch), None);
+    let template = json!({
+        "command": "git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat -c protocol.allow=never -c commit.gpgSign=false commit --no-verify -m safe --template=/etc/passwd"
+    });
+    assert_eq!(lane_git_action(&template, branch), None);
+
+    let push = json!({
+        "command": "git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat -c protocol.ext.allow=never -c core.sshCommand=ssh push -u origin swarm/maya-feature"
+    });
+    assert_eq!(lane_git_action(&push, branch), Some("push"));
+    assert_eq!(lane_git_action(&push, "swarm/another-feature"), None);
+    assert_eq!(
+        lane_git_action(
+            &json!({ "command": "git push --force origin main" }),
+            branch
+        ),
+        None
+    );
+}
+
+#[test]
+fn lane_git_grant_is_bound_to_the_exact_live_worktree_and_request_cwd() {
+    let unique = format!(
+        "swarmz-lane-grant-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    let checkout = root.join(".worktrees/lane");
+    let git_dir = root.join(".git/worktrees/lane");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::create_dir_all(&git_dir).unwrap();
+    std::fs::write(
+        checkout.join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )
+    .unwrap();
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/swarm/lane\n").unwrap();
+
+    let grant = verified_lane_git_grant(checkout.to_str().unwrap(), "swarm/lane").unwrap();
+    let command = "git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat -c protocol.allow=never -c commit.gpgSign=false commit --no-verify -m safe";
+    let params = json!({ "command": command, "cwd": checkout });
+    assert_eq!(
+        lane_git_request_action(checkout.to_str().unwrap(), &params, &grant),
+        Some("commit")
+    );
+    assert_eq!(
+        lane_git_request_action(
+            checkout.to_str().unwrap(),
+            &json!({ "command": command, "cwd": root }),
+            &grant
+        ),
+        None
+    );
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/swarm/other\n").unwrap();
+    assert_eq!(
+        lane_git_request_action(checkout.to_str().unwrap(), &params, &grant),
+        None
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
 
 #[test]
 fn access_mapping_matches_wire_strings() {

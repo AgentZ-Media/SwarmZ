@@ -219,6 +219,16 @@ function ApprovalTakeover({
         >
           Allow for session
         </button>
+        {!isFileChange && item.canAlwaysAllow && (
+          <button
+            onClick={() => respond("always")}
+            disabled={responding}
+            title="Save Codex's proposed command-prefix rule in SwarmZ Settings"
+            className="focus-ring rounded-md border border-line2 px-3 py-1.5 font-mono text-11 text-mut hover:border-acc/55 hover:bg-pop hover:text-txt disabled:opacity-40"
+          >
+            Always allow
+          </button>
+        )}
         <button
           onClick={() => respond("accept")}
           disabled={responding}

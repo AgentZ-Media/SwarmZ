@@ -830,6 +830,21 @@ async fn vibe_session_respond_approval(
     .await
 }
 
+/// Replace the SwarmZ-scoped persistent command-prefix rules. The frontend
+/// mirrors its validated Settings snapshot; Rust revalidates every token and
+/// remains the authority that matches a captured Codex proposal.
+#[tauri::command]
+fn vibe_set_approval_rules(rules: Vec<Vec<String>>) -> Result<(), String> {
+    codex::sessions::set_approval_rules(rules)
+}
+
+/// Enable/clear the narrow Commit/Push capability for a verified `swarm/*`
+/// linked worktree session. Rust revalidates the live .git pointer and HEAD.
+#[tauri::command]
+fn vibe_session_set_lane_git(session_id: String, branch: Option<String>) -> Result<(), String> {
+    codex::sessions::set_lane_git_branch(&session_id, branch)
+}
+
 /// Change the session's access mode (takes effect on the next turn).
 #[tauri::command]
 async fn vibe_session_set_access(session_id: String, access: String) -> Result<(), String> {
@@ -890,11 +905,28 @@ async fn vibe_session_set_cwd(session_id: String, cwd: String) -> Result<(), Str
 /// path, so an omitted flag defaults to the strict gate (fail closed).
 #[tauri::command]
 async fn vibe_session_review(
+    app: AppHandle,
     session_id: String,
     target: String,
+    review_lane_id: String,
     require_workspace: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    codex::sessions::session_review(&session_id, &target, require_workspace.unwrap_or(true)).await
+    if review_lane_id.is_empty()
+        || review_lane_id.len() > 128
+        || !review_lane_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err("review lane id is invalid".into());
+    }
+    codex::sessions::session_review_visible(
+        &app,
+        &session_id,
+        &target,
+        require_workspace.unwrap_or(true),
+        &review_lane_id,
+    )
+    .await
 }
 
 // ---- Conductor plan documents — see plans.rs ----
@@ -1033,6 +1065,8 @@ pub fn run() {
             vibe_session_interrupt,
             vibe_session_compact,
             vibe_session_respond_approval,
+            vibe_set_approval_rules,
+            vibe_session_set_lane_git,
             vibe_session_set_access,
             vibe_session_set_model_effort,
             vibe_session_close,

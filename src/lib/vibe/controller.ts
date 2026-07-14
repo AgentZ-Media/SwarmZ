@@ -32,6 +32,9 @@ import type {
   VibeTokenUsage,
 } from "@/types";
 import { shouldAutoCompact } from "@/lib/compact";
+import {
+  approvalPatternFromPayload,
+} from "@/lib/approval-rules";
 import { beginInflight } from "@/lib/inflight";
 import {
   useVibe,
@@ -40,6 +43,7 @@ import {
 import { pickAgentName } from "./names";
 import { reportItemIdOf } from "./report-item";
 import { useVibeUi } from "./ui-store";
+import { useReviewLanes } from "./review-lane-store";
 import {
   closeNativeSession,
   compactNativeSession,
@@ -50,6 +54,7 @@ import {
   sendNativeTurn,
   setNativeSessionAccess,
   setNativeSessionCwd,
+  setNativeSessionLaneGit,
   setNativeSessionModelEffort,
   startNativeSession,
   steerNativeTurn,
@@ -82,10 +87,18 @@ export interface VibeSessionEvent {
   data: Record<string, unknown>;
 }
 
+interface ReviewStartedEvent {
+  kind: "started";
+  review_id: string;
+  session_id: string;
+  review_thread_id: string;
+}
+
 /** The decisions a pending approval can be answered with. */
 export type VibeApprovalDecision =
   | "accept"
   | "acceptForSession"
+  | "always"
   | "decline"
   | "cancel";
 
@@ -227,15 +240,55 @@ function toVibeItem(raw: unknown, turnId: string | null): VibeItem | null {
 
 // ---- event handling ----
 
-let eventsStarted = false;
+let eventsReady: Promise<void> | null = null;
+
+interface PendingReviewLane {
+  sessionId: string;
+  projectId: string;
+  agentName: string;
+  source: "orchestrator" | "auto" | "github" | "mission";
+  target: string;
+  requestedAt: number;
+}
+
+const pendingReviewLanes = new Map<string, PendingReviewLane>();
+
+function materializeReviewLane(reviewId: string, reviewThreadId: string): void {
+  const pending = pendingReviewLanes.get(reviewId);
+  if (!pending || !reviewThreadId) return;
+  useReviewLanes.getState().start({
+    id: reviewId,
+    sessionId: pending.sessionId,
+    projectId: pending.projectId,
+    agentName: pending.agentName,
+    source: pending.source,
+    target: pending.target,
+    reviewThreadId,
+    startedAt: pending.requestedAt,
+  });
+}
 
 /** Subscribe once, lazily — only sessions we started/resumed emit events. */
-function ensureEvents() {
-  if (eventsStarted) return;
-  eventsStarted = true;
-  void listen<VibeSessionEvent>("vibe://session-event", (ev) => {
-    handleEvent(ev.payload.session_id, ev.payload);
-  });
+function ensureEvents(): Promise<void> {
+  if (eventsReady) return eventsReady;
+  eventsReady = Promise.all([
+    listen<VibeSessionEvent>("vibe://session-event", (ev) => {
+      handleEvent(ev.payload.session_id, ev.payload);
+    }),
+    listen<ReviewStartedEvent>("vibe://review-event", (ev) => {
+      if (ev.payload.kind !== "started") return;
+      materializeReviewLane(
+        ev.payload.review_id,
+        ev.payload.review_thread_id,
+      );
+    }),
+  ])
+    .then(() => undefined)
+    .catch((error) => {
+      eventsReady = null;
+      throw error;
+    });
+  return eventsReady;
 }
 
 function warn(sessionId: string, text: string) {
@@ -471,19 +524,28 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
       // Conductor routing class (classified in Rust, conservative) —
       // anything unexpected degrades to "destructive" (human-only)
       const escalation = data.escalation === "routine" ? "routine" : "destructive";
+      const autoRule = data.auto_decision === "rule";
+      const lanePolicy = data.auto_decision === "lanePolicy";
+      const autoApproved = autoRule || lanePolicy;
       store.upsertItem(sessionId, {
         id: approvalId,
         at: Date.now(),
         kind: "approval",
         approvalKind: kind,
-        status: "pending",
+        status: autoRule ? "acceptedAlways" : lanePolicy ? "accepted" : "pending",
         escalation,
+        ...(autoRule
+          ? { decidedBy: "rule" as const }
+          : lanePolicy
+            ? { decidedBy: "lanePolicy" as const }
+            : {}),
+        canAlwaysAllow: data.can_always_allow === true,
         payload:
           data.request && typeof data.request === "object"
             ? (data.request as Record<string, unknown>)
             : {},
       });
-      pushSessionEvent(sessionId, "waiting");
+      if (!autoApproved) pushSessionEvent(sessionId, "waiting");
       break;
     }
     case "compacted": {
@@ -687,7 +749,7 @@ function takenAgentNames(projectId: string): string[] {
  * can't start.
  */
 export async function startSession(opts: StartSessionOpts): Promise<string> {
-  ensureEvents();
+  await ensureEvents();
   const spawnedBy = opts.spawnedBy ?? "user";
   // every session belongs to a project tab: reuse/open one for the dir when
   // the caller didn't resolve it — conductor spawns don't steal the active tab
@@ -723,12 +785,21 @@ export async function startSession(opts: StartSessionOpts): Promise<string> {
     threadId: null,
   };
   useVibe.getState().createSession(newSession);
+  let nativeStarted = false;
   try {
     const res = await startNativeSession(id, { ...opts, access });
+    nativeStarted = true;
+    await setNativeSessionLaneGit(
+      id,
+      spawnedBy === "conductor" && opts.worktree && access === "workspace"
+        ? opts.worktree.branch
+        : null,
+    );
     liveBackends.add(id);
     useVibe.getState().setThreadId(id, res.thread_id);
     return id;
   } catch (err) {
+    if (nativeStarted) await closeNativeSession(id).catch(() => undefined);
     useVibe.getState().dropSession(id);
     throw new Error(errorText(err));
   }
@@ -741,7 +812,7 @@ export async function startSession(opts: StartSessionOpts): Promise<string> {
  */
 export async function resumeSession(sessionId: string): Promise<void> {
   if (liveBackends.has(sessionId)) return;
-  ensureEvents();
+  await ensureEvents();
   const session = useVibe.getState().sessions[sessionId]?.session;
   if (!session) throw new Error(`unknown vibe session "${sessionId}"`);
   if (!session.threadId) throw new Error("this session has no thread to resume");
@@ -751,6 +822,19 @@ export async function resumeSession(sessionId: string): Promise<void> {
     effort: session.effort,
     access: session.access,
   });
+  try {
+    await setNativeSessionLaneGit(
+      sessionId,
+      session.spawnedBy === "conductor" &&
+        session.worktree &&
+        session.access === "workspace"
+        ? session.worktree.branch
+        : null,
+    );
+  } catch (error) {
+    await closeNativeSession(sessionId).catch(() => undefined);
+    throw error;
+  }
   liveBackends.add(sessionId);
   useVibe.getState().setThreadId(sessionId, res.thread_id);
   if (!res.resumed) {
@@ -798,9 +882,9 @@ export async function sendMessageStrict(
     throw new Error(
       "the session is compacting its context — wait for the compaction to finish",
     );
-  ensureEvents();
   deliveryClaims.add(sessionId);
   try {
+    await ensureEvents();
     store.upsertItem(sessionId, {
       id: `user-${nanoid(8)}`,
       at: Date.now(),
@@ -971,7 +1055,7 @@ export async function steerMessageStrict(
     const res = await sendMessageStrict(sessionId, freshText, opts);
     return { mode: "queued", turnId: res.turnId };
   }
-  ensureEvents();
+  await ensureEvents();
   try {
     const res = await steerNativeTurn(
       sessionId,
@@ -1031,7 +1115,29 @@ export async function assignWorktreeToSession(
     );
   if (liveBackends.has(sessionId)) {
     // backend FIRST — the store commits only on its ack
-    await setNativeSessionCwd(sessionId, args.path);
+    const session = useVibe.getState().sessions[sessionId]?.session;
+    try {
+      await setNativeSessionCwd(sessionId, args.path);
+      await setNativeSessionLaneGit(
+        sessionId,
+        session?.spawnedBy === "conductor" && session.access === "workspace"
+          ? args.branch
+          : null,
+      );
+    } catch (error) {
+      // CWD changed before the capability check. Tear down the backend so a
+      // failed grant can never leave native execution in a path the store has
+      // not acknowledged; the next delivery resumes from persisted old meta.
+      try {
+        await closeNativeSession(sessionId);
+        liveBackends.delete(sessionId);
+      } catch (closeError) {
+        throw new Error(
+          `worktree assignment failed (${errorText(error)}) and the inconsistent backend could not be closed (${errorText(closeError)})`,
+        );
+      }
+      throw error;
+    }
   }
   useVibe.getState().assignWorktree(sessionId, {
     projectDir: args.path,
@@ -1048,22 +1154,48 @@ export async function assignWorktreeToSession(
 export async function reviewSession(
   sessionId: string,
   target: string,
-  opts: { requireWorkspace?: boolean } = {},
+  opts: {
+    requireWorkspace?: boolean;
+    source?: "orchestrator" | "auto" | "github" | "mission";
+  } = {},
 ): Promise<{ status: string; review: string | null; review_thread_id: string }> {
   const session = useVibe.getState().sessions[sessionId]?.session;
   if (!session) throw new Error(`unknown vibe session "${sessionId}"`);
-  ensureEvents();
+  await ensureEvents();
+  const reviewId = `review-${nanoid(10)}`;
+  pendingReviewLanes.set(reviewId, {
+    sessionId,
+    projectId: session.projectId,
+    agentName: session.agentName,
+    source: opts.source ?? "orchestrator",
+    target,
+    requestedAt: Date.now(),
+  });
   // a detached review holds NO session/conductor busy flag — surface it to
   // the quit guard so quitting can't silently kill minutes of review work
   const endInflight = beginInflight("review");
   try {
     await resumeSession(sessionId);
-    return await reviewNativeSession(
+    const result = await reviewNativeSession(
       sessionId,
       target,
+      reviewId,
       opts.requireWorkspace,
     );
+    // The native response itself is a start acknowledgement too. This keeps
+    // an extremely fast review visible even if its event is delivered later.
+    materializeReviewLane(reviewId, result.review_thread_id);
+    useReviewLanes
+      .getState()
+      .complete(reviewId, result.status, result.review);
+    return result;
+  } catch (error) {
+    if (useReviewLanes.getState().lanes[reviewId]) {
+      useReviewLanes.getState().fail(reviewId, errorText(error));
+    }
+    throw error;
   } finally {
+    pendingReviewLanes.delete(reviewId);
     endInflight();
   }
 }
@@ -1130,7 +1262,6 @@ export async function compactSession(
   // path is exempt: it runs inside that very claim.
   if (!opts?.fromDelivery && deliveryClaims.has(sessionId))
     throw new Error("a message is being delivered — try again in a moment");
-  ensureEvents();
   // claim the marker BEFORE the first await — two same-tick compactions
   // (manual + auto) must never both pass the checks and share one bit
   compactingSessions.add(sessionId);
@@ -1138,6 +1269,7 @@ export async function compactSession(
     compactionWaiters.set(sessionId, resolve);
   });
   try {
+    await ensureEvents();
     await resumeSession(sessionId);
     await compactNativeSession(sessionId); // blocks until the turn genuinely ended
     // settle handshake: the terminal event was emitted before the RPC
@@ -1200,6 +1332,7 @@ async function maybeAutoCompactBeforeTurn(sessionId: string): Promise<void> {
 const DECISION_STATUS: Record<VibeApprovalDecision, VibeApprovalStatus> = {
   accept: "accepted",
   acceptForSession: "acceptedForSession",
+  always: "acceptedAlways",
   decline: "declined",
   cancel: "cancelled",
 };
@@ -1211,11 +1344,34 @@ export async function respondApproval(
   approvalId: string,
   decision: VibeApprovalDecision,
 ): Promise<void> {
+  if (decision === "always") {
+    const item = useVibe.getState().sessions[sessionId]?.items[approvalId];
+    if (!item || item.kind !== "approval" || !item.canAlwaysAllow) {
+      warn(sessionId, "This command did not provide a persistent approval rule.");
+      return;
+    }
+    const pattern = approvalPatternFromPayload(item.payload);
+    if (!pattern) {
+      warn(sessionId, "The persistent command rule was malformed.");
+      return;
+    }
+    try {
+      await useSwarm.getState().addApprovalRule(pattern);
+    } catch (error) {
+      warn(sessionId, `Couldn't save the persistent rule: ${errorText(error)}`);
+      return;
+    }
+  }
   useVibe
     .getState()
     .setApprovalStatus(sessionId, approvalId, DECISION_STATUS[decision], "human");
   try {
-    await respondNativeApproval(sessionId, approvalId, decision, false);
+    await respondNativeApproval(
+      sessionId,
+      approvalId,
+      decision === "always" ? "accept" : decision,
+      false,
+    );
   } catch (err) {
     warn(sessionId, `Couldn't answer the approval: ${errorText(err)}`);
     // revert the optimistic mark — Rust never recorded the decision, the
@@ -1237,7 +1393,7 @@ export async function respondApproval(
 export async function respondApprovalStrict(
   sessionId: string,
   approvalId: string,
-  decision: VibeApprovalDecision,
+  decision: Exclude<VibeApprovalDecision, "always">,
 ): Promise<void> {
   await respondNativeApproval(sessionId, approvalId, decision, true);
   useVibe

@@ -319,6 +319,91 @@ pub(crate) fn unwrap_shell_strict(tokens: &[String]) -> Option<&str> {
     Some(tokens[2].as_str())
 }
 
+/// Is this one of the two exact, hook-suppressed Git commands SwarmZ grants
+/// to an Orchestrator-owned worktree lane? The live worktree/branch claim is
+/// checked separately in sessions.rs. Everything else remains human-only.
+pub(crate) fn lane_git_action(params: &Value, branch: &str) -> Option<&'static str> {
+    fn starts_with(tokens: &[String], prefix: &[&str]) -> bool {
+        tokens.len() >= prefix.len()
+            && tokens
+                .iter()
+                .zip(prefix)
+                .all(|(token, expected)| token == expected)
+    }
+
+    fn tokens_of(raw: &str, depth: u8) -> Option<Vec<String>> {
+        if depth > 2 {
+            return None;
+        }
+        let tokens = tokenize_strict(raw)?;
+        if let Some(inner) = unwrap_shell_strict(&tokens) {
+            return tokens_of(inner, depth + 1);
+        }
+        Some(tokens)
+    }
+
+    let raw = params.get("command")?.as_str()?;
+    let tokens = tokens_of(raw, 0)?;
+    if normalized_head(tokens.first()?)? != "git" {
+        return None;
+    }
+    let args = &tokens[1..];
+    const LOCAL_PREFIX: &[&str] = &[
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "commit.gpgSign=false",
+        "commit",
+    ];
+    const PUSH_PREFIX: &[&str] = &[
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "core.sshCommand=ssh",
+        "push",
+    ];
+    if starts_with(args, LOCAL_PREFIX) {
+        let rest = &args[LOCAL_PREFIX.len()..];
+        // Positive grammar only: no editor/template/pathspec/config surface.
+        // Staging remains a separate approval because `git add` may execute
+        // repository-configured clean filters.
+        return (rest.len() == 3
+            && rest[0] == "--no-verify"
+            && matches!(rest[1].as_str(), "-m" | "--message")
+            && !rest[2].is_empty()
+            && rest[2].len() <= 4_096
+            && !rest[2].chars().any(char::is_control))
+        .then_some("commit");
+    }
+    if starts_with(args, PUSH_PREFIX) {
+        let mut rest = &args[PUSH_PREFIX.len()..];
+        if matches!(
+            rest.first().map(String::as_str),
+            Some("-u" | "--set-upstream")
+        ) {
+            rest = &rest[1..];
+        }
+        if rest.len() != 2 || rest[0] != "origin" {
+            return None;
+        }
+        let refspec = rest[1].as_str();
+        return (refspec == branch || refspec == format!("HEAD:{branch}")).then_some("push");
+    }
+    None
+}
+
 /// Is this full command line routine? Pure, fail-closed, recursion-bounded.
 /// `cwd` is the session's TRUSTED working directory — every path-bearing
 /// operand of a routine candidate must stay inside it (audit R3).

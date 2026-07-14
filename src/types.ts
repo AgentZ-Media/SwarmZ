@@ -216,6 +216,19 @@ export interface PersistedProjects {
 
 // ---- Settings ----
 
+export interface ApprovalRule {
+  id: string;
+  /** argv prefix proposed by Codex; trailing arguments remain allowed. */
+  pattern: string[];
+  createdAt: number;
+}
+
+export interface ReviewIterationCounter {
+  laneKey: string;
+  count: number;
+  updatedAt: number;
+}
+
 /** Small app-wide preferences, persisted across restarts. Edited in the Settings dialog. */
 export interface AppSettings {
   /** last project directory a session was launched in — prefilled in the New Session dialog */
@@ -247,13 +260,12 @@ export interface AppSettings {
   orchestratorCodexEffort?: string;
   /** default scan roots for the orchestrator's list_projects when the model passes none */
   orchestratorScanRoots?: string[];
-  /**
-   * Phase 5 auto-review: when a conductor-tasked agent finishes a lane that
-   * changed code, a detached codex review runs automatically BEFORE the
-   * Conductor's agent-finished turn — the findings ride into that turn, so
-   * the Conductor reports reviewed work. Off by default (reviews cost turns).
-   */
+  /** Master switch for Orchestrator code-review loops. Off by default. */
   autoReviewFinishedLanes?: boolean;
+  /** Maximum detached review attempts per worktree/feature lane (default 2). */
+  autoReviewMaxIterations?: number;
+  /** Internal durable review-loop counters, keyed by worktree feature lane. */
+  reviewIterationCounts?: ReviewIterationCounter[];
   /**
    * Phase 8 auto-compaction: when a session/Conductor chat nears its context
    * window (≥85%), `thread/compact/start` runs BEFORE the next turn to shrink
@@ -262,6 +274,18 @@ export interface AppSettings {
    * the manual compact button (and codex' own auto-compaction) only.
    */
   autoCompact?: boolean;
+  /**
+   * Master switch for the per-project autonomous-turn circuit breaker. ON by
+   * default; false deliberately removes both configured limits and clears the
+   * current counters/latches.
+   */
+  autonomyBudgetEnabled?: boolean;
+  /** Autonomous turns allowed since the last human message (default 5). */
+  autonomyMaxConsecutiveTurns?: number;
+  /** Autonomous turns allowed per rolling hour and project (default 20). */
+  autonomyMaxTurnsPerHour?: number;
+  /** Human-created SwarmZ-only Codex command-prefix approvals. */
+  approvalRules?: ApprovalRule[];
   /**
    * Motion off-switch (DESIGN.md): stamps `data-motion="off"` on the root
    * element, collapsing every nonessential animation (sweeps, pulses,
@@ -518,6 +542,7 @@ export type VibeApprovalStatus =
   | "pending"
   | "accepted"
   | "acceptedForSession"
+  | "acceptedAlways"
   | "declined"
   | "cancelled";
 
@@ -624,7 +649,9 @@ export type VibeItem =
        * field existed. Drives the "approved by Conductor" attribution so the
        * user can see, at a glance, which approvals they did NOT give themselves.
        */
-      decidedBy?: "conductor" | "human";
+      decidedBy?: "conductor" | "human" | "rule" | "lanePolicy";
+      /** Rust validated a structured Codex execpolicy proposal for persistence. */
+      canAlwaysAllow?: boolean;
       /** the raw request params (itemId, reason, command, cwd, …) */
       payload: Record<string, unknown>;
     }

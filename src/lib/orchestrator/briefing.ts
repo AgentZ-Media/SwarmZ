@@ -34,6 +34,9 @@ export function worktreeBriefing(w: WorktreeBriefingInput): string {
     `[workspace] You work in a git WORKTREE, not the main checkout: ${worktree} on branch ${branch}.`,
     `The main repository lives at ${root} — leave it untouched; all your work happens inside this worktree.`,
     "Untracked files (.env, local configs, keys) were copied in from the main checkout; dependency/build dirs (node_modules, target, dist, …) were NOT — install dependencies here first when your task needs builds, tests or a dev server.",
+    "You may commit already-staged changes and push this worktree branch without asking when you use SwarmZ's exact safe Git forms below; staging and every other Git command stay approval-gated.",
+    'Commit: git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat -c protocol.allow=never -c commit.gpgSign=false commit --no-verify -m "<message>"',
+    `Push: git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat -c protocol.ext.allow=never -c core.sshCommand=ssh push -u origin ${branch}`,
   ];
   if (w.shared) {
     lines.push(
