@@ -9,6 +9,7 @@ import type { MissionOutboxRecord } from "./outbox";
 import { deriveApprovedMissionScope, type ApprovedMissionScope } from "./controller-core";
 import { useRuntimeEnvironments } from "@/lib/runtime/store";
 import type { TaskAttempt } from "./types";
+export { safeId } from "./ids";
 
 export interface MissionGitEvidence {
   base_sha: string;
@@ -18,16 +19,6 @@ export interface MissionGitEvidence {
   dirty: boolean;
   branch: string | null;
   base_is_ancestor: boolean;
-}
-
-export function safeId(value: string, prefix: string): string {
-  const slug = value.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 70) || "item";
-  let hash = 2_166_136_261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16_777_619);
-  }
-  return `${prefix}-${slug}-${(hash >>> 0).toString(36)}`;
 }
 
 export function missionPersistenceReady(): boolean {
@@ -92,11 +83,29 @@ export function activeLease(attempt: TaskAttempt): ActiveLease | null {
 export function tokenCount(sessionId: string | null): number {
   if (!sessionId) return 0;
   const total = useVibe.getState().sessions[sessionId]?.tokenUsage?.total;
+  return tokenCountFromBucket(total);
+}
+
+/** Parse the real app-server camelCase shape while tolerating persisted v1 snake_case. */
+export function tokenCountFromBucket(
+  total: Record<string, number> | null | undefined,
+): number {
   if (!total) return 0;
-  const explicit = total.total_tokens;
-  if (typeof explicit === "number" && Number.isFinite(explicit)) return Math.max(0, explicit);
-  return ["input_tokens", "output_tokens", "cached_input_tokens"]
-    .reduce((sum, key) => sum + (typeof total[key] === "number" ? Math.max(0, total[key]) : 0), 0);
+  for (const key of ["totalTokens", "total_tokens"] as const) {
+    const explicit = total[key];
+    if (typeof explicit === "number" && Number.isFinite(explicit)) {
+      return Math.max(0, explicit);
+    }
+  }
+  const value = (...keys: string[]) => {
+    const found = keys.map((key) => total[key]).find((item) =>
+      typeof item === "number" && Number.isFinite(item),
+    );
+    return typeof found === "number" ? Math.max(0, found) : 0;
+  };
+  // cachedInputTokens is already part of inputTokens on the Codex wire and
+  // must not be added a second time.
+  return value("inputTokens", "input_tokens") + value("outputTokens", "output_tokens");
 }
 
 export function missionUsage(scope: ApprovedMissionScope, now: number) {

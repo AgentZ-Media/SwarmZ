@@ -32,6 +32,11 @@ import {
   runIndependentGates,
   turnIdForAttempt,
 } from "./verification-gates";
+import {
+  orphanMissionSessionIds,
+  runningAttemptRecoveryIssue,
+  type MissionRecoverySession,
+} from "./recovery-core";
 
 const OWNER_ID = "mission-controller";
 const CLAIM_MS = 5 * 60_000;
@@ -311,6 +316,23 @@ export async function recoverOutboxAndAttempts(): Promise<void> {
     .sort((left, right) => left.createdAt - right.createdAt);
   for (const record of settlements) await dispatchSettle(record);
 
+  const recoverySessions: Record<string, MissionRecoverySession> = Object.fromEntries(
+    Object.values(useVibe.getState().sessions).map((entry) => [
+      entry.session.id,
+      entry.session,
+    ]),
+  );
+  const orphanSessionIds = orphanMissionSessionIds(
+    useMissions.getState().projection,
+    outbox,
+    Object.values(recoverySessions),
+  );
+  for (const sessionId of orphanSessionIds) {
+    await closeSession(sessionId);
+    await flushVibePersist();
+    delete recoverySessions[sessionId];
+  }
+
   for (const attempt of Object.values(useMissions.getState().projection.attempts)) {
     if (attempt.status !== "running") {
       await cleanupAttemptRuntimeBestEffort(attempt);
@@ -325,12 +347,8 @@ export async function recoverOutboxAndAttempts(): Promise<void> {
       }
       continue;
     }
-    const spawn = spawnRecordForAttempt(attempt.id);
-    if (!spawn || spawn.status === "dead_letter" ||
-      (spawn.status === "delivered" &&
-        (!attempt.sessionId || !useVibe.getState().sessions[attempt.sessionId]))) {
-      await durableSettle(attempt, "failed", "Recovered running attempt has no deliverable spawn command", null);
-    }
+    const issue = runningAttemptRecoveryIssue(attempt, outbox, recoverySessions);
+    if (issue) await durableSettle(attempt, "failed", issue, null);
   }
 }
 

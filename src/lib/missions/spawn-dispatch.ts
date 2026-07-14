@@ -37,6 +37,7 @@ import {
   safeId,
   spawnRecordForAttempt,
 } from "./controller-shared";
+import { sessionMatchesSpawn, spawnProjectionIssue } from "./recovery-core";
 
 const OWNER_ID = "mission-controller";
 const CLAIM_MS = 5 * 60_000;
@@ -215,6 +216,11 @@ export async function dispatchSpawn(record: MissionOutboxRecord): Promise<void> 
   let turnStarted = false;
   let runtimePreparedDurable = false;
   try {
+    const projectionIssue = spawnProjectionIssue(
+      useMissions.getState().projection,
+      claimed,
+    );
+    if (projectionIssue) throw new Error(projectionIssue);
     await ensureSpawnWorktree(claimed);
     const base = await gitEvidence(payload.cwd, null);
     if (payload.baseSha && base.head_sha.toLowerCase() !== payload.baseSha.toLowerCase()) {
@@ -251,7 +257,11 @@ export async function dispatchSpawn(record: MissionOutboxRecord): Promise<void> 
       effectivePrompt = `${payload.prompt}\n\n${launched.prompt}`;
     }
     const sessionId = payload.sessionId ?? safeId(payload.attemptId, "ms");
-    if (!useVibe.getState().sessions[sessionId]) {
+    const existingSession = useVibe.getState().sessions[sessionId]?.session;
+    if (existingSession && !sessionMatchesSpawn(existingSession, claimed)) {
+      throw new Error("persisted session disagrees with the durable Mission spawn command");
+    }
+    if (!existingSession) {
       await startSession({
         id: sessionId,
         name: `Task ${payload.taskId}`,
