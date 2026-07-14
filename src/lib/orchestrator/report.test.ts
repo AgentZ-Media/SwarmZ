@@ -200,8 +200,8 @@ describe("expectation registry", () => {
   });
 
   it("binds to a turn id: a stale turn's finish can't eat the mark", () => {
-    noteReportExpected("s1");
-    bindReportExpectation("s1", "turn-NEW");
+    const token = noteReportExpected("s1");
+    bindReportExpectation("s1", token, "turn-NEW");
     // an OLD turn completing (registered-before-send race) does NOT consume
     expect(takeReportExpectation("s1", "turn-OLD")).toBe(false);
     // the bound turn's finish consumes
@@ -209,16 +209,27 @@ describe("expectation registry", () => {
     expect(takeReportExpectation("s1", "turn-NEW")).toBe(false);
   });
 
-  it("unbound expectations and unknown finish turn ids stay permissive", () => {
+  it("does not let a bound stale completion consume an unbound expectation", () => {
     noteReportExpected("s1");
-    // no bind (ack still in flight) → any finish consumes
-    expect(takeReportExpectation("s1", "turn-X")).toBe(true);
-    noteReportExpected("s2");
-    bindReportExpectation("s2", "turn-B");
+    expect(takeReportExpectation("s1", "turn-X")).toBe(false);
+    // An event source without a turn id keeps the legacy conservative path.
+    expect(takeReportExpectation("s1", null)).toBe(true);
+    const token = noteReportExpected("s2");
+    bindReportExpectation("s2", token, "turn-B");
     // finish with UNKNOWN turn id (codex handed none out) → consumes
     expect(takeReportExpectation("s2", null)).toBe(true);
     // binding after consumption is a no-op
-    bindReportExpectation("s2", "turn-C");
+    bindReportExpectation("s2", token, "turn-C");
     expect(takeReportExpectation("s2", "turn-C")).toBe(false);
+  });
+
+  it("keeps concurrent registrations isolated by token", () => {
+    const first = noteReportExpected("s1");
+    const second = noteReportExpected("s1");
+    bindReportExpectation("s1", first, "turn-A");
+    bindReportExpectation("s1", second, "turn-B");
+    clearReportExpectation("s1", second);
+    expect(takeReportExpectation("s1", "turn-B")).toBe(false);
+    expect(takeReportExpectation("s1", "turn-A")).toBe(true);
   });
 });

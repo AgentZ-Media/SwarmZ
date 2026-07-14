@@ -116,6 +116,7 @@ import {
   validModelId,
 } from "./executor-guards";
 import {
+  busyLaneBlocker,
   findWorktreeEntry,
   sessionsInPath,
   withWorktreeLock,
@@ -147,6 +148,32 @@ function stripNotes(items: NoteItem[]): ToolNoteItem[] {
  * never a bus timeout.
  */
 const SHARED_LANE_WAIT_MS = 8 * 60 * 1000;
+
+/**
+ * Serialize the Conductor's check-and-send boundary per canonical checkout.
+ * A different busy session in the same checkout owns the writer lease until
+ * its turn lands idle; callers must retry instead of creating two writers.
+ */
+async function withLaneWriterClaim<T>(
+  entry: VibeSessionEntry,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return withWorktreeLock(entry.session.projectDir, async () => {
+    const state = useVibe.getState();
+    const blocker = busyLaneBlocker(
+      sessionsInPath(entry.session.projectDir),
+      entry.session.projectDir,
+      entry.session.id,
+      state.busy,
+    );
+    if (blocker) {
+      throw new Error(
+        `refused: shared checkout writer lease is held by "${blocker.session.name}" — wait for that turn to finish`,
+      );
+    }
+    return operation();
+  });
+}
 
 /** Placement of one agent: worktree "new" | "shared:<agent>" | "none". */
 async function resolvePlacement(
@@ -543,9 +570,10 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
       );
     const text = String(args.text ?? "");
     if (!text) throw new Error("text must not be empty");
-    const id = entry.session.id;
-    const name = entry.session.name;
-    assertNoDoublePrompt(id, name);
+    return withLaneWriterClaim(entry, async () => {
+      const id = entry.session.id;
+      const name = entry.session.name;
+      assertNoDoublePrompt(id, name);
     // expect_report (Phase 5): the fresh turn is outputSchema-constrained so
     // the agent ends with a machine-readable status report. Schema AND
     // report suffix apply ONLY to FRESH turns (freshTurnText) — a steered
@@ -556,7 +584,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     // registered BEFORE the send — a very fast completion event must not
     // beat the registration and lose the structured parsing; cleared again
     // on a steer (no schema applied) or a failed send
-    if (expectReport) noteReportExpected(id);
+    const expectationToken = expectReport ? noteReportExpected(id) : null;
     let how: { mode: "steered" | "queued"; turnId: string | null };
     try {
       // steerMessageStrict routes by state: busy → turn/steer (mid-flight
@@ -577,12 +605,12 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
           : { via: "conductor", requireWorkspace: true },
       );
     } catch (err) {
-      if (expectReport) clearReportExpectation(id);
+      if (expectationToken) clearReportExpectation(id, expectationToken);
       throw err;
     }
-    if (expectReport) {
-      if (how.mode === "steered") clearReportExpectation(id);
-      else bindReportExpectation(id, how.turnId);
+    if (expectationToken) {
+      if (how.mode === "steered") clearReportExpectation(id, expectationToken);
+      else bindReportExpectation(id, expectationToken, how.turnId);
     }
     notePromptDelivered(id, name, ctx);
     const result: PromptAgentResult = {
@@ -590,7 +618,8 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
       agent: { id, name },
       mode: how.mode === "steered" ? "steered" : "turn",
     };
-    return result;
+      return result;
+    });
   },
 
   spawn_agents: async (args, ctx) => {
@@ -660,26 +689,28 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
       text,
       expectReport,
     }: (typeof tasks)[number]) => {
+      const expectationToken = expectReport ? noteReportExpected(id) : null;
       try {
         // expect_report (Phase 5): the task turn is outputSchema-constrained
         // so the agent ends with a machine-readable status report. The
         // expectation registers BEFORE the send (a racing completion event
         // must not lose the parsing), binds to the acked turn id after, and
         // clears on a failed send (catch below).
-        if (expectReport) noteReportExpected(id);
-        const sent = await vibeSendMessage(
-          id,
-          expectReport ? text + REPORT_PROMPT_SUFFIX : text,
-          expectReport
-            ? {
-                via: "conductor",
-                requireWorkspace: true,
-                outputSchema:
-                  AGENT_REPORT_SCHEMA as unknown as Record<string, unknown>,
-              }
-            : { via: "conductor", requireWorkspace: true },
-        );
-        if (expectReport) bindReportExpectation(id, sent.turnId);
+        const entry = useVibe.getState().sessions[id];
+        if (!entry) throw new Error("agent disappeared before its task could be delivered");
+        const sent = await withLaneWriterClaim(entry, () => vibeSendMessage(
+            id,
+            expectReport ? text + REPORT_PROMPT_SUFFIX : text,
+            expectReport
+              ? {
+                  via: "conductor",
+                  requireWorkspace: true,
+                  outputSchema:
+                    AGENT_REPORT_SCHEMA as unknown as Record<string, unknown>,
+                }
+              : { via: "conductor", requireWorkspace: true },
+          ));
+        if (expectationToken) bindReportExpectation(id, expectationToken, sent.turnId);
         notePromptDelivered(
           id,
           useVibe.getState().sessions[id]?.session.name ??
@@ -689,7 +720,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         );
         return true;
       } catch (e) {
-        if (expectReport) clearReportExpectation(id);
+        if (typeof expectationToken === "string") clearReportExpectation(id, expectationToken);
         const r = results[index];
         if (r)
           r.warning = `task not delivered: ${e instanceof Error ? e.message : String(e)}`;

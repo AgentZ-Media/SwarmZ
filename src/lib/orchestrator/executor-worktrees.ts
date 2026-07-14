@@ -14,8 +14,22 @@ export function sessionsInPath(path: string): VibeSessionEntry[] {
   );
 }
 
+export function busyLaneBlocker(
+  entries: readonly VibeSessionEntry[],
+  path: string,
+  targetSessionId: string,
+  busy: Readonly<Record<string, boolean>>,
+): VibeSessionEntry | null {
+  return entries.find((entry) =>
+    entry.session.id !== targetSessionId &&
+    samePath(entry.session.projectDir, path) &&
+    busy[entry.session.id],
+  ) ?? null;
+}
+
+/** Mutating worktree operations must never split a lock through path aliases. */
 export function canonicalizePath(path: string): Promise<string> {
-  return invoke<string>("canonicalize_path", { path }).catch(() => path);
+  return invoke<string>("canonicalize_path", { path });
 }
 
 export async function findWorktreeEntry(
@@ -41,6 +55,13 @@ export async function withWorktreeLock<T>(
   const key = (await canonicalizePath(path)).replace(/\/+$/, "");
   const tail = worktreeLocks.get(key) ?? Promise.resolve();
   const run = tail.then(fn, fn);
-  worktreeLocks.set(key, run.catch(() => {}));
-  return run;
+  const tracked = run.catch(() => {});
+  worktreeLocks.set(key, tracked);
+  try {
+    return await run;
+  } finally {
+    // Do not delete a newer waiter that was appended while this operation
+    // ran. Once the final waiter settles, the key is released completely.
+    if (worktreeLocks.get(key) === tracked) worktreeLocks.delete(key);
+  }
 }
