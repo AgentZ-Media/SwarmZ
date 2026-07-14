@@ -409,10 +409,9 @@ pub fn integration_apply(
         IntegrationStrategy::CherryPick => git_ok(bin, &worktree.path, &["cherry-pick", "--abort"]),
         IntegrationStrategy::Merge => git_ok(bin, &worktree.path, &["merge", "--abort"]),
     };
-    let checkout_restored = current_head(bin, &worktree.path).ok().as_deref()
-        == Some(head_before.as_str())
+    let checkout_restored = abort.is_ok()
+        && current_head(bin, &worktree.path).ok().as_deref() == Some(head_before.as_str())
         && status_porcelain(bin, &worktree.path).ok().as_deref() == Some("");
-    let _ = abort;
     if conflicts.is_empty() {
         return Err(if checkout_restored {
             format!(

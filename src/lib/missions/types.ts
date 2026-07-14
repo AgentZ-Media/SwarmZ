@@ -51,6 +51,13 @@ export interface MissionPolicy {
   requireQualityGates: boolean;
   integrationMode: "manual" | "train";
   archiveCompletedWorkers: boolean;
+  /** Optional private-preview execution grants; missing values fail closed. */
+  networkAuthority?: "deny" | "read_only" | "allow";
+  githubAuthority?: "deny" | "read_only" | "write";
+  allowedTools?: string[];
+  qualityCommands?: string[];
+  stopOnRegression?: "continue" | "pause_mission" | "needs_human" | "cancel_mission";
+  stopOnConflict?: "continue" | "pause_mission" | "needs_human" | "cancel_mission";
 }
 
 export interface MissionBudget {
@@ -125,6 +132,9 @@ export interface MissionTask {
   updatedAt: number;
   archivedAt: number | null;
   pausedAt: number | null;
+  /** Human-provided context consumed by the next fresh retry attempt. */
+  resumeInstruction?: string | null;
+  requeuedAfterAttemptId?: string | null;
 }
 
 export interface TaskAttempt {
@@ -135,6 +145,7 @@ export interface TaskAttempt {
   status: AttemptStatus;
   sessionId: string | null;
   workerLabel: string | null;
+  resumeInstruction?: string | null;
   startedAt: number | null;
   finishedAt: number | null;
   summary: string | null;
@@ -249,6 +260,8 @@ export type MissionTaskInput = Omit<
   | "updatedAt"
   | "archivedAt"
   | "pausedAt"
+  | "resumeInstruction"
+  | "requeuedAfterAttemptId"
 > & { createdAt: number };
 
 export type MissionEventPayload =
@@ -286,6 +299,15 @@ export type MissionEventPayload =
   | { type: "task.archived"; data: { taskId: string; archivedAt: number } }
   | { type: "task.paused"; data: { taskId: string; pausedAt: number } }
   | { type: "task.resumed"; data: { taskId: string; resumedAt: number } }
+  | {
+      type: "task.requeued";
+      data: {
+        taskId: string;
+        afterAttemptId: string;
+        instruction: string;
+        requeuedAt: number;
+      };
+    }
   | {
       type: "attempt.started";
       data: {

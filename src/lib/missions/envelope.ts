@@ -61,6 +61,8 @@ export interface EnvelopeStartRequest {
   requiredTools?: readonly string[];
   network?: Exclude<NetworkAuthority, "deny">;
   github?: Exclude<GithubAuthority, "deny">;
+  /** Retries consume attempt budget, but not another unique task slot. */
+  isFirstTaskStart?: boolean;
   now: number;
   /** Existing persisted autonomy breaker is the final emergency stop. */
   breakerOpen: boolean;
@@ -238,7 +240,9 @@ export function authorizeEnvelopeStart(
     return { ok: false, code: "expired", reason: "mission envelope expired" };
   }
   const limits = envelope.limits;
-  if (usage.tasksStarted >= limits.maxTasks) return { ok: false, code: "task_limit", reason: "task-start budget exhausted" };
+  if ((request.isFirstTaskStart ?? true) && usage.tasksStarted >= limits.maxTasks) {
+    return { ok: false, code: "task_limit", reason: "unique task-start budget exhausted" };
+  }
   if (usage.attemptsStarted >= limits.maxAttempts) return { ok: false, code: "attempt_limit", reason: "attempt budget exhausted" };
   if (limits.maxTokens !== null && usage.tokensUsed >= limits.maxTokens) return { ok: false, code: "token_limit", reason: "token budget exhausted" };
   if (limits.maxActiveMs !== null && usage.activeMs >= limits.maxActiveMs) return { ok: false, code: "time_limit", reason: "active-time budget exhausted" };

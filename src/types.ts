@@ -448,7 +448,7 @@ export interface PersistedOrchestratorChats {
 export type VibeAccess = "workspace" | "full";
 
 /** Who created a session: the human (dialog/palette) or the Conductor. */
-export type VibeSpawnedBy = "user" | "conductor";
+export type VibeSpawnedBy = "user" | "conductor" | "mission";
 
 /**
  * The git worktree a session's agent works in. Phase 2 only carries the
@@ -541,6 +541,8 @@ export type VibeItem =
        * Undefined = a human message (or a pre-existing item).
        */
       via?: "conductor";
+      /** Durable backend turn binding (Mission evidence boundary). */
+      turnId?: string;
     }
   | {
       id: string;
@@ -558,6 +560,8 @@ export type VibeItem =
        * when the text still parses as a valid AgentReport.
        */
       report?: boolean;
+      /** Durable backend turn binding (Mission evidence boundary). */
+      turnId?: string;
     }
   | {
       id: string;
@@ -569,6 +573,8 @@ export type VibeItem =
       exitCode?: number | null;
       /** aggregatedOutput, capped */
       output: string;
+      /** Durable backend turn binding (Mission evidence boundary). */
+      turnId?: string;
     }
   | {
       id: string;

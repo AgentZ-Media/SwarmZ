@@ -17,6 +17,7 @@ const EVENT_TYPES = new Set([
   "task.archived",
   "task.paused",
   "task.resumed",
+  "task.requeued",
   "attempt.started",
   "attempt.finished",
   "artifact.recorded",

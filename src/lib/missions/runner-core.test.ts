@@ -85,7 +85,7 @@ function envelope(patch: Partial<MissionExecutionEnvelope> = {}): MissionExecuti
       maxParallel: 5,
     },
     capabilities: {
-      allowedTools: ["edit_file", "test"],
+      allowedTools: ["workspace_sandbox"],
       allowedRoots: ["/repo"],
       network: "deny",
       github: "deny",
@@ -182,6 +182,39 @@ describe("mission runner core", () => {
       closeAfterTerminalReport: true,
       label: "Task task-0 · attempt 1",
     });
+  });
+
+  it("admits a retry when the unique-task scope is full but attempt budget remains", () => {
+    let projection = buildProjection(1);
+    projection = reduceMissionEvent(projection, {
+      eventId: "retry-start",
+      missionId: "mission-1",
+      revision: 3,
+      occurredAt: 10,
+      actor: "scheduler",
+      type: "attempt.started",
+      data: { id: "old-attempt", taskId: "task-0", startedAt: 10 },
+    });
+    projection = reduceMissionEvent(projection, {
+      eventId: "retry-failed",
+      missionId: "mission-1",
+      revision: 4,
+      occurredAt: 20,
+      actor: "system",
+      type: "attempt.finished",
+      data: { attemptId: "old-attempt", status: "failed", finishedAt: 20 },
+    });
+    const plan = planMissionStarts({
+      projection,
+      scheduler: schedulerFor(projection),
+      envelope: envelope({ limits: { ...envelope().limits, maxTasks: 1 } }),
+      usage: { ...zeroUsage, tasksStarted: 1, attemptsStarted: 1 },
+      now: 100,
+      breakerOpen: false,
+      completedOperationIds: new Set(),
+    });
+    expect(plan.commands).toHaveLength(1);
+    expect(plan.commands[0]).toMatchObject({ taskId: "task-0", ordinal: 2 });
   });
 
   it("is replay-idempotent through deterministic operation and attempt ids", () => {

@@ -88,9 +88,16 @@ function commandIdentity(
   ordinal: number,
 ): { operationId: string; attemptId: string } {
   const stem = `${envelope.missionId}:${task.id}:${ordinal}:r${envelope.revision}`;
+  let hash = 2_166_136_261;
+  for (let index = 0; index < stem.length; index += 1) {
+    hash ^= stem.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  const digest = (hash >>> 0).toString(36);
+  const taskSlug = task.id.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 32) || "task";
   return {
-    operationId: `mission-start:${stem}`,
-    attemptId: `attempt:${stem}`,
+    operationId: `mission-start:${taskSlug}:a${ordinal}:r${envelope.revision}:${digest}`,
+    attemptId: `ma-${taskSlug}-a${ordinal}-r${envelope.revision}-${digest}`,
   };
 }
 
@@ -167,6 +174,7 @@ export function planMissionStarts(input: MissionRunnerInput): MissionRunnerPlan 
       requiredTools: capabilities.tools,
       network: capabilities.network,
       github: capabilities.github,
+      isFirstTaskStart: task.attemptIds.length === 0,
       now: input.now,
       breakerOpen: input.breakerOpen,
       breakerReason: input.breakerReason,

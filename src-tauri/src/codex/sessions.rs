@@ -1332,6 +1332,10 @@ fn thread_start_params(profile: &SessionProfile) -> Value {
         "cwd": profile.cwd,
         "sandbox": profile.access.sandbox_mode(),
         "approvalPolicy": profile.access.approval_policy(),
+        // Product invariant: temporary lanes never inherit a global Codex
+        // personality. The Orchestrator's fixed identity lives in its own
+        // developer instructions, not in reusable worker presets.
+        "personality": "none",
     });
     if let Some(model) = &profile.model {
         p["model"] = json!(model);
@@ -1347,6 +1351,7 @@ fn thread_resume_params(thread_id: &str, profile: &SessionProfile) -> Value {
         "cwd": profile.cwd,
         "sandbox": profile.access.sandbox_mode(),
         "approvalPolicy": profile.access.approval_policy(),
+        "personality": "none",
     });
     if let Some(model) = &profile.model {
         p["model"] = json!(model);
@@ -2442,12 +2447,17 @@ mod tests {
         assert_eq!(start["cwd"], "/repo");
         assert_eq!(start["sandbox"], "workspace-write");
         assert_eq!(start["approvalPolicy"], "on-request");
+        assert_eq!(start["personality"], "none");
         assert_eq!(start["model"], "gpt-5.5");
         // the standard Codex harness stays intact
         assert!(start.get("dynamicTools").is_none());
         assert!(start.get("developerInstructions").is_none());
         // effort is a per-turn override, not a thread/start field
         assert!(start.get("effort").is_none());
+        assert_eq!(
+            thread_resume_params("thread-1", &profile)["personality"],
+            "none"
+        );
 
         // ordinary turn: model + effort ride along, no sandbox override on wire
         let plain = turn_params("tn", "hi", &profile, false, None);

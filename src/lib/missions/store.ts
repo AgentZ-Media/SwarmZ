@@ -37,6 +37,12 @@ export const DEFAULT_MISSION_POLICY: MissionPolicy = {
   requireQualityGates: true,
   integrationMode: "train",
   archiveCompletedWorkers: true,
+  networkAuthority: "deny",
+  githubAuthority: "deny",
+  allowedTools: ["workspace_sandbox"],
+  qualityCommands: [],
+  stopOnRegression: "needs_human",
+  stopOnConflict: "pause_mission",
 };
 
 export const DEFAULT_MISSION_BUDGET: MissionBudget = {
@@ -94,6 +100,14 @@ export interface MissionsState {
   pauseTask: (missionId: string, taskId: string, meta?: MissionCommandMeta) => void;
   resumeTask: (missionId: string, taskId: string, meta?: MissionCommandMeta) => void;
   archiveTask: (missionId: string, taskId: string, meta?: MissionCommandMeta) => void;
+  requeueTask: (
+    missionId: string,
+    taskId: string,
+    afterAttemptId: string,
+    instruction: string,
+    options?: { extendAttemptLimit?: boolean },
+    meta?: MissionCommandMeta,
+  ) => void;
   createAttempt: (
     missionId: string,
     taskId: string,
@@ -135,6 +149,16 @@ export interface MissionsState {
       details?: string | null;
       artifactIds?: string[];
     },
+    meta?: MissionCommandMeta,
+  ) => void;
+  settleQualityGates: (
+    missionId: string,
+    results: readonly {
+      gateId: string;
+      status: Exclude<QualityGateStatus, "pending" | "running">;
+      details?: string | null;
+      artifactIds?: string[];
+    }[],
     meta?: MissionCommandMeta,
   ) => void;
   createIntegrationTrain: (
@@ -416,6 +440,36 @@ export const useMissions = create<MissionsState>((set, get) => ({
   archiveTask: (missionId, taskId, meta) => {
     appendPayloads(get, set, missionId, [{ type: "task.archived", data: { taskId, archivedAt: meta?.occurredAt ?? Date.now() } }], meta);
   },
+  requeueTask: (missionId, taskId, afterAttemptId, instruction, options, meta) => {
+    const mission = get().projection.missions[missionId];
+    if (!mission) throw new Error("mission is unknown");
+    const task = get().projection.tasks[taskId];
+    if (!task || task.missionId !== missionId) throw new Error("task is unknown");
+    const exhausted = task.attemptIds.length >= task.maxAttempts;
+    if (exhausted && (!options?.extendAttemptLimit || task.maxAttempts >= 20)) {
+      throw new Error(task.maxAttempts >= 20
+        ? "task retry hard cap (20) is exhausted"
+        : "task retry budget is exhausted; explicit attempt-limit extension is required");
+    }
+    const at = meta?.occurredAt ?? Date.now();
+    appendPayloads(get, set, missionId, [
+      ...(exhausted ? [{
+        type: "task.updated" as const,
+        data: {
+          taskId,
+          patch: { maxAttempts: task.maxAttempts + 1 },
+          updatedAt: at,
+        },
+      }] : []),
+      {
+        type: "task.requeued",
+        data: { taskId, afterAttemptId, instruction, requeuedAt: at },
+      },
+      mission.pausedAt !== null
+        ? { type: "mission.resumed", data: { resumedAt: at } }
+        : { type: "mission.activated", data: { activatedAt: at } },
+    ], { ...meta, actor: "human", occurredAt: at });
+  },
 
   createAttempt: (missionId, taskId, input, meta) => {
     const id = input?.id ?? nanoid(14);
@@ -480,6 +534,14 @@ export const useMissions = create<MissionsState>((set, get) => ({
         updatedAt: meta?.occurredAt ?? Date.now(),
       },
     }], meta);
+  },
+
+  settleQualityGates: (missionId, results, meta) => {
+    const at = meta?.occurredAt ?? Date.now();
+    appendPayloads(get, set, missionId, results.map(({ gateId, ...input }) => ({
+      type: "quality_gate.resulted" as const,
+      data: { gateId, ...input, updatedAt: at },
+    })), { ...meta, occurredAt: at });
   },
 
   createIntegrationTrain: (missionId, input, meta) => {

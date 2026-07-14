@@ -21,8 +21,14 @@ export type MissionOutboxCommand =
       payload: {
         taskId: string;
         attemptId: string;
+        /** Deterministic final Vibe/Rust session id known before spawn. */
+        sessionId?: string;
         projectId: string;
         cwd: string;
+        root?: string;
+        branch?: string;
+        baseSha?: string;
+        copyEnv?: boolean;
         prompt: string;
         model?: string;
         effort?: string;
@@ -47,6 +53,7 @@ export type MissionOutboxCommand =
         summary?: string | null;
         error?: string | null;
         completionId: string;
+        report?: Record<string, unknown> | null;
       };
     }
   | {
@@ -212,38 +219,56 @@ function validateCommand(command: EnqueueMissionCommand): void {
   assertId("idempotency key", command.idempotencyKey);
   const serialized = JSON.stringify(command.payload);
   if (serialized.length > 100_000) throw new Error("outbox payload exceeds 100 KB");
-  if (command.kind === "spawn") {
-    const payload = command.payload;
-    assertId("task id", payload.taskId);
-    assertId("attempt id", payload.attemptId);
-    assertId("project id", payload.projectId);
-    if (!payload.cwd.trim() || !payload.prompt.trim()) throw new Error("spawn cwd and prompt are required");
-  } else if (command.kind === "prompt") {
-    const payload = command.payload;
-    assertId("session id", payload.sessionId);
-    assertId("task id", payload.taskId);
-    assertId("attempt id", payload.attemptId);
-    if (!payload.prompt.trim()) throw new Error("prompt text is required");
-  } else if (command.kind === "settle") {
-    const payload = command.payload;
-    assertId("task id", payload.taskId);
-    assertId("attempt id", payload.attemptId);
-    assertId("completion id", payload.completionId);
-  } else if (command.kind === "integrate") {
-    const payload = command.payload;
-    assertId("train id", payload.trainId);
-    assertId("task id", payload.taskId);
-    assertId("operation id", payload.operationId);
-    if (!/^[0-9a-f]{7,64}$/i.test(payload.commit) || !/^[0-9a-f]{7,64}$/i.test(payload.expectedHead)) {
-      throw new Error("integration commits are invalid");
+  switch (command.kind) {
+    case "spawn": {
+      const payload = command.payload;
+      assertId("task id", payload.taskId);
+      assertId("attempt id", payload.attemptId);
+      if (payload.sessionId) assertId("session id", payload.sessionId);
+      if (payload.baseSha && !/^[0-9a-f]{40,64}$/i.test(payload.baseSha)) {
+        throw new Error("spawn base SHA is invalid");
+      }
+      if (payload.copyEnv === true) throw new Error("mission spawn may not copy environment files");
+      assertId("project id", payload.projectId);
+      if (!payload.cwd.trim() || !payload.prompt.trim()) throw new Error("spawn cwd and prompt are required");
+      break;
     }
-  } else {
-    const payload = command.payload;
-    assertId("gate id", payload.gateId);
-    assertId("plan id", payload.planId);
-    if (!payload.command.trim() || !/^[0-9a-f]{7,64}$/i.test(payload.expectedHead)) {
-      throw new Error("gate command or expected head is invalid");
+    case "prompt": {
+      const payload = command.payload;
+      assertId("session id", payload.sessionId);
+      assertId("task id", payload.taskId);
+      assertId("attempt id", payload.attemptId);
+      if (!payload.prompt.trim()) throw new Error("prompt text is required");
+      break;
     }
+    case "settle": {
+      const payload = command.payload;
+      assertId("task id", payload.taskId);
+      assertId("attempt id", payload.attemptId);
+      assertId("completion id", payload.completionId);
+      break;
+    }
+    case "integrate": {
+      const payload = command.payload;
+      assertId("train id", payload.trainId);
+      assertId("task id", payload.taskId);
+      assertId("operation id", payload.operationId);
+      if (!/^[0-9a-f]{7,64}$/i.test(payload.commit) || !/^[0-9a-f]{7,64}$/i.test(payload.expectedHead)) {
+        throw new Error("integration commits are invalid");
+      }
+      break;
+    }
+    case "gate": {
+      const payload = command.payload;
+      assertId("gate id", payload.gateId);
+      assertId("plan id", payload.planId);
+      if (!payload.command.trim() || !/^[0-9a-f]{7,64}$/i.test(payload.expectedHead)) {
+        throw new Error("gate command or expected head is invalid");
+      }
+      break;
+    }
+    default:
+      throw new Error("unknown mission outbox command kind");
   }
 }
 
@@ -415,6 +440,58 @@ export function claimNextMissionCommand(
     explanation: selected
       ? `claimed ${selected.id} as attempt ${selected.attempts}/${selected.maxAttempts}`
       : "no outbox command is currently claimable",
+  };
+}
+
+/** Claim one known write-ahead record without stealing another subsystem's command. */
+export function claimMissionCommandById(
+  snapshot: MissionOutboxSnapshot,
+  recordId: string,
+  ownerId: string,
+  claimId: string,
+  now: number,
+  leaseMs: number,
+): ClaimDecision {
+  assertReady(snapshot);
+  assertId("outbox record id", recordId);
+  assertId("claim owner", ownerId);
+  assertId("claim id", claimId);
+  finiteTime(now);
+  const duration = Math.min(60 * 60_000, Math.max(1_000, Math.floor(leaseMs)));
+  let current = reapExpiredClaims(snapshot, now);
+  const record = current.records[recordId];
+  if (!record) throw new Error("outbox record is unknown");
+  let evaluation: OutboxEvaluation;
+  let selected: MissionOutboxRecord | null = null;
+  if (record.status === "delivered") {
+    evaluation = { recordId, eligible: false, reason: "delivered", message: "already delivered" };
+  } else if (record.status === "dead_letter") {
+    evaluation = { recordId, eligible: false, reason: "dead_letter", message: "manual retry is required" };
+  } else if (record.status === "claimed") {
+    evaluation = { recordId, eligible: false, reason: "lease_active", message: `claimed until ${record.lease?.expiresAt ?? 0}` };
+  } else if (record.attempts >= record.maxAttempts) {
+    const dead = { ...record, status: "dead_letter" as const, lease: null, updatedAt: now, nextAttemptAt: Number.MAX_SAFE_INTEGER };
+    current = replaceRecord(current, dead);
+    evaluation = { recordId, eligible: false, reason: "attempts_exhausted", message: "retry budget is exhausted" };
+  } else if (record.nextAttemptAt > now) {
+    evaluation = { recordId, eligible: false, reason: "not_due", message: `retry is due at ${record.nextAttemptAt}` };
+  } else {
+    selected = {
+      ...record,
+      status: "claimed",
+      attempts: record.attempts + 1,
+      updatedAt: now,
+      lease: { ownerId, claimId, claimedAt: now, expiresAt: now + duration },
+      lastError: null,
+    };
+    current = replaceRecord(current, selected);
+    evaluation = { recordId, eligible: true, reason: "ready", message: "requested command claimed" };
+  }
+  return {
+    snapshot: current,
+    record: selected,
+    evaluations: [evaluation],
+    explanation: selected ? `claimed ${selected.id} directly` : evaluation.message,
   };
 }
 

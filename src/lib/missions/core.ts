@@ -134,6 +134,7 @@ function deriveTaskStatus(
   const attempts = taskAttempts(state, task);
   const latest = attempts[attempts.length - 1];
   if (!latest) return "ready";
+  if (task.requeuedAfterAttemptId === latest.id) return "ready";
   if (latest.status === "queued" || latest.status === "running") return "running";
   if (latest.status === "cancelled") return "cancelled";
   if (latest.status === "needs_human") return "needs_human";
@@ -368,6 +369,26 @@ export function reduceMissionEvent(
     ) {
       throw new MissionInvariantError("mission policy is invalid");
     }
+    const policy = event.data.policy;
+    if (
+      (policy.networkAuthority !== undefined &&
+        !["deny", "read_only", "allow"].includes(policy.networkAuthority)) ||
+      (policy.githubAuthority !== undefined &&
+        !["deny", "read_only", "write"].includes(policy.githubAuthority)) ||
+      (policy.allowedTools !== undefined &&
+        (policy.allowedTools.length > 100 ||
+          policy.allowedTools.some((tool) => !/^[A-Za-z0-9_-][A-Za-z0-9._:-]{0,199}$/.test(tool)))) ||
+      (policy.qualityCommands !== undefined &&
+        (policy.qualityCommands.length > 20 ||
+          policy.qualityCommands.some((command) =>
+            typeof command !== "string" || !command.trim() || command.length > 1_000))) ||
+      (policy.stopOnRegression !== undefined &&
+        !["continue", "pause_mission", "needs_human", "cancel_mission"].includes(policy.stopOnRegression)) ||
+      (policy.stopOnConflict !== undefined &&
+        !["continue", "pause_mission", "needs_human", "cancel_mission"].includes(policy.stopOnConflict))
+    ) {
+      throw new MissionInvariantError("mission execution policy is invalid");
+    }
     const { budget } = event.data;
     if (
       (budget.maxAttemptsTotal !== null &&
@@ -465,6 +486,8 @@ export function reduceMissionEvent(
           updatedAt: event.data.createdAt,
           archivedAt: null,
           pausedAt: null,
+          resumeInstruction: null,
+          requeuedAfterAttemptId: null,
         };
         state.tasks[task.id] = task;
         replaceTaskDependencies(state, task);
@@ -558,6 +581,27 @@ export function reduceMissionEvent(
         };
         break;
       }
+      case "task.requeued": {
+        if (event.actor !== "human") {
+          throw new MissionInvariantError("only a human can requeue a task");
+        }
+        const task = state.tasks[event.data.taskId];
+        if (!task || task.missionId !== event.missionId) throw new MissionInvariantError("task is unknown");
+        const latestAttemptId = task.attemptIds[task.attemptIds.length - 1];
+        const latest = latestAttemptId ? state.attempts[latestAttemptId] : null;
+        if (!latest || latest.id !== event.data.afterAttemptId ||
+          !["needs_human", "blocked", "failed", "cancelled"].includes(latest.status)) {
+          throw new MissionInvariantError("requeue must bind the latest terminal attempt");
+        }
+        assertString("resume instruction", event.data.instruction, 4_000);
+        state.tasks[task.id] = {
+          ...task,
+          resumeInstruction: event.data.instruction.trim(),
+          requeuedAfterAttemptId: latest.id,
+          updatedAt: event.data.requeuedAt,
+        };
+        break;
+      }
       case "attempt.started": {
         assertId("attempt id", event.data.id);
         if (state.attempts[event.data.id]) throw new MissionInvariantError("attempt id already exists");
@@ -575,6 +619,7 @@ export function reduceMissionEvent(
           status: "running",
           sessionId: event.data.sessionId ?? null,
           workerLabel: event.data.workerLabel ?? null,
+          resumeInstruction: task.resumeInstruction,
           startedAt: event.data.startedAt,
           finishedAt: null,
           summary: null,
@@ -586,6 +631,8 @@ export function reduceMissionEvent(
         state.tasks[task.id] = {
           ...task,
           attemptIds: [...task.attemptIds, attempt.id],
+          resumeInstruction: null,
+          requeuedAfterAttemptId: null,
           updatedAt: event.occurredAt,
         };
         break;

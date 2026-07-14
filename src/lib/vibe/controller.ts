@@ -274,6 +274,9 @@ function finalizeStream(
       at: Date.now(),
       kind: "assistant",
       text: finalText,
+      ...(store.sessions[sessionId]?.turnId
+        ? { turnId: store.sessions[sessionId].turnId as string }
+        : {}),
       ...(phase !== undefined ? { phase } : {}),
     });
   }
@@ -288,7 +291,7 @@ function str(v: unknown): string {
 }
 
 /** Convert one raw codex item to a store item, or null to drop it. */
-function toVibeItem(raw: unknown): VibeItem | null {
+function toVibeItem(raw: unknown, turnId: string | null): VibeItem | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
   const id = str(r.id);
@@ -308,6 +311,7 @@ function toVibeItem(raw: unknown): VibeItem | null {
             ? (r.exitCode as number | null)
             : null,
         output: typeof r.aggregatedOutput === "string" ? r.aggregatedOutput : "",
+        ...(turnId ? { turnId } : {}),
       };
     case "fileChange":
       return {
@@ -502,6 +506,17 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
         sessionId,
         typeof data.turn_id === "string" ? data.turn_id : null,
       );
+      const turnId = typeof data.turn_id === "string" ? data.turn_id : null;
+      if (turnId) {
+        const entry = store.sessions[sessionId];
+        for (let index = entry.order.length - 1; index >= 0; index -= 1) {
+          const item = entry.items[entry.order[index]];
+          if (item?.kind === "user" && !item.turnId) {
+            store.patchItem(sessionId, item.id, { turnId });
+            break;
+          }
+        }
+      }
       break;
     }
     case "delta": {
@@ -520,6 +535,9 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
           kind: "assistant",
           text: "",
           streaming: true,
+          ...(store.sessions[sessionId]?.turnId
+            ? { turnId: store.sessions[sessionId].turnId as string }
+            : {}),
         });
       }
       st.buffer += text;
@@ -536,7 +554,7 @@ function handleEvent(sessionId: string, event: VibeSessionEvent) {
     }
     case "item_started":
     case "item_completed": {
-      const item = toVibeItem(data.item);
+      const item = toVibeItem(data.item, store.sessions[sessionId]?.turnId ?? null);
       if (item) store.upsertItem(sessionId, item);
       break;
     }
@@ -758,6 +776,8 @@ function errorText(err: unknown): string {
 // ---- public surface ----
 
 export interface StartSessionOpts {
+  /** Optional deterministic id for durable Mission write-ahead dispatch. */
+  id?: string;
   /** display name — omitted = the generated agent name */
   name?: string;
   projectDir: string;
@@ -809,7 +829,14 @@ export async function startSession(opts: StartSessionOpts): Promise<string> {
     opts.agentName?.trim() ||
     opts.name?.trim() ||
     pickAgentName(takenAgentNames(projectId));
-  const id = nanoid(10);
+  const id = opts.id ?? nanoid(10);
+  if (!/^[A-Za-z0-9_-][A-Za-z0-9._:-]{0,127}$/.test(id) ||
+    ["__proto__", "prototype", "constructor"].includes(id)) {
+    throw new Error("session id is invalid");
+  }
+  if (useVibe.getState().sessions[id]) {
+    throw new Error(`vibe session "${id}" already exists`);
+  }
   const access = opts.access ?? "full";
   const newSession: NewVibeSession = {
     id,
@@ -885,6 +912,9 @@ export async function sendMessageStrict(
   const store = useVibe.getState();
   if (!store.sessions[sessionId])
     throw new Error(`unknown vibe session "${sessionId}"`);
+  if (store.sessions[sessionId].session.spawnedBy === "mission" && !opts?.missionController) {
+    throw new Error("mission workers accept exactly their durable controller-owned assignment");
+  }
   // the SYNCHRONOUS delivery claim: `deliverTurn` awaits (auto-compaction)
   // BEFORE it flips the busy flag, so the busy check alone would let two
   // same-tick sends both pass, both append their user item, and the losing
@@ -942,6 +972,8 @@ export interface SendTurnOpts {
    * never sets this.
    */
   requireWorkspace?: boolean;
+  /** Internal Mission lifecycle path; all other follow-up turns are refused. */
+  missionController?: boolean;
 }
 
 /**
@@ -1054,6 +1086,9 @@ export async function steerMessageStrict(
   const store = useVibe.getState();
   if (!store.sessions[sessionId])
     throw new Error(`unknown vibe session "${sessionId}"`);
+  if (store.sessions[sessionId].session.spawnedBy === "mission" && !opts?.missionController) {
+    throw new Error("mission workers cannot be steered outside their durable assignment");
+  }
   // a compaction's turn must never be steered — the instruction would be
   // absorbed by the summarization turn and lost. STRICT: reject; the caller
   // (prompt_agent) retries once the short compaction is over.
@@ -1382,19 +1417,22 @@ async function cleanupSessionBackend(sessionId: string): Promise<void> {
   // flush a pending accounting mirror before the entry disappears
   cancelUsageMirror(sessionId);
   mirrorUsageHistory(sessionId);
+  if (liveBackends.has(sessionId)) {
+    try {
+      await invokeClose(sessionId);
+      liveBackends.delete(sessionId);
+    } catch (error) {
+      // Fail closed: removing the visible/store identity here would orphan a
+      // possibly still-running app-server with no handle for retry/recovery.
+      warn(sessionId, `Couldn't close worker process: ${errorText(error)}`);
+      throw error instanceof Error ? error : new Error(errorText(error));
+    }
+  }
   resetStream(sessionId);
   streams.delete(sessionId);
   lastTurnOutcomes.delete(sessionId);
   schemaTurns.delete(sessionId);
   compactingSessions.delete(sessionId);
-  if (liveBackends.has(sessionId)) {
-    liveBackends.delete(sessionId);
-    try {
-      await invokeClose(sessionId);
-    } catch {
-      /* best effort — the process dies with the app anyway */
-    }
-  }
 }
 
 /** Close a session: end its process, drop controller state + the store entry. */

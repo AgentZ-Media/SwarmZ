@@ -31,6 +31,7 @@ import {
   closeSession,
 } from "./lib/vibe/controller";
 import { ensureNotifyPermission, notify } from "./lib/transport";
+import { startMissionController } from "./lib/missions/controller";
 
 // Optional surfaces are sizeable and closed on a normal launch. Keep them out
 // of the startup graph; after first use they remain mounted so Radix can finish
@@ -109,6 +110,9 @@ export default function App() {
     // GitHub integration (Phase 7): repo/PR detection, the Rust write-gate
     // sync, the PR watcher and its pr-changed → ticker/autonomy routing
     const stopGithub = startGithubController();
+    // Durable Mission scheduler: remains fail-closed until missions, outbox
+    // and session stores hydrate; owns only temporary one-assignment workers.
+    const stopMissions = startMissionController();
     return () => {
       updates.stopBackgroundPolling();
       stopLimits();
@@ -116,6 +120,7 @@ export default function App() {
       stopOrchestratorBus();
       stopVibePings();
       stopGithub();
+      stopMissions();
     };
   }, [hydrate]);
 

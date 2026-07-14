@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { emptyMissionProjection } from "./core";
+import { deriveApprovedMissionScope } from "./controller-core";
 import { useMissions } from "./store";
 import type { AddMissionTaskInput } from "./store";
 
@@ -105,6 +106,79 @@ describe("mission command store", () => {
     expect(projection.tasks["task-1"].attemptIds).toEqual(["attempt-1", "attempt-2"]);
     expect(projection.attempts["attempt-1"]).toMatchObject({ status: "failed", error: "red" });
     expect(projection.attempts["attempt-2"]).toMatchObject({ status: "succeeded", summary: "green" });
+  });
+
+  it("requeues a terminal intervention with an instruction for one fresh attempt", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
+    useMissions.getState().addTask("mission-1", task("task-1"));
+    useMissions.getState().createAttempt("mission-1", "task-1", { id: "attempt-1" });
+    useMissions.getState().settleAttempt("mission-1", "attempt-1", {
+      status: "needs_human",
+      summary: "Need a decision",
+    });
+    useMissions.getState().requeueTask(
+      "mission-1",
+      "task-1",
+      "attempt-1",
+      "Use the safe migration",
+      undefined,
+    );
+    expect(useMissions.getState().projection.tasks["task-1"].status).toBe("ready");
+    const events = useMissions.getState().events;
+    expect(events.slice(-2).map((event) => [event.type, event.actor])).toEqual([
+      ["task.requeued", "human"],
+      ["mission.activated", "human"],
+    ]);
+    expect(deriveApprovedMissionScope(events, "mission-1")?.tasks["task-1"])
+      .toMatchObject({ resumeInstruction: "Use the safe migration" });
+    useMissions.getState().createAttempt("mission-1", "task-1", { id: "attempt-2" });
+    expect(useMissions.getState().projection.attempts["attempt-2"].resumeInstruction)
+      .toBe("Use the safe migration");
+    expect(useMissions.getState().projection.tasks["task-1"].resumeInstruction).toBeNull();
+  });
+
+  it("requires an explicit atomic attempt-limit extension for an exhausted requeue", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
+    useMissions.getState().addTask("mission-1", { ...task("task-1"), maxAttempts: 1 });
+    useMissions.getState().createAttempt("mission-1", "task-1", { id: "attempt-1" });
+    useMissions.getState().settleAttempt("mission-1", "attempt-1", { status: "needs_human" });
+    expect(() => useMissions.getState().requeueTask(
+      "mission-1", "task-1", "attempt-1", "Retry",
+    )).toThrow(/explicit attempt-limit extension/);
+    useMissions.getState().requeueTask(
+      "mission-1", "task-1", "attempt-1", "Retry", { extendAttemptLimit: true },
+    );
+    expect(useMissions.getState().projection.tasks["task-1"])
+      .toMatchObject({ maxAttempts: 2, status: "ready" });
+    expect(useMissions.getState().events.slice(-3).map((event) => event.type))
+      .toEqual(["task.updated", "task.requeued", "mission.activated"]);
+  });
+
+  it("settles multiple quality gates in one event-log batch", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
+    useMissions.getState().addTask("mission-1", task("task-1"));
+    for (const id of ["gate-1", "gate-2"]) {
+      useMissions.getState().addQualityGate("mission-1", {
+        id,
+        taskId: "task-1",
+        kind: "unit_tests",
+        label: id,
+        command: id,
+        required: true,
+      });
+    }
+    const before = useMissions.getState().events.length;
+    useMissions.getState().settleQualityGates("mission-1", [
+      { gateId: "gate-1", status: "passed" },
+      { gateId: "gate-2", status: "passed" },
+    ]);
+    expect(useMissions.getState().events.slice(before).map((event) => event.type))
+      .toEqual(["quality_gate.resulted", "quality_gate.resulted"]);
+    expect(useMissions.getState().projection.qualityGates["gate-1"].status).toBe("passed");
+    expect(useMissions.getState().projection.qualityGates["gate-2"].status).toBe("passed");
   });
 
   it("refuses writes before safe hydration", () => {

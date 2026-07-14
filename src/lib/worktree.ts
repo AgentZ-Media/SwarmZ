@@ -78,6 +78,11 @@ export async function addWorktree(args: {
   }
 }
 
+/** Canonical main checkout root for a repo subdirectory or another worktree. */
+export function resolveWorktreeMainRoot(cwd: string, gitBin?: string): Promise<string> {
+  return invoke<string>("worktree_resolve_main_root", { cwd, bin: gitBin });
+}
+
 /** Would closing this worktree lose work? (dirty files / local-only commits) */
 export function worktreeStatus(
   path: string,

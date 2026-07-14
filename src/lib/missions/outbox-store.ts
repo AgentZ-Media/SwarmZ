@@ -7,6 +7,7 @@ import {
 } from "@/lib/persistence/coordinator";
 import {
   claimNextMissionCommand,
+  claimMissionCommandById,
   deliverMissionCommand,
   emptyMissionOutbox,
   enqueueMissionCommand,
@@ -31,6 +32,11 @@ export interface MissionOutboxState {
     options?: { recordId?: string; now?: number },
   ): Promise<MissionOutboxRecord>;
   claimNext(
+    ownerId: string,
+    options?: { claimId?: string; now?: number; leaseMs?: number },
+  ): Promise<MissionOutboxRecord | null>;
+  claim(
+    recordId: string,
     ownerId: string,
     options?: { claimId?: string; now?: number; leaseMs?: number },
   ): Promise<MissionOutboxRecord | null>;
@@ -129,6 +135,19 @@ export const useMissionOutbox = create<MissionOutboxState>((set, get) => ({
     if (decision.snapshot !== get().snapshot) {
       await persistTransition(set, decision.snapshot);
     }
+    return decision.record;
+  },
+
+  claim: async (recordId, ownerId, options) => {
+    const decision = claimMissionCommandById(
+      get().snapshot,
+      recordId,
+      ownerId,
+      options?.claimId ?? nanoid(16),
+      options?.now ?? Date.now(),
+      options?.leaseMs ?? 60_000,
+    );
+    if (decision.snapshot !== get().snapshot) await persistTransition(set, decision.snapshot);
     return decision.record;
   },
 

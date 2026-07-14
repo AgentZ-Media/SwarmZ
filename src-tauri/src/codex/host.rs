@@ -241,6 +241,25 @@ impl Client {
         // minimal GUI PATH otherwise breaks anything codex spawns by name
         // (user-configured MCP servers etc.)
         let mut cmd = Command::new(program);
+        // Never leak the desktop process' ambient credentials into Codex
+        // workers. Mission lanes are intentionally secret-free by default,
+        // and ordinary sessions should follow the same predictable boundary.
+        // Explicit runtime environments resolve narrowly-scoped secret
+        // references in their native runner instead of inheriting everything.
+        cmd.env_clear();
+        for key in [
+            "HOME",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "SHELL",
+            "TERM",
+            "CODEX_HOME",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
         if let Some(dir) = std::path::Path::new(program)
             .parent()
             .filter(|d| !d.as_os_str().is_empty())

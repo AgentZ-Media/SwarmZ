@@ -25,7 +25,7 @@ function draft(): MissionExecutionEnvelope {
       maxParallel: 8,
     },
     capabilities: {
-      allowedTools: ["read_file", "edit_file", "test"],
+      allowedTools: ["workspace_sandbox"],
       allowedRoots: ["/repo"],
       network: "read_only",
       github: "read_only",
@@ -62,7 +62,7 @@ function request(patch: Partial<Parameters<typeof authorizeEnvelopeStart>[2]> = 
     missionId: "mission-1",
     envelopeRevision: 1,
     rootPath: "/repo/src",
-    requiredTools: ["edit_file"],
+    requiredTools: ["workspace_sandbox"],
     now: 200,
     breakerOpen: false,
     ...patch,
@@ -120,6 +120,14 @@ describe("Mission Execution Envelope", () => {
   ] as const)("fails closed at the %s boundary", (field, value, code) => {
     expect(authorizeEnvelopeStart(approved(), { ...usage, [field]: value }, request()))
       .toMatchObject({ ok: false, code });
+  });
+
+  it("lets a retry consume attempt budget without consuming a second unique-task slot", () => {
+    expect(authorizeEnvelopeStart(
+      approved(),
+      { ...usage, tasksStarted: 50, attemptsStarted: 50 },
+      request({ isFirstTaskStart: false }),
+    )).toEqual({ ok: true });
   });
 
   it("fails closed on corrupt usage instead of minting allowance", () => {

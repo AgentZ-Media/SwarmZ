@@ -202,6 +202,41 @@ describe("mission event reducer", () => {
     expect(state.attempts["try-1"].status).toBe("failed");
   });
 
+  it("requires a human-bound requeue before retrying a needs-human task", () => {
+    const build = eventBuilder();
+    let state = replayMissionEvents([
+      created(build),
+      build({ type: "task.added", data: task("task-1", [], 3) }),
+      build({ type: "attempt.started", data: { id: "try-1", taskId: "task-1", startedAt: 30 } }),
+      build({
+        type: "attempt.finished",
+        data: { attemptId: "try-1", status: "needs_human", finishedAt: 40, summary: "Choose an API" },
+      }),
+    ]);
+    expect(state.tasks["task-1"].status).toBe("needs_human");
+    const requeue = build({
+      type: "task.requeued",
+      data: { taskId: "task-1", afterAttemptId: "try-1", instruction: "Use API B", requeuedAt: 50 },
+    });
+    expect(() => reduceMissionEvent(state, requeue)).toThrow(/only a human/);
+    state = reduceMissionEvent(state, { ...requeue, actor: "human" });
+    expect(state.tasks["task-1"]).toMatchObject({
+      status: "ready",
+      resumeInstruction: "Use API B",
+      requeuedAfterAttemptId: "try-1",
+    });
+    state = reduceMissionEvent(state, build({
+      type: "attempt.started",
+      data: { id: "try-2", taskId: "task-1", startedAt: 60 },
+    }));
+    expect(state.attempts["try-2"].resumeInstruction).toBe("Use API B");
+    expect(state.tasks["task-1"]).toMatchObject({
+      status: "running",
+      resumeInstruction: null,
+      requeuedAfterAttemptId: null,
+    });
+  });
+
   it("blocks successful attempts on required quality gates", () => {
     const build = eventBuilder();
     let state = replayMissionEvents([

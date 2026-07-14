@@ -14,6 +14,7 @@ const EVENT_LABEL: Record<MissionEvent["type"], string> = {
   "task.updated": "Task updated",
   "task.paused": "Task paused",
   "task.resumed": "Task resumed",
+  "task.requeued": "Task requeued",
   "task.archived": "Task archived",
   "attempt.started": "Attempt started",
   "attempt.finished": "Attempt finished",

@@ -20,6 +20,8 @@ pub struct MissionGitEvidence {
     pub diff_sha256: String,
     pub files_changed: Vec<String>,
     pub dirty: bool,
+    pub branch: Option<String>,
+    pub base_is_ancestor: bool,
 }
 
 fn valid_sha(value: &str) -> bool {
@@ -72,6 +74,17 @@ pub fn collect(
         None => head.clone(),
     };
     let range = format!("{base}..{head}");
+    let branch_value = String::from_utf8(run(cwd, bin, &["rev-parse", "--abbrev-ref", "HEAD"])?)
+        .map_err(|_| "branch name is not UTF-8".to_owned())?
+        .trim()
+        .to_owned();
+    let branch = (branch_value != "HEAD" && !branch_value.is_empty()).then_some(branch_value);
+    let mut ancestor_command = git_command(bin, cwd);
+    ancestor_command.args(["merge-base", "--is-ancestor", &base, &head]);
+    let base_is_ancestor = output_with_timeout(&mut ancestor_command, TIMEOUT)
+        .map_err(|error| format!("git ancestor evidence failed: {error}"))?
+        .status
+        .success();
     let names = run(
         cwd,
         bin,
@@ -119,6 +132,8 @@ pub fn collect(
         diff_sha256: diff_sha,
         files_changed: files,
         dirty,
+        branch,
+        base_is_ancestor,
     })
 }
 

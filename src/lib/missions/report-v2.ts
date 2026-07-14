@@ -226,6 +226,7 @@ export interface MissionReportObservation {
   headSha: string;
   baseSha?: string | null;
   diffSha256?: string | null;
+  filesChanged?: readonly string[];
   /** Independently observed process outcomes, never agent assertions. */
   commands: Readonly<Record<string, number>>;
   requiredCommands?: readonly string[];
@@ -273,6 +274,14 @@ export function assessMissionReportV2(
       !observation.diffSha256 ||
       observation.diffSha256.toLowerCase() !== report.evidence.diffSha256.toLowerCase()) {
       issues.push("changed files require matching observed diff evidence");
+    }
+  }
+  if (observation.filesChanged) {
+    const reported = [...new Set(report.filesChanged)].sort();
+    const observed = [...new Set(observation.filesChanged)].sort();
+    if (reported.length !== observed.length ||
+      reported.some((file, index) => file !== observed[index])) {
+      issues.push("reported changed files do not match independent Git evidence");
     }
   }
   for (const command of report.commands) {

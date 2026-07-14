@@ -608,7 +608,10 @@ function sanitizeSession(raw: unknown): VibeSession | null {
       typeof s.agentName === "string" && s.agentName.trim()
         ? s.agentName
         : name,
-    spawnedBy: s.spawnedBy === "conductor" ? "conductor" : "user",
+    spawnedBy:
+      s.spawnedBy === "conductor" || s.spawnedBy === "mission"
+        ? s.spawnedBy
+        : "user",
     worktree: sanitizeWorktree(s.worktree),
     projectDir: s.projectDir,
     ...(typeof s.model === "string" && s.model ? { model: s.model } : {}),
@@ -672,6 +675,7 @@ function sanitizeItem(raw: unknown): VibeItem | null {
         kind: "user",
         text,
         ...(m.via === "conductor" ? { via: "conductor" as const } : {}),
+        ...(typeof m.turnId === "string" ? { turnId: m.turnId } : {}),
       };
     case "warning":
     case "notice": // compaction dividers survive restarts
@@ -686,6 +690,7 @@ function sanitizeItem(raw: unknown): VibeItem | null {
         ...(typeof m.phase === "string" ? { phase: m.phase } : {}),
         // the report stamp survives restarts — the card keeps rendering
         ...(m.report === true ? { report: true } : {}),
+        ...(typeof m.turnId === "string" ? { turnId: m.turnId } : {}),
       };
     case "command":
       return {
@@ -700,6 +705,7 @@ function sanitizeItem(raw: unknown): VibeItem | null {
             ? (m.exitCode as number | null)
             : null,
         output: typeof m.output === "string" ? m.output : "",
+        ...(typeof m.turnId === "string" ? { turnId: m.turnId } : {}),
       };
     case "fileChange":
       return {

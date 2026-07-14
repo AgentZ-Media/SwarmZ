@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   adoptMissionCommandReceipt,
+  claimMissionCommandById,
   claimNextMissionCommand,
   deliverMissionCommand,
   emptyMissionOutbox,
@@ -18,7 +19,9 @@ import {
 
 const NOW = 100_000;
 
-function spawn(index = 1): EnqueueMissionCommand {
+type SpawnCommand = Extract<EnqueueMissionCommand, { kind: "spawn" }>;
+
+function spawn(index = 1): SpawnCommand {
   return {
     missionId: "mission",
     idempotencyKey: `spawn:task-${index}`,
@@ -100,6 +103,14 @@ describe("mission durable outbox", () => {
     expect(claim.evaluations).toHaveLength(2);
   });
 
+  it("claims one requested record without stealing another subsystem's due command", () => {
+    let snapshot = enqueue(emptyMissionOutbox(), spawn(1), 1, NOW);
+    snapshot = enqueue(snapshot, spawn(2), 2, NOW + 1);
+    const claim = claimMissionCommandById(snapshot, "record-2", "spawn-controller", "claim-2", NOW + 2, 5_000);
+    expect(claim.record).toMatchObject({ id: "record-2", status: "claimed" });
+    expect(claim.snapshot.records["record-1"].status).toBe("pending");
+  });
+
   it("records delivery once and ignores duplicate completion", () => {
     const queued = enqueue(emptyMissionOutbox(), spawn(), 1);
     const claimed = claimNextMissionCommand(queued, "worker", "claim-1", NOW, 5_000).snapshot;
@@ -162,5 +173,23 @@ describe("mission durable outbox", () => {
     expect(() => claimNextMissionCommand(emptyMissionOutbox("failed"), "worker", "claim", NOW, 1_000)).toThrow(/not safely hydrated/);
     expect(() => migrateMissionOutbox({ version: 99, records: [] })).toThrow(/unsupported/);
     expect(() => migrateMissionOutbox({ version: 1, records: [{ id: "broken" }] })).toThrow(/malformed/);
+  });
+
+  it("rejects unknown runtime command kinds and environment-copy spawns", () => {
+    expect(() => enqueueMissionCommand(
+      emptyMissionOutbox(),
+      { ...spawn(), kind: "unexpected_kind" } as unknown as EnqueueMissionCommand,
+      "record-1",
+      NOW,
+    )).toThrow(/unknown.*kind/i);
+    expect(() => enqueueMissionCommand(
+      emptyMissionOutbox(),
+      {
+        ...spawn(),
+        payload: { ...spawn().payload, copyEnv: true },
+      },
+      "record-1",
+      NOW,
+    )).toThrow(/may not copy environment/i);
   });
 });
