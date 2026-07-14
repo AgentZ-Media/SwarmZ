@@ -477,6 +477,20 @@ fn trusted_dir(path: PathBuf, owner_uid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
+fn trusted_host_tool_dir(
+    home: &Path,
+    value: std::ffi::OsString,
+    owner_uid: u32,
+) -> Option<PathBuf> {
+    let candidate = PathBuf::from(value);
+    if !candidate.is_absolute() {
+        return None;
+    }
+    let trusted = trusted_dir(candidate, owner_uid)?;
+    trusted.starts_with(home).then_some(trusted)
+}
+
+#[cfg(target_os = "macos")]
 fn active_rust_toolchain(home: &Path, owner_uid: u32) -> Option<PathBuf> {
     let rustup = home.join(".rustup");
     let settings = fs::read_to_string(rustup.join("settings.toml")).ok()?;
@@ -562,6 +576,29 @@ fn sandbox_capabilities(main_root: &Path) -> Result<SandboxCapabilities, String>
                 .internal_env
                 .insert("COREPACK_HOME".into(), path.to_string_lossy().into_owned());
             capabilities.read_roots.push(path);
+        }
+        if let Some(pnpm_home) = std::env::var_os("PNPM_HOME")
+            .and_then(|value| trusted_host_tool_dir(&home, value, owner_uid))
+        {
+            // pnpm/action-setup uses <home>/setup-pnpm/node_modules/.bin.
+            // The shim resolves into the adjacent package, so expose the
+            // ownership-checked node_modules root while PATH receives only
+            // the bin directory. Regular PNPM_HOME layouts expose themselves.
+            let package_root = pnpm_home
+                .parent()
+                .filter(|parent| {
+                    pnpm_home.file_name().and_then(|name| name.to_str()) == Some(".bin")
+                        && parent.file_name().and_then(|name| name.to_str()) == Some("node_modules")
+                })
+                .and_then(|parent| trusted_dir(parent.to_path_buf(), owner_uid))
+                .filter(|path| path.starts_with(&home))
+                .unwrap_or_else(|| pnpm_home.clone());
+            capabilities.path_dirs.push(pnpm_home.clone());
+            capabilities.exec_roots.push(package_root.clone());
+            capabilities.read_roots.push(package_root);
+            capabilities
+                .internal_env
+                .insert("PNPM_HOME".into(), pnpm_home.to_string_lossy().into_owned());
         }
         if let Some(path) = trusted_dir(home.join(".cargo/registry"), owner_uid) {
             capabilities.read_roots.push(path);

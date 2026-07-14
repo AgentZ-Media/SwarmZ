@@ -370,10 +370,10 @@ fn healthcheck_is_local_owned_and_waits_for_readiness() {
 
     let mut request = service_request(&root, "attempt_health");
     request.argv = vec![
-            "/usr/bin/python3".into(),
-            "-c".into(),
-            "import http.server,os; http.server.HTTPServer(('127.0.0.1',int(os.environ['API_PORT'])),http.server.SimpleHTTPRequestHandler).serve_forever()".into(),
-        ];
+        "node".into(),
+        "-e".into(),
+        "require('http').createServer((_,res)=>{res.writeHead(204);res.end()}).listen(Number(process.env.API_PORT),'127.0.0.1')".into(),
+    ];
     request.healthcheck_url = Some("http://127.0.0.1:${API_PORT}/".into());
     let service = service_start(&leases, request).unwrap();
     assert_eq!(service.state, RuntimeServiceState::Running);

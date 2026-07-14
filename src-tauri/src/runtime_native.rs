@@ -609,12 +609,18 @@ pub fn service_start(
         {
             return Err("runtime service exited during startup but cleanup is unresolved".into());
         }
+        let diagnostic = current.stderr.trim();
+        let diagnostic = (!diagnostic.is_empty()).then(|| {
+            let clipped = diagnostic.chars().take(1_024).collect::<String>();
+            format!("; stderr: {clipped}")
+        });
         return Err(format!(
-            "runtime service exited during startup{}",
+            "runtime service exited during startup{}{}",
             current
                 .exit_code
                 .map(|code| format!(" (exit {code})"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            diagnostic.unwrap_or_default()
         ));
     }
     Ok(current)
