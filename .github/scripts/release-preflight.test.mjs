@@ -10,7 +10,13 @@ function fixture(version = "1.1.0") {
   mkdirSync(join(root, "src-tauri"), { recursive: true });
   mkdirSync(join(root, "docs/release-notes"), { recursive: true });
   writeFileSync(join(root, "package.json"), JSON.stringify({ version }));
-  writeFileSync(join(root, "src-tauri/tauri.conf.json"), JSON.stringify({ version }));
+  writeFileSync(
+    join(root, "src-tauri/tauri.conf.json"),
+    JSON.stringify({
+      version,
+      bundle: { macOS: { signingIdentity: "-" } },
+    }),
+  );
   writeFileSync(join(root, "src-tauri/Cargo.toml"), `[package]\nname = "swarmz"\nversion = "${version}"\n`);
   writeFileSync(join(root, `docs/release-notes/v${version}.md`), `# v${version} — Release\n\n${"Complete release notes. ".repeat(5)}`);
   writeFileSync(join(root, "docs/release-notes/_install_footer.md"), `---\n\n${"Complete installation instructions. ".repeat(4)}`);
@@ -40,6 +46,18 @@ test("rejects a mismatch in every authoritative version source", () => {
     writeFileSync(path, current.replace("1.1.0", "1.0.3"));
     assert.throws(() => runPreflight("v1.1.0", root), new RegExp(source.replaceAll(".", "\\.")));
   }
+});
+
+test("requires complete ad-hoc signing for the macOS app bundle", () => {
+  const root = fixture();
+  const path = join(root, "src-tauri/tauri.conf.json");
+  const config = JSON.parse(readFileSync(path, "utf8"));
+  delete config.bundle.macOS.signingIdentity;
+  writeFileSync(path, JSON.stringify(config));
+  assert.throws(
+    () => runPreflight("v1.1.0", root),
+    /bundle\.macOS\.signingIdentity/,
+  );
 });
 
 test("rejects missing, placeholder and symlinked release notes", () => {

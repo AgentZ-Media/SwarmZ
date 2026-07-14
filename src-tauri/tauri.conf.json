@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "SwarmZ",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "identifier": "de.agent-z.swarmz",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -42,6 +42,9 @@
     "category": "DeveloperTool",
     "shortDescription": "Native macOS Mission Control for large Codex engineering goals.",
     "longDescription": "SwarmZ turns large backlogs into durable Missions with dependency-aware scheduling, fresh task-bound Codex workers, isolated git worktrees, reproducible quality evidence, recovery and an Integration Train. One fixed project Orchestrator coordinates and learns; workers have no reusable persona or memory. Runtime Environments, GitHub issue and PR flows, reminders, candidate batches and multi-root work remain bounded by explicit human-approved policy. App state stays on your Mac; model traffic uses your Codex CLI sign-in and optional GitHub operations use your local gh CLI.",
+    "macOS": {
+      "signingIdentity": "-"
+    },
     "createUpdaterArtifacts": true
   },
   "plugins": {
