@@ -12,7 +12,7 @@ type AttentionTone = "attention" | "blocked" | "failed";
 
 interface AttentionRow {
   key: string;
-  source: "mission" | "worker";
+  source: "mission" | "train" | "worker";
   sourceId: string;
   missionId: string | null;
   title: string;
@@ -60,6 +60,10 @@ export function AttentionInbox({
       parts.push(
         `${task.id}:${task.status}:${task.updatedAt}:${task.title}:${task.description}:${latestAttempt?.status ?? ""}:${latestAttempt?.finishedAt ?? ""}:${latestAttempt?.error ?? ""}:${latestAttempt?.summary ?? ""}:${reportQuestion(latestAttempt?.report ?? null) ?? ""}:${failedGate?.updatedAt ?? ""}:${failedGate?.details ?? ""}`,
       );
+    }
+    for (const train of Object.values(state.projection.integrationTrains)) {
+      if (train.status !== "blocked") continue;
+      parts.push(`${train.id}:${train.status}:${train.updatedAt}:${train.entries.map((entry) => `${entry.taskId}:${entry.status}:${entry.detail ?? ""}`).join(",")}`);
     }
     return parts.join("|");
   });
@@ -182,8 +186,13 @@ function AttentionItem({ row }: { row: AttentionRow }) {
       return;
     }
     ui.setSelectedMissionId(row.missionId);
-    ui.setSelectedMissionTaskId(row.sourceId);
-    ui.setWorkspaceView("board");
+    if (row.source === "train") {
+      ui.setSelectedMissionTaskId(null);
+      ui.setWorkspaceView("integration");
+    } else {
+      ui.setSelectedMissionTaskId(row.sourceId);
+      ui.setWorkspaceView("board");
+    }
   };
 
   return (
@@ -263,6 +272,23 @@ function buildAttentionRows(): AttentionRow[] {
         missionState.projection.qualityGates,
       ),
     );
+  }
+  for (const train of Object.values(missionState.projection.integrationTrains)) {
+    if (train.status !== "blocked") continue;
+    const mission = missionState.projection.missions[train.missionId];
+    const failed = train.entries.find((entry) => entry.status === "failed");
+    missionRows.push({
+      key: `train:${train.id}`,
+      source: "train",
+      sourceId: train.id,
+      missionId: train.missionId,
+      title: "Integration train blocked",
+      place: `${mission?.title ?? "Unknown mission"} · ${train.integrationBranch}`,
+      detail: failed?.detail || "The integration branch needs review before the mission can complete.",
+      since: train.updatedAt,
+      tone: failed ? "failed" : "blocked",
+      statusLabel: failed ? "conflict" : "blocked",
+    });
   }
 
   const workerRows: AttentionRow[] = vibeTriageEntries(useVibe.getState()).map(

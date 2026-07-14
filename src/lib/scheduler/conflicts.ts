@@ -46,6 +46,18 @@ function globRegex(pattern: string): RegExp {
   return new RegExp(source);
 }
 
+/** Exact, bounded path-intent check used by post-run evidence enforcement. */
+export function pathMatchesDeclaredIntent(
+  path: string,
+  files: readonly string[],
+  globs: readonly string[],
+): boolean {
+  const normalized = normalize(path);
+  if (!normalized || normalized.startsWith("../") || normalized.startsWith("/")) return false;
+  return uniqueSorted(files).includes(normalized) ||
+    uniqueSorted(globs).some((glob) => globRegex(glob).test(normalized));
+}
+
 function hasWildcard(value: string): boolean {
   return /[*?[\]]/.test(value);
 }

@@ -15,7 +15,7 @@ const policy = {
   maxParallelAttempts: 8,
   stopOnCriticalFailure: true,
   requireQualityGates: true,
-  integrationMode: "train" as const,
+  integrationMode: "manual" as const,
   archiveCompletedWorkers: true,
 };
 const budget = {
@@ -74,6 +74,40 @@ function task(id: string, dependencyIds: string[] = [], maxAttempts = 2): Missio
 }
 
 describe("mission event reducer", () => {
+  it("keeps train-mode work active until every root integration train completes", () => {
+    const build = eventBuilder();
+    let state = reduceMissionEvent(emptyMissionProjection(), build({
+      type: "mission.created",
+      data: {
+        projectId: "project-1", title: "Train", objective: "Integrate",
+        policy: { ...policy, integrationMode: "train" }, budget, createdAt: 1,
+      },
+    }));
+    state = reduceMissionEvent(state, build({ type: "task.added", data: task("task-1") }));
+    state = reduceMissionEvent(state, build({ type: "mission.activated", data: { activatedAt: 20 } }));
+    state = reduceMissionEvent(state, build({ type: "attempt.started", data: { id: "attempt-1", taskId: "task-1", startedAt: 30 } }));
+    state = reduceMissionEvent(state, build({ type: "attempt.finished", data: { attemptId: "attempt-1", status: "succeeded", finishedAt: 40 } }));
+    expect(state.missions["mission-1"].status).toBe("active");
+    state = reduceMissionEvent(state, build({
+      type: "integration_train.created",
+      data: {
+        id: "train-1", missionId: "mission-1", baseBranch: "main",
+        integrationBranch: "swarmz/integration/one", status: "open",
+        entries: [{ taskId: "task-1", position: 0, status: "queued", commit: null, detail: null }],
+        createdAt: 50, updatedAt: 50,
+      },
+    }));
+    expect(state.missions["mission-1"].status).toBe("active");
+    state = reduceMissionEvent(state, build({
+      type: "integration_train.updated",
+      data: {
+        trainId: "train-1", status: "completed",
+        entries: [{ taskId: "task-1", position: 0, status: "integrated", commit: "a".repeat(40), detail: "verified" }],
+        updatedAt: 60,
+      },
+    }));
+    expect(state.missions["mission-1"].status).toBe("succeeded");
+  });
   it("derives draft, active and explicit activated status", () => {
     const build = eventBuilder();
     let state = reduceMissionEvent(emptyMissionProjection(), created(build));

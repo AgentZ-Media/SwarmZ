@@ -13,6 +13,7 @@ import {
   missionTurnEvidence,
   missionHardStopReason,
   taskHasSafeMissionPlacement,
+  unexpectedChangedFiles,
 } from "./controller-core";
 import type { MissionEvent, MissionEventPayload, MissionProjection } from "./types";
 
@@ -84,6 +85,16 @@ function history() {
 }
 
 describe("mission controller pure authority helpers", () => {
+  it("enforces declared file and glob scope only when a scope exists", () => {
+    expect(unexpectedChangedFiles(
+      { declaredFiles: ["src/main.ts"], declaredGlobs: ["tests/**/*.test.ts"] },
+      ["src/main.ts", "tests/unit/a.test.ts", "README.md"],
+    )).toEqual(["README.md"]);
+    expect(unexpectedChangedFiles(
+      { declaredFiles: [], declaredGlobs: [] },
+      ["anything/is/advisory.ts"],
+    )).toEqual([]);
+  });
   it("authorizes exactly the latest human activate/resume snapshot", () => {
     const state = history();
     state.apply({ type: "mission.activated", data: { activatedAt: 30 } });

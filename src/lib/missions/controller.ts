@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { schedule } from "@/lib/scheduler/core";
+import { retryAfterFailure, schedule } from "@/lib/scheduler/core";
 import type { ActiveLease, SchedulableTask } from "@/lib/scheduler/types";
 import { addWorktree, listWorktrees, removeWorktree, resolveWorktreeMainRoot } from "@/lib/worktree";
 import { autonomyTripped } from "@/lib/orchestrator/autonomy";
@@ -33,6 +33,7 @@ import {
   missionAttemptPrompt,
   predictedWorktreePath,
   taskIsInsideApprovedScope,
+  unexpectedChangedFiles,
   taskHasSafeMissionPlacement,
   verifiedGateResults,
   workerOutcomeDisposition,
@@ -662,6 +663,10 @@ async function settleCompletedAttempt(attempt: TaskAttempt): Promise<void> {
     if (base.branch && evidence.branch !== base.branch) {
       throw new Error("worker HEAD is no longer on its approved worktree branch");
     }
+    const outsideScope = unexpectedChangedFiles(task, evidence.files_changed);
+    if (outsideScope.length > 0) {
+      throw new Error(`worker changed files outside the approved task scope: ${outsideScope.slice(0, 20).join(", ")}`);
+    }
     const commands = turnEvidence.commands;
     const required = requiredCommands(scope, task);
     const observation: MissionReportObservation = {
@@ -789,6 +794,16 @@ async function admitStarts(): Promise<void> {
     candidates.push({
       task,
       enqueuedAt: task.updatedAt,
+      nextEligibleAt: (() => {
+        const latestId = task.attemptIds[task.attemptIds.length - 1];
+        const latest = latestId ? missionState.projection.attempts[latestId] : null;
+        if (latest?.status !== "failed" || latest.finishedAt === null) return null;
+        return retryAfterFailure(task, latest.finishedAt, true, {
+          baseDelayMs: 5_000,
+          maxDelayMs: 5 * 60_000,
+          jitterRatio: 0.1,
+        }).nextEligibleAt;
+      })(),
       worktreePath: placement.cwd === task.root.path ? null : placement.cwd,
     });
   }

@@ -1,4 +1,5 @@
 import type {
+  IntegrationTrain,
   IntegrationTrainEntry,
   Mission,
   MissionDependency,
@@ -165,7 +166,28 @@ function deriveMissionStatus(
     .filter((task): task is MissionTask => !!task);
   const live = tasks.filter((task) => task.status !== "archived");
   if (live.length === 0) return mission.activatedAt === null ? "draft" : "active";
-  if (live.every((task) => task.status === "succeeded")) return "succeeded";
+  if (live.every((task) => task.status === "succeeded")) {
+    if (mission.policy.integrationMode === "manual") return "succeeded";
+    const trains = mission.integrationTrainIds
+      .map((id) => state.integrationTrains[id])
+      .filter((train): train is IntegrationTrain => !!train);
+    // A train-mode mission is not complete merely because isolated branches
+    // are green. Every repository root needs one durable completed train.
+    if (trains.some((train) => train.status === "blocked")) return "blocked";
+    if (trains.some((train) => train.status === "cancelled")) return "failed";
+    const integratedTaskIds = new Set(
+      trains
+        .filter((train) => train.status === "completed")
+        .flatMap((train) => train.entries)
+        .filter((entry) => entry.status === "integrated" || entry.status === "skipped")
+        .map((entry) => entry.taskId),
+    );
+    if (trains.some((train) => train.status !== "completed") ||
+      live.some((task) => !integratedTaskIds.has(task.id))) {
+      return "active";
+    }
+    return "succeeded";
+  }
   if (live.some((task) => task.status === "needs_human")) return "needs_human";
   if (live.some((task) => task.status === "running" || task.status === "ready")) {
     return "active";

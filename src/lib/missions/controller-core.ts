@@ -9,6 +9,7 @@ import type {
 import type { VibeItem } from "@/types";
 import type { MissionExecutionEnvelope } from "./envelope";
 import type { MissionEnvelopeUsage } from "./envelope";
+import { pathMatchesDeclaredIntent } from "@/lib/scheduler/conflicts";
 
 export interface ApprovedMissionScope {
   missionId: string;
@@ -298,4 +299,15 @@ export function missionHardStopReason(
     return "Mission cost budget cannot be safely continued";
   }
   return null;
+}
+
+/** Empty declarations are advisory; once present they become a hard boundary. */
+export function unexpectedChangedFiles(
+  task: Pick<MissionTask, "declaredFiles" | "declaredGlobs">,
+  changedFiles: readonly string[],
+): string[] {
+  if (task.declaredFiles.length === 0 && task.declaredGlobs.length === 0) return [];
+  return changedFiles.filter((path) =>
+    !pathMatchesDeclaredIntent(path, task.declaredFiles, task.declaredGlobs),
+  );
 }

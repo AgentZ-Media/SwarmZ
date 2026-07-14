@@ -50,8 +50,14 @@ export function MissionTaskInspector({
     [selectedTaskId, revisionSignature],
   );
   const [actionError, setActionError] = useState<string | null>(null);
+  const [retryInstruction, setRetryInstruction] = useState("");
+  const [extendAttemptLimit, setExtendAttemptLimit] = useState(false);
   const closeRef = useRef<HTMLButtonElement>(null);
-  useEffect(() => setActionError(null), [selectedTaskId]);
+  useEffect(() => {
+    setActionError(null);
+    setRetryInstruction("");
+    setExtendAttemptLimit(false);
+  }, [selectedTaskId]);
   useEffect(() => {
     if (!selectedTaskId) return;
     closeRef.current?.focus();
@@ -105,6 +111,14 @@ export function MissionTaskInspector({
   const canPause = canPauseTask(task.status);
   const canResume = task.status === "paused";
   const canArchive = task.status !== "archived" && task.status !== "running";
+  const latestAttempt = attempts[attempts.length - 1] ?? null;
+  const canRequeue = !!latestAttempt &&
+    ["needs_human", "blocked", "failed", "cancelled"].includes(latestAttempt.status);
+  const reportQuestion = latestAttempt?.report &&
+    typeof latestAttempt.report.question === "string"
+    ? latestAttempt.report.question
+    : null;
+  const attemptLimitExhausted = attempts.length >= task.maxAttempts;
 
   const runAction = (action: "pause" | "resume" | "archive") => {
     setActionError(null);
@@ -116,6 +130,27 @@ export function MissionTaskInspector({
         state.archiveTask(task.missionId, task.id);
         useVibeUi.getState().setSelectedMissionTaskId(null);
       }
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const requeueFreshAttempt = () => {
+    setActionError(null);
+    try {
+      if (!latestAttempt || !canRequeue) throw new Error("This task is not waiting for a fresh attempt.");
+      const instruction = retryInstruction.trim();
+      if (instruction.length < 2) throw new Error("Add a concrete answer or correction for the next worker.");
+      if (instruction.length > 4_000) throw new Error("Retry instructions must stay below 4,000 characters.");
+      useMissions.getState().requeueTask(
+        task.missionId,
+        task.id,
+        latestAttempt.id,
+        instruction,
+        { extendAttemptLimit: attemptLimitExhausted && extendAttemptLimit },
+      );
+      setRetryInstruction("");
+      setExtendAttemptLimit(false);
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
     }
@@ -307,6 +342,38 @@ export function MissionTaskInspector({
       </div>
 
       <footer className="border-t border-line bg-panel px-4 py-3">
+        {canRequeue && (
+          <div className="mb-3 rounded-md border border-attn/30 bg-attn/5 p-3">
+            <p className="text-11 font-semibold text-txt">Answer and start a fresh worker</p>
+            <p className="mt-1 text-10 leading-normal text-fnt">
+              {reportQuestion || latestAttempt?.summary || "The previous attempt needs a human correction before work can continue."}
+            </p>
+            <div className="mt-2 flex items-end gap-2">
+              <label className="min-w-0 flex-1 text-10 text-fnt">
+                Human instruction
+                <textarea
+                  value={retryInstruction}
+                  onChange={(event) => setRetryInstruction(event.target.value)}
+                  rows={2}
+                  maxLength={4_000}
+                  placeholder="Give the decision, missing context or corrected constraint…"
+                  className="focus-ring mt-1 w-full resize-y rounded-md border border-line2 bg-card px-2.5 py-2 text-11 leading-normal text-txt placeholder:text-fnt"
+                />
+              </label>
+              <button type="button" onClick={requeueFreshAttempt} disabled={retryInstruction.trim().length < 2 || (attemptLimitExhausted && (!extendAttemptLimit || task.maxAttempts >= 20))} className="focus-ring h-8 shrink-0 rounded-md bg-acc px-3 text-11 font-semibold text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">
+                Approve fresh retry
+              </button>
+            </div>
+            {attemptLimitExhausted && task.maxAttempts < 20 && (
+              <label className="mt-2 flex items-start gap-2 text-10 leading-normal text-attn">
+                <input type="checkbox" checked={extendAttemptLimit} onChange={(event) => setExtendAttemptLimit(event.target.checked)} className="focus-ring mt-0.5 accent-[var(--acc)]" />
+                <span>Attempt limit reached. Approve exactly one additional attempt ({task.maxAttempts} → {task.maxAttempts + 1}, hard cap 20).</span>
+              </label>
+            )}
+            {attemptLimitExhausted && task.maxAttempts >= 20 && <p className="mt-2 text-10 text-err">The hard cap of 20 attempts is exhausted. Split or rewrite the task instead of retrying it again.</p>}
+            <p className="mt-1.5 text-10 text-fnt">This creates a new approved mission revision. The previous worker is never resumed.</p>
+          </div>
+        )}
         {actionError && (
           <p role="alert" className="mb-2 break-words text-11 text-err">
             {actionError}

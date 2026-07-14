@@ -30,8 +30,11 @@ export function MissionCreateDialog() {
   const [objective, setObjective] = useState("");
   const [input, setInput] = useState(EXAMPLE);
   const [parallel, setParallel] = useState(4);
-  const [networkAuthority, setNetworkAuthority] = useState<"deny" | "read_only" | "allow">("deny");
-  const [githubAuthority, setGithubAuthority] = useState<"deny" | "read_only" | "write">("deny");
+  // Autonomous Mission workers always use the workspace sandbox. Network and
+  // GitHub writes remain human/native-gated instead of being advertised as an
+  // unenforced grant.
+  const networkAuthority = "deny" as const;
+  const githubAuthority = "deny" as const;
   const [qualityCommands, setQualityCommands] = useState("");
   const [maxTokens, setMaxTokens] = useState("");
   const [maxMinutes, setMaxMinutes] = useState("");
@@ -121,7 +124,7 @@ export function MissionCreateDialog() {
           networkAuthority,
           githubAuthority,
           qualityCommands: commands,
-          allowedTools: ["read_file", "edit_file", "test"],
+          allowedTools: ["workspace_sandbox"],
         },
         budget: { maxTokens: tokenBudget, maxActiveMinutes: minuteBudget },
       });
@@ -180,8 +183,6 @@ export function MissionCreateDialog() {
       close();
       setTitle("");
       setObjective("");
-      setNetworkAuthority("deny");
-      setGithubAuthority("deny");
       setQualityCommands("");
       setMaxTokens("");
       setMaxMinutes("");
@@ -252,12 +253,13 @@ export function MissionCreateDialog() {
             <div className="border-t border-line pt-4">
               <p className="text-11 font-medium uppercase tracking-[0.08em] text-fnt">Execution envelope</p>
               <div className="mt-2 grid grid-cols-2 gap-2">
-                <label className="text-10 text-fnt">Network<select value={networkAuthority} onChange={(event) => setNetworkAuthority(event.target.value as typeof networkAuthority)} className="focus-ring mt-1 h-8 w-full rounded-md border border-line2 bg-card px-2 font-mono text-10 text-txt"><option value="deny">Denied</option><option value="read_only">Read only</option><option value="allow">Allowed</option></select></label>
-                <label className="text-10 text-fnt">GitHub<select value={githubAuthority} onChange={(event) => setGithubAuthority(event.target.value as typeof githubAuthority)} className="focus-ring mt-1 h-8 w-full rounded-md border border-line2 bg-card px-2 font-mono text-10 text-txt"><option value="deny">Denied</option><option value="read_only">Read only</option><option value="write">Write</option></select></label>
+                <label className="text-10 text-fnt">Worker network<select value={networkAuthority} disabled className="mt-1 h-8 w-full cursor-not-allowed rounded-md border border-line2 bg-card px-2 font-mono text-10 text-fnt"><option value="deny">Sandbox denied</option></select></label>
+                <label className="text-10 text-fnt">Worker GitHub<select value={githubAuthority} disabled className="mt-1 h-8 w-full cursor-not-allowed rounded-md border border-line2 bg-card px-2 font-mono text-10 text-fnt"><option value="deny">Native gate only</option></select></label>
                 <label className="text-10 text-fnt">Token cap<input value={maxTokens} onChange={(event) => setMaxTokens(event.target.value.replace(/\D/g, ""))} inputMode="numeric" placeholder="unlimited" className="focus-ring mt-1 h-8 w-full rounded-md border border-line2 bg-card px-2 font-mono text-10 text-txt placeholder:text-fnt" /></label>
                 <label className="text-10 text-fnt">Active minutes<input value={maxMinutes} onChange={(event) => setMaxMinutes(event.target.value.replace(/[^0-9.]/g, ""))} inputMode="decimal" placeholder="unlimited" className="focus-ring mt-1 h-8 w-full rounded-md border border-line2 bg-card px-2 font-mono text-10 text-txt placeholder:text-fnt" /></label>
               </div>
               <label className="mt-3 block text-10 text-fnt">Independent verification commands<textarea value={qualityCommands} onChange={(event) => setQualityCommands(event.target.value)} rows={3} placeholder={"pnpm test\npnpm build"} className="focus-ring mt-1 w-full resize-y rounded-md border border-line2 bg-card px-2 py-1.5 font-mono text-10 leading-relaxed text-txt placeholder:text-fnt" /></label>
+              <p className="mt-2 text-10 leading-normal text-fnt">Autonomous lanes never receive ambient credentials. GitHub mutations stay behind SwarmZ&apos;s native human approval gate.</p>
             </div>
             <p className="text-11 leading-relaxed text-fnt">The scheduler also respects global limits, dependencies, file locks, budgets and quality gates. Workers are temporary execution lanes; only the Orchestrator keeps memory.</p>
             {parsed.warnings.map((warning) => <p key={warning} className="flex gap-2 text-11 leading-relaxed text-attn"><AlertTriangle size={13} className="mt-0.5 shrink-0" />{warning}</p>)}
