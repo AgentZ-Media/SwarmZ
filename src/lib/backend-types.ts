@@ -11,6 +11,7 @@ import type {
   UsageHistoryEntry,
 } from "@/types";
 import type { PersistedMissions } from "@/lib/missions/types";
+import type { PersistedMissionOutbox } from "@/lib/missions/outbox";
 
 export type Unlisten = () => void;
 
@@ -56,6 +57,10 @@ export interface Backend {
   /** Append-only Mission Control event log and its schema envelope. */
   loadMissions(): Promise<PersistedMissions | null>;
   saveMissions(data: PersistedMissions): Promise<void>;
+
+  /** Write-ahead Mission Control side-effect commands and delivery leases. */
+  loadMissionOutbox(): Promise<PersistedMissionOutbox | null>;
+  saveMissionOutbox(data: PersistedMissionOutbox): Promise<void>;
 
   /**
    * Delete top-level swarmz.json keys (missing keys are a no-op) — the

@@ -22,6 +22,7 @@ import type {
 } from "@/types";
 import type { Backend } from "./backend-types";
 import type { PersistedMissions } from "@/lib/missions/types";
+import type { PersistedMissionOutbox } from "@/lib/missions/outbox";
 
 const store = new LazyStore("swarmz.json");
 
@@ -101,6 +102,15 @@ export const tauriBackend: Backend = {
   },
   saveMissions: async (data) => {
     await store.set("missions", data);
+    await store.save();
+  },
+
+  loadMissionOutbox: async () => {
+    // Unknown outbox state must throw so startup dispatch remains fail-closed.
+    return (await store.get<PersistedMissionOutbox>("missionOutbox")) ?? null;
+  },
+  saveMissionOutbox: async (data) => {
+    await store.set("missionOutbox", data);
     await store.save();
   },
 

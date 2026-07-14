@@ -104,7 +104,7 @@ pub(crate) fn git_command_net(bin: &str, cwd: &Path) -> Command {
 /// Hard cap per drained pipe (audit R12): a pathological child spewing
 /// gigabytes must not grow an unbounded buffer — the excess is read and
 /// discarded (the pipe keeps draining so the child never blocks on it).
-const DRAIN_CAP_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const DRAIN_CAP_BYTES: usize = 32 * 1024 * 1024;
 
 /// `Command::output()` with a hard deadline. A repo on a disconnected
 /// network volume / FUSE mount makes git hang indefinitely — without a

@@ -65,6 +65,10 @@ import {
   flushMissionsPersist,
   hydrateMissions,
 } from "@/lib/missions/store";
+import {
+  flushMissionOutboxPersist,
+  hydrateMissionOutbox,
+} from "@/lib/missions/outbox-store";
 
 // Keep the persisted usage history bounded; oldest sessions fall off first.
 const MAX_HISTORY_ENTRIES = 1000;
@@ -203,6 +207,8 @@ export async function flushAllPersists(): Promise<void> {
     flushConductorTimersPersist(),
     // durable Mission Control event log
     flushMissionsPersist(),
+    // write-ahead Mission Control side effects and claims
+    flushMissionOutboxPersist(),
     // the autonomy budgets keep their own debounced slice
     flushAutonomyPersist(),
   ]);
@@ -428,6 +434,14 @@ export const useSwarm = create<SwarmState>((set, get) => ({
       await hydrateMissions();
     } catch {
       /* per-slice fail-closed health is exposed by the mission store */
+    }
+    try {
+      // Side-effect dispatch must remain paused until both the event log and
+      // its write-ahead outbox are independently known. The outbox hydrates
+      // immediately after missions so startup reconcile sees one stable pair.
+      await hydrateMissionOutbox();
+    } catch {
+      /* the outbox store exposes its fail-closed hydration state */
     }
     // both hydrators also SWALLOW load failures internally (per-slice
     // tolerance) — their `hydrated` flags are the authoritative success

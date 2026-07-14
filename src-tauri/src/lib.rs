@@ -4,6 +4,7 @@ mod explore;
 mod fsx;
 mod git;
 mod github;
+mod mission_evidence;
 mod orchestrator;
 mod plans;
 mod projects;
@@ -61,6 +62,19 @@ async fn git_info(cwd: String, bin: Option<String>) -> Option<git::GitInfo> {
         .await
         .ok()
         .flatten()
+}
+
+#[tauri::command]
+async fn mission_git_evidence(
+    cwd: String,
+    base_sha: Option<String>,
+    bin: Option<String>,
+) -> Result<mission_evidence::MissionGitEvidence, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        mission_evidence::collect(&cwd, base_sha.as_deref(), bin.as_deref())
+    })
+    .await
+    .map_err(|error| format!("mission evidence worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -822,6 +836,7 @@ pub fn run() {
             path_is_file,
             canonicalize_path,
             git_info,
+            mission_git_evidence,
             worktree_add,
             worktree_status,
             worktree_remove,
