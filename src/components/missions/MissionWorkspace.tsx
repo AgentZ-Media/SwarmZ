@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Bell, ChevronDown, GitBranch, LayoutDashboard, Network, Pause, Play, Plus, Radio, ScrollText, ShieldAlert, Workflow, X } from "lucide-react";
+import { Activity, AlertTriangle, Bell, ChevronDown, GitBranch, LayoutDashboard, Network, Pause, Play, Plus, Radio, ScrollText, ShieldAlert, Workflow, X } from "lucide-react";
 import { useMissions } from "@/lib/missions/store";
 import type { Mission, MissionTask } from "@/lib/missions/types";
 import { useProjects } from "@/lib/projects/store";
@@ -13,6 +13,7 @@ import { MissionTimeline } from "./MissionTimeline";
 import { AttentionInbox } from "./AttentionInbox";
 import { MissionTaskInspector } from "./MissionTaskInspector";
 import { MissionRecoveryPanel } from "./MissionRecoveryPanel";
+import { MissionInsightsPanel } from "./MissionInsightsPanel";
 import { useMissionOutbox } from "@/lib/missions/outbox-store";
 
 const TABS: Array<{ id: WorkspaceView; label: string; icon: typeof LayoutDashboard }> = [
@@ -24,6 +25,7 @@ const TABS: Array<{ id: WorkspaceView; label: string; icon: typeof LayoutDashboa
 ];
 
 export function MissionWorkspace() {
+  const [insightsOpen, setInsightsOpen] = useState(false);
   const projectId = useProjects((state) => state.activeProjectId);
   const selectedId = useVibeUi((state) => state.selectedMissionId);
   const view = useVibeUi((state) => state.workspaceView);
@@ -59,7 +61,7 @@ export function MissionWorkspace() {
   return (
     <div className="relative flex min-h-0 flex-1">
       <main className="flex min-w-0 flex-1 flex-col">
-        <MissionHeader mission={mission} missions={missions} />
+        <MissionHeader mission={mission} missions={missions} onOpenInsights={() => setInsightsOpen(true)} />
         <div className="flex h-10 shrink-0 items-center border-b border-line px-3">
           <nav aria-label="Mission views" className="flex h-full items-center gap-0.5">
             {TABS.map((tab) => {
@@ -80,11 +82,12 @@ export function MissionWorkspace() {
       {attentionOpen && <div className="absolute inset-0 z-30 flex justify-end bg-black/45 2xl:hidden" onMouseDown={(event) => { if (event.target === event.currentTarget) useVibeUi.getState().setAttentionOpen(false); }}><aside role="dialog" aria-modal="true" aria-label="Attention inbox" className="relative h-full w-[min(360px,92vw)] border-l border-line2 bg-panel shadow-2xl"><button onClick={() => useVibeUi.getState().setAttentionOpen(false)} aria-label="Close attention inbox" className="focus-ring absolute right-2 top-2 z-10 flex h-8 w-8 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt"><X size={14} /></button><AttentionInbox className="h-full w-full rounded-none border-0" /></aside></div>}
       {selectedTaskId && <div role="dialog" aria-modal="true" aria-label="Mission task details" className="absolute inset-0 z-40 flex justify-end bg-black/45" onMouseDown={(event) => { if (event.target === event.currentTarget) useVibeUi.getState().setSelectedMissionTaskId(null); }}><MissionTaskInspector className="h-full w-[min(760px,94vw)] rounded-none border-y-0 border-r-0 shadow-2xl" /></div>}
       {recoveryOpen && <MissionRecoveryPanel missionId={mission.id} />}
+      {insightsOpen && <div role="dialog" aria-modal="true" aria-label="Mission insights" className="absolute inset-0 z-40 flex justify-end bg-black/45" onMouseDown={(event) => { if (event.target === event.currentTarget) setInsightsOpen(false); }}><div className="relative h-full w-[min(760px,94vw)] border-l border-line2 bg-panel p-3 shadow-2xl"><button onClick={() => setInsightsOpen(false)} aria-label="Close mission insights" className="focus-ring absolute right-5 top-5 z-10 flex h-8 w-8 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt"><X size={14} /></button><MissionInsightsPanel missionId={mission.id} className="h-full rounded-lg" /></div></div>}
     </div>
   );
 }
 
-function MissionHeader({ mission, missions }: { mission: Mission; missions: Mission[] }) {
+function MissionHeader({ mission, missions, onOpenInsights }: { mission: Mission; missions: Mission[]; onOpenInsights: () => void }) {
   const [chooser, setChooser] = useState(false);
   const taskSignature = useMissions((state) => mission.taskIds.map((id) => state.projection.tasks[id]?.status ?? "missing").join("|"));
   const stats = useMemo(() => {
@@ -93,7 +96,7 @@ function MissionHeader({ mission, missions }: { mission: Mission; missions: Miss
     const done = tasks.filter((task) => task.status === "succeeded").length;
     const running = tasks.filter((task) => task.status === "running").length;
     const attention = tasks.filter((task) => ["needs_human", "blocked", "failed"].includes(task.status)).length;
-    return { total: tasks.length, done, running, attention, percent: tasks.length ? Math.round(done / tasks.length * 100) : 0 };
+    return { total: tasks.length, done, running, attention, roots: new Set(tasks.map((task) => task.root.path)).size, percent: tasks.length ? Math.round(done / tasks.length * 100) : 0 };
   }, [mission.id, mission.taskIds, taskSignature]);
   const paused = mission.status === "paused";
   const terminal = ["cancelled", "failed", "succeeded"].includes(mission.status);
@@ -111,7 +114,8 @@ function MissionHeader({ mission, missions }: { mission: Mission; missions: Miss
           {chooser && <div className="absolute left-0 top-10 z-40 w-[min(420px,80vw)] border border-line2 bg-pop p-1 shadow-2xl">{missions.map((item) => <button key={item.id} onClick={() => { useVibeUi.getState().setSelectedMissionId(item.id); setChooser(false); }} className={cn("focus-ring flex w-full items-center gap-2 rounded-sm px-2.5 py-2 text-left text-12 hover:bg-card", item.id === mission.id ? "text-txt" : "text-mut")}><span className="truncate">{item.title}</span><span className="ml-auto font-mono text-10 uppercase text-fnt">{item.status}</span></button>)}</div>}
         </div>
         <span className={cn("shrink-0 rounded-sm border px-1.5 py-0.5 font-mono text-10 uppercase", paused ? "border-warn/30 text-warn" : terminal ? "border-line text-fnt" : "border-acc/30 text-acc")}>{mission.status}</span>
-        <button onClick={() => useVibeUi.getState().setRecoveryOpen(true)} title="Open durable delivery ledger" className={cn("focus-ring ml-auto flex h-8 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-11 hover:bg-card", recoveryCount ? "border-attn/35 text-attn" : "border-line2 text-mut hover:text-txt")}><ShieldAlert size={12} />{recoveryCount ? `${recoveryCount} recovery` : "Ledger"}</button>
+        <button onClick={onOpenInsights} title="Open evidence-based mission insights" className="focus-ring ml-auto flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-line2 px-2.5 text-11 text-mut hover:bg-card hover:text-txt"><Activity size={12} />Insights</button>
+        <button onClick={() => useVibeUi.getState().setRecoveryOpen(true)} title="Open durable delivery ledger" className={cn("focus-ring flex h-8 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-11 hover:bg-card", recoveryCount ? "border-attn/35 text-attn" : "border-line2 text-mut hover:text-txt")}><ShieldAlert size={12} />{recoveryCount ? `${recoveryCount} recovery` : "Ledger"}</button>
         <button onClick={() => paused ? useMissions.getState().activateMission(mission.id) : useMissions.getState().pauseMission(mission.id)} disabled={terminal} className="focus-ring flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-line2 px-2.5 text-11 text-mut hover:bg-card hover:text-txt disabled:opacity-40">{paused ? <Play size={12} /> : <Pause size={12} />}{paused ? "Resume" : "Pause"}</button>
         <button onClick={() => useVibeUi.getState().setMissionCreateOpen(true)} className="focus-ring flex h-8 shrink-0 items-center gap-1.5 rounded-md bg-acc px-3 text-11 font-semibold text-white hover:brightness-110"><Plus size={12} /> Mission</button>
       </div>
@@ -120,7 +124,7 @@ function MissionHeader({ mission, missions }: { mission: Mission; missions: Miss
         <span className="font-mono text-10 tabular-nums text-mut">{stats.done}/{stats.total} verified · {stats.percent}%</span>
         <span className="hidden font-mono text-10 tabular-nums text-acc sm:inline">▶ {stats.running} running</span>
         {stats.attention > 0 && <span className="flex items-center gap-1 font-mono text-10 tabular-nums text-attn"><AlertTriangle size={10} /> {stats.attention} attention</span>}
-        <span className="hidden font-mono text-10 text-fnt lg:inline">limit {mission.policy.maxParallelAttempts} · train {mission.policy.integrationMode}</span>
+        <span className="hidden font-mono text-10 text-fnt lg:inline">{stats.roots} root{stats.roots === 1 ? "" : "s"} · limit {mission.policy.maxParallelAttempts} · train {mission.policy.integrationMode}</span>
       </div>
     </header>
   );
