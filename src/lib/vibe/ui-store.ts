@@ -48,6 +48,8 @@ interface VibeUiState {
   setSelectedMissionTaskId: (id: string | null) => void;
   attentionOpen: boolean;
   setAttentionOpen: (open: boolean) => void;
+  recoveryOpen: boolean;
+  setRecoveryOpen: (open: boolean) => void;
   /** "show me the Conductor" (⌘⇧O, Deck dot, title bar, palette): land on
    * the fleet AND make sure the sidebar is visible */
   showConductor: () => void;
@@ -91,6 +93,8 @@ export const useVibeUi = create<VibeUiState>((set) => ({
     set({ selectedMissionTaskId }),
   attentionOpen: false,
   setAttentionOpen: (attentionOpen) => set({ attentionOpen }),
+  recoveryOpen: false,
+  setRecoveryOpen: (recoveryOpen) => set({ recoveryOpen }),
   showConductor: () =>
     set({ stageMode: "workspace", conductorOpen: true, wide: false }),
   backToFleet: () =>
