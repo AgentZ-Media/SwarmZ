@@ -164,7 +164,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         // ---- agents ----
         ToolDefinition {
             name: "spawn_agents",
-            description: "Bring in 1–8 new agents for this project. Each entry: a task (submitted as the agent's first order — write it self-contained), a worktree placement (\"new\" = a fresh git worktree on an own branch, \"shared:<agentName>\" = work in an EXISTING agent's worktree, \"none\" = directly in the project folder — for read/analysis tasks), and optional model/effort/access/name overrides. Names are picked automatically (collision-free); the result returns each agent's name, id and worktree path. Per-entry errors do not abort the batch.",
+            description: "Bring in 1–8 new agents for this project. Each entry: a task (submitted as the agent's first order — write it self-contained), a worktree placement (\"new\" = a fresh git worktree on an own branch, \"shared:<agentName>\" = work in an EXISTING agent's worktree, \"none\" = directly in the project folder — for ONE read/analysis lane), and optional model/effort/access/name overrides. IMPORTANT: a batch with several independent agents must use \"new\" for each; several \"none\" entries are refused before any agent is created because they cannot run concurrently in the same checkout. Names are picked automatically (collision-free). The result distinguishes created windows from backend-acknowledged initial tasks; never claim an agent is working unless its delivery is \"started\". Per-entry errors do not abort the batch.",
             parameters: json!({
                 "type": "object",
                 "properties": {

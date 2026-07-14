@@ -210,6 +210,10 @@ export interface SpawnAgentResult {
   branch?: string | null;
   /** true when the agent shares its worktree with another agent */
   shared?: boolean;
+  /** present only after turn/start was acknowledged by the native backend */
+  delivery?: "started";
+  /** exact acknowledged initial turn, when Codex returned one */
+  turnId?: string | null;
   /** task delivery note */
   warning?: string;
   /** set when this agent failed to start */

@@ -162,9 +162,12 @@ function prepareChanges(changes: VibeFileChange[]): PreparedFile[] {
 export const FileChangeCard = memo(function FileChangeCard({
   changes,
   status,
+  embedded = false,
 }: {
   changes: VibeFileChange[];
   status: string;
+  /** Render flush inside an already-bordered expanded activity group. */
+  embedded?: boolean;
 }) {
   const files = useMemo(() => prepareChanges(changes), [changes]);
   const totals = useMemo(
@@ -179,7 +182,14 @@ export const FileChangeCard = memo(function FileChangeCard({
     files.length > FILE_COLLAPSE || totals.add + totals.del > LINE_COLLAPSE * 2;
 
   return (
-    <div className="max-w-[92%] overflow-hidden rounded-lg border border-line bg-card">
+    <div
+      className={cn(
+        "overflow-hidden",
+        embedded
+          ? "w-full bg-panel/35"
+          : "max-w-[92%] rounded-lg border border-line bg-card",
+      )}
+    >
       <div className="flex items-center gap-2 border-b border-line px-3 py-1.5 font-mono text-11">
         <span aria-hidden className="text-acc">
           Δ

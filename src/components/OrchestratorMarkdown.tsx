@@ -1,26 +1,25 @@
-// Tiny dependency-free markdown renderer for orchestrator assistant messages
-// (ChatView.tsx). Deliberately a small subset — headings, lists,
-// fenced code, inline code/bold/italic, links — rendered as React nodes (no
-// innerHTML, so model output can never inject markup). Unclosed markers in a
-// still-streaming message simply render literally until the closing half
-// arrives; the next batched store write re-parses the whole text.
+// Shared safe Markdown renderer for every conversational surface in SwarmZ.
+// `react-markdown` never executes raw HTML; `remark-gfm` adds the structures
+// Codex commonly emits (tables, task lists, autolinks and strikethrough).
 
-import { Fragment, type ReactNode } from "react";
+import {
+  Children,
+  cloneElement,
+  isValidElement,
+  type ComponentPropsWithoutRef,
+  type ReactElement,
+  type ReactNode,
+} from "react";
+import Markdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { openUrl } from "@/lib/transport";
-import { pathPillLabel, splitLineSuffix, splitTextWithPaths } from "@/lib/paths";
+import {
+  isPathHref,
+  pathPillLabel,
+  splitLineSuffix,
+  splitTextWithPaths,
+} from "@/lib/paths";
 
-// Inline tokens: code, bold, italic, http(s) links (group 4), and markdown
-// links whose href is a filesystem path (group 5, e.g. `[foo.ts](/a/foo.ts:9)`)
-// — the latter render as a non-clickable path pill, not a link.
-const INLINE =
-  /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))|(\[[^\]\n]+\]\(~?\/[^)\s]+\))/g;
-
-/**
- * A filesystem path rendered as a compact pill: ONLY the filename (plus an
- * optional `:line`), with the full path in the tooltip. Not a link — just a
- * legibility affordance. Used on prose text nodes and on markdown links whose
- * href is a path; code spans and fenced blocks are never touched.
- */
 function PathPill({ path }: { path: string }) {
   const { base, line } = pathPillLabel(path);
   return (
@@ -34,190 +33,150 @@ function PathPill({ path }: { path: string }) {
   );
 }
 
-/** Split a prose run into text + path-pill nodes (paths.ts detection). */
 function renderTextWithPaths(text: string, keyPrefix: string): ReactNode[] {
-  const segs = splitTextWithPaths(text);
-  if (segs.length <= 1 && !segs.some((s) => s.path)) return text ? [text] : [];
-  return segs.map((s, i) =>
-    s.path ? (
-      <PathPill key={`${keyPrefix}-p${i}`} path={s.text} />
+  const segments = splitTextWithPaths(text);
+  return segments.map((segment, index) =>
+    segment.path ? (
+      <PathPill key={`${keyPrefix}-path-${index}`} path={segment.text} />
     ) : (
-      <Fragment key={`${keyPrefix}-t${i}`}>{s.text}</Fragment>
+      segment.text
     ),
   );
 }
 
-function renderInline(text: string, keyPrefix: string): ReactNode[] {
-  const out: ReactNode[] = [];
-  let last = 0;
-  let i = 0;
-  for (const m of text.matchAll(INLINE)) {
-    const idx = m.index ?? 0;
-    if (idx > last)
-      out.push(...renderTextWithPaths(text.slice(last, idx), `${keyPrefix}-${i}a`));
-    const token = m[0];
-    const key = `${keyPrefix}-${i++}`;
-    if (m[1]) {
-      out.push(
-        <code
-          key={key}
-          className="rounded-xs bg-pop px-1 py-px font-mono text-[0.9em]"
-        >
-          {token.slice(1, -1)}
-        </code>,
-      );
-    } else if (m[2]) {
-      out.push(
-        <strong key={key} className="font-semibold">
-          {renderInline(token.slice(2, -2), key)}
-        </strong>,
-      );
-    } else if (m[3]) {
-      out.push(
-        <em key={key}>{renderInline(token.slice(1, -1), key)}</em>,
-      );
-    } else if (m[4]) {
-      const label = token.slice(1, token.indexOf("]("));
-      const url = token.slice(token.indexOf("](") + 2, -1);
-      out.push(
-        <button
-          key={key}
-          type="button"
-          className="cursor-pointer text-acc underline-offset-2 hover:text-acc-bright hover:underline"
-          title={url}
-          onClick={() => void openUrl(url)}
-        >
-          {label}
-        </button>,
-      );
-    } else {
-      // m[5]: markdown link with a filesystem-path href — a path pill, never a
-      // link. Line number comes from the href suffix, else from the link text
-      // (e.g. `[foo.ts:12](/a/foo.ts)`); the tooltip shows the full path.
-      const label = token.slice(1, token.indexOf("]("));
-      const href = token.slice(token.indexOf("](") + 2, -1);
-      const { line: hrefLine } = splitLineSuffix(href);
-      const line = hrefLine ?? splitLineSuffix(label).line;
-      const path = hrefLine || !line ? href : `${href}:${line}`;
-      out.push(<PathPill key={key} path={path} />);
+/** Recursively add path pills to prose without touching code or links. */
+function pathAware(children: ReactNode, keyPrefix: string): ReactNode {
+  return Children.toArray(children).flatMap((child, index) => {
+    if (typeof child === "string") {
+      return renderTextWithPaths(child, `${keyPrefix}-${index}`);
     }
-    last = idx + token.length;
-  }
-  if (last < text.length)
-    out.push(...renderTextWithPaths(text.slice(last), `${keyPrefix}-end`));
-  return out;
+    if (!isValidElement(child) || child.type === "code" || child.type === "a") {
+      return child;
+    }
+    const element = child as ReactElement<{ children?: ReactNode }>;
+    if (element.props.children === undefined) return child;
+    return cloneElement(element, {
+      children: pathAware(element.props.children, `${keyPrefix}-${index}`),
+    });
+  });
 }
 
-type Block =
-  | { kind: "p"; text: string }
-  | { kind: "h"; level: number; text: string }
-  | { kind: "ul"; items: string[] }
-  | { kind: "ol"; items: string[] }
-  | { kind: "code"; text: string };
-
-function parseBlocks(text: string): Block[] {
-  const blocks: Block[] = [];
-  const lines = text.split("\n");
-  let i = 0;
-  const flushPara = (buf: string[]) => {
-    if (buf.length) blocks.push({ kind: "p", text: buf.join("\n") });
-    buf.length = 0;
-  };
-  const para: string[] = [];
-  while (i < lines.length) {
-    const line = lines[i];
-    if (/^```/.test(line)) {
-      flushPara(para);
-      const buf: string[] = [];
-      i++;
-      while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
-      i++; // closing fence (or EOF while streaming)
-      blocks.push({ kind: "code", text: buf.join("\n") });
-      continue;
-    }
-    const h = /^(#{1,4})\s+(.*)$/.exec(line);
-    if (h) {
-      flushPara(para);
-      blocks.push({ kind: "h", level: h[1].length, text: h[2] });
-      i++;
-      continue;
-    }
-    const ul = /^\s*[-*•]\s+(.*)$/.exec(line);
-    const ol = /^\s*\d+[.)]\s+(.*)$/.exec(line);
-    if (ul || ol) {
-      flushPara(para);
-      const kind = ul ? "ul" : "ol";
-      const re = ul ? /^\s*[-*•]\s+(.*)$/ : /^\s*\d+[.)]\s+(.*)$/;
-      const items: string[] = [];
-      while (i < lines.length) {
-        const m = re.exec(lines[i]);
-        if (!m) break;
-        items.push(m[1]);
-        i++;
-      }
-      blocks.push({ kind, items } as Block);
-      continue;
-    }
-    if (!line.trim()) {
-      flushPara(para);
-      i++;
-      continue;
-    }
-    para.push(line);
-    i++;
+function ExternalLink({ href = "", children }: ComponentPropsWithoutRef<"a">) {
+  if (isPathHref(href)) {
+    const label = Children.toArray(children).join("");
+    const { line: hrefLine } = splitLineSuffix(href);
+    const line = hrefLine ?? splitLineSuffix(label).line;
+    const path = hrefLine || !line ? href : `${href}:${line}`;
+    return <PathPill path={path} />;
   }
-  flushPara(para);
-  return blocks;
+  if (/^https?:\/\//i.test(href)) {
+    return (
+      <button
+        type="button"
+        className="cursor-pointer text-acc underline-offset-2 hover:text-acc-bright hover:underline"
+        title={href}
+        onClick={() => void openUrl(href)}
+      >
+        {children}
+      </button>
+    );
+  }
+  // Agent output is untrusted. Unknown schemes and relative navigation stay
+  // visible but inert instead of navigating the embedded webview.
+  return <span title={href || undefined}>{children}</span>;
 }
+
+const components: Components = {
+  h1: ({ children }) => (
+    <h1 className="pt-1 text-16 font-semibold tracking-[-0.01em] text-txt">
+      {pathAware(children, "h1")}
+    </h1>
+  ),
+  h2: ({ children }) => (
+    <h2 className="pt-1 text-14 font-semibold tracking-[-0.01em] text-txt">
+      {pathAware(children, "h2")}
+    </h2>
+  ),
+  h3: ({ children }) => (
+    <h3 className="pt-1 text-13 font-semibold tracking-[-0.01em] text-txt">
+      {pathAware(children, "h3")}
+    </h3>
+  ),
+  h4: ({ children }) => (
+    <h4 className="pt-1 text-13 font-semibold text-txt">
+      {pathAware(children, "h4")}
+    </h4>
+  ),
+  p: ({ children }) => (
+    <p className="whitespace-pre-wrap break-words">{pathAware(children, "p")}</p>
+  ),
+  ul: ({ children, className }) => (
+    <ul className={`space-y-1 pl-5 ${className?.includes("contains-task-list") ? "list-none" : "list-disc"}`}>
+      {children}
+    </ul>
+  ),
+  ol: ({ children }) => <ol className="list-decimal space-y-1 pl-5">{children}</ol>,
+  li: ({ children, className }) => (
+    <li className={`${className?.includes("task-list-item") ? "-ml-5 flex items-start gap-2" : "break-words pl-0.5"}`}>
+      {pathAware(children, "li")}
+    </li>
+  ),
+  input: (props) => (
+    <input {...props} className="mt-1 h-3.5 w-3.5 shrink-0 accent-acc" disabled />
+  ),
+  blockquote: ({ children }) => (
+    <blockquote className="rounded-md bg-pop/55 px-3 py-2 text-mut">
+      {children}
+    </blockquote>
+  ),
+  hr: () => <hr className="border-0 border-t border-line" />,
+  a: ExternalLink,
+  pre: ({ children }) => (
+    <pre className="overflow-x-auto rounded-lg border border-line bg-card p-3 font-mono text-11 leading-[1.6] text-mut">
+      {children}
+    </pre>
+  ),
+  code: ({ children, className }) => {
+    const fenced = Boolean(className);
+    return fenced ? (
+      <code className={className}>{children}</code>
+    ) : (
+      <code className="rounded-xs bg-pop px-1 py-px font-mono text-[0.9em] text-txt">
+        {children}
+      </code>
+    );
+  },
+  table: ({ children }) => (
+    <div className="max-w-full overflow-x-auto rounded-lg border border-line">
+      <table className="w-full border-collapse text-left text-12">{children}</table>
+    </div>
+  ),
+  thead: ({ children }) => <thead className="bg-pop text-txt">{children}</thead>,
+  tbody: ({ children }) => <tbody className="divide-y divide-line">{children}</tbody>,
+  tr: ({ children }) => <tr className="divide-x divide-line">{children}</tr>,
+  th: ({ children }) => (
+    <th className="whitespace-nowrap px-3 py-2 font-semibold">
+      {pathAware(children, "th")}
+    </th>
+  ),
+  td: ({ children }) => (
+    <td className="min-w-32 px-3 py-2 align-top text-mut">
+      {pathAware(children, "td")}
+    </td>
+  ),
+  img: ({ alt }) => (
+    <span className="rounded-xs border border-line bg-pop px-1.5 py-0.5 font-mono text-11 text-fnt">
+      image{alt ? `: ${alt}` : ""}
+    </span>
+  ),
+};
 
 export function OrchestratorMarkdown({ text }: { text: string }) {
-  const blocks = parseBlocks(text);
   return (
-    <div className="space-y-2.5">
-      {blocks.map((b, i) => {
-        switch (b.kind) {
-          case "h":
-            return (
-              <div
-                key={i}
-                className={`pt-1 font-semibold tracking-[-0.01em] ${b.level <= 2 ? "text-14" : "text-13"}`}
-              >
-                {renderInline(b.text, `h${i}`)}
-              </div>
-            );
-          case "code":
-            return (
-              <pre
-                key={i}
-                className="overflow-x-auto rounded-lg border border-line bg-card p-3 font-mono text-11"
-              >
-                {b.text}
-              </pre>
-            );
-          case "ul":
-          case "ol": {
-            const Tag = b.kind === "ul" ? "ul" : "ol";
-            return (
-              <Tag
-                key={i}
-                className={`space-y-1 pl-5 ${b.kind === "ul" ? "list-disc" : "list-decimal"}`}
-              >
-                {b.items.map((item, j) => (
-                  <li key={j} className="break-words pl-0.5">
-                    {renderInline(item, `${i}-${j}`)}
-                  </li>
-                ))}
-              </Tag>
-            );
-          }
-          default:
-            return (
-              <p key={i} className="whitespace-pre-wrap break-words">
-                {renderInline(b.text, `p${i}`)}
-              </p>
-            );
-        }
-      })}
+    <div className="space-y-2.5 [&_.contains-task-list]:space-y-1">
+      <Markdown remarkPlugins={[remarkGfm]} components={components}>
+        {text}
+      </Markdown>
     </div>
   );
 }

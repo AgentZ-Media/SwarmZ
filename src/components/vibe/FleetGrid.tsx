@@ -30,7 +30,12 @@ import {
 } from "@/lib/vibe/ui";
 import { hasHumanAttention } from "@/lib/vibe/attention";
 import { changeStats } from "@/lib/vibe/diff";
-import { reportForItem } from "@/lib/vibe/report-item";
+import { reportForItem, reportPreviewForItem } from "@/lib/vibe/report-item";
+import {
+  compactWorkerFeedIds,
+  markdownPreview,
+  trailingWorkerActivityCount,
+} from "@/lib/vibe/feed-groups";
 import { cn, folderName } from "@/lib/utils";
 import type { VibeItem } from "@/types";
 
@@ -364,9 +369,15 @@ function MiniFeed({
   busy: boolean;
   onOpen: () => void;
 }) {
-  const tailSig = useVibe((s) =>
-    (s.sessions[id]?.order ?? []).slice(-4).join("|"),
-  );
+  const tailSig = useVibe((s) => {
+    const entry = s.sessions[id];
+    if (!entry) return "";
+    return compactWorkerFeedIds(entry.order, entry.items).join("|");
+  });
+  const activityCount = useVibe((s) => {
+    const entry = s.sessions[id];
+    return entry ? trailingWorkerActivityCount(entry.order, entry.items) : 0;
+  });
   const itemIds = useMemo(() => (tailSig ? tailSig.split("|") : []), [tailSig]);
   return (
     <div
@@ -381,9 +392,15 @@ function MiniFeed({
       {itemIds.map((iid) => (
         <MiniLine key={iid} sessionId={id} itemId={iid} />
       ))}
-      {busy && (
-        <div className="font-mono text-11 text-fnt">
-          <span className="animate-zcaret">…</span>
+      {(activityCount > 0 || busy) && (
+        <div className="flex items-center gap-1.5 font-mono text-11 text-fnt">
+          <span aria-hidden className={busy ? "animate-zcaret text-acc" : "text-ok"}>
+            {busy ? "▸" : "✓"}
+          </span>
+          <span>
+            {busy ? "Working" : "Worked"}
+            {activityCount > 0 && ` · ${activityCount} step${activityCount === 1 ? "" : "s"}`}
+          </span>
         </div>
       )}
     </div>
@@ -468,7 +485,7 @@ function miniLine(item: VibeItem): MiniLineSpec | null {
     case "assistant": {
       // an expect_report turn's final message: a readable status line
       // instead of clamped raw JSON (same gate as the ItemFeed report card)
-      const report = reportForItem(item);
+      const report = reportForItem(item) ?? reportPreviewForItem(item);
       if (report) {
         return {
           glyph: report.needsHuman ? "⚑" : report.done ? "✓" : "▸",
@@ -485,7 +502,7 @@ function miniLine(item: VibeItem): MiniLineSpec | null {
       return {
         glyph: "·",
         glyphCls: "text-acc",
-        text: item.text,
+        text: markdownPreview(item.text),
         textCls: "text-mut",
         clamp2: true,
       };

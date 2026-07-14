@@ -162,7 +162,11 @@ export function ConductorSidebar() {
         {/* decorative accent halo above the header */}
         <div className="conductor-glow pointer-events-none absolute -top-[70px] left-1/2 h-[180px] w-[380px] -translate-x-1/2" />
 
-        <ConductorHeader chatId={activeChatId} projectId={projectId} />
+        <ConductorHeader
+          chatId={activeChatId}
+          projectId={projectId}
+          sidebarWidth={visibleWidth}
+        />
         {activeChatId ? (
           <MessageList chatId={activeChatId} />
         ) : (
@@ -270,13 +274,17 @@ function formatTimerAt(at: number): string {
 function ConductorHeader({
   chatId,
   projectId,
+  sidebarWidth,
 }: {
   chatId: string | null;
   projectId: string | null;
+  sidebarWidth: number;
 }) {
   const busy = useOrchestrator((s) => (chatId ? !!s.busy[chatId] : false));
+  const compact = sidebarWidth < 500;
+  const tight = sidebarWidth < 390;
   return (
-    <div className="relative flex h-12 shrink-0 items-center gap-2 border-b border-line px-4">
+    <div className="relative flex h-12 min-w-0 shrink-0 items-center gap-2 border-b border-line px-3">
       <span
         aria-hidden
         className={cn(
@@ -287,17 +295,19 @@ function ConductorHeader({
       <span aria-hidden className="font-mono text-12 text-acc">
         //
       </span>
-      <span className="-ml-1 min-w-0 truncate text-14 font-semibold tracking-[-0.01em] text-txt">
-        Orchestrator
-      </span>
-      {busy && (
+      {!compact && (
+        <span className="-ml-1 shrink-0 text-14 font-semibold tracking-[-0.01em] text-txt">
+          Orchestrator
+        </span>
+      )}
+      {busy && !compact && (
         <span className="animate-zcaret shrink-0 font-mono text-10 text-acc">
           ▸ working…
         </span>
       )}
-      <div className="ml-auto flex shrink-0 items-center gap-1">
+      <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-1">
         <ConductorPlansButton projectId={projectId} />
-        <ChatSwitcher projectId={projectId} />
+        <ChatSwitcher projectId={projectId} className="min-w-0 flex-1" />
         <button
           onClick={() => projectId && createChat(projectId)}
           title="New chat"
@@ -305,15 +315,19 @@ function ConductorHeader({
         >
           <Plus size={13} />
         </button>
-        {chatId && <ChatMeta chatId={chatId} />}
+        {chatId && <ChatMeta chatId={chatId} compact={compact} />}
         {busy && chatId && (
           <button
             onClick={() => interrupt(chatId)}
-            className="focus-ring flex shrink-0 items-center gap-1.5 rounded-sm border border-line2 px-2.5 py-1 font-mono text-11 text-mut hover:text-txt"
+            className="focus-ring flex h-6 w-6 shrink-0 items-center justify-center rounded-sm border border-line2 font-mono text-11 text-mut hover:text-txt"
             title="Stop the running turn"
+            aria-label="Stop the running turn"
           >
-            <Square size={9} className="fill-current" /> Stop
+            <Square size={9} className="fill-current" />
           </button>
+        )}
+        {busy && tight && (
+          <span className="sr-only" role="status">Orchestrator is working</span>
         )}
       </div>
     </div>

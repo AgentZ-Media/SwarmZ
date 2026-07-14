@@ -596,7 +596,13 @@ function EmptyChat() {
  * the context gauge. The gauge appears once the token_usage event feeds
  * `tokenUsage` — defensive until then (renders nothing).
  */
-export function ChatMeta({ chatId }: { chatId: string }) {
+export function ChatMeta({
+  chatId,
+  compact = false,
+}: {
+  chatId: string;
+  compact?: boolean;
+}) {
   const model = useOrchestrator(
     (s) => s.chats.find((c) => c.id === chatId)?.model,
   );
@@ -618,14 +624,24 @@ export function ChatMeta({ chatId }: { chatId: string }) {
       >
         <button
           title="Model & reasoning effort — applies from the next turn"
-          className="focus-ring flex items-center gap-1 rounded-sm px-2 py-1 font-mono text-11 text-fnt transition-colors hover:bg-card hover:text-mut"
+          aria-label={`${label}${effort ? ` · ${effort}` : ""} — change model and reasoning effort`}
+          className={cn(
+            "focus-ring flex h-6 shrink-0 items-center justify-center gap-1 rounded-sm font-mono text-11 text-fnt transition-colors hover:bg-card hover:text-mut",
+            compact ? "w-6" : "px-2",
+          )}
         >
-          <span className="max-w-28 truncate">{label}</span>
-          {effort && <span>· {effort}</span>}
-          <ChevronDown size={9} />
+          {compact ? (
+            <Cpu size={11} />
+          ) : (
+            <>
+              <span className="max-w-28 truncate">{label}</span>
+              {effort && <span>· {effort}</span>}
+              <ChevronDown size={9} />
+            </>
+          )}
         </button>
       </ModelEffortPicker>
-      <ChatContextGauge chatId={chatId} />
+      {!compact && <ChatContextGauge chatId={chatId} />}
     </div>
   );
 }
@@ -670,7 +686,13 @@ function ChatContextGauge({ chatId }: { chatId: string }) {
  * Deliberately sibling BUTTONS, not a Radix menu — a nested delete inside a
  * menuitem is keyboard-unreachable.
  */
-export function ChatSwitcher({ projectId }: { projectId: string | null }) {
+export function ChatSwitcher({
+  projectId,
+  className,
+}: {
+  projectId: string | null;
+  className?: string;
+}) {
   const allChats = useOrchestrator((s) => s.chats);
   const activeChatId = useOrchestrator((s) =>
     projectId ? activeChatIdFor(s, projectId) : null,
@@ -688,7 +710,7 @@ export function ChatSwitcher({ projectId }: { projectId: string | null }) {
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <button className="focus-ring flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-11 text-mut transition-colors hover:bg-card hover:text-txt">
+        <button className={cn("focus-ring flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-11 text-mut transition-colors hover:bg-card hover:text-txt", className)}>
           <span className="min-w-0 truncate">
             {active?.title ?? DEFAULT_CHAT_TITLE}
           </span>

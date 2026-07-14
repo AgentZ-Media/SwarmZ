@@ -220,6 +220,12 @@ export interface PersistedProjects {
 export interface AppSettings {
   /** last project directory a session was launched in — prefilled in the New Session dialog */
   lastCwd?: string;
+  /**
+   * Last GitHub attention revision the human has seen, keyed by the stable
+   * `github:<project>:<pr>` attention id. A changed PR/failure fingerprint no
+   * longer matches and becomes unread again.
+   */
+  githubAttentionAcknowledged?: Record<string, string>;
   /** download updates in the background as soon as they're found (installing still needs a restart) */
   autoUpdate?: boolean;
   /** absolute path used instead of `codex` when spawning the app-server */
@@ -262,6 +268,11 @@ export interface AppSettings {
    * carets, entrances). Off by default — motion on.
    */
   reduceMotion?: boolean;
+  /**
+   * Play one short Web Audio cue when an agent newly starts waiting for human
+   * input. ON by default; false keeps every attention transition silent.
+   */
+  attentionSound?: boolean;
   /** absolute path to the `gh` binary (GitHub CLI) — empty = auto-resolve */
   ghPath?: string;
   /**

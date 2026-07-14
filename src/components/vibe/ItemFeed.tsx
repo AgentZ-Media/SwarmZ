@@ -1,8 +1,9 @@
-import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { VList, type VListHandle } from "virtua";
 import { useVibe } from "@/lib/vibe/session-store";
-import { reportForItem } from "@/lib/vibe/report-item";
+import { reportForItem, reportPreviewForItem } from "@/lib/vibe/report-item";
+import { groupWorkerFeed } from "@/lib/vibe/feed-groups";
 import { approvalCommand, commandExit } from "@/lib/vibe/ui";
 import { cn } from "@/lib/utils";
 import type { AgentReport } from "@/lib/orchestrator/report";
@@ -10,9 +11,8 @@ import type { VibeFileChange, VibeItem } from "@/types";
 import { FileChangeCard } from "./DiffCard";
 import { OrchestratorMarkdown } from "@/components/OrchestratorMarkdown";
 
-/** Only the last slice of a command's output is painted — the store keeps
- * more, but a giant <pre> would blow up row measurement. */
-const OUTPUT_RENDER_CAP = 6_000;
+/** Only the last slice of expanded command output is painted. */
+const OUTPUT_RENDER_CAP = 4_000;
 
 /**
  * The focus-stage transcript: a virtualized, bottom-pinned feed. Rows are
@@ -23,6 +23,11 @@ const OUTPUT_RENDER_CAP = 6_000;
  */
 export function ItemFeed({ sessionId }: { sessionId: string }) {
   const order = useVibe((s) => s.sessions[sessionId]?.order);
+  const entries = useMemo(() => {
+    if (!order) return [];
+    const items = useVibe.getState().sessions[sessionId]?.items ?? {};
+    return groupWorkerFeed(order, items);
+  }, [order, sessionId]);
   // tail signature: length + last item id + its growing text/output length.
   // Changes on every append AND on every streaming delta → the pin effect
   // fires, but the O(1) compute keeps it free.
@@ -51,7 +56,7 @@ export function ItemFeed({ sessionId }: { sessionId: string }) {
       h.scrollOffset >= h.scrollSize - h.viewportSize - 24;
   }, []);
 
-  const count = order?.length ?? 0;
+  const count = entries.length;
   useLayoutEffect(() => {
     if (count === 0) return;
     if (atBottomRef.current) ref.current?.scrollToIndex(count - 1, { align: "end" });
@@ -71,9 +76,17 @@ export function ItemFeed({ sessionId }: { sessionId: string }) {
 
   return (
     <VList ref={ref} onScroll={onScroll} className="min-h-0 flex-1 px-6 py-6">
-      {order.map((iid) => (
-        <ItemRow key={iid} sessionId={sessionId} itemId={iid} />
-      ))}
+      {entries.map((entry) =>
+        entry.kind === "item" ? (
+          <ItemRow key={entry.id} sessionId={sessionId} itemId={entry.id} />
+        ) : (
+          <ActivityGroup
+            key={entry.key}
+            sessionId={sessionId}
+            itemIds={entry.ids}
+          />
+        ),
+      )}
     </VList>
   );
 }
@@ -104,11 +117,14 @@ function RenderItem({ item }: { item: VibeItem }) {
       // an expect_report turn's final message renders as a report card, not
       // as raw JSON (the gate is strict: stamped `report: true` AND parses)
       const report = reportForItem(item);
-      if (report) return <ReportCard report={report} />;
+      if (report) return <ReportCard report={report} final />;
+      const preview = reportPreviewForItem(item);
+      if (preview) return <ReportCard report={preview} />;
       return <AssistantRow text={item.text} streaming={!!item.streaming} />;
     }
     case "command":
-      return <CommandRow item={item} />;
+      // Commands are rendered by the surrounding ActivityGroup.
+      return null;
     case "fileChange":
       return <FileChangeCard changes={item.changes} status={item.status} />;
     case "approval":
@@ -120,7 +136,8 @@ function RenderItem({ item }: { item: VibeItem }) {
     case "plan":
       return item.explanation ? <PlanExplanationRow text={item.explanation} /> : null;
     case "webSearch":
-      return <WebSearchRow query={item.query} />;
+      // Searches are rendered by the surrounding ActivityGroup.
+      return null;
     default:
       return null;
   }
@@ -151,12 +168,9 @@ function UserRow({ text, via }: { text: string; via?: "conductor" }) {
   );
 }
 
-// A finished assistant message renders as lightweight markdown (the shared
-// OrchestratorMarkdown subset — bold/italic/inline+fenced code/lists/links, no
-// innerHTML). A STILL-STREAMING message stays plaintext + caret: re-parsing
-// markdown on every ~80 ms delta batch would be wasteful and unclosed markers
-// would flicker. Rows are memoized per item id (ItemRow), so a completed
-// message parses exactly once when `streaming` clears.
+// Agent and Orchestrator prose share the same safe GFM renderer. Streaming
+// deltas are already batched (~80 ms) and only this memoized row changes, so
+// headings/lists/tables become readable while the worker is still talking.
 const AssistantRow = memo(function AssistantRow({
   text,
   streaming,
@@ -164,17 +178,12 @@ const AssistantRow = memo(function AssistantRow({
   text: string;
   streaming: boolean;
 }) {
-  if (streaming) {
-    return (
-      <div className="w-full select-text whitespace-pre-wrap text-13 leading-relaxed text-txt/90">
-        {text}
-        <span className="animate-zcaret ml-0.5 inline-block h-[13px] w-[6px] translate-y-[2px] rounded-[1px] bg-txt/70 align-baseline" />
-      </div>
-    );
-  }
   return (
     <div className="w-full select-text text-13 leading-relaxed text-txt/90">
       <OrchestratorMarkdown text={text} />
+      {streaming && (
+        <span className="animate-zcaret ml-0.5 inline-block h-[13px] w-[6px] translate-y-[2px] rounded-[1px] bg-txt/70 align-baseline" />
+      )}
     </div>
   );
 });
@@ -191,7 +200,13 @@ const REPORT_FILES_SHOWN = 6;
  * DESIGN.md: needs-you = attn (like the approval card), done = a green
  * checkmark on a quiet card, in-progress = neutral.
  */
-function ReportCard({ report }: { report: AgentReport }) {
+function ReportCard({
+  report,
+  final = false,
+}: {
+  report: AgentReport;
+  final?: boolean;
+}) {
   const needsYou = report.needsHuman;
   const status = needsYou ? "needs you" : report.done ? "done" : "in progress";
   const glyph = needsYou ? "⚑" : report.done ? "✓" : "▸";
@@ -219,7 +234,7 @@ function ReportCard({ report }: { report: AgentReport }) {
         <span aria-hidden className={glyphCls}>
           {glyph}
         </span>
-        <span className="font-semibold">report</span>
+        <span className="font-semibold">{final ? "report" : "progress"}</span>
         <span className="opacity-75">— {status}</span>
         {tests && (
           <span
@@ -273,38 +288,109 @@ function ReportCard({ report }: { report: AgentReport }) {
   );
 }
 
-function CommandRow({ item }: { item: Extract<VibeItem, { kind: "command" }> }) {
+/** Consecutive commands/searches collapse into one human-scale status row. */
+const ActivityGroup = memo(function ActivityGroup({
+  sessionId,
+  itemIds,
+}: {
+  sessionId: string;
+  itemIds: string[];
+}) {
+  const statusSig = useVibe((s) => {
+    const items = s.sessions[sessionId]?.items;
+    if (!items) return "";
+    return itemIds
+      .map((id) => {
+        const item = items[id];
+        return item?.kind === "command"
+          ? `${item.status}:${item.exitCode ?? ""}`
+          : item?.kind === "fileChange"
+            ? `fileChange:${item.status}`
+          : item?.kind ?? "missing";
+      })
+      .join("|");
+  });
+  const [open, setOpen] = useState(false);
+  const states = statusSig.split("|");
+  const running = states.some((state) => /in.?progress|running|started/i.test(state));
+  const failed = states.some((state) => /failed|error|:-?[1-9]\d*$/i.test(state));
+  const label = running ? "Working" : "Worked";
+  return (
+    <div className="mx-auto w-full max-w-[46rem] pb-4">
+      <div className="max-w-[88%] overflow-hidden rounded-lg border border-line bg-card">
+        <button
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+          className="focus-ring flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-11 text-mut hover:bg-pop"
+          aria-expanded={open}
+        >
+          <ChevronRight
+            size={10}
+            className={cn("shrink-0 text-fnt transition-transform", open && "rotate-90")}
+          />
+          <span className={cn("shrink-0", failed ? "text-warn" : running ? "animate-zcaret text-acc" : "text-ok")}>
+            {failed ? "⚠" : running ? "▸" : "✓"}
+          </span>
+          <span>{label} · {itemIds.length} step{itemIds.length === 1 ? "" : "s"}</span>
+        </button>
+        {open && (
+          <div className="divide-y divide-line border-t border-line">
+            {itemIds.map((itemId) => (
+              <ActivityDetail key={itemId} sessionId={sessionId} itemId={itemId} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
+const ActivityDetail = memo(function ActivityDetail({
+  sessionId,
+  itemId,
+}: {
+  sessionId: string;
+  itemId: string;
+}) {
+  const item = useVibe((s) => s.sessions[sessionId]?.items[itemId]);
+  const [outputOpen, setOutputOpen] = useState(false);
+  if (!item) return null;
+  if (item.kind === "webSearch") {
+    return (
+      <div className="flex min-w-0 items-center gap-2 px-3 py-1.5 font-mono text-11 text-fnt">
+        <span aria-hidden>⌕</span>
+        <span className="truncate" title={item.query}>{item.query}</span>
+      </div>
+    );
+  }
+  if (item.kind === "fileChange") {
+    return (
+      <FileChangeCard
+        changes={item.changes}
+        status={item.status}
+        embedded
+      />
+    );
+  }
+  if (item.kind !== "command") return null;
   const { text, failed } = commandExit(item);
   const running = text === "running";
-  const [open, setOpen] = useState(running);
   const hasOutput = item.output.trim().length > 0;
-  const shown =
-    item.output.length > OUTPUT_RENDER_CAP
-      ? item.output.slice(item.output.length - OUTPUT_RENDER_CAP)
-      : item.output;
-
+  const shown = item.output.length > OUTPUT_RENDER_CAP
+    ? item.output.slice(item.output.length - OUTPUT_RENDER_CAP)
+    : item.output;
   return (
-    <div className="max-w-[88%] overflow-hidden rounded-lg border border-line bg-card">
+    <div>
       <button
-        onClick={() => hasOutput && setOpen((o) => !o)}
+        type="button"
+        onClick={() => hasOutput && setOutputOpen((value) => !value)}
         className={cn(
-          "focus-ring flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-11 text-mut",
+          "focus-ring flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-11 text-fnt",
           hasOutput && "hover:bg-pop",
         )}
       >
-        {hasOutput && (
-          <ChevronRight
-            size={10}
-            className={cn(
-              "shrink-0 text-fnt transition-transform",
-              open && "rotate-90",
-            )}
-          />
-        )}
-        <span aria-hidden className="shrink-0 text-fnt">
-          $
-        </span>
-        <span className="min-w-0 flex-1 truncate text-txt">
+        <span aria-hidden className="w-3 shrink-0">$</span>
+        <span className="min-w-0 flex-1 truncate" title={item.command}>
           {item.command || "command"}
         </span>
         <span
@@ -316,14 +402,14 @@ function CommandRow({ item }: { item: Extract<VibeItem, { kind: "command" }> }) 
           {text}
         </span>
       </button>
-      {open && hasOutput && (
-        <pre className="max-h-[190px] select-text overflow-auto border-t border-line px-3 py-2.5 font-mono text-11 leading-[1.6] text-mut">
+      {outputOpen && hasOutput && (
+        <pre className="max-h-[160px] select-text overflow-auto border-t border-line bg-panel px-3 py-2 font-mono text-11 leading-[1.6] text-mut">
           {shown}
         </pre>
       )}
     </div>
   );
-}
+});
 
 function ApprovalRow({
   item,
@@ -450,14 +536,6 @@ function PlanExplanationRow({ text }: { text: string }) {
   return (
     <div className="max-w-[82%] select-text whitespace-pre-wrap text-12 leading-normal text-fnt">
       {text}
-    </div>
-  );
-}
-
-function WebSearchRow({ query }: { query: string }) {
-  return (
-    <div className="max-w-[82%] select-text font-mono text-11 text-fnt">
-      ⌕ {query}
     </div>
   );
 }

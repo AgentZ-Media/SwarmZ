@@ -3,8 +3,10 @@ import { useGithub } from "@/lib/github/store";
 import { useMissions } from "@/lib/missions/store";
 import { useProjects } from "@/lib/projects/store";
 import { useVibe } from "@/lib/vibe/session-store";
+import { useSwarm } from "@/store";
 import { vibeTriageEntries } from "@/lib/vibe/triage";
 import { buildAttentionRows, type AttentionRow } from "./core";
+import { isAttentionAcknowledged } from "./acknowledgement";
 
 /**
  * Reactive global attention projection. Every Zustand selector returns only
@@ -96,16 +98,31 @@ export function useAttentionRows(): AttentionRow[] {
       .sort()
       .join("|"),
   );
+  const acknowledgementSignature = useSwarm((state) =>
+    Object.entries(state.settings.githubAttentionAcknowledged ?? {})
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, revision]) => `${key}:${revision}`)
+      .join("|"),
+  );
 
   return useMemo(
-    () =>
-      buildAttentionRows({
+    () => {
+      const rows = buildAttentionRows({
         projection: useMissions.getState().projection,
         workers: vibeTriageEntries(useVibe.getState()),
         githubByProject: useGithub.getState().byProject,
         projects: useProjects.getState().projects,
-      }),
-    [missionSignature, workerSignature, githubSignature, projectSignature],
+      });
+      const acknowledged = useSwarm.getState().settings.githubAttentionAcknowledged;
+      return rows.filter((row) => !isAttentionAcknowledged(row, acknowledged));
+    },
+    [
+      missionSignature,
+      workerSignature,
+      githubSignature,
+      projectSignature,
+      acknowledgementSignature,
+    ],
   );
 }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { VibeItem } from "@/types";
-import { reportForItem, reportItemIdOf } from "./report-item";
+import { reportForItem, reportItemIdOf, reportPreviewForItem } from "./report-item";
 
 const REPORT_JSON = JSON.stringify({
   done: true,
@@ -120,5 +120,22 @@ describe("reportForItem", () => {
     expect(r?.needsHuman).toBe(true);
     expect(r?.question).toBe("Keep the legacy endpoint?");
     expect(r?.testsPass).toBeNull();
+  });
+});
+
+describe("reportPreviewForItem", () => {
+  it("renders an unstamped schema-shaped progress update without granting authority", () => {
+    const progress = REPORT_JSON.replace('"done":true', '"done":false');
+    const item = assistant("a1", progress);
+    expect(reportForItem(item)).toBeNull();
+    expect(reportPreviewForItem(item)).toMatchObject({
+      done: false,
+      summary: "Implemented the fix and ran the checks.",
+    });
+  });
+
+  it("leaves normal prose and non-assistant JSON alone", () => {
+    expect(reportPreviewForItem(assistant("a1", "Starting now."))).toBeNull();
+    expect(reportPreviewForItem(user("u1", REPORT_JSON))).toBeNull();
   });
 });

@@ -6,8 +6,10 @@
 //   · `reportItemIdOf` — which item the vibe controller stamps `report: true`
 //     on when a schema turn COMPLETES (the last assistant message, and only
 //     when its text genuinely parses as a report — no false alarms)
-//   · `reportForItem` — the UI gate: the parsed report for a stamped item,
-//     null for everything else (plain assistant text path)
+//   · `reportForItem` — the AUTHORITY gate: parsed only for a final stamped
+//     item (attention/Mission logic consumes this)
+//   · `reportPreviewForItem` — PRESENTATION only: turns any valid report-
+//     shaped assistant update into readable UI instead of raw JSON
 
 import { parseAgentReport, type AgentReport } from "@/lib/orchestrator/report";
 import type { VibeItem } from "@/types";
@@ -43,5 +45,16 @@ export function reportItemIdOf(
  */
 export function reportForItem(item: VibeItem): AgentReport | null {
   if (item.kind !== "assistant" || !item.report || item.streaming) return null;
+  return parseAgentReport(item.text);
+}
+
+/**
+ * Presentation-only parser for schema-shaped intermediate updates. Codex may
+ * emit a valid `{done:false,...}` status before the controller stamps the
+ * final report. Rendering it as a progress card is safe; it does NOT grant
+ * report authority and must never feed attention, settlement or evidence.
+ */
+export function reportPreviewForItem(item: VibeItem): AgentReport | null {
+  if (item.kind !== "assistant") return null;
   return parseAgentReport(item.text);
 }

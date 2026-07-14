@@ -22,7 +22,8 @@ import {
   activateProject,
   requestCloseProject,
 } from "@/lib/vibe/controller";
-import { useAttentionCount } from "@/lib/attention/use-attention";
+import { useAttentionRows } from "@/lib/attention/use-attention";
+import { acknowledgeGithubAttention } from "@/lib/attention/acknowledgement";
 import { discoverProjects } from "@/lib/orchestrator/native";
 import { useUpdates } from "@/lib/updates";
 import { WorktreesButton } from "./WorktreePanel";
@@ -195,9 +196,21 @@ function GitHubButton() {
 function NeedsYouPill() {
   // Exact same row projection as the inbox: workers, mission tasks, blocked
   // integration trains and actionable GitHub PR/CI failures cannot drift.
-  const count = useAttentionCount();
+  const rows = useAttentionRows();
+  const count = rows.length;
   if (count === 0) return null;
   const jump = () => {
+    // GitHub CI/conflict/review failures are notifications, not durable human
+    // decisions. Opening the inbox acknowledges the exact revisions currently
+    // shown; changed/new failures surface once again. Worker/mission blockers
+    // remain counted until actually resolved.
+    const swarm = useSwarm.getState();
+    swarm.updateSettings({
+      githubAttentionAcknowledged: acknowledgeGithubAttention(
+        swarm.settings.githubAttentionAcknowledged,
+        rows,
+      ),
+    });
     useVibeUi.getState().setAttentionOpen(true);
   };
   return (

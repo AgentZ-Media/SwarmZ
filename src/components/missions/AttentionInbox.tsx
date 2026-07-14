@@ -9,6 +9,7 @@ import { useAttentionRows } from "@/lib/attention/use-attention";
 import { activateProject, focusSession } from "@/lib/vibe/controller";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { useSwarm } from "@/store";
+import { acknowledgeGithubAttention } from "@/lib/attention/acknowledgement";
 import { cn } from "@/lib/utils";
 
 export interface AttentionInboxProps {
@@ -136,6 +137,15 @@ export function AttentionInbox({
 
 function AttentionItem({ row }: { row: AttentionRow }) {
   const navigate = () => {
+    if (row.source === "github") {
+      const swarm = useSwarm.getState();
+      swarm.updateSettings({
+        githubAttentionAcknowledged: acknowledgeGithubAttention(
+          swarm.settings.githubAttentionAcknowledged,
+          [row],
+        ),
+      });
+    }
     const ui = useVibeUi.getState();
     ui.setAttentionOpen(false);
     // Attention is global. Re-open/activate the owning project before any

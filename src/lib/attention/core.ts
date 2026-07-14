@@ -22,6 +22,8 @@ export interface AttentionRow {
   since: number;
   tone: AttentionTone;
   statusLabel: string;
+  /** changes whenever the underlying attention-worthy state changes */
+  revision: string;
 }
 
 export interface AttentionSnapshot {
@@ -84,6 +86,7 @@ export function buildAttentionRows(snapshot: AttentionSnapshot): AttentionRow[] 
       since: train.updatedAt,
       tone: failed ? "failed" : "blocked",
       statusLabel: failed ? "conflict" : "blocked",
+      revision: `${train.updatedAt}:${failed?.status ?? train.status}:${failed?.detail ?? ""}`,
     });
   }
 
@@ -104,6 +107,7 @@ export function buildAttentionRows(snapshot: AttentionSnapshot): AttentionRow[] 
       since: worker.since ?? 0,
       tone: "attention",
       statusLabel: worker.kind === "approval" ? "approval" : "question",
+      revision: `${worker.kind}:${worker.since ?? 0}:${worker.summary ?? ""}`,
     });
   }
 
@@ -128,6 +132,14 @@ export function buildAttentionRows(snapshot: AttentionSnapshot): AttentionRow[] 
           : (github.prsFetchedAt ?? 0),
         tone: "failed",
         statusLabel: issue.label,
+        revision: [
+          pr.updated_at,
+          pr.checks.passing,
+          pr.checks.failing,
+          pr.checks.pending,
+          pr.mergeable,
+          pr.review_decision,
+        ].join(":"),
       });
     }
   }
@@ -191,6 +203,13 @@ function missionTaskRow(
         : tone === "failed"
           ? "failed"
           : "blocked",
+    revision: [
+      task.status,
+      task.updatedAt,
+      latestAttempt?.finishedAt ?? 0,
+      failedGate?.updatedAt ?? 0,
+      question ?? "",
+    ].join(":"),
   };
 }
 

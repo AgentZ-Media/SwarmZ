@@ -8,7 +8,7 @@ import { QuitConfirmDialog } from "./components/QuitConfirmDialog";
 import { CloseWorktreeDialog } from "./components/CloseWorktreeDialog";
 import { useSwarm } from "./store";
 import { useVibe } from "./lib/vibe/session-store";
-import { hasPendingApproval } from "./lib/vibe/ui";
+import { humanAttention } from "./lib/vibe/attention";
 import { useVibeUi } from "./lib/vibe/ui-store";
 import { useUpdates } from "./lib/updates";
 import { useLimits } from "./lib/limits";
@@ -36,6 +36,11 @@ import { startMissionSchedules } from "./lib/missions/schedules";
 import { startMissionOutboxCompaction } from "./lib/missions/outbox-compaction";
 import { useProjects } from "./lib/projects/store";
 import { startIntegrationController } from "./lib/integration/controller";
+import {
+  installAttentionSoundUnlock,
+  newlyWaitingSessions,
+  playAttentionSound,
+} from "./lib/attention/sound";
 
 // Optional surfaces are sizeable and closed on a normal launch. Keep them out
 // of the startup graph; after first use they remain mounted so Radix can finish
@@ -97,7 +102,6 @@ export default function App() {
   const githubRequested = useLoadOnce(githubOpen);
   const runtimeRequested = useLoadOnce(runtimeOpen);
   const notifyGranted = useRef(false);
-  const prevPending = useRef<Set<string>>(new Set());
 
   // init
   useEffect(() => {
@@ -157,30 +161,67 @@ export default function App() {
     );
   }, [reduceMotion]);
 
-  // native notification when a session raises a pending approval (needs-you);
-  // seeded from the current state so hydrated pre-existing approvals never
-  // re-notify on launch (same lesson as Toasts' lastSeenRef)
+  // WebKit and other browser engines allow Web Audio after a user gesture.
+  // Prime only while the persisted preference is enabled; enabling it from
+  // Settings plays an intentional preview in that same click gesture.
+  const attentionSoundEnabled = useSwarm(
+    (s) => s.settings.attentionSound !== false,
+  );
   useEffect(() => {
-    const seed = new Set<string>();
-    const initial = useVibe.getState();
-    for (const id of initial.order) {
-      const entry = initial.sessions[id];
-      if (entry && hasPendingApproval(entry)) seed.add(id);
-    }
-    prevPending.current = seed;
+    if (!attentionSoundEnabled) return;
+    return installAttentionSoundUnlock();
+  }, [attentionSoundEnabled]);
+
+  // Notify/sound only on a NEW no-attention → attention edge. The first fully
+  // hydrated state is the seed, so historic blockers never make noise merely
+  // because SwarmZ launched. Structured needs_human reports share the sound;
+  // native notifications retain their existing approval-only contract.
+  useEffect(() => {
+    let seeded = false;
+    let previous = new Set<string>();
     const unsub = useVibe.subscribe((state) => {
-      const nowPending = new Set<string>();
+      if (!state.hydrated) return;
+      const current = new Set<string>();
+      const kinds = new Map<string, "approval" | "report">();
       for (const id of state.order) {
         const entry = state.sessions[id];
-        if (entry && hasPendingApproval(entry)) {
-          nowPending.add(id);
-          if (!prevPending.current.has(id) && notifyGranted.current) {
-            void notify(`🔔 ${entry.session.name}`, "Session needs your approval");
-          }
+        const attention = entry ? humanAttention(entry) : null;
+        if (!attention) continue;
+        current.add(id);
+        kinds.set(id, attention.kind);
+      }
+      if (!seeded) {
+        previous = current;
+        seeded = true;
+        return;
+      }
+      const newlyWaiting = newlyWaitingSessions(previous, current);
+      for (const id of newlyWaiting) {
+        const entry = state.sessions[id];
+        if (entry && kinds.get(id) === "approval" && notifyGranted.current) {
+          void notify(`🔔 ${entry.session.name}`, "Session needs your approval");
         }
       }
-      prevPending.current = nowPending;
+      if (
+        newlyWaiting.length > 0 &&
+        useSwarm.getState().settings.attentionSound !== false
+      ) {
+        void playAttentionSound();
+      }
+      previous = current;
     });
+    // subscribe() does not call the listener immediately. If hydration already
+    // completed before this effect, seed from the authoritative current state.
+    const initial = useVibe.getState();
+    if (initial.hydrated) {
+      previous = new Set(
+        initial.order.filter((id) => {
+          const entry = initial.sessions[id];
+          return !!entry && humanAttention(entry) !== null;
+        }),
+      );
+      seeded = true;
+    }
     return unsub;
   }, []);
 

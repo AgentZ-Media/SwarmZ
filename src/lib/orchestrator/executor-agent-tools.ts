@@ -56,6 +56,7 @@ import {
   sessionsInPath,
   withWorktreeLock,
 } from "./executor-worktrees";
+import { assertSafeSpawnBatch, spawnBatchSummary } from "./spawn-batch";
 
 type AgentTool =
   | "prompt_agent"
@@ -285,15 +286,6 @@ async function spawnOneAgent(
   };
 }
 
-/** Honest, human-readable account of what the batch created. */
-function buildSummary(results: SpawnAgentResult[]): string {
-  const created = results.filter((r) => r.id && !r.error).length;
-  const failed = results.filter((r) => r.error).length;
-  let summary = `spawned ${created} agent${created === 1 ? "" : "s"}`;
-  if (failed) summary += `; ${failed} failed`;
-  return summary;
-}
-
 export const agentExecutors: ExecutorFamily<AgentTool> = {
   prompt_agent: async (args, ctx) => {
     const entry = requireSession(args.agent, ctx);
@@ -366,7 +358,23 @@ export const agentExecutors: ExecutorFamily<AgentTool> = {
     const specs = args.agents as SpawnAgentSpec[];
     if (!Array.isArray(specs) || specs.length < 1 || specs.length > 8)
       throw new Error("agents must contain 1–8 entries");
+    // Fail before worktree/session side effects. Several `none` entries all
+    // resolve to the main checkout and cannot honestly start in parallel.
+    assertSafeSpawnBatch(specs);
     const { id: projectId, dir: projectDir } = requireProject(ctx);
+    if (specs.some((spec) => String(spec?.worktree ?? "").trim() === "none")) {
+      const blocker = busyLaneBlocker(
+        sessionsInPath(projectDir),
+        projectDir,
+        "",
+        useVibe.getState().busy,
+      );
+      if (blocker) {
+        throw new Error(
+          `spawn batch refused before creating agents: the project checkout is busy with "${blocker.session.name}". Wait for that turn to finish or use worktree "new".`,
+        );
+      }
+    }
     // Fetch once for the batch, before any worktree/session is created. Only
     // explicit overrides need strict validation; default-config spawns keep
     // working if model/list is temporarily unavailable.
@@ -451,6 +459,11 @@ export const agentExecutors: ExecutorFamily<AgentTool> = {
               : { via: "conductor", requireWorkspace: true },
           ));
         if (expectationToken) bindReportExpectation(id, expectationToken, sent.turnId);
+        const result = results[index];
+        if (result) {
+          result.delivery = "started";
+          result.turnId = sent.turnId;
+        }
         notePromptDelivered(
           id,
           useVibe.getState().sessions[id]?.session.name ??
@@ -498,7 +511,7 @@ export const agentExecutors: ExecutorFamily<AgentTool> = {
 
     const out: SpawnAgentsResult = {
       agents: results,
-      summary: buildSummary(results),
+      summary: spawnBatchSummary(results),
     };
     return out;
   },
