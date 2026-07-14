@@ -157,14 +157,35 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'SwarmZ ${{ github.ref_name }}'
           releaseBody: ${{ needs.preflight.outputs.body }}
-          releaseDraft: false
+          # Keep every artifact private until the native bundle and DMG have
+          # passed the checks below. A failed build must never become latest.
+          releaseDraft: true
           prerelease: false
           args: --target aarch64-apple-darwin
 
-      - name: Verify published app bundle signature
+      - name: Verify app bundle signature and DMG integrity
         shell: bash
         run: |
           set -euo pipefail
           app="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/SwarmZ.app"
+          tarball="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/SwarmZ.app.tar.gz"
           test -f "$app/Contents/_CodeSignature/CodeResources"
+          test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = "de.agent-z.swarmz"
+          test "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "${GITHUB_REF_NAME#v}"
           codesign --verify --deep --strict --verbose=4 "$app"
+          tar -tzf "$tarball" | awk '
+            $0 == "SwarmZ.app/Contents/_CodeSignature/CodeResources" { found = 1 }
+            END { exit !found }
+          '
+          shopt -s nullglob
+          dmgs=(src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg)
+          if (( ${#dmgs[@]} != 1 )); then
+            echo "::error::Expected exactly one DMG, found ${#dmgs[@]}."
+            exit 1
+          fi
+          hdiutil verify "${dmgs[0]}"
+
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
