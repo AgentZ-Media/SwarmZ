@@ -37,10 +37,18 @@ function cargoPackageVersion(source) {
   return versions[0];
 }
 
-function jsonVersion(root, relativePath) {
+function jsonObject(root, relativePath) {
   const path = resolve(root, relativePath);
   regularFile(path, relativePath);
   const value = JSON.parse(readUtf8(path));
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${relativePath} must contain a JSON object`);
+  }
+  return value;
+}
+
+function jsonVersion(root, relativePath) {
+  const value = jsonObject(root, relativePath);
   if (!value || typeof value !== "object" || typeof value.version !== "string") {
     throw new Error(`${relativePath} must contain a string version`);
   }
@@ -53,9 +61,10 @@ export function runPreflight(tag, root = process.cwd()) {
     throw new Error("release tag must be stable vMAJOR.MINOR.PATCH without leading zeroes");
   }
   const version = tag.slice(1);
+  const tauriConfig = jsonObject(root, "src-tauri/tauri.conf.json");
   const versions = new Map([
     ["package.json", jsonVersion(root, "package.json")],
-    ["src-tauri/tauri.conf.json", jsonVersion(root, "src-tauri/tauri.conf.json")],
+    ["src-tauri/tauri.conf.json", tauriConfig.version],
   ]);
   const cargoPath = resolve(root, "src-tauri/Cargo.toml");
   regularFile(cargoPath, "src-tauri/Cargo.toml");
@@ -64,6 +73,11 @@ export function runPreflight(tag, root = process.cwd()) {
     if (actual !== version) {
       throw new Error(`${source} version ${JSON.stringify(actual)} does not match tag version ${JSON.stringify(version)}`);
     }
+  }
+  if (tauriConfig.bundle?.macOS?.signingIdentity !== "-") {
+    throw new Error(
+      'src-tauri/tauri.conf.json must set bundle.macOS.signingIdentity to "-" so release app bundles receive a complete ad-hoc signature',
+    );
   }
 
   const notesRelative = `docs/release-notes/${tag}.md`;

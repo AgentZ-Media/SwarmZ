@@ -160,3 +160,11 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: --target aarch64-apple-darwin
+
+      - name: Verify published app bundle signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/SwarmZ.app"
+          test -f "$app/Contents/_CodeSignature/CodeResources"
+          codesign --verify --deep --strict --verbose=4 "$app"
