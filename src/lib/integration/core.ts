@@ -41,8 +41,17 @@ export function operationIdFor(
   commit: string,
   strategy: IntegrationStrategy,
   expectedHead: string,
+  retryRevision = 0,
 ): string {
-  return stableId("intop", [trainId, taskId, attemptId, commit, strategy, expectedHead]);
+  return stableId("intop", [
+    trainId,
+    taskId,
+    attemptId,
+    commit,
+    strategy,
+    expectedHead,
+    `retry:${Math.max(0, Math.floor(retryRevision))}`,
+  ]);
 }
 
 function validCommit(value: unknown): string | null {
@@ -210,6 +219,7 @@ function operationPlan(
     readiness.commit,
     input.strategy,
     input.currentHead,
+    input.train.entries.find((entry) => entry.taskId === readiness.taskId)?.retryRevision ?? 0,
   );
   const common = {
     targetBranch: input.train.integrationBranch,

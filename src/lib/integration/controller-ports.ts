@@ -68,6 +68,11 @@ export interface IntegrationControllerPorts {
   claim(recordId: string, ownerId: string, leaseMs: number): Promise<MissionOutboxRecord | null>;
   deliver(recordId: string, claimId: string, receipt: Record<string, unknown>): Promise<MissionOutboxRecord>;
   fail(recordId: string, claimId: string, error: string, retryable: boolean): Promise<MissionOutboxRecord>;
+  adoptReceipt(
+    idempotencyKey: string,
+    receipt: Record<string, unknown>,
+    deliveredAt: number,
+  ): Promise<MissionOutboxRecord | null>;
   createTrain(
     missionId: string,
     train: Omit<IntegrationTrain, "missionId" | "createdAt" | "updatedAt">,
@@ -78,11 +83,13 @@ export interface IntegrationControllerPorts {
     trainId: string,
     patch: { status?: IntegrationTrain["status"]; entries?: IntegrationTrainEntry[] },
     idempotencyKey: string,
+    actor?: MissionEvent["actor"],
   ): void;
   recordArtifact(
     missionId: string,
     artifact: Omit<MissionArtifact, "missionId" | "createdAt"> & { createdAt?: number },
     idempotencyKey: string,
+    actor?: MissionEvent["actor"],
   ): void;
   flushMissions(): Promise<void>;
   now(): number;
@@ -122,21 +129,23 @@ export function productionIntegrationControllerPorts(): IntegrationControllerPor
       useMissionOutbox.getState().deliver(recordId, claimId, receipt),
     fail: (recordId, claimId, error, retryable) =>
       useMissionOutbox.getState().fail(recordId, claimId, error, { retryable }),
+    adoptReceipt: (idempotencyKey, receipt, deliveredAt) =>
+      useMissionOutbox.getState().adoptReceipt(idempotencyKey, receipt, deliveredAt),
     createTrain: (missionId, train, idempotencyKey) => {
       useMissions.getState().createIntegrationTrain(missionId, train, {
         actor: "system",
         idempotencyKey,
       });
     },
-    updateTrain: (missionId, trainId, patch, idempotencyKey) => {
+    updateTrain: (missionId, trainId, patch, idempotencyKey, actor = "system") => {
       useMissions.getState().updateIntegrationTrain(missionId, trainId, patch, {
-        actor: "system",
+        actor,
         idempotencyKey,
       });
     },
-    recordArtifact: (missionId, artifact, idempotencyKey) => {
+    recordArtifact: (missionId, artifact, idempotencyKey, actor = "system") => {
       useMissions.getState().recordArtifact(missionId, artifact, {
-        actor: "system",
+        actor,
         idempotencyKey,
       });
     },

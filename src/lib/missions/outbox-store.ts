@@ -8,6 +8,7 @@ import {
 import {
   claimNextMissionCommand,
   claimMissionCommandById,
+  adoptMissionCommandReceipt,
   deliverMissionCommand,
   emptyMissionOutbox,
   enqueueMissionCommand,
@@ -54,6 +55,11 @@ export interface MissionOutboxState {
     options?: { now?: number; retryable?: boolean },
   ): Promise<MissionOutboxRecord>;
   retryDeadLetter(recordId: string, now?: number): Promise<MissionOutboxRecord>;
+  adoptReceipt(
+    idempotencyKey: string,
+    receipt: Record<string, unknown>,
+    deliveredAt?: number,
+  ): Promise<MissionOutboxRecord | null>;
   pruneArchivedDelivered(
     archivedMissionIds: ReadonlySet<string>,
     durablyAppliedRecords: ReadonlyMap<string, MissionOutboxRecord>,
@@ -178,6 +184,13 @@ export const useMissionOutbox = create<MissionOutboxState>((set, get) => ({
 
   retryDeadLetter: async (recordId, now = Date.now()) => {
     const decision = retryDeadLetter(get().snapshot, recordId, now);
+    if (decision.changed) await persistTransition(set, decision.snapshot);
+    return decision.record;
+  },
+
+  adoptReceipt: async (idempotencyKey, receipt, deliveredAt = Date.now()) => {
+    const decision = adoptMissionCommandReceipt(get().snapshot, idempotencyKey, receipt, deliveredAt);
+    if (!decision) return null;
     if (decision.changed) await persistTransition(set, decision.snapshot);
     return decision.record;
   },

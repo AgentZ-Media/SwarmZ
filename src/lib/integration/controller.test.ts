@@ -38,6 +38,7 @@ interface Harness {
   acceptanceCalls: AcceptanceCommandRequest[];
   rollbackCalls: IntegrationRollbackRequest[];
   headByPath: Map<string, string>;
+  setApplyMode(mode: ApplyMode): void;
 }
 
 function addEvent(
@@ -68,7 +69,6 @@ function missionEvents(roots: readonly string[], command: string): MissionEvent[
         stopOnCriticalFailure: true,
         requireQualityGates: true,
         integrationMode: "train",
-        archiveCompletedWorkers: true,
         networkAuthority: "deny",
         githubAuthority: "deny",
         allowedTools: ["read_file", "edit_file", "test"],
@@ -199,6 +199,7 @@ function makeHarness(options: {
   const rollbackCalls: IntegrationRollbackRequest[] = [];
   let clock = 10_000;
   let crashed = false;
+  let applyMode = options.applyMode;
 
   const canonical = (cwd: string) => cwd.startsWith("/repo-b") ? "/repo-b" : "/repo-a";
   const ports: IntegrationControllerPorts = {
@@ -248,7 +249,7 @@ function makeHarness(options: {
       );
       if (!durable) throw new Error("test invariant: Git ran before claimed durable outbox record");
       const head = headByPath.get(request.worktreePath) as string;
-      if (options.applyMode === "conflict") {
+      if (applyMode === "conflict") {
         return {
           status: "blocked",
           strategy: request.strategy,
@@ -275,7 +276,7 @@ function makeHarness(options: {
       ancestors.get(request.worktreePath)?.add(head);
       headByPath.set(request.worktreePath, next);
       applied.add(key);
-      if (options.applyMode === "crash_once" && !crashed) {
+      if (applyMode === "crash_once" && !crashed) {
         crashed = true;
         throw new Error("simulated acknowledgement crash after cherry-pick");
       }
@@ -389,6 +390,21 @@ function makeHarness(options: {
       outbox[recordId] = failed;
       return failed;
     },
+    adoptReceipt: async (idempotencyKey, receipt, deliveredAt) => {
+      const record = Object.values(outbox).find((value) => value.idempotencyKey === idempotencyKey);
+      if (!record) return null;
+      if (record.status === "delivered") return record;
+      const delivered: MissionOutboxRecord = {
+        ...record,
+        status: "delivered",
+        updatedAt: deliveredAt,
+        lease: null,
+        delivery: { deliveredAt, receipt },
+        lastError: null,
+      };
+      outbox[record.id] = delivered;
+      return delivered;
+    },
     createTrain: (missionId, train) => {
       const now = clock++;
       projection.integrationTrains[train.id] = {
@@ -424,6 +440,7 @@ function makeHarness(options: {
     acceptanceCalls,
     rollbackCalls,
     headByPath,
+    setApplyMode: (mode) => { applyMode = mode; },
   };
 }
 
@@ -478,6 +495,96 @@ describe("integration train controller", () => {
     expect(harness.rollbackCalls).toHaveLength(0);
   });
 
+  it("human-retries only the failed entry with a fresh operation generation and supersedes stale records", async () => {
+    const harness = makeHarness({ applyMode: "conflict" });
+    await ticks(harness, 2);
+    const train = Object.values(harness.projection.integrationTrains)[0];
+    const stale = Object.values(harness.outbox).find((record) => record.command.kind === "integrate");
+    expect(stale).toBeTruthy();
+    harness.outbox[stale!.id] = {
+      ...stale!,
+      status: "dead_letter",
+      delivery: null,
+      lastError: "manual recovery required",
+    };
+    const previousOperationId = stale!.command.kind === "integrate"
+      ? stale!.command.payload.operationId
+      : "";
+
+    const retried = await harness.controller.humanApprovedRetry({
+      missionId: MISSION_ID,
+      trainId: train.id,
+      taskId: "task-1",
+      reason: "Conflict was resolved in the source commit and is safe to retry.",
+      approval: { approvalId: "human-retry-1", approvedBy: "human", approvedAt: 20_000 },
+    });
+
+    expect(retried.status).toBe("running");
+    expect(retried.entries[0]).toMatchObject({
+      status: "queued",
+      commit: null,
+      operationId: null,
+      retryRevision: 1,
+    });
+    expect(harness.outbox[stale!.id]).toMatchObject({
+      status: "delivered",
+      delivery: { receipt: { status: "superseded_by_human_remediation", action: "retry" } },
+    });
+    expect(Object.values(harness.projection.artifacts).some((artifact) =>
+      artifact.label === "integration-entry-retry-approved" &&
+      artifact.metadata.approvalId === "human-retry-1")).toBe(true);
+
+    harness.setApplyMode("success");
+    await ticks(harness, 4);
+    const current = harness.projection.integrationTrains[train.id];
+    expect(current.entries[0].status).toBe("integrated");
+    const newOperation = Object.values(harness.outbox).find((record) =>
+      record.command.kind === "integrate" &&
+      record.command.payload.operationId !== previousOperationId,
+    );
+    expect(newOperation?.status).toBe("delivered");
+  });
+
+  it("requires a durable reason to skip one failed entry and supersedes its unfinished operation", async () => {
+    const harness = makeHarness({ applyMode: "conflict" });
+    await ticks(harness, 2);
+    const train = Object.values(harness.projection.integrationTrains)[0];
+    const stale = Object.values(harness.outbox).find((record) => record.command.kind === "integrate");
+    expect(stale).toBeTruthy();
+    harness.outbox[stale!.id] = {
+      ...stale!,
+      status: "failed",
+      delivery: null,
+      lastError: "pending manual decision",
+    };
+
+    await expect(harness.controller.humanApprovedSkip({
+      missionId: MISSION_ID,
+      trainId: train.id,
+      taskId: "task-1",
+      reason: "too short",
+      approval: { approvalId: "human-skip-short", approvedBy: "human", approvedAt: 20_000 },
+    })).rejects.toThrow("at least 10 characters");
+
+    const skipped = await harness.controller.humanApprovedSkip({
+      missionId: MISSION_ID,
+      trainId: train.id,
+      taskId: "task-1",
+      reason: "This optional change is intentionally excluded from this release.",
+      approval: { approvalId: "human-skip-1", approvedBy: "human", approvedAt: 20_001 },
+    });
+
+    expect(skipped.status).toBe("running");
+    expect(skipped.entries[0]).toMatchObject({ status: "skipped" });
+    expect(harness.outbox[stale!.id]).toMatchObject({
+      status: "delivered",
+      delivery: { receipt: { status: "superseded_by_human_remediation", action: "skip" } },
+    });
+    expect(Object.values(harness.projection.artifacts).some((artifact) =>
+      artifact.label === "integration-entry-skip-approved" &&
+      artifact.metadata.reason === "This optional change is intentionally excluded from this release.")).toBe(true);
+  });
+
   it("requires an exact human-selected checkpoint for destructive rollback", async () => {
     const harness = makeHarness();
     await ticks(harness, 2);
@@ -485,6 +592,7 @@ describe("integration train controller", () => {
     const baseline = Object.values(harness.projection.artifacts)
       .find((artifact) => artifact.label === "integration-checkpoint");
     expect(baseline).toBeTruthy();
+    harness.projection.integrationTrains[train.id] = { ...train, status: "blocked" };
 
     const request: HumanRollbackRequest = {
       missionId: MISSION_ID,
@@ -497,8 +605,58 @@ describe("integration train controller", () => {
     expect(result.headAfter).toBe(BASE_A);
     expect(harness.rollbackCalls).toHaveLength(1);
     expect(harness.projection.integrationTrains[train.id].status).toBe("blocked");
+    expect(harness.projection.integrationTrains[train.id].entries[0]).toMatchObject({
+      status: "queued",
+      commit: null,
+      operationId: null,
+      retryRevision: 1,
+    });
     expect(Object.values(harness.projection.artifacts).some((artifact) =>
       artifact.label === "integration-rollback-completed")).toBe(true);
+  });
+
+  it("refuses rollback unless the train is blocked and no integration record is claimed", async () => {
+    const harness = makeHarness();
+    await ticks(harness, 2);
+    const train = Object.values(harness.projection.integrationTrains)[0];
+    const checkpoint = Object.values(harness.projection.artifacts)
+      .find((artifact) => artifact.label === "integration-checkpoint");
+    const request: HumanRollbackRequest = {
+      missionId: MISSION_ID,
+      trainId: train.id,
+      checkpointId: checkpoint!.id,
+      approval: { approvalId: "human-rollback-guard", approvedBy: "human", approvedAt: 21_000 },
+    };
+
+    await expect(harness.controller.humanApprovedRollback(request))
+      .rejects.toThrow("only available for a blocked train");
+
+    harness.projection.integrationTrains[train.id] = { ...train, status: "blocked" };
+    const record = Object.values(harness.outbox).find((value) => value.command.kind === "integrate");
+    expect(record).toBeTruthy();
+    harness.outbox[record!.id] = {
+      ...record!,
+      status: "claimed",
+      delivery: null,
+      lease: { ownerId: "other", claimId: "live-claim", claimedAt: 20_000, expiresAt: 30_000 },
+    };
+    await expect(harness.controller.humanApprovedRollback(request))
+      .rejects.toThrow("actively claimed");
+    expect(harness.rollbackCalls).toHaveLength(0);
+  });
+
+  it("uses action-neutral server guards for retry and skip", async () => {
+    const harness = makeHarness();
+    await ticks(harness, 2);
+    const train = Object.values(harness.projection.integrationTrains)[0];
+
+    await expect(harness.controller.humanApprovedRetry({
+      missionId: MISSION_ID,
+      trainId: train.id,
+      taskId: "task-1",
+      reason: "A sufficiently detailed remediation explanation.",
+      approval: { approvalId: "human-neutral-guard", approvedBy: "human", approvedAt: 22_000 },
+    })).rejects.toThrow("human remediation is only available for a blocked train");
   });
 
   it("refuses shell syntax in an approved regression command", async () => {

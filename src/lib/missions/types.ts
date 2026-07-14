@@ -57,7 +57,6 @@ export interface MissionPolicy {
   stopOnCriticalFailure: boolean;
   requireQualityGates: boolean;
   integrationMode: "manual" | "train";
-  archiveCompletedWorkers: boolean;
   /** Optional private-preview execution grants; missing values fail closed. */
   networkAuthority?: "deny" | "read_only" | "allow";
   githubAuthority?: "deny" | "read_only" | "write";
@@ -259,6 +258,10 @@ export interface IntegrationTrainEntry {
   status: "queued" | "integrating" | "integrated" | "failed" | "skipped";
   commit: string | null;
   detail: string | null;
+  /** Durable generation for an explicitly human-approved retry. */
+  retryRevision?: number;
+  /** Exact durable operation currently associated with this entry. */
+  operationId?: string | null;
 }
 
 export interface IntegrationTrain {

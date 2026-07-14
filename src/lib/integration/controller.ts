@@ -47,22 +47,34 @@ import type {
 const TICK_MS = 1_000;
 const CLAIM_MS = 5 * 60_000;
 const OWNER_ID = "integration-controller";
+export interface HumanIntegrationApproval {
+  approvalId: string;
+  approvedBy: "human";
+  approvedAt: number;
+}
+
+export interface HumanEntryActionRequest {
+  missionId: string;
+  trainId: string;
+  taskId: string;
+  reason: string;
+  approval: HumanIntegrationApproval;
+}
+
 export interface HumanRollbackRequest {
   missionId: string;
   trainId: string;
   /** The human chooses the exact durable checkpoint; the controller never guesses. */
   checkpointId: string;
-  approval: {
-    approvalId: string;
-    approvedBy: "human";
-    approvedAt: number;
-  };
+  approval: HumanIntegrationApproval;
 }
 
 export interface IntegrationTrainController {
   tick(): Promise<void>;
   start(): () => void;
   stop(): void;
+  humanApprovedRetry(request: HumanEntryActionRequest): Promise<IntegrationTrain>;
+  humanApprovedSkip(request: HumanEntryActionRequest): Promise<IntegrationTrain>;
   humanApprovedRollback(request: HumanRollbackRequest): Promise<IntegrationRollbackResult>;
 }
 
@@ -83,9 +95,10 @@ export function createIntegrationTrainController(
   async function persistArtifact(
     missionId: string,
     artifact: Omit<MissionArtifact, "missionId" | "createdAt"> & { createdAt?: number },
+    actor: "system" | "human" = "system",
   ): Promise<void> {
     if (ports.snapshot().projection.artifacts[artifact.id]) return;
-    ports.recordArtifact(missionId, artifact, `integration-artifact:${artifact.id}`);
+    ports.recordArtifact(missionId, artifact, `integration-artifact:${artifact.id}`, actor);
     await ports.flushMissions();
   }
 
@@ -94,6 +107,7 @@ export function createIntegrationTrainController(
     train: IntegrationTrain,
     patch: { status?: IntegrationTrain["status"]; entries?: IntegrationTrainEntry[] },
     reason: string,
+    actor: "system" | "human" = "system",
   ): Promise<void> {
     const unchangedStatus = patch.status === undefined || patch.status === train.status;
     const unchangedEntries = patch.entries === undefined || sameEntries(patch.entries, train.entries);
@@ -103,6 +117,7 @@ export function createIntegrationTrainController(
       train.id,
       patch,
       stableId("integration-update", train.id, reason, JSON.stringify(patch)),
+      actor,
     );
     await ports.flushMissions();
   }
@@ -280,7 +295,14 @@ export function createIntegrationTrainController(
       if (!task) continue;
       const commit = entry.commit ?? commitForTask(task, snapshot.projection);
       if (!commit) continue;
-      const records = integrationRecordsFor(snapshot, train.id, task.id, commit);
+      const allRecords = integrationRecordsFor(snapshot, train.id, task.id, commit);
+      const records = entry.status === "integrated"
+        ? allRecords
+        : entry.operationId
+          ? integrationRecordsFor(snapshot, train.id, task.id, commit, entry.operationId)
+          : (entry.retryRevision ?? 0) > 0
+            ? []
+            : allRecords;
       const delivered = [...records].reverse().find((record) => record.status === "delivered");
       if (entry.status === "integrated") {
         // A crash may leave the first exact-HEAD command unacknowledged while
@@ -396,7 +418,13 @@ export function createIntegrationTrainController(
     }, stableId("outbox", operation.operationId));
     const train = ports.snapshot().projection.integrationTrains[context.train.id] ?? context.train;
     const entries = train.entries.map((entry) => entry.taskId === operation.taskId
-      ? { ...entry, status: "integrating" as const, commit: operation.commit, detail: operation.explanation }
+      ? {
+          ...entry,
+          status: "integrating" as const,
+          commit: operation.commit,
+          operationId: operation.operationId,
+          detail: operation.explanation,
+        }
       : entry);
     await updateTrain(context.missionId, train, { status: "running", entries },
       `integrating:${operation.operationId}`);
@@ -585,15 +613,233 @@ export function createIntegrationTrainController(
     }
   }
 
-  async function humanApprovedRollback(request: HumanRollbackRequest): Promise<IntegrationRollbackResult> {
-    if (request.approval.approvedBy !== "human" || !request.approval.approvalId.trim() ||
-      !Number.isFinite(request.approval.approvedAt)) {
-      throw new Error("rollback requires an explicit, durable human approval");
+  function assertHumanApproval(approval: HumanIntegrationApproval, action: string): void {
+    if (approval.approvedBy !== "human" || !approval.approvalId.trim() ||
+      !Number.isFinite(approval.approvedAt) || approval.approvedAt <= 0) {
+      throw new Error(`${action} requires an explicit, durable human approval`);
     }
+  }
+
+  function normalizedReason(reason: string, action: string): string {
+    const normalized = errorMessage(reason);
+    if (normalized.length < 10) {
+      throw new Error(`${action} requires a reason of at least 10 characters`);
+    }
+    return normalized;
+  }
+
+  async function safeHumanEntryContext(request: HumanEntryActionRequest): Promise<{
+    snapshot: ReturnType<IntegrationControllerPorts["snapshot"]>;
+    train: IntegrationTrain;
+    entry: IntegrationTrainEntry;
+    root: string;
+    worktreePath: string;
+    evidence: MissionGitEvidence;
+  }> {
     const snapshot = ports.snapshot();
     if (!snapshot.ready) throw new Error("integration persistence is not safely hydrated");
     const train = snapshot.projection.integrationTrains[request.trainId];
     if (!train || train.missionId !== request.missionId) throw new Error("integration train is unknown");
+    if (train.status !== "blocked") throw new Error("human remediation is only available for a blocked train");
+    if (outboxRecords(snapshot, request.missionId, "integrate").some((record) =>
+      record.status === "claimed" && record.command.kind === "integrate" &&
+      record.command.payload.trainId === train.id,
+    )) {
+      throw new Error("human remediation refused while an integration operation is actively claimed");
+    }
+    const entry = train.entries.find((value) => value.taskId === request.taskId);
+    if (!entry) throw new Error("integration train entry is unknown");
+    const task = snapshot.projection.tasks[entry.taskId];
+    if (!task || task.missionId !== request.missionId) throw new Error("integration task is unknown");
+    const root = await ports.resolveMainRoot(task.root.path, snapshot.gitBin);
+    const worktreePath = await ensureWorktree(root, train.integrationBranch, snapshot.gitBin);
+    const evidence = await ports.gitEvidence(worktreePath, null, snapshot.gitBin);
+    if (evidence.branch !== train.integrationBranch || evidence.dirty) {
+      throw new Error("integration checkout must be clean and on its recorded branch");
+    }
+    return { snapshot, train, entry, root, worktreePath, evidence };
+  }
+
+  async function supersedeIntegrationRecords(
+    missionId: string,
+    trainId: string,
+    taskIds: ReadonlySet<string>,
+    action: "retry" | "skip" | "rollback",
+    approval: HumanIntegrationApproval,
+  ): Promise<void> {
+    const records = outboxRecords(ports.snapshot(), missionId, "integrate").filter((record) =>
+      record.command.kind === "integrate" &&
+      record.command.payload.trainId === trainId &&
+      taskIds.has(record.command.payload.taskId) &&
+      record.status !== "delivered",
+    );
+    if (records.some((record) => record.status === "claimed")) {
+      throw new Error("human remediation refused while an integration operation is actively claimed");
+    }
+    for (const record of records) {
+      if (record.command.kind !== "integrate") continue;
+      const adopted = await ports.adoptReceipt(record.idempotencyKey, {
+        status: "superseded_by_human_remediation",
+        action,
+        approvalId: approval.approvalId,
+        approvedBy: "human",
+        approvedAt: approval.approvedAt,
+        trainId,
+        taskId: record.command.payload.taskId,
+        operationId: record.command.payload.operationId,
+        commit: record.command.payload.commit,
+        headVerified: false,
+        detail: `Unfinished operation superseded by human-approved ${action}`,
+      }, ports.now());
+      if (!adopted || adopted.id !== record.id || adopted.status !== "delivered") {
+        throw new Error(`failed to durably supersede integration record ${record.id}`);
+      }
+    }
+  }
+
+  async function humanApprovedRetry(request: HumanEntryActionRequest): Promise<IntegrationTrain> {
+    assertHumanApproval(request.approval, "retry");
+    const reason = normalizedReason(request.reason, "retry");
+    const artifactId = stableId(
+      "retryapproval",
+      request.trainId,
+      request.taskId,
+      request.approval.approvalId,
+    );
+    const initial = ports.snapshot();
+    const initialTrain = initial.projection.integrationTrains[request.trainId];
+    const existingApproval = initial.projection.artifacts[artifactId];
+    const initialEntry = initialTrain?.entries.find((entry) => entry.taskId === request.taskId);
+    if (existingApproval && initialTrain && initialEntry?.status !== "failed") return initialTrain;
+    const { train, entry, root, evidence } = await safeHumanEntryContext(request);
+    if (train.status !== "blocked" || entry.status !== "failed") {
+      throw new Error("retry is only available for the failed entry of a blocked train");
+    }
+    const recordedRevision = existingApproval?.metadata.retryRevision;
+    const retryRevision = typeof recordedRevision === "number" && Number.isInteger(recordedRevision)
+      ? recordedRevision
+      : Math.max(0, entry.retryRevision ?? 0) + 1;
+    if (existingApproval && (
+      existingApproval.metadata.trainId !== train.id ||
+      existingApproval.metadata.taskId !== entry.taskId ||
+      existingApproval.metadata.reason !== reason
+    )) {
+      throw new Error("retry approval id was already used for different durable input");
+    }
+    await persistArtifact(request.missionId, {
+      id: artifactId,
+      taskId: entry.taskId,
+      attemptId: null,
+      kind: "log",
+      label: "integration-entry-retry-approved",
+      uri: null,
+      createdAt: request.approval.approvedAt,
+      metadata: {
+        trainId: train.id,
+        taskId: entry.taskId,
+        retryRevision,
+        previousOperationId: entry.operationId ?? null,
+        expectedHead: evidence.head_sha,
+        root,
+        reason,
+        approvalId: request.approval.approvalId,
+        approvedBy: "human",
+      },
+    }, "human");
+    await supersedeIntegrationRecords(
+      request.missionId,
+      train.id,
+      new Set([entry.taskId]),
+      "retry",
+      request.approval,
+    );
+    const entries = train.entries.map((value) => value.taskId === entry.taskId
+      ? {
+          ...value,
+          status: "queued" as const,
+          commit: null,
+          operationId: null,
+          retryRevision,
+          detail: `Human-approved retry: ${reason}`,
+        }
+      : value);
+    await updateTrain(request.missionId, train, { status: "running", entries },
+      `human-retry:${request.approval.approvalId}:${retryRevision}`, "human");
+    return ports.snapshot().projection.integrationTrains[train.id] ?? { ...train, status: "running", entries };
+  }
+
+  async function humanApprovedSkip(request: HumanEntryActionRequest): Promise<IntegrationTrain> {
+    assertHumanApproval(request.approval, "skip");
+    const reason = normalizedReason(request.reason, "skip");
+    const artifactId = stableId(
+      "skipapproval",
+      request.trainId,
+      request.taskId,
+      request.approval.approvalId,
+    );
+    const initial = ports.snapshot();
+    const initialTrain = initial.projection.integrationTrains[request.trainId];
+    const existingApproval = initial.projection.artifacts[artifactId];
+    const initialEntry = initialTrain?.entries.find((entry) => entry.taskId === request.taskId);
+    if (existingApproval && initialTrain && initialEntry?.status === "skipped") return initialTrain;
+    const { train, entry, root, evidence } = await safeHumanEntryContext(request);
+    if (train.status !== "blocked" || entry.status !== "failed") {
+      throw new Error("skip is only available for the failed entry of a blocked train");
+    }
+    if (existingApproval && (
+      existingApproval.metadata.trainId !== train.id ||
+      existingApproval.metadata.taskId !== entry.taskId ||
+      existingApproval.metadata.reason !== reason
+    )) {
+      throw new Error("skip approval id was already used for different durable input");
+    }
+    await persistArtifact(request.missionId, {
+      id: artifactId,
+      taskId: entry.taskId,
+      attemptId: null,
+      kind: "log",
+      label: "integration-entry-skip-approved",
+      uri: null,
+      createdAt: request.approval.approvedAt,
+      metadata: {
+        trainId: train.id,
+        taskId: entry.taskId,
+        skippedOperationId: entry.operationId ?? null,
+        expectedHead: evidence.head_sha,
+        root,
+        reason,
+        approvalId: request.approval.approvalId,
+        approvedBy: "human",
+      },
+    }, "human");
+    await supersedeIntegrationRecords(
+      request.missionId,
+      train.id,
+      new Set([entry.taskId]),
+      "skip",
+      request.approval,
+    );
+    const entries = train.entries.map((value) => value.taskId === entry.taskId
+      ? { ...value, status: "skipped" as const, detail: `Human-approved skip: ${reason}` }
+      : value);
+    await updateTrain(request.missionId, train, { status: "running", entries },
+      `human-skip:${request.approval.approvalId}`, "human");
+    return ports.snapshot().projection.integrationTrains[train.id] ?? { ...train, status: "running", entries };
+  }
+
+  async function humanApprovedRollback(request: HumanRollbackRequest): Promise<IntegrationRollbackResult> {
+    assertHumanApproval(request.approval, "rollback");
+    const snapshot = ports.snapshot();
+    if (!snapshot.ready) throw new Error("integration persistence is not safely hydrated");
+    const train = snapshot.projection.integrationTrains[request.trainId];
+    if (!train || train.missionId !== request.missionId) throw new Error("integration train is unknown");
+    if (train.status !== "blocked") throw new Error("rollback is only available for a blocked train");
+    if (outboxRecords(snapshot, request.missionId, "integrate").some((record) =>
+      record.status === "claimed" && record.command.kind === "integrate" &&
+      record.command.payload.trainId === train.id,
+    )) {
+      throw new Error("rollback refused while an integration operation is actively claimed");
+    }
     const task = train.entries
       .map((entry) => snapshot.projection.tasks[entry.taskId])
       .find((value): value is MissionTask => Boolean(value));
@@ -607,6 +853,9 @@ export function createIntegrationTrainController(
     const checkpoint = checkpoints.find((value) => value.id === request.checkpointId);
     if (!checkpoint) throw new Error("rollback refused: train has no durable checkpoint");
     const evidence = await ports.gitEvidence(worktreePath, null, snapshot.gitBin);
+    if (evidence.branch !== train.integrationBranch || evidence.dirty) {
+      throw new Error("rollback requires a clean integration checkout on its recorded branch");
+    }
     await persistArtifact(request.missionId, {
       id: stableId("rollbackapproval", train.id, checkpoint.id, request.approval.approvalId),
       taskId: null,
@@ -623,7 +872,14 @@ export function createIntegrationTrainController(
         approvalId: request.approval.approvalId,
         approvedBy: "human",
       },
-    });
+    }, "human");
+    await supersedeIntegrationRecords(
+      request.missionId,
+      train.id,
+      new Set(train.entries.map((entry) => entry.taskId)),
+      "rollback",
+      request.approval,
+    );
     const result = await ports.rollback({
       root,
       worktreePath,
@@ -643,8 +899,23 @@ export function createIntegrationTrainController(
       metadata: { trainId: train.id, checkpointId: checkpoint.id, ...result },
     });
     const current = ports.snapshot().projection.integrationTrains[train.id] ?? train;
-    await updateTrain(request.missionId, current, { status: "blocked" },
-      `human-rollback:${request.approval.approvalId}:${result.headAfter}`);
+    const checkpointed = new Set(checkpoint.integratedTaskIds);
+    const entries = current.entries.map((entry) => {
+      if (checkpointed.has(entry.taskId)) return entry;
+      const retryRevision = Math.max(0, entry.retryRevision ?? 0) + 1;
+      return {
+        ...entry,
+        status: entry.status === "failed" ? "failed" as const : "queued" as const,
+        commit: null,
+        operationId: null,
+        retryRevision,
+        detail: entry.status === "failed"
+          ? `Rolled back to ${checkpoint.id}; human retry or skip is still required`
+          : `Rolled back to ${checkpoint.id}; queued for reintegration`,
+      };
+    });
+    await updateTrain(request.missionId, current, { status: "blocked", entries },
+      `human-rollback:${request.approval.approvalId}:${result.headAfter}`, "human");
     return result;
   }
 
@@ -660,6 +931,8 @@ export function createIntegrationTrainController(
       if (timer) clearInterval(timer);
       timer = null;
     },
+    humanApprovedRetry,
+    humanApprovedSkip,
     humanApprovedRollback,
   };
   return controllerApi;
@@ -687,4 +960,22 @@ export function rollbackIntegrationTrain(
     activeController = createIntegrationTrainController(productionIntegrationControllerPorts());
   }
   return activeController.humanApprovedRollback(request);
+}
+
+export function retryIntegrationTrainEntry(
+  request: HumanEntryActionRequest,
+): Promise<IntegrationTrain> {
+  if (!activeController) {
+    activeController = createIntegrationTrainController(productionIntegrationControllerPorts());
+  }
+  return activeController.humanApprovedRetry(request);
+}
+
+export function skipIntegrationTrainEntry(
+  request: HumanEntryActionRequest,
+): Promise<IntegrationTrain> {
+  if (!activeController) {
+    activeController = createIntegrationTrainController(productionIntegrationControllerPorts());
+  }
+  return activeController.humanApprovedSkip(request);
 }

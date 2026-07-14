@@ -108,6 +108,28 @@ describe("mission outbox store pruning", () => {
       .toBe("delivered");
   });
 
+  it("durably adopts a human remediation receipt without redispatch", async () => {
+    const snapshot = add(emptyMissionOutbox(), "superseded", "mission-active");
+    useMissionOutbox.setState({ snapshot });
+
+    const record = await useMissionOutbox.getState().adoptReceipt(
+      "spawn:superseded",
+      { status: "superseded_by_human_remediation", approvedBy: "human" },
+      NOW + 5,
+    );
+
+    expect(record).toMatchObject({
+      id: "record-superseded",
+      status: "delivered",
+      delivery: { receipt: { status: "superseded_by_human_remediation", approvedBy: "human" } },
+    });
+    expect(transport.save).toHaveBeenCalledTimes(1);
+    expect(transport.save.mock.calls[0][0].records[0]).toMatchObject({
+      id: "record-superseded",
+      status: "delivered",
+    });
+  });
+
   it("serializes a concurrent enqueue behind pruning without losing either transition", async () => {
     let snapshot = add(emptyMissionOutbox(), "old", "mission-archived");
     snapshot = markDelivered(snapshot, "old");

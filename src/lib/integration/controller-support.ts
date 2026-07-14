@@ -127,12 +127,14 @@ export function integrationRecordsFor(
   trainId: string,
   taskId: string,
   commit: string,
+  operationId?: string | null,
 ): MissionOutboxRecord[] {
   return outboxRecords(snapshot, snapshot.projection.integrationTrains[trainId]?.missionId ?? "", "integrate")
     .filter((record) => record.command.kind === "integrate" &&
       record.command.payload.trainId === trainId &&
       record.command.payload.taskId === taskId &&
-      record.command.payload.commit.toLowerCase() === commit.toLowerCase());
+      record.command.payload.commit.toLowerCase() === commit.toLowerCase() &&
+      (!operationId || record.command.payload.operationId === operationId));
 }
 
 export function gateGreen(record: MissionOutboxRecord): boolean {
@@ -196,5 +198,7 @@ export function trainEntries(tasks: readonly MissionTask[]): IntegrationTrainEnt
       status: "queued" as const,
       commit: null,
       detail: null,
+      retryRevision: 0,
+      operationId: null,
     }));
 }
