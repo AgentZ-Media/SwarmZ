@@ -8,6 +8,7 @@ import type {
   QualityGate,
   TaskAttempt,
 } from "@/lib/missions/types";
+import { selectedAttemptForTask } from "@/lib/missions/core";
 import type { IntegrationControllerSnapshot } from "./controller-ports";
 import type {
   IntegrationCheckpoint,
@@ -52,11 +53,7 @@ export function validCommit(value: unknown): string | null {
 }
 
 function successfulAttempt(task: MissionTask, projection: MissionProjection): TaskAttempt | null {
-  const attempts = task.attemptIds
-    .map((id) => projection.attempts[id])
-    .filter((attempt): attempt is TaskAttempt => Boolean(attempt) && attempt.status === "succeeded")
-    .sort((left, right) => right.ordinal - left.ordinal || right.id.localeCompare(left.id));
-  return attempts[0] ?? null;
+  return selectedAttemptForTask(projection, task);
 }
 
 export function commitForTask(task: MissionTask, projection: MissionProjection): string | null {

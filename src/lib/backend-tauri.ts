@@ -44,6 +44,9 @@ export const tauriBackend: Backend = {
     return granted;
   },
   notify: async (title, body) => {
+    if (!(await isPermissionGranted())) {
+      throw new Error("Native notification permission is not granted");
+    }
     sendNotification({ title, body });
   },
 

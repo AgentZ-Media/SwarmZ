@@ -2,6 +2,13 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { emptyMissionProjection } from "./core";
 import { deriveApprovedMissionScope } from "./controller-core";
 import { useMissions } from "./store";
+import { useMissionOutbox } from "./outbox-store";
+import {
+  claimMissionCommandById,
+  deliverMissionCommand,
+  emptyMissionOutbox,
+  enqueueMissionCommand,
+} from "./outbox";
 import type { AddMissionTaskInput } from "./store";
 
 function task(id: string, dependencyIds: string[] = []): AddMissionTaskInput {
@@ -28,6 +35,11 @@ describe("mission command store", () => {
       projection: emptyMissionProjection(),
       events: [],
       hydrated: true,
+      hydrateStatus: "ready",
+      hydrateError: null,
+    });
+    useMissionOutbox.setState({
+      snapshot: emptyMissionOutbox(),
       hydrateStatus: "ready",
       hydrateError: null,
     });
@@ -156,6 +168,67 @@ describe("mission command store", () => {
       .toEqual(["task.updated", "task.requeued", "mission.activated"]);
   });
 
+  it("checkpoints delivered receipts into the immutable archive event batch", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
+    state.addTask("mission-1", task("task-1"));
+    state.createAttempt("mission-1", "task-1", { id: "attempt-1" });
+    state.settleAttempt("mission-1", "attempt-1", { status: "succeeded" });
+
+    const queued = enqueueMissionCommand(
+      emptyMissionOutbox(),
+      {
+        missionId: "mission-1",
+        idempotencyKey: "settle:attempt-1",
+        kind: "settle",
+        payload: {
+          taskId: "task-1",
+          attemptId: "attempt-1",
+          status: "succeeded",
+          completionId: "completion-1",
+        },
+      },
+      "outbox-1",
+      10,
+    ).snapshot;
+    const claimed = claimMissionCommandById(
+      queued,
+      "outbox-1",
+      "worker",
+      "claim-1",
+      11,
+      5_000,
+    ).snapshot;
+    const delivered = deliverMissionCommand(
+      claimed,
+      "outbox-1",
+      "claim-1",
+      { completionId: "completion-1" },
+      12,
+    ).snapshot;
+    useMissionOutbox.setState({ snapshot: delivered });
+
+    state.archiveMission("mission-1", { occurredAt: 20 });
+    const tail = useMissions.getState().events.slice(-2);
+    expect(tail.map((event) => event.type)).toEqual([
+      "artifact.recorded",
+      "mission.archived",
+    ]);
+    const artifact = Object.values(useMissions.getState().projection.artifacts)
+      .find((value) => value.label === "mission-outbox-audit");
+    expect(artifact?.metadata).toMatchObject({
+      archivedAt: 20,
+      recordCount: 1,
+      records: [{
+        recordId: "outbox-1",
+        completionId: "completion-1",
+        status: "succeeded",
+      }],
+    });
+    expect(useMissions.getState().projection.missions["mission-1"].status)
+      .toBe("archived");
+  });
+
   it("settles multiple quality gates in one event-log batch", () => {
     const state = useMissions.getState();
     state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
@@ -179,6 +252,93 @@ describe("mission command store", () => {
       .toEqual(["quality_gate.resulted", "quality_gate.resulted"]);
     expect(useMissions.getState().projection.qualityGates["gate-1"].status).toBe("passed");
     expect(useMissions.getState().projection.qualityGates["gate-2"].status).toBe("passed");
+  });
+
+  it("runs an artifact-backed candidate batch and requires an explicit ambiguous override", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
+    state.addTask("mission-1", { ...task("task-1"), maxAttempts: 4 });
+    const batchId = state.requestCandidateBatch("mission-1", "task-1", {
+      count: 2,
+      instruction: "Compare two independent implementations",
+      minimumScoreMargin: 10,
+    });
+    state.createAttempt("mission-1", "task-1", { id: "candidate-1", candidateBatchId: batchId });
+    state.recordArtifact("mission-1", {
+      id: "commit-1", taskId: "task-1", attemptId: "candidate-1", kind: "commit",
+      label: "Verified commit", uri: `git:${"a".repeat(40)}`, metadata: { commit: "a".repeat(40) },
+    });
+    state.settleAttempt("mission-1", "candidate-1", { status: "succeeded" });
+    state.createAttempt("mission-1", "task-1", { id: "candidate-2", candidateBatchId: batchId });
+    state.recordArtifact("mission-1", {
+      id: "commit-2", taskId: "task-1", attemptId: "candidate-2", kind: "commit",
+      label: "Verified commit", uri: `git:${"b".repeat(40)}`, metadata: { commit: "b".repeat(40) },
+    });
+    state.settleAttempt("mission-1", "candidate-2", { status: "succeeded" });
+    expect(useMissions.getState().projection.tasks["task-1"].status).toBe("needs_human");
+    expect(() => state.selectCandidate("mission-1", batchId, "candidate-1")).toThrow(/unambiguous/);
+    state.overrideCandidate("mission-1", batchId, "candidate-1", "Candidate one is safer because it preserves the public API.");
+    expect(useMissions.getState().projection.tasks["task-1"]).toMatchObject({
+      status: "succeeded",
+      selectedCandidateAttemptId: "candidate-1",
+    });
+  });
+
+  it("accepts only the selector's clear evidence winner", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
+    state.addTask("mission-1", { ...task("task-1"), maxAttempts: 4 });
+    const batchId = state.requestCandidateBatch("mission-1", "task-1", { count: 2, instruction: "Compare" });
+    for (const id of ["candidate-1", "candidate-2"]) {
+      state.createAttempt("mission-1", "task-1", { id, candidateBatchId: batchId });
+      state.recordArtifact("mission-1", {
+        id: `commit-${id}`, taskId: "task-1", attemptId: id, kind: "commit",
+        label: "Verified commit", uri: null, metadata: {
+          authority: "swarmz_native", evidenceKind: "commit", commit: "a".repeat(40),
+        },
+      });
+      if (id === "candidate-2") state.recordArtifact("mission-1", {
+        id: "tests-2", taskId: "task-1", attemptId: id, kind: "test_result",
+        label: "Independent tests", uri: null, metadata: {
+          authority: "swarmz_native", evidenceKind: "test", exitCode: 0,
+        },
+      });
+      state.settleAttempt("mission-1", id, { status: "succeeded" });
+    }
+    expect(() => state.selectCandidate("mission-1", batchId, "candidate-1")).toThrow(/evidence decision/);
+    state.selectCandidate("mission-1", batchId, "candidate-2");
+    expect(useMissions.getState().projection.candidateBatches[batchId].selectedAttemptId).toBe("candidate-2");
+  });
+
+  it("persists schedule create, cancellation and at-most-once claim lifecycle", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" }, { occurredAt: 1_000 });
+    const cancelled = state.createSchedule("mission-1", "Review", 2_000, { occurredAt: 1_000 });
+    state.cancelSchedule("mission-1", cancelled, { occurredAt: 1_100 });
+    expect(() => state.claimSchedule("mission-1", cancelled, { occurredAt: 2_000 })).toThrow(/cannot be claimed/);
+    const fired = state.createSchedule("mission-1", "Ship", 3_000, { occurredAt: 1_200 });
+    state.claimSchedule("mission-1", fired, { occurredAt: 3_000 });
+    expect(() => state.claimSchedule("mission-1", fired, { occurredAt: 3_001 })).toThrow(/cannot be claimed/);
+    state.fireSchedule("mission-1", fired, { occurredAt: 3_002 });
+    expect(useMissions.getState().projection.schedules[fired]).toMatchObject({ claimedAt: 3_000, firedAt: 3_002 });
+  });
+
+  it("releases a denied reminder delivery for a visible bounded retry", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" }, { occurredAt: 1_000 });
+    const id = state.createSchedule("mission-1", "Review", 2_000, { occurredAt: 1_000 });
+    state.claimSchedule("mission-1", id, { occurredAt: 2_000 });
+    state.failScheduleDelivery("mission-1", id, "permission denied", 32_000, { occurredAt: 2_001 });
+    expect(useMissions.getState().projection.schedules[id]).toMatchObject({
+      claimedAt: null,
+      firedAt: null,
+      deliveryAttempts: 1,
+      lastDeliveryError: "permission denied",
+      nextAttemptAt: 32_000,
+    });
+    state.claimSchedule("mission-1", id, { occurredAt: 32_000 });
+    state.fireSchedule("mission-1", id, { occurredAt: 32_001 });
+    expect(useMissions.getState().projection.schedules[id]).toMatchObject({ firedAt: 32_001, deliveryAttempts: 2 });
   });
 
   it("refuses writes before safe hydration", () => {

@@ -55,10 +55,13 @@ function successfulAttempt(
   task: MissionTask,
   attempts: Readonly<Record<string, TaskAttempt>>,
 ): TaskAttempt | null {
+  if (task.selectedCandidateAttemptId) {
+    const selected = attempts[task.selectedCandidateAttemptId];
+    return selected?.status === "succeeded" ? selected : null;
+  }
   return task.attemptIds
     .map((id) => attempts[id])
-    .filter((attempt): attempt is TaskAttempt => Boolean(attempt))
-    .filter((attempt) => attempt.status === "succeeded")
+    .filter((attempt): attempt is TaskAttempt => Boolean(attempt) && attempt.status === "succeeded")
     .sort((a, b) => b.ordinal - a.ordinal || b.id.localeCompare(a.id))[0] ?? null;
 }
 

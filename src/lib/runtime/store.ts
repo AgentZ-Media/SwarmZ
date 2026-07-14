@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { loadRuntimeEnvironments, saveRuntimeEnvironments } from "@/lib/transport";
+import { createPersistenceCoordinator } from "@/lib/persistence/coordinator";
 import {
   validateRuntimeEnvironment,
   type PersistedRuntimeEnvironments,
@@ -77,12 +78,22 @@ function snapshot(): PersistedRuntimeEnvironments {
   };
 }
 
-let persistChain = Promise.resolve();
-function persistNow(): Promise<void> {
-  persistChain = persistChain.then(async () => {
-    await saveRuntimeEnvironments(snapshot());
-  });
-  return persistChain;
+const runtimePersistence = createPersistenceCoordinator({
+  name: "runtimeEnvironments",
+  debounceMs: 0,
+  snapshot,
+  save: saveRuntimeEnvironments,
+});
+
+async function persistNow(): Promise<void> {
+  runtimePersistence.schedule();
+  await runtimePersistence.flush();
+  const health = runtimePersistence.health();
+  if (health.write === "failed") {
+    throw health.error instanceof Error
+      ? health.error
+      : new Error("Runtime Environment store could not be saved");
+  }
 }
 
 function requireHydrated(): void {
@@ -104,7 +115,9 @@ export const useRuntimeEnvironments = create<RuntimeEnvironmentState>((set, get)
     try {
       const persisted = sanitizePersistedRuntimeEnvironments(await loadRuntimeEnvironments());
       set({ ...persisted, hydrated: true, hydrateError: null });
+      runtimePersistence.hydrationSucceeded();
     } catch (error) {
+      runtimePersistence.hydrationFailed(error);
       set({
         hydrated: false,
         hydrateError: error instanceof Error ? error.message : "Runtime store could not be read",
@@ -170,7 +183,13 @@ export async function hydrateRuntimeEnvironments(): Promise<void> {
 }
 
 export async function flushRuntimeEnvironmentsPersist(): Promise<void> {
-  await persistChain;
+  await runtimePersistence.flush();
+  const health = runtimePersistence.health();
+  if (health.write === "failed") {
+    throw health.error instanceof Error
+      ? health.error
+      : new Error("Runtime Environment store could not be saved");
+  }
 }
 
 export function createDefaultRuntimeEnvironment(index = 1): RuntimeEnvironmentSpec {

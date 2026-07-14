@@ -358,11 +358,14 @@ fn copy_environment(bin: &str, root: &Path, dest: &crate::fsx::DirHandle) -> u64
     copied
 }
 
-/// Create `<repo>/.worktrees/<slug>` on a new branch off the current HEAD.
+/// Create `<repo>/.worktrees/<slug>` on a new branch off an exact commit.
+/// `base_sha = None` preserves the interactive UI's current-HEAD behavior;
+/// durable Mission callers always provide their previously approved SHA.
 pub fn add(
     cwd: &str,
     branch: &str,
     copy_env: bool,
+    base_sha: Option<&str>,
     bin_override: Option<&str>,
 ) -> Result<WorktreeInfo, String> {
     let bin = git_bin(bin_override);
@@ -373,6 +376,26 @@ pub fn add(
     let root = main_root(bin, Path::new(cwd))?;
     run(bin, &root, &["check-ref-format", "--branch", branch])
         .map_err(|_| format!("\"{branch}\" is not a valid branch name"))?;
+    let approved_base = match base_sha {
+        Some(value) => {
+            let value = value.trim();
+            if !(40..=64).contains(&value.len())
+                || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("worktree base SHA is invalid".into());
+            }
+            let resolved = run(
+                bin,
+                &root,
+                &["rev-parse", "--verify", &format!("{value}^{{commit}}")],
+            )?;
+            if !resolved.eq_ignore_ascii_case(value) {
+                return Err("worktree base SHA must be a full exact commit id".into());
+            }
+            Some(resolved)
+        }
+        None => None,
+    };
 
     // audit R4 + final hardening F8: a symlinked `.worktrees` would redirect
     // the whole checkout (and the env copy — .env files included) to an
@@ -405,9 +428,11 @@ pub fn add(
     // `-b` creates it at the current HEAD, so that OID (captured BEFORE the
     // add) is the only tip the rollback may delete. A tip that moved in the
     // race window (a commit landing on the fresh branch) survives.
-    let expected_branch_oid = run(bin, &root, &["rev-parse", "--verify", "HEAD"])
-        .ok()
-        .filter(|s| !s.is_empty());
+    let expected_branch_oid = approved_base.clone().or_else(|| {
+        run(bin, &root, &["rev-parse", "--verify", "HEAD"])
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
     let rollback = |path_str: &str| {
         let _ = run(bin, &root, &["worktree", "remove", "--force", path_str]);
         let _ = run(bin, &root, &["worktree", "prune"]);
@@ -417,7 +442,11 @@ pub fn add(
     };
 
     let path_str = path.to_string_lossy().into_owned();
-    run(bin, &root, &["worktree", "add", "-b", branch, &path_str])?;
+    let mut add_args = vec!["worktree", "add", "-b", branch, &path_str];
+    if let Some(base) = approved_base.as_deref() {
+        add_args.push(base);
+    }
+    run(bin, &root, &add_args)?;
 
     // F8 post-add verification through the ANCHORED handle: the checkout
     // must exist as a real directory under the container fd opened above —
@@ -932,7 +961,7 @@ mod tests {
         let repo = temp_repo();
         let cwd = repo.to_string_lossy().into_owned();
 
-        let info = add(&cwd, "test/brave-falcon-7341", true, None).unwrap();
+        let info = add(&cwd, "test/brave-falcon-7341", true, None, None).unwrap();
         assert_eq!(info.root, cwd);
         assert!(info.path.ends_with(".worktrees/brave-falcon-7341"));
         // env copied, heavyweights skipped
@@ -997,6 +1026,27 @@ mod tests {
     }
 
     #[test]
+    fn add_can_bind_a_durable_exact_base_sha_instead_of_mutable_head() {
+        let repo = temp_repo();
+        let cwd = repo.to_string_lossy().into_owned();
+        let base = run(git_bin(None), &repo, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(repo.join("later.txt"), "later").unwrap();
+        run(git_bin(None), &repo, &["add", "later.txt"]).unwrap();
+        run(git_bin(None), &repo, &["commit", "-qm", "later"]).unwrap();
+        let mutable_head = run(git_bin(None), &repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(base, mutable_head);
+
+        let info = add(&cwd, "test/exact-base", false, Some(&base), None).unwrap();
+        let observed = run(git_bin(None), Path::new(&info.path), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(observed, base);
+        assert!(add(&cwd, "test/short-base", false, Some(&base[..12]), None)
+            .unwrap_err()
+            .contains("base SHA"));
+        remove(&info.root, &info.path, &info.branch, false, None).unwrap();
+        fs::remove_dir_all(repo).ok();
+    }
+
+    #[test]
     fn oversized_manifest_file_is_never_partially_materialized() {
         let repo = temp_repo();
         fs::write(
@@ -1005,7 +1055,7 @@ mod tests {
         )
         .unwrap();
         let cwd = repo.to_string_lossy().into_owned();
-        let info = add(&cwd, "test/oversized-env", true, None).unwrap();
+        let info = add(&cwd, "test/oversized-env", true, None, None).unwrap();
         assert!(!Path::new(&info.path).join(".env").exists());
         assert_eq!(info.copied, 0);
         fs::remove_dir_all(repo).ok();
@@ -1015,7 +1065,7 @@ mod tests {
     fn gated_remove_refuses_dirt_and_unknown_state() {
         let repo = temp_repo();
         let cwd = repo.to_string_lossy().into_owned();
-        let info = add(&cwd, "test/gated", true, None).unwrap();
+        let info = add(&cwd, "test/gated", true, None, None).unwrap();
 
         // dirty tracked file → the gated removal refuses, force succeeds
         fs::write(Path::new(&info.path).join("a.txt"), "changed").unwrap();
@@ -1031,7 +1081,7 @@ mod tests {
         assert!(!Path::new(&info.path).exists());
 
         // hand-deleted folder + local-only commits → gated refuses branch -D
-        let info2 = add(&cwd, "test/gated2", false, None).unwrap();
+        let info2 = add(&cwd, "test/gated2", false, None, None).unwrap();
         fs::write(Path::new(&info2.path).join("a.txt"), "wt").unwrap();
         run(
             git_bin(None),
@@ -1079,7 +1129,7 @@ mod tests {
     fn missing_folder_still_reports_local_only_commits_as_ahead() {
         let repo = temp_repo();
         let cwd = repo.to_string_lossy().into_owned();
-        let info = add(&cwd, "test/orphan", false, None).unwrap();
+        let info = add(&cwd, "test/orphan", false, None, None).unwrap();
         // commit in the worktree, then delete the folder by hand — the
         // branch now holds a commit nothing else reaches
         fs::write(Path::new(&info.path).join("a.txt"), "wt change").unwrap();
@@ -1106,9 +1156,9 @@ mod tests {
     fn add_from_inside_a_worktree_targets_the_main_repo() {
         let repo = temp_repo();
         let cwd = repo.to_string_lossy().into_owned();
-        let first = add(&cwd, "test/one", false, None).unwrap();
+        let first = add(&cwd, "test/one", false, None, None).unwrap();
         // splitting from a worktree pane passes the root, but be safe anyway
-        let second = add(&first.path, "test/two", false, None).unwrap();
+        let second = add(&first.path, "test/two", false, None, None).unwrap();
         assert_eq!(second.root, cwd);
         assert!(second.path.starts_with(&cwd));
         fs::remove_dir_all(&repo).ok();
@@ -1121,7 +1171,7 @@ mod tests {
     fn remove_refuses_foreign_paths_and_branch_spoofing() {
         let repo = temp_repo();
         let cwd = repo.to_string_lossy().into_owned();
-        let info = add(&cwd, "test/confined", false, None).unwrap();
+        let info = add(&cwd, "test/confined", false, None, None).unwrap();
 
         // (a) paths outside .worktrees refuse — even with force
         for target in [
@@ -1196,7 +1246,7 @@ mod tests {
         )
         .unwrap();
 
-        let info = add(&cwd, "test/c7-anchored", true, None).unwrap();
+        let info = add(&cwd, "test/c7-anchored", true, None, None).unwrap();
         let dest = Path::new(&info.path);
         // The unrelated symlink is outside the manifest and never appears.
         let copied_link = dest.join("link-to-secret");
@@ -1231,7 +1281,7 @@ mod tests {
         let outside = std::env::temp_dir().join(format!("swarmz-wt-out-{}", std::process::id()));
         fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, repo.join(".worktrees")).unwrap();
-        let err = add(&cwd, "test/redirected", true, None).unwrap_err();
+        let err = add(&cwd, "test/redirected", true, None, None).unwrap_err();
         assert!(err.contains("symlink"), "{err}");
         fs::remove_dir_all(&repo).ok();
         fs::remove_dir_all(&outside).ok();
@@ -1299,7 +1349,7 @@ mod tests {
         perm.set_mode(0o755);
         fs::set_permissions(&wrapper, perm).unwrap();
 
-        let err = add(&cwd, branch, true, Some(&wrapper.to_string_lossy())).unwrap_err();
+        let err = add(&cwd, branch, true, None, Some(&wrapper.to_string_lossy())).unwrap_err();
         assert!(err.contains("redirected"), "{err}");
         // C7: no env file crossed into the evil target
         assert!(
@@ -1363,7 +1413,7 @@ mod tests {
         let repo = temp_repo();
         let bin = git_bin(None);
         let cwd = repo.to_string_lossy().into_owned();
-        let info = add(&cwd, "test/checkedout", false, None).unwrap();
+        let info = add(&cwd, "test/checkedout", false, None, None).unwrap();
         let oid = branch_oid(bin, &repo, &info.branch).expect("worktree branch tip");
         let err = delete_branch_transactional(bin, &repo, &info.branch, &oid).unwrap_err();
         assert!(err.contains("checked out"), "{err}");
@@ -1388,7 +1438,7 @@ mod tests {
         // an entry-less exclude just beyond 1 MiB
         let big = format!("# padding\n{}\n", "x".repeat(1024 * 1024));
         fs::write(repo.join(".git/info/exclude"), &big).unwrap();
-        let err = add(&cwd, "test/too-big", false, None).unwrap_err();
+        let err = add(&cwd, "test/too-big", false, None, None).unwrap_err();
         assert!(err.contains("refusing to rewrite"), "{err}");
         // the exclude file was NOT truncated
         assert_eq!(
@@ -1400,7 +1450,7 @@ mod tests {
         // the add passes
         let big_with_entry = format!("/.worktrees/\n{}\n", "x".repeat(1024 * 1024));
         fs::write(repo.join(".git/info/exclude"), &big_with_entry).unwrap();
-        add(&cwd, "test/big-but-present", false, None).unwrap();
+        add(&cwd, "test/big-but-present", false, None, None).unwrap();
         fs::remove_dir_all(&repo).ok();
     }
 
@@ -1470,7 +1520,7 @@ mod tests {
         // (reference-transaction) — none may fire a hook. copy_env=false so
         // the untracked `hooks/` fixture doesn't dirty the worktree; the
         // status query still exercises the fsmonitor vector.
-        let info = add(&cwd, "test/hooks-suppressed", false, None).unwrap();
+        let info = add(&cwd, "test/hooks-suppressed", false, None, None).unwrap();
         let st = status(&info.path, None);
         assert!(st.exists && st.ahead == 0, "{st:?}");
         remove(&cwd, &info.path, &info.branch, false, None).unwrap();
@@ -1485,10 +1535,10 @@ mod tests {
     fn invalid_branch_and_duplicate_folder_are_rejected() {
         let repo = temp_repo();
         let cwd = repo.to_string_lossy().into_owned();
-        assert!(add(&cwd, "bad..name", false, None).is_err());
-        add(&cwd, "test/dup", false, None).unwrap();
+        assert!(add(&cwd, "bad..name", false, None, None).is_err());
+        add(&cwd, "test/dup", false, None, None).unwrap();
         // same slug → same folder → must refuse, not clobber
-        assert!(add(&cwd, "other/dup", false, None).is_err());
+        assert!(add(&cwd, "other/dup", false, None, None).is_err());
         fs::remove_dir_all(&repo).ok();
     }
 }

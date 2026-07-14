@@ -12,10 +12,33 @@ import {
   exactPromptTurnId,
   missionTurnEvidence,
   missionHardStopReason,
+  missionTaskChangeIssue,
+  finalHeadEvidenceMatches,
   taskHasSafeMissionPlacement,
   unexpectedChangedFiles,
+  shouldCleanupRuntimeAfterSpawnFailure,
 } from "./controller-core";
 import type { MissionEvent, MissionEventPayload, MissionProjection } from "./types";
+
+describe("Runtime prepared-receipt crash boundary", () => {
+  it("never cleans setup after the receipt entered the dirty projection", () => {
+    expect(shouldCleanupRuntimeAfterSpawnFailure({
+      runtimeLaunched: true,
+      preparedRecorded: true,
+      turnStarted: false,
+    })).toBe(false);
+    expect(shouldCleanupRuntimeAfterSpawnFailure({
+      runtimeLaunched: true,
+      preparedRecorded: false,
+      turnStarted: false,
+    })).toBe(true);
+    expect(shouldCleanupRuntimeAfterSpawnFailure({
+      runtimeLaunched: true,
+      preparedRecorded: false,
+      turnStarted: true,
+    })).toBe(false);
+  });
+});
 
 function history() {
   let projection = emptyMissionProjection();
@@ -196,6 +219,31 @@ describe("mission controller pure authority helpers", () => {
     expect(state.projection().attempts["attempt-2"].resumeInstruction).toBe("Use API version two");
     expect(state.projection().tasks["task-1"].resumeInstruction).toBeNull();
     expect(taskIsInsideApprovedScope(scope, state.projection().tasks["task-1"])).toBe(true);
+  });
+
+  it("fails closed on unchanged or empty coding output unless human-approved", () => {
+    const base = "a".repeat(40);
+    expect(missionTaskChangeIssue({}, { base_sha: base, head_sha: base, files_changed: [] }))
+      .toMatch(/no commit/);
+    expect(missionTaskChangeIssue({}, { base_sha: base, head_sha: "b".repeat(40), files_changed: [] }))
+      .toMatch(/empty/);
+    expect(missionTaskChangeIssue({ allowNoop: true }, { base_sha: base, head_sha: base, files_changed: [] }))
+      .toBeNull();
+    expect(missionTaskChangeIssue({ allowNoop: true }, { base_sha: base, head_sha: "b".repeat(40), files_changed: [] }))
+      .toMatch(/inconsistent/);
+  });
+
+  it("binds native quality commands to the exact clean final HEAD and diff", () => {
+    const expected = {
+      base_sha: "a".repeat(40),
+      head_sha: "b".repeat(40),
+      diff_sha256: "c".repeat(64),
+      files_changed: ["src/a.ts"],
+    };
+    expect(finalHeadEvidenceMatches(expected, { ...expected, dirty: false })).toBe(true);
+    expect(finalHeadEvidenceMatches(expected, { ...expected, head_sha: "d".repeat(40), dirty: false })).toBe(false);
+    expect(finalHeadEvidenceMatches(expected, { ...expected, files_changed: ["src/b.ts"], dirty: false })).toBe(false);
+    expect(finalHeadEvidenceMatches(expected, { ...expected, dirty: true })).toBe(false);
   });
 
   it("validates every required gate before returning any passed result", () => {

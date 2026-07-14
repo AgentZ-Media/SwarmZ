@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -98,6 +99,10 @@ pub struct RuntimePortRequest {
 pub struct RuntimeServiceStartRequest {
     pub instance_id: String,
     pub service_id: String,
+    pub owner_project_id: String,
+    pub owner_mission_id: String,
+    pub owner_attempt_id: String,
+    pub main_root: String,
     pub project_root: String,
     pub cwd_relative: String,
     pub argv: Vec<String>,
@@ -127,6 +132,10 @@ pub enum RuntimeServiceState {
 pub struct RuntimeServiceSnapshot {
     pub instance_id: String,
     pub service_id: String,
+    pub owner_project_id: String,
+    pub owner_mission_id: String,
+    pub owner_attempt_id: String,
+    pub main_root: String,
     pub project_root: String,
     pub state: RuntimeServiceState,
     pub pid: Option<u32>,
@@ -154,6 +163,14 @@ struct ServiceLease {
     key: String,
     instance_id: String,
     service_id: String,
+    #[serde(default)]
+    owner_project_id: String,
+    #[serde(default)]
+    owner_mission_id: String,
+    #[serde(default)]
+    owner_attempt_id: String,
+    #[serde(default)]
+    main_root: String,
     project_root: String,
     pid: u32,
     process_identity: Option<String>,
@@ -175,12 +192,26 @@ static ACTIVE_SERVICES: Lazy<Mutex<HashMap<String, ActiveService>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static SERVICE_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(Mutex::default);
 
+pub fn operations_in_flight() -> usize {
+    ACTIVE_SERVICES
+        .lock()
+        .len()
+        .saturating_add(process::active_command_count())
+}
+
 mod process;
 
+pub(crate) use process::spawn_sandboxed_process;
 use process::*;
 pub use process::{command_cancel, command_run};
 fn service_key(instance_id: &str, service_id: &str) -> String {
-    format!("{instance_id}:{service_id}")
+    // Length-prefix both model-supplied ids. Delimiter-only concatenation is
+    // ambiguous because validated run ids may contain `:`.
+    format!(
+        "{}:{instance_id}|{}:{service_id}",
+        instance_id.len(),
+        service_id.len()
+    )
 }
 
 fn lease_file(lease_root: &Path, key: &str) -> PathBuf {
@@ -192,11 +223,41 @@ fn write_lease(lease_root: &Path, lease: &ServiceLease) -> Result<PathBuf, Strin
     fs::create_dir_all(lease_root)
         .map_err(|error| format!("could not create lease store: {error}"))?;
     let path = lease_file(lease_root, &lease.key);
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    if path.exists() {
+        return Err("refused: a runtime service lease already exists".into());
+    }
+    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), now_ms()));
     let bytes = serde_json::to_vec(lease).map_err(|error| error.to_string())?;
-    fs::write(&tmp, bytes).map_err(|error| format!("could not write service lease: {error}"))?;
-    fs::rename(&tmp, &path).map_err(|error| format!("could not commit service lease: {error}"))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|error| format!("could not create service lease: {error}"))?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("could not write service lease: {error}"));
+    }
+    // hard_link is the portable same-filesystem NOREPLACE commit primitive:
+    // unlike rename it can never overwrite an existing lease for this key.
+    if let Err(error) = fs::hard_link(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "could not exclusively commit service lease: {error}"
+        ));
+    }
+    if let Err(error) = fs::remove_file(&tmp) {
+        let _ = fs::remove_file(&path);
+        return Err(format!("could not finalize service lease: {error}"));
+    }
     Ok(path)
+}
+
+fn remove_lease(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove service lease: {error}")),
+    }
 }
 
 fn process_identity(pid: u32) -> Option<String> {
@@ -248,7 +309,7 @@ fn allocate_ports(
         })
         .collect();
     used.extend(
-        read_leases(lease_root)
+        read_leases(lease_root)?
             .into_iter()
             .flat_map(|(_, lease)| lease.ports.into_values()),
     );
@@ -349,9 +410,24 @@ pub fn service_start(
     let _lifecycle = SERVICE_LIFECYCLE_LOCK.lock();
     let instance_id = checked_id(&request.instance_id, "runtime instance id")?;
     let service_id = checked_id(&request.service_id, "runtime service id")?;
+    let owner_project_id = checked_id(&request.owner_project_id, "runtime owner project id")?;
+    let owner_mission_id = checked_id(&request.owner_mission_id, "runtime owner mission id")?;
+    let owner_attempt_id = checked_id(&request.owner_attempt_id, "runtime owner attempt id")?;
     let key = service_key(&instance_id, &service_id);
     if ACTIVE_SERVICES.lock().contains_key(&key) {
         return Err("refused: runtime service is already active".into());
+    }
+    let leases = read_leases(lease_root)?;
+    if leases
+        .iter()
+        .any(|(_, lease)| lease.instance_id == instance_id && lease.service_id == service_id)
+    {
+        return Err(
+            "refused: runtime service has an existing durable lease; reconcile it first".into(),
+        );
+    }
+    if leases.len() >= MAX_LEASES {
+        return Err("refused: runtime service lease cap is reached".into());
     }
     if request.database_namespace.is_empty()
         || request.database_namespace.len() > 63
@@ -366,6 +442,11 @@ pub fn service_start(
         return Err("refused: runtime output limit is outside the allowed range".into());
     }
     let (root, cwd) = confined_cwd(&request.project_root, &request.cwd_relative)?;
+    let main_root = fs::canonicalize(request.main_root.trim())
+        .map_err(|_| "refused: runtime main root does not exist".to_string())?;
+    if !main_root.is_dir() || (!root.starts_with(&main_root) && root != main_root) {
+        return Err("refused: runtime worktree is outside its owner main root".into());
+    }
     let ports = allocate_ports(&key, &request.ports, lease_root)?;
     let healthcheck = resolve_healthcheck(request.healthcheck_url.as_deref(), &ports)?;
     let mut explicit = request.env.clone();
@@ -376,13 +457,10 @@ pub fn service_start(
         }
     }
     let (env, secrets) = resolved_env(&explicit, &request.secret_bindings)?;
-    let mut prepared = prepare_command(&cwd, &request.argv, &env)?;
-    let mut child = prepared
-        .command
-        .spawn()
+    // Services may bind/connect only on loopback for their declared local
+    // health surface. Non-loopback IPs and Unix sockets remain denied.
+    let mut child = spawn_sandboxed_process(&root, &cwd, &request.argv, &env, true)
         .map_err(|error| format!("could not start runtime service: {error}"))?;
-    #[cfg(unix)]
-    drop(prepared.cwd_handle);
     let pid = child.id();
     let stdout = drain_bounded(child.stdout.take(), request.max_output_bytes);
     let stderr = drain_bounded(child.stderr.take(), request.max_output_bytes);
@@ -390,6 +468,10 @@ pub fn service_start(
     let snapshot = Arc::new(Mutex::new(RuntimeServiceSnapshot {
         instance_id: instance_id.clone(),
         service_id: service_id.clone(),
+        owner_project_id: owner_project_id.clone(),
+        owner_mission_id: owner_mission_id.clone(),
+        owner_attempt_id: owner_attempt_id.clone(),
+        main_root: main_root.to_string_lossy().into_owned(),
         project_root: root.to_string_lossy().into_owned(),
         state: RuntimeServiceState::Starting,
         pid: Some(pid),
@@ -402,10 +484,14 @@ pub fn service_start(
         stderr_truncated: false,
     }));
     let lease = ServiceLease {
-        version: 1,
+        version: 2,
         key: key.clone(),
         instance_id,
         service_id,
+        owner_project_id,
+        owner_mission_id,
+        owner_attempt_id,
+        main_root: main_root.to_string_lossy().into_owned(),
         project_root: root.to_string_lossy().into_owned(),
         pid,
         process_identity: process_identity(pid),
@@ -429,6 +515,7 @@ pub fn service_start(
         },
     );
     let monitor_snapshot = Arc::clone(&snapshot);
+    let monitor_key = key.clone();
     std::thread::spawn(move || {
         let exit = loop {
             if cancel.load(Ordering::Acquire) {
@@ -466,7 +553,7 @@ pub fn service_start(
             state.stderr_truncated = err_truncated;
         }
         let _ = fs::remove_file(lease_path);
-        ACTIVE_SERVICES.lock().remove(&key);
+        ACTIVE_SERVICES.lock().remove(&monitor_key);
     });
 
     if let Some((host, port, path)) = healthcheck {
@@ -481,7 +568,23 @@ pub fn service_start(
             }
             if Instant::now() >= deadline {
                 cancel_for_start.store(true, Ordering::Release);
-                return Err("runtime service healthcheck timed out".into());
+                let stop_deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
+                while ACTIVE_SERVICES.lock().contains_key(&key) && Instant::now() < stop_deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if ACTIVE_SERVICES.lock().contains_key(&key)
+                    || read_leases(lease_root)?
+                        .iter()
+                        .any(|(_, lease)| lease.key == key)
+                {
+                    return Err(
+                        "runtime service healthcheck timed out and owned cleanup could not be confirmed"
+                            .into(),
+                    );
+                }
+                return Err(
+                    "runtime service healthcheck timed out; owned process was stopped".into(),
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -494,6 +597,17 @@ pub fn service_start(
     }
     let current = snapshot.lock().clone();
     if current.state == RuntimeServiceState::Exited {
+        let stop_deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
+        while ACTIVE_SERVICES.lock().contains_key(&key) && Instant::now() < stop_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if ACTIVE_SERVICES.lock().contains_key(&key)
+            || read_leases(lease_root)?
+                .iter()
+                .any(|(_, lease)| lease.key == key)
+        {
+            return Err("runtime service exited during startup but cleanup is unresolved".into());
+        }
         return Err(format!(
             "runtime service exited during startup{}",
             current
@@ -505,32 +619,40 @@ pub fn service_start(
     Ok(current)
 }
 
-fn read_leases(lease_root: &Path) -> Vec<(PathBuf, ServiceLease)> {
-    let Ok(entries) = fs::read_dir(lease_root) else {
-        return Vec::new();
+fn read_leases(lease_root: &Path) -> Result<Vec<(PathBuf, ServiceLease)>, String> {
+    let entries = match fs::read_dir(lease_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not read runtime service leases: {error}")),
     };
-    entries
-        .flatten()
-        .take(MAX_LEASES)
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                return None;
-            }
-            let metadata = fs::symlink_metadata(&path).ok()?;
-            if !metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.len() > 32 * 1024
-            {
-                return None;
-            }
-            let lease = serde_json::from_slice::<ServiceLease>(&fs::read(&path).ok()?).ok()?;
-            (lease.version == 1).then_some((path, lease))
-        })
-        .collect()
+    let mut leases = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("could not inspect service lease: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if leases.len() >= MAX_LEASES {
+            return Err("refused: runtime service lease cap is exceeded".into());
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("could not inspect service lease metadata: {error}"))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 32 * 1024 {
+            return Err("refused: runtime service lease store contains an unsafe entry".into());
+        }
+        let bytes =
+            fs::read(&path).map_err(|error| format!("could not read service lease: {error}"))?;
+        let lease = serde_json::from_slice::<ServiceLease>(&bytes)
+            .map_err(|_| "refused: runtime service lease is corrupt".to_string())?;
+        if !matches!(lease.version, 1 | 2) || lease_file(lease_root, &lease.key) != path {
+            return Err("refused: runtime service lease identity is invalid".into());
+        }
+        leases.push((path, lease));
+    }
+    Ok(leases)
 }
 
-pub fn service_list(lease_root: &Path) -> Vec<RuntimeServiceSnapshot> {
+pub fn service_list(lease_root: &Path) -> Result<Vec<RuntimeServiceSnapshot>, String> {
     let mut snapshots: Vec<_> = ACTIVE_SERVICES
         .lock()
         .values()
@@ -540,13 +662,21 @@ pub fn service_list(lease_root: &Path) -> Vec<RuntimeServiceSnapshot> {
         .iter()
         .map(|snapshot| service_key(&snapshot.instance_id, &snapshot.service_id))
         .collect();
-    for (_, lease) in read_leases(lease_root) {
+    for (_, lease) in read_leases(lease_root)? {
         if active.contains(&lease.key) {
             continue;
         }
         snapshots.push(RuntimeServiceSnapshot {
             instance_id: lease.instance_id,
             service_id: lease.service_id,
+            owner_project_id: lease.owner_project_id,
+            owner_mission_id: lease.owner_mission_id,
+            owner_attempt_id: lease.owner_attempt_id,
+            main_root: if lease.main_root.is_empty() {
+                lease.project_root.clone()
+            } else {
+                lease.main_root
+            },
             project_root: lease.project_root,
             state: RuntimeServiceState::Orphaned,
             pid: Some(lease.pid),
@@ -564,58 +694,95 @@ pub fn service_list(lease_root: &Path) -> Vec<RuntimeServiceSnapshot> {
             .cmp(&b.instance_id)
             .then(a.service_id.cmp(&b.service_id))
     });
-    snapshots
+    Ok(snapshots)
 }
 
 pub fn service_stop(
     lease_root: &Path,
     instance_id: &str,
     service_id: &str,
+    project_root: &str,
 ) -> Result<bool, String> {
-    let key = service_key(
-        &checked_id(instance_id, "runtime instance id")?,
-        &checked_id(service_id, "runtime service id")?,
-    );
+    let expected_root = fs::canonicalize(project_root.trim())
+        .map_err(|_| "refused: runtime service owner root does not exist".to_string())?;
+    let instance_id = checked_id(instance_id, "runtime instance id")?;
+    let service_id = checked_id(service_id, "runtime service id")?;
+    let key = service_key(&instance_id, &service_id);
     let active_cancel = {
         let active = ACTIVE_SERVICES.lock();
-        active.get(&key).map(|service| Arc::clone(&service.cancel))
+        active.get(&key).map(|service| {
+            let snapshot = service.snapshot.lock();
+            if Path::new(&snapshot.project_root) != expected_root {
+                return Err("refused: runtime service is owned by another worktree".to_string());
+            }
+            Ok(Arc::clone(&service.cancel))
+        })
     };
     if let Some(cancel) = active_cancel {
+        let cancel = cancel?;
         cancel.store(true, Ordering::Release);
         let deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
         while ACTIVE_SERVICES.lock().contains_key(&key) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        return Ok(!ACTIVE_SERVICES.lock().contains_key(&key));
+        if ACTIVE_SERVICES.lock().contains_key(&key) {
+            return Err("runtime service did not stop before the ownership deadline".into());
+        }
+        if read_leases(lease_root)?
+            .iter()
+            .any(|(_, lease)| lease.key == key)
+        {
+            return Err(
+                "runtime service stopped but its durable lease could not be cleared".into(),
+            );
+        }
+        return Ok(true);
     }
-    let Some((path, lease)) = read_leases(lease_root)
+    let Some((path, lease)) = read_leases(lease_root)?
         .into_iter()
-        .find(|(_, lease)| lease.key == key)
+        .find(|(_, lease)| lease.instance_id == instance_id && lease.service_id == service_id)
     else {
         return Ok(false);
     };
+    if Path::new(&lease.project_root) != expected_root {
+        return Err("refused: runtime service lease is owned by another worktree".into());
+    }
     let Some(identity) = lease.process_identity.as_deref() else {
         return Err("refused: orphaned service ownership cannot be verified".into());
     };
     if process_identity(lease.pid).as_deref() != Some(identity) {
-        fs::remove_file(path).ok();
+        remove_lease(&path)?;
         return Ok(false);
     }
     if !kill_pid_group(lease.pid) {
         return Err("could not stop the verified orphaned service group".into());
     }
-    fs::remove_file(path).ok();
+    if !wait_for_identity_exit(lease.pid, identity, SERVICE_STOP_TIMEOUT) {
+        return Err("verified orphaned service did not exit before the ownership deadline".into());
+    }
+    remove_lease(&path)?;
     Ok(true)
 }
 
-pub fn service_reconcile(lease_root: &Path) -> RuntimeReconcileResult {
+fn wait_for_identity_exit(pid: u32, identity: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if process_identity(pid).as_deref() != Some(identity) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    process_identity(pid).as_deref() != Some(identity)
+}
+
+pub fn service_reconcile(lease_root: &Path) -> Result<RuntimeReconcileResult, String> {
     let active: HashSet<_> = ACTIVE_SERVICES.lock().keys().cloned().collect();
     let mut result = RuntimeReconcileResult {
         cleaned: Vec::new(),
         stale: Vec::new(),
         unresolved: Vec::new(),
     };
-    for (path, lease) in read_leases(lease_root) {
+    for (path, lease) in read_leases(lease_root)? {
         if active.contains(&lease.key) {
             continue;
         }
@@ -624,12 +791,17 @@ pub fn service_reconcile(lease_root: &Path) -> RuntimeReconcileResult {
             process_identity(lease.pid),
         ) {
             (_, None) => {
-                fs::remove_file(path).ok();
-                result.stale.push(lease.key);
+                if remove_lease(&path).is_ok() {
+                    result.stale.push(lease.key);
+                } else {
+                    result.unresolved.push(lease.key);
+                }
             }
             (Some(expected), Some(observed)) if expected == observed => {
-                if kill_pid_group(lease.pid) {
-                    fs::remove_file(path).ok();
+                if kill_pid_group(lease.pid)
+                    && wait_for_identity_exit(lease.pid, expected, SERVICE_STOP_TIMEOUT)
+                    && remove_lease(&path).is_ok()
+                {
                     result.cleaned.push(lease.key);
                 } else {
                     result.unresolved.push(lease.key);
@@ -638,10 +810,10 @@ pub fn service_reconcile(lease_root: &Path) -> RuntimeReconcileResult {
             _ => result.unresolved.push(lease.key),
         }
     }
-    result
+    Ok(result)
 }
 
-pub fn service_stop_all(lease_root: &Path) -> RuntimeReconcileResult {
+pub fn service_stop_all(lease_root: &Path) -> Result<RuntimeReconcileResult, String> {
     process::cancel_all_commands();
     let cancels: Vec<_> = ACTIVE_SERVICES
         .lock()
@@ -655,7 +827,18 @@ pub fn service_stop_all(lease_root: &Path) -> RuntimeReconcileResult {
     while !ACTIVE_SERVICES.lock().is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    service_reconcile(lease_root)
+    let active_unresolved: Vec<_> = ACTIVE_SERVICES.lock().keys().cloned().collect();
+    let command_unresolved = process::wait_for_all_commands(SERVICE_STOP_TIMEOUT);
+    let mut result = service_reconcile(lease_root)?;
+    result.unresolved.extend(active_unresolved);
+    result.unresolved.extend(
+        command_unresolved
+            .into_iter()
+            .map(|run_id| format!("command:{run_id}")),
+    );
+    result.unresolved.sort();
+    result.unresolved.dedup();
+    Ok(result)
 }
 
 #[cfg(test)]

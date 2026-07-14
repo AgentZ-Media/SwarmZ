@@ -3,7 +3,11 @@ import type { AttemptStatus } from "./types";
 export const MISSION_OUTBOX_VERSION = 1 as const;
 export const DEFAULT_OUTBOX_MAX_ATTEMPTS = 5;
 export const MAX_OUTBOX_RECORDS = 10_000;
+/** Keep enough headroom to durably settle every currently admitted worker. */
+export const OUTBOX_ADMISSION_SOFT_LIMIT = MAX_OUTBOX_RECORDS - 500;
 export const MAX_OUTBOX_SERIALIZED_BYTES = 16 * 1024 * 1024;
+export const DEFAULT_OUTBOX_PRUNE_BATCH = 500;
+export const MAX_OUTBOX_PRUNE_BATCH = 1_000;
 
 export type OutboxHydration = "unknown" | "ready" | "failed";
 export type OutboxStatus =
@@ -153,6 +157,14 @@ export interface MutationDecision {
   explanation: string;
 }
 
+export interface OutboxPruneDecision {
+  snapshot: MissionOutboxSnapshot;
+  removedRecordIds: readonly string[];
+  scannedRecords: number;
+  changed: boolean;
+  explanation: string;
+}
+
 const ID_RE = /^[A-Za-z0-9_-][A-Za-z0-9._:-]{0,191}$/;
 
 function assertId(label: string, value: string): void {
@@ -285,6 +297,64 @@ function replaceRecord(
   return { ...snapshot, records: { ...snapshot.records, [record.id]: record } };
 }
 
+/**
+ * Remove a bounded, deterministic batch of completed commands after the
+ * owning Mission has been durably archived.
+ *
+ * The caller supplies the archive proof because Missions and the outbox have
+ * separate persistence envelopes. This pure boundary deliberately retains
+ * every non-delivered state (including failed/dead-letter work) and a
+ * delivered record without its invariant delivery receipt.
+ */
+export function pruneDeliveredCommandsForArchivedMissions(
+  snapshot: MissionOutboxSnapshot,
+  archivedMissionIds: ReadonlySet<string>,
+  durablyAppliedRecords: ReadonlyMap<string, MissionOutboxRecord>,
+  batchSize = DEFAULT_OUTBOX_PRUNE_BATCH,
+): OutboxPruneDecision {
+  assertReady(snapshot);
+  const limit = Math.min(
+    MAX_OUTBOX_PRUNE_BATCH,
+    Math.max(1, Math.floor(Number.isFinite(batchSize) ? batchSize : DEFAULT_OUTBOX_PRUNE_BATCH)),
+  );
+  const records = Object.values(snapshot.records);
+  const removable = records
+    .filter((record) =>
+      record.status === "delivered" &&
+      record.delivery !== null &&
+      archivedMissionIds.has(record.missionId) &&
+      durablyAppliedRecords.get(record.id) === record,
+    )
+    .sort((left, right) =>
+      (left.delivery?.deliveredAt ?? left.updatedAt) -
+        (right.delivery?.deliveredAt ?? right.updatedAt) ||
+      left.createdAt - right.createdAt ||
+      left.id.localeCompare(right.id),
+    )
+    .slice(0, limit);
+  if (removable.length === 0) {
+    return {
+      snapshot,
+      removedRecordIds: [],
+      scannedRecords: records.length,
+      changed: false,
+      explanation: "no delivered command belongs to an archived mission",
+    };
+  }
+  const removed = new Set(removable.map((record) => record.id));
+  const retained: Record<string, MissionOutboxRecord> = Object.create(null);
+  for (const record of records) {
+    if (!removed.has(record.id)) retained[record.id] = record;
+  }
+  return {
+    snapshot: { ...snapshot, records: retained },
+    removedRecordIds: removable.map((record) => record.id),
+    scannedRecords: records.length,
+    changed: true,
+    explanation: `pruned ${removable.length} delivered archived-mission command(s)`,
+  };
+}
+
 export function enqueueMissionCommand(
   snapshot: MissionOutboxSnapshot,
   command: EnqueueMissionCommand,
@@ -311,7 +381,16 @@ export function enqueueMissionCommand(
     };
   }
   if (snapshot.records[recordId]) throw new Error("outbox record id already exists");
-  if (Object.keys(snapshot.records).length >= MAX_OUTBOX_RECORDS) {
+  const recordCount = Object.keys(snapshot.records).length;
+  if (
+    recordCount >= OUTBOX_ADMISSION_SOFT_LIMIT &&
+    command.kind !== "settle"
+  ) {
+    throw new Error(
+      "mission outbox backpressure is active; archive completed missions before admitting new work",
+    );
+  }
+  if (recordCount >= MAX_OUTBOX_RECORDS) {
     throw new Error("mission outbox capacity is exhausted");
   }
   const maxAttempts = Math.min(

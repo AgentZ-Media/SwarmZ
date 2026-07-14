@@ -113,6 +113,8 @@ export interface QuitBlockers {
   reviews: number;
   /** git worktree add/remove operations in flight */
   worktreeOps: number;
+  /** sandboxed Runtime Environment commands/services; -1 = query failed */
+  runtimeOps: number;
 }
 
 // ---- Git worktrees ----

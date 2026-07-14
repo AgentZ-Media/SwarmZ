@@ -11,6 +11,7 @@ import type {
   TaskAttempt,
   TaskStatus,
 } from "./types";
+import { candidatesForBatch, selectCandidateAttempt } from "./candidates";
 
 const ID_RE = /^[A-Za-z0-9_-][A-Za-z0-9._:-]{0,127}$/;
 const FORBIDDEN_IDS = new Set(["__proto__", "prototype", "constructor"]);
@@ -38,6 +39,8 @@ export function emptyMissionProjection(): MissionProjection {
     artifacts: Object.create(null),
     qualityGates: Object.create(null),
     integrationTrains: Object.create(null),
+    candidateBatches: Object.create(null),
+    schedules: Object.create(null),
     appliedEventIds: Object.create(null),
     idempotencyKeys: Object.create(null),
   };
@@ -84,12 +87,14 @@ function copyProjection(state: MissionProjection): MissionProjection {
     artifacts: { ...state.artifacts },
     qualityGates: { ...state.qualityGates },
     integrationTrains: { ...state.integrationTrains },
+    candidateBatches: { ...state.candidateBatches },
+    schedules: { ...state.schedules },
     appliedEventIds: { ...state.appliedEventIds },
     idempotencyKeys: { ...state.idempotencyKeys },
   };
 }
 
-/** Stable enough for persisted event identity: JSON event data is plain data. */
+/** Full persisted event identity. Event ids bind transport metadata too. */
 export function missionEventFingerprint(event: MissionEvent): string {
   return JSON.stringify({
     missionId: event.missionId,
@@ -101,10 +106,42 @@ export function missionEventFingerprint(event: MissionEvent): string {
   });
 }
 
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, canonicalValue(entry)]),
+    );
+  }
+  return value;
+}
+
+/** Canonical command identity: retries may have fresh event transport metadata. */
+export function missionCommandFingerprint(event: MissionEvent): string {
+  return JSON.stringify(canonicalValue({
+    missionId: event.missionId,
+    actor: event.actor,
+    type: event.type,
+    data: event.data,
+  }));
+}
+
 function taskAttempts(state: MissionProjection, task: MissionTask): TaskAttempt[] {
   return task.attemptIds
     .map((id) => state.attempts[id])
     .filter((value): value is TaskAttempt => !!value);
+}
+
+/** Attempt whose commit is authoritative for downstream integration. */
+export function selectedAttemptForTask(
+  state: MissionProjection,
+  task: MissionTask,
+): TaskAttempt | null {
+  if (task.selectedCandidateAttemptId) return state.attempts[task.selectedCandidateAttemptId] ?? null;
+  const attempts = taskAttempts(state, task).filter((attempt) => attempt.status === "succeeded");
+  return attempts[attempts.length - 1] ?? null;
 }
 
 function deriveTaskStatus(
@@ -133,7 +170,23 @@ function deriveTaskStatus(
   }
 
   const attempts = taskAttempts(state, task);
-  const latest = attempts[attempts.length - 1];
+  const latestBatch = Object.values(state.candidateBatches)
+    .filter((batch) => batch.taskId === task.id)
+    .sort((left, right) => right.requestedAt - left.requestedAt || right.id.localeCompare(left.id))[0];
+  if (latestBatch && !latestBatch.selectedAttemptId) {
+    const batchAttempts = latestBatch.attemptIds
+      .map((id) => state.attempts[id])
+      .filter((attempt): attempt is TaskAttempt => !!attempt);
+    if (batchAttempts.length < latestBatch.count) {
+      return batchAttempts.length === 0 ? "ready" : "running";
+    }
+    if (batchAttempts.some((attempt) => attempt.status === "running")) return "running";
+    return "needs_human";
+  }
+  const selected = latestBatch?.selectedAttemptId
+    ? state.attempts[latestBatch.selectedAttemptId]
+    : null;
+  const latest = selected ?? attempts[attempts.length - 1];
   if (!latest) return "ready";
   if (task.requeuedAfterAttemptId === latest.id) return "ready";
   if (latest.status === "queued" || latest.status === "running") return "running";
@@ -239,6 +292,9 @@ function assertTaskInput(
   if (!Number.isInteger(task.maxAttempts) || task.maxAttempts < 1 || task.maxAttempts > 20) {
     throw new MissionInvariantError("task maxAttempts must be 1..20");
   }
+  if (task.allowNoop !== undefined && typeof task.allowNoop !== "boolean") {
+    throw new MissionInvariantError("task allowNoop must be boolean");
+  }
   if (!task.root.path.trim() || !task.root.projectId.trim()) {
     throw new MissionInvariantError("task root must identify a project and path");
   }
@@ -343,6 +399,7 @@ export function reduceMissionEvent(
   assertId("event id", event.eventId);
   assertId("mission id", event.missionId);
   const fingerprint = missionEventFingerprint(event);
+  const commandFingerprint = missionCommandFingerprint(event);
   const applied = current.appliedEventIds[event.eventId];
   if (applied !== undefined) {
     if (applied !== fingerprint) throw new MissionInvariantError("event id conflict");
@@ -352,7 +409,7 @@ export function reduceMissionEvent(
     assertString("idempotency key", event.idempotencyKey, 200);
     const prior = current.idempotencyKeys[event.idempotencyKey];
     if (prior !== undefined) {
-      if (prior !== fingerprint) {
+      if (prior !== commandFingerprint) {
         throw new MissionInvariantError("idempotency key conflict");
       }
       return current;
@@ -407,7 +464,10 @@ export function reduceMissionEvent(
       (policy.stopOnRegression !== undefined &&
         !["continue", "pause_mission", "needs_human", "cancel_mission"].includes(policy.stopOnRegression)) ||
       (policy.stopOnConflict !== undefined &&
-        !["continue", "pause_mission", "needs_human", "cancel_mission"].includes(policy.stopOnConflict))
+        !["continue", "pause_mission", "needs_human", "cancel_mission"].includes(policy.stopOnConflict)) ||
+      (policy.runtimeEnvironment !== undefined && policy.runtimeEnvironment !== null &&
+        (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(policy.runtimeEnvironment.environmentId) ||
+          !/^sha256:[0-9a-f]{64}$/.test(policy.runtimeEnvironment.specFingerprint)))
     ) {
       throw new MissionInvariantError("mission execution policy is invalid");
     }
@@ -432,7 +492,12 @@ export function reduceMissionEvent(
       status: "draft",
       taskIds: [],
       integrationTrainIds: [],
-      policy: { ...event.data.policy },
+      policy: {
+        ...event.data.policy,
+        runtimeEnvironment: event.data.policy.runtimeEnvironment
+          ? { ...event.data.policy.runtimeEnvironment }
+          : null,
+      },
       budget: { ...event.data.budget },
       createdAt: event.data.createdAt,
       updatedAt: event.occurredAt,
@@ -510,6 +575,8 @@ export function reduceMissionEvent(
           pausedAt: null,
           resumeInstruction: null,
           requeuedAfterAttemptId: null,
+          selectedCandidateAttemptId: null,
+          allowNoop: event.data.allowNoop === true,
         };
         state.tasks[task.id] = task;
         replaceTaskDependencies(state, task);
@@ -529,6 +596,9 @@ export function reduceMissionEvent(
           throw new MissionInvariantError("active or archived task cannot be edited");
         }
         const patch = event.data.patch;
+        if (patch.allowNoop !== undefined && event.actor !== "human") {
+          throw new MissionInvariantError("only a human can approve no-op task success");
+        }
         if (patch.priority !== undefined &&
           (!Number.isInteger(patch.priority) || patch.priority < 0 || patch.priority > 100)) {
           throw new MissionInvariantError("task priority must be an integer from 0 to 100");
@@ -565,6 +635,9 @@ export function reduceMissionEvent(
         assertString("task title", candidate.title, 300);
         if (candidate.description.length > 20_000) throw new MissionInvariantError("task description is too long");
         assertString("task role", candidate.role, 100);
+        if (candidate.allowNoop !== undefined && typeof candidate.allowNoop !== "boolean") {
+          throw new MissionInvariantError("task allowNoop must be boolean");
+        }
         if (!candidate.root.path.trim() || !candidate.root.projectId.trim() ||
           candidate.root.path.length > 8_192 || candidate.root.projectId.length > 200) {
           throw new MissionInvariantError("task root is invalid");
@@ -629,7 +702,16 @@ export function reduceMissionEvent(
         if (state.attempts[event.data.id]) throw new MissionInvariantError("attempt id already exists");
         const task = state.tasks[event.data.taskId];
         if (!task || task.missionId !== event.missionId) throw new MissionInvariantError("task is unknown");
-        if (["running", "succeeded", "cancelled", "archived", "paused", "blocked_by_dependency"].includes(task.status)) {
+        const batch = event.data.candidateBatchId
+          ? state.candidateBatches[event.data.candidateBatchId]
+          : null;
+        if (event.data.candidateBatchId &&
+          (!batch || batch.taskId !== task.id || batch.selectedAttemptId || batch.attemptIds.length >= batch.count)) {
+          throw new MissionInvariantError("candidate batch cannot accept this attempt");
+        }
+        if (["cancelled", "archived", "paused", "blocked_by_dependency"].includes(task.status) ||
+          (task.status === "succeeded" && !batch) ||
+          (task.status === "running" && !batch)) {
           throw new MissionInvariantError(`task cannot start from ${task.status}`);
         }
         if (task.attemptIds.length >= task.maxAttempts) throw new MissionInvariantError("task retry budget exhausted");
@@ -648,6 +730,7 @@ export function reduceMissionEvent(
           error: null,
           report: null,
           artifactIds: [],
+          candidateBatchId: batch?.id ?? null,
         };
         state.attempts[attempt.id] = attempt;
         state.tasks[task.id] = {
@@ -655,8 +738,15 @@ export function reduceMissionEvent(
           attemptIds: [...task.attemptIds, attempt.id],
           resumeInstruction: null,
           requeuedAfterAttemptId: null,
+          ...(batch ? {} : { selectedCandidateAttemptId: null }),
           updatedAt: event.occurredAt,
         };
+        if (batch) {
+          state.candidateBatches[batch.id] = {
+            ...batch,
+            attemptIds: [...batch.attemptIds, attempt.id],
+          };
+        }
         break;
       }
       case "attempt.finished": {
@@ -766,11 +856,151 @@ export function reduceMissionEvent(
         };
         break;
       }
+      case "candidate_batch.requested": {
+        if (event.actor !== "human") throw new MissionInvariantError("only a human can request candidate attempts");
+        const data = event.data;
+        assertId("candidate batch id", data.id);
+        const task = state.tasks[data.taskId];
+        if (!task || task.missionId !== event.missionId) throw new MissionInvariantError("candidate task is unknown");
+        if (state.candidateBatches[data.id]) throw new MissionInvariantError("candidate batch already exists");
+        if (!Number.isInteger(data.count) || data.count < 2 || data.count > 8) {
+          throw new MissionInvariantError("candidate count must be 2..8");
+        }
+        if (!["ready", "failed", "blocked", "needs_human", "succeeded"].includes(task.status) ||
+          task.attemptIds.length + data.count > task.maxAttempts) {
+          throw new MissionInvariantError("candidate attempts exceed the available task budget");
+        }
+        if (Object.values(state.candidateBatches).some((batch) =>
+          batch.taskId === task.id && !batch.selectedAttemptId)) {
+          throw new MissionInvariantError("task already has an open candidate batch");
+        }
+        assertString("candidate instruction", data.instruction, 4_000);
+        if (!Number.isInteger(data.minimumEvidenceCount) || data.minimumEvidenceCount < 1 || data.minimumEvidenceCount > 64 ||
+          !Number.isFinite(data.minimumScoreMargin) || data.minimumScoreMargin < 0 || data.minimumScoreMargin > 10_000) {
+          throw new MissionInvariantError("candidate evidence policy is invalid");
+        }
+        state.candidateBatches[data.id] = {
+          ...data,
+          attemptIds: [],
+          selectedAttemptId: null,
+          selectedAt: null,
+        };
+        break;
+      }
+      case "candidate_batch.selected":
+      case "candidate_batch.overridden": {
+        if (event.actor !== "human") throw new MissionInvariantError("only a human can choose a candidate");
+        const batch = state.candidateBatches[event.data.batchId];
+        if (!batch || batch.missionId !== event.missionId || batch.selectedAttemptId) {
+          throw new MissionInvariantError("candidate batch is unknown or already selected");
+        }
+        if (batch.attemptIds.length !== batch.count || batch.attemptIds.some((id) => state.attempts[id]?.status === "running")) {
+          throw new MissionInvariantError("all candidate attempts must be terminal before selection");
+        }
+        const attempt = state.attempts[event.data.attemptId];
+        if (!attempt || !batch.attemptIds.includes(attempt.id) || attempt.status !== "succeeded") {
+          throw new MissionInvariantError("selected candidate must be a successful batch attempt");
+        }
+        if (!Object.values(state.artifacts).some((artifact) =>
+          artifact.attemptId === attempt.id && artifact.taskId === batch.taskId)) {
+          throw new MissionInvariantError("selected candidate needs artifact-backed evidence");
+        }
+        const selection = selectCandidateAttempt(candidatesForBatch(state, batch), {
+          minimumEvidenceCount: batch.minimumEvidenceCount,
+          minimumScoreMargin: batch.minimumScoreMargin,
+          tieBreakers: ["lower_tokens", "lower_duration", "attempt_id"],
+        });
+        if (event.type === "candidate_batch.selected") {
+          if (selection.decision !== "selected" || selection.selectedAttemptId !== attempt.id) {
+            throw new MissionInvariantError("candidate does not match the unambiguous evidence decision");
+          }
+        } else {
+          assertString("candidate override reason", event.data.reason, 1_000);
+          if (selection.decision === "selected") {
+            throw new MissionInvariantError("an unambiguous evidence decision cannot be overridden");
+          }
+        }
+        state.candidateBatches[batch.id] = {
+          ...batch,
+          selectedAttemptId: attempt.id,
+          selectedAt: event.data.selectedAt,
+        };
+        state.tasks[batch.taskId] = {
+          ...state.tasks[batch.taskId],
+          selectedCandidateAttemptId: attempt.id,
+          updatedAt: event.data.selectedAt,
+        };
+        break;
+      }
+      case "schedule.created": {
+        const schedule = event.data;
+        assertId("schedule id", schedule.id);
+        if (schedule.missionId !== event.missionId || schedule.projectId !== mission.projectId || state.schedules[schedule.id]) {
+          throw new MissionInvariantError("mission schedule identity is invalid");
+        }
+        assertString("schedule note", schedule.note, 500);
+        if (!Number.isFinite(schedule.at) || schedule.at < event.occurredAt - 60_000 || schedule.at > event.occurredAt + 365 * 24 * 60 * 60_000) {
+          throw new MissionInvariantError("schedule time is invalid");
+        }
+        if (schedule.cancelledAt !== null || schedule.claimedAt !== null || schedule.firedAt !== null) {
+          throw new MissionInvariantError("new schedule must be pending");
+        }
+        state.schedules[schedule.id] = {
+          ...schedule,
+          note: schedule.note.trim(),
+          deliveryAttempts: schedule.deliveryAttempts ?? 0,
+          lastDeliveryError: schedule.lastDeliveryError ?? null,
+          nextAttemptAt: schedule.nextAttemptAt ?? null,
+        };
+        break;
+      }
+      case "schedule.cancelled":
+      case "schedule.claimed":
+      case "schedule.delivery_failed":
+      case "schedule.fired": {
+        const schedule = state.schedules[event.data.scheduleId];
+        if (!schedule || schedule.missionId !== event.missionId) throw new MissionInvariantError("schedule is unknown");
+        if (event.type === "schedule.cancelled") {
+          if (schedule.claimedAt !== null || schedule.cancelledAt !== null) throw new MissionInvariantError("schedule is no longer cancellable");
+          state.schedules[schedule.id] = { ...schedule, cancelledAt: event.data.cancelledAt };
+        } else if (event.type === "schedule.claimed") {
+          if (event.actor !== "system" || schedule.cancelledAt !== null || schedule.claimedAt !== null) throw new MissionInvariantError("schedule cannot be claimed");
+          state.schedules[schedule.id] = {
+            ...schedule,
+            claimedAt: event.data.claimedAt,
+            deliveryAttempts: (schedule.deliveryAttempts ?? 0) + 1,
+            lastDeliveryError: null,
+          };
+        } else if (event.type === "schedule.delivery_failed") {
+          if (event.actor !== "system" || schedule.claimedAt === null || schedule.firedAt !== null || schedule.cancelledAt !== null) {
+            throw new MissionInvariantError("only a claimed reminder can record delivery failure");
+          }
+          assertString("schedule delivery error", event.data.error, 1_000);
+          if (!Number.isFinite(event.data.nextAttemptAt) || event.data.nextAttemptAt < event.data.failedAt) {
+            throw new MissionInvariantError("schedule retry time is invalid");
+          }
+          state.schedules[schedule.id] = {
+            ...schedule,
+            claimedAt: null,
+            lastDeliveryError: event.data.error.trim(),
+            nextAttemptAt: event.data.nextAttemptAt,
+          };
+        } else {
+          if (event.actor !== "system" || schedule.claimedAt === null || schedule.firedAt !== null) throw new MissionInvariantError("schedule must be claimed before firing");
+          state.schedules[schedule.id] = {
+            ...schedule,
+            firedAt: event.data.firedAt,
+            lastDeliveryError: null,
+            nextAttemptAt: null,
+          };
+        }
+        break;
+      }
     }
   }
 
   state.appliedEventIds[event.eventId] = fingerprint;
-  if (event.idempotencyKey) state.idempotencyKeys[event.idempotencyKey] = fingerprint;
+  if (event.idempotencyKey) state.idempotencyKeys[event.idempotencyKey] = commandFingerprint;
   refreshMission(state, event.missionId);
   return state;
 }

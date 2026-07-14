@@ -20,7 +20,8 @@ export function hasHardBlocker(b: QuitBlockers): boolean {
     b.claimedTimers > 0 ||
     b.ghWrites !== 0 ||
     b.reviews > 0 ||
-    b.worktreeOps > 0
+    b.worktreeOps > 0 ||
+    b.runtimeOps !== 0
   );
 }
 
@@ -46,6 +47,13 @@ export function summarizeBlockers(b: QuitBlockers): string {
     parts.push(
       b.worktreeOps === 1 ? "a worktree operation" : `${b.worktreeOps} worktree operations`,
     );
+  if (b.runtimeOps > 0)
+    parts.push(
+      b.runtimeOps === 1
+        ? "a Runtime Environment process"
+        : `${b.runtimeOps} Runtime Environment processes`,
+    );
+  else if (b.runtimeOps < 0) parts.push("possibly a Runtime Environment process");
   if (parts.length === 0) return "Work is still running — quitting will interrupt it.";
   const total =
     b.sessionIds.length +
@@ -53,7 +61,8 @@ export function summarizeBlockers(b: QuitBlockers): string {
     b.claimedTimers +
     (b.ghWrites !== 0 ? Math.max(b.ghWrites, 1) : 0) +
     b.reviews +
-    b.worktreeOps;
+    b.worktreeOps +
+    (b.runtimeOps !== 0 ? Math.max(b.runtimeOps, 1) : 0);
   const it = total === 1 ? "it" : "them";
   return `${parts.join(", ")} still running — quitting will interrupt ${it}.`;
 }

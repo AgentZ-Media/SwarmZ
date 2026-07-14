@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -584,7 +584,9 @@ fn kill_process_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-fn validate_acceptance(request: &AcceptanceCommandRequest) -> Result<(PathBuf, u64), String> {
+fn validate_acceptance(
+    request: &AcceptanceCommandRequest,
+) -> Result<(PathBuf, PathBuf, u64), String> {
     checked_id(&request.run_id, "run id")?;
     checked_id(&request.approval_id, "approval id")?;
     if request.argv.is_empty() || request.argv.len() > ACCEPTANCE_MAX_ARGS {
@@ -616,14 +618,14 @@ fn validate_acceptance(request: &AcceptanceCommandRequest) -> Result<(PathBuf, u
     if !cwd.is_dir() || request.approved_roots.is_empty() {
         return Err("refused: acceptance cwd is not inside an approved root".into());
     }
-    let allowed = request.approved_roots.iter().any(|root| {
-        fs::canonicalize(root.trim())
-            .ok()
-            .is_some_and(|root| root.is_dir() && cwd.starts_with(root))
-    });
-    if !allowed {
-        return Err("refused: acceptance cwd is not inside an approved root".into());
-    }
+    let approved_root = request
+        .approved_roots
+        .iter()
+        .filter_map(|root| fs::canonicalize(root.trim()).ok())
+        .filter(|root| root.is_dir() && cwd.starts_with(root))
+        // Narrowest matching authority wins when callers supplied nested roots.
+        .max_by_key(|root| root.components().count())
+        .ok_or_else(|| "refused: acceptance cwd is not inside an approved root".to_string())?;
     let timeout_ms = request.timeout_ms.unwrap_or(ACCEPTANCE_DEFAULT_TIMEOUT_MS);
     if !(ACCEPTANCE_MIN_TIMEOUT_MS..=ACCEPTANCE_MAX_TIMEOUT_MS).contains(&timeout_ms) {
         return Err("refused: acceptance timeout must be between 100 ms and 15 minutes".into());
@@ -661,7 +663,7 @@ fn validate_acceptance(request: &AcceptanceCommandRequest) -> Result<(PathBuf, u
     if env_bytes > ACCEPTANCE_MAX_ENV_BYTES {
         return Err("refused: acceptance environment exceeds 16 KiB".into());
     }
-    Ok((cwd, timeout_ms))
+    Ok((approved_root, cwd, timeout_ms))
 }
 
 #[cfg(unix)]
@@ -708,9 +710,9 @@ pub fn acceptance_command_cancel(run_id: &str) -> bool {
 pub fn acceptance_command_run(
     request: AcceptanceCommandRequest,
 ) -> Result<AcceptanceCommandResult, String> {
-    let (cwd, timeout_ms) = validate_acceptance(&request)?;
+    let (_approved_root, cwd, timeout_ms) = validate_acceptance(&request)?;
     #[cfg(unix)]
-    let cwd_handle = open_acceptance_cwd(&cwd)?;
+    let _cwd_handle = open_acceptance_cwd(&cwd)?;
     let run_id = checked_id(&request.run_id, "run id")?;
     let cancelled = Arc::new(AtomicBool::new(false));
     {
@@ -722,45 +724,19 @@ pub fn acceptance_command_run(
     }
 
     let result = (|| {
-        let mut command = Command::new(&request.argv[0]);
-        command
-            .args(&request.argv[1..])
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(not(unix))]
-        command.current_dir(&cwd);
-        // Deliberately inherit only the minimum host context needed to find
-        // normal developer tools. Tokens, cloud credentials and arbitrary
-        // loader settings never cross the native boundary by default.
-        for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
-        }
-        command.envs(&request.env);
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            use std::os::unix::process::CommandExt;
-            let cwd_fd = cwd_handle.as_raw_fd();
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::setsid() < 0 || libc::fchdir(cwd_fd) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-
         let started = Instant::now();
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("could not start approved acceptance command: {error}"))?;
-        #[cfg(unix)]
-        drop(cwd_handle);
+        // Authority validation above proves cwd is inside an approved root,
+        // but runtime authority is intentionally narrower: only this exact
+        // checkout/worktree is writable. A gate in `.worktrees/x` cannot
+        // mutate the main checkout or a sibling worktree.
+        let mut child = crate::runtime_native::spawn_sandboxed_process(
+            &cwd,
+            &cwd,
+            &request.argv,
+            &request.env,
+            false,
+        )
+        .map_err(|error| format!("could not start approved acceptance command: {error}"))?;
         let stdout = drain_bounded(child.stdout.take());
         let stderr = drain_bounded(child.stderr.take());
         let deadline = started + Duration::from_millis(timeout_ms);
@@ -1005,6 +981,29 @@ mod tests {
         assert!(acceptance_command_run(refused)
             .unwrap_err()
             .contains("approved root"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn acceptance_process_cannot_write_outside_its_canonical_sandbox_root() {
+        let dir = temp_repo();
+        let checkout = dir.join(".worktrees").join("candidate");
+        fs::create_dir_all(&checkout).unwrap();
+        let outside = dir.join("main-checkout-mutation.txt");
+        fs::remove_file(&outside).ok();
+        let mut request = acceptance_request(
+            "run-sandbox-escape",
+            &checkout,
+            vec![
+                "/usr/bin/touch".into(),
+                outside.to_string_lossy().into_owned(),
+            ],
+        );
+        request.approved_roots = vec![dir.to_string_lossy().into_owned()];
+        let result = acceptance_command_run(request).unwrap();
+        assert_eq!(result.status, AcceptanceCommandStatus::Completed);
+        assert_ne!(result.exit_code, Some(0));
+        assert!(!outside.exists());
         fs::remove_dir_all(dir).ok();
     }
 

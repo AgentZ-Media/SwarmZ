@@ -25,6 +25,14 @@ const EVENT_TYPES = new Set([
   "quality_gate.resulted",
   "integration_train.created",
   "integration_train.updated",
+  "candidate_batch.requested",
+  "candidate_batch.selected",
+  "candidate_batch.overridden",
+  "schedule.created",
+  "schedule.cancelled",
+  "schedule.claimed",
+  "schedule.delivery_failed",
+  "schedule.fired",
 ]);
 
 function record(value: unknown): Record<string, unknown> | null {

@@ -50,6 +50,7 @@ export function missionTaskAuthorityFingerprint(task: MissionTask): string {
     declaredFiles: task.declaredFiles,
     declaredGlobs: task.declaredGlobs,
     maxAttempts: task.maxAttempts,
+    allowNoop: task.allowNoop === true,
     archivedAt: task.archivedAt,
     pausedAt: task.pausedAt,
     resumeInstruction: task.resumeInstruction,
@@ -219,7 +220,51 @@ export function missionAttemptPrompt(
       : "",
     "Work only on this one assignment. Do not adopt a persona or retain identity for later work.",
     "Commit the completed changes before reporting success. Your final response must fill Mission Report Schema v2; claims are independently verified against Git and command exit codes.",
+    task.allowNoop
+      ? "This task has a human-approved allowNoop exception; unchanged HEAD may succeed only when independent verification confirms an empty scoped diff."
+      : "Success requires a new commit and at least one changed file in the approved scope; unchanged/no-op output fails closed.",
   ].filter(Boolean).join("\n\n");
+}
+
+/** Fail closed for coding work unless the exception was in the human-approved task snapshot. */
+export function missionTaskChangeIssue(
+  task: Pick<MissionTask, "allowNoop">,
+  evidence: { base_sha: string; head_sha: string; files_changed: readonly string[] },
+): string | null {
+  const unchangedHead = evidence.base_sha.toLowerCase() === evidence.head_sha.toLowerCase();
+  const emptyDiff = evidence.files_changed.length === 0;
+  if (!task.allowNoop && (unchangedHead || emptyDiff)) {
+    return unchangedHead
+      ? "worker produced no commit beyond the approved base SHA"
+      : "worker produced an empty scoped diff";
+  }
+  if (task.allowNoop && unchangedHead !== emptyDiff) {
+    return "no-op evidence is inconsistent: HEAD and scoped diff disagree";
+  }
+  return null;
+}
+
+/** Exact pre/post command binding for independently executed quality gates. */
+export function finalHeadEvidenceMatches(
+  expected: {
+    base_sha: string;
+    head_sha: string;
+    diff_sha256: string;
+    files_changed: readonly string[];
+  },
+  observed: {
+    base_sha: string;
+    head_sha: string;
+    diff_sha256: string;
+    files_changed: readonly string[];
+    dirty: boolean;
+  },
+): boolean {
+  return !observed.dirty &&
+    observed.base_sha.toLowerCase() === expected.base_sha.toLowerCase() &&
+    observed.head_sha.toLowerCase() === expected.head_sha.toLowerCase() &&
+    observed.diff_sha256.toLowerCase() === expected.diff_sha256.toLowerCase() &&
+    observed.files_changed.join("\u001f") === expected.files_changed.join("\u001f");
 }
 
 export function verifiedGateResults(
@@ -299,6 +344,17 @@ export function missionHardStopReason(
     return "Mission cost budget cannot be safely continued";
   }
   return null;
+}
+
+/** A projection receipt may be dirty-but-not-yet-durable after a failed save.
+ * Cleanup must not invalidate state that the persistence coordinator can
+ * later commit as the authoritative prepared receipt. */
+export function shouldCleanupRuntimeAfterSpawnFailure(input: {
+  runtimeLaunched: boolean;
+  preparedRecorded: boolean;
+  turnStarted: boolean;
+}): boolean {
+  return input.runtimeLaunched && !input.preparedRecorded && !input.turnStarted;
 }
 
 /** Empty declarations are advisory; once present they become a hard boundary. */

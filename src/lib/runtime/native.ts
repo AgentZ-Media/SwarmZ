@@ -25,6 +25,10 @@ export interface NativeRuntimeCommandResult {
 export interface NativeRuntimeServiceStartRequest {
   instanceId: string;
   serviceId: string;
+  ownerProjectId: string;
+  ownerMissionId: string;
+  ownerAttemptId: string;
+  mainRoot: string;
   projectRoot: string;
   cwdRelative: string;
   argv: string[];
@@ -46,6 +50,10 @@ export type RuntimeServiceState =
 export interface RuntimeServiceSnapshot {
   instanceId: string;
   serviceId: string;
+  ownerProjectId: string;
+  ownerMissionId: string;
+  ownerAttemptId: string;
+  mainRoot: string;
   projectRoot: string;
   state: RuntimeServiceState;
   pid: number | null;
@@ -93,8 +101,12 @@ export function startRuntimeService(
   });
 }
 
-export function stopRuntimeService(instanceId: string, serviceId: string): Promise<boolean> {
-  return invoke<boolean>("runtime_service_stop", { instanceId, serviceId });
+export function stopRuntimeService(
+  instanceId: string,
+  serviceId: string,
+  projectRoot: string,
+): Promise<boolean> {
+  return invoke<boolean>("runtime_service_stop", { instanceId, serviceId, projectRoot });
 }
 
 export function listRuntimeServices(): Promise<RuntimeServiceSnapshot[]> {

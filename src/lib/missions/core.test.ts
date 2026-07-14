@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MissionInvariantError,
   emptyMissionProjection,
+  missionCommandFingerprint,
   reduceMissionEvent,
   replayMissionEvents,
 } from "./core";
@@ -202,12 +203,36 @@ describe("mission event reducer", () => {
       { idempotencyKey: "pause-command" },
     );
     const paused = reduceMissionEvent(state, pause);
-    expect(reduceMissionEvent(paused, { ...pause, eventId: "retry-event" })).toBe(paused);
+    expect(reduceMissionEvent(paused, {
+      ...pause,
+      eventId: "retry-event",
+      revision: pause.revision + 99,
+      occurredAt: pause.occurredAt + 9_999,
+    })).toBe(paused);
     expect(() => reduceMissionEvent(paused, {
       ...pause,
       eventId: "conflict-event",
       data: { pausedAt: 99 },
     } as MissionEvent)).toThrow(/idempotency key conflict/);
+  });
+
+  it("canonicalizes command payload keys while excluding retry transport metadata", () => {
+    const build = eventBuilder();
+    const original = build({ type: "mission.paused", data: { pausedAt: 20 } });
+    const retry = {
+      ...original,
+      eventId: "retry-transport",
+      revision: 99,
+      occurredAt: 123_456,
+      data: Object.fromEntries(Object.entries(original.data).reverse()),
+    } as MissionEvent;
+    expect(missionCommandFingerprint(retry)).toBe(missionCommandFingerprint(original));
+    const changed = {
+      ...retry,
+      type: "mission.paused",
+      data: { pausedAt: 21 },
+    } as MissionEvent;
+    expect(missionCommandFingerprint(changed)).not.toBe(missionCommandFingerprint(original));
   });
 
   it("keeps terminal attempts immutable and retries as a new attempt", () => {
@@ -368,5 +393,16 @@ describe("mission event reducer", () => {
     const badBuild = eventBuilder();
     badBuild({ type: "mission.created", data: { projectId: "p", title: "x", objective: "x", policy, budget, createdAt: 1 } });
     expect(() => reduceMissionEvent(state, badBuild({ type: "task.added", data: invalid }))).toThrow(/priority/);
+    const runtimeBuild = eventBuilder("runtime-mission");
+    expect(() => replayMissionEvents([runtimeBuild({
+      type: "mission.created",
+      data: {
+        projectId: "project-1", title: "Runtime", objective: "x", budget, createdAt: 1,
+        policy: {
+          ...policy,
+          runtimeEnvironment: { environmentId: "local", specFingerprint: "not-a-digest" },
+        },
+      },
+    })])).toThrow(/mission execution policy/);
   });
 });

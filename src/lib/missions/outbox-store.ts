@@ -12,6 +12,7 @@ import {
   emptyMissionOutbox,
   enqueueMissionCommand,
   failMissionCommand,
+  pruneDeliveredCommandsForArchivedMissions,
   retryDeadLetter,
   type EnqueueMissionCommand,
   type MissionOutboxRecord,
@@ -53,6 +54,11 @@ export interface MissionOutboxState {
     options?: { now?: number; retryable?: boolean },
   ): Promise<MissionOutboxRecord>;
   retryDeadLetter(recordId: string, now?: number): Promise<MissionOutboxRecord>;
+  pruneArchivedDelivered(
+    archivedMissionIds: ReadonlySet<string>,
+    durablyAppliedRecords: ReadonlyMap<string, MissionOutboxRecord>,
+    options?: { batchSize?: number },
+  ): Promise<readonly string[]>;
 }
 
 function snapshot(): ReturnType<typeof serializeMissionOutbox> {
@@ -174,6 +180,17 @@ export const useMissionOutbox = create<MissionOutboxState>((set, get) => ({
     const decision = retryDeadLetter(get().snapshot, recordId, now);
     if (decision.changed) await persistTransition(set, decision.snapshot);
     return decision.record;
+  },
+
+  pruneArchivedDelivered: async (archivedMissionIds, durablyAppliedRecords, options) => {
+    const decision = pruneDeliveredCommandsForArchivedMissions(
+      get().snapshot,
+      archivedMissionIds,
+      durablyAppliedRecords,
+      options?.batchSize,
+    );
+    if (decision.changed) await persistTransition(set, decision.snapshot);
+    return decision.removedRecordIds;
   },
 }));
 

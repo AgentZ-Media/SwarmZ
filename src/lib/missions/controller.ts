@@ -9,6 +9,7 @@ import {
   closeSession,
   interrupt,
   lastTurnOutcomeOf,
+  reviewSession,
   sendMessageStrict,
   startSession,
 } from "@/lib/vibe/controller";
@@ -19,8 +20,8 @@ import {
 } from "./store";
 import { useMissionOutbox } from "./outbox-store";
 import type { MissionOutboxRecord } from "./outbox";
-import { planMissionStarts, planReportSettlement } from "./runner-core";
-import { envelopeStopAction, type StopAction } from "./envelope";
+import { planMissionStarts, planReportSettlement, type StartAttemptCommand } from "./runner-core";
+import { authorizeEnvelopeStart, envelopeStopAction, type StopAction } from "./envelope";
 import {
   MISSION_REPORT_V2_SCHEMA,
   parseMissionReportV2,
@@ -35,14 +36,28 @@ import {
   taskIsInsideApprovedScope,
   unexpectedChangedFiles,
   taskHasSafeMissionPlacement,
-  verifiedGateResults,
+  missionTaskChangeIssue,
+  finalHeadEvidenceMatches,
   workerOutcomeDisposition,
   exactPromptTurnId,
   missionTurnEvidence,
   missionHardStopReason,
+  shouldCleanupRuntimeAfterSpawnFailure,
   type ApprovedMissionScope,
 } from "./controller-core";
-import type { MissionTask, TaskAttempt } from "./types";
+import type { MissionArtifact, MissionTask, TaskAttempt } from "./types";
+import type { MissionRuntimeBinding } from "./types";
+import { useRuntimeEnvironments } from "@/lib/runtime/store";
+import {
+  cleanupBoundMissionRuntime,
+  prepareBoundMissionRuntime,
+  resumePreparedBoundMissionRuntime,
+  resolveProjectMissionRuntime,
+  type MissionRuntimeContext,
+} from "./runtime-binding";
+import { runtimeEnvironmentInstanceId, type RuntimeLaunchResult } from "@/lib/runtime/controller";
+import { parseApprovedArgv } from "@/lib/integration/controller-core";
+import { runAcceptanceCommand } from "@/lib/integration/native";
 
 const TICK_MS = 1_000;
 const OWNER_ID = "mission-controller";
@@ -80,9 +95,105 @@ function missionPersistenceReady(): boolean {
     outbox.hydrateStatus === "ready" &&
     outbox.snapshot.hydration === "ready" &&
     useVibe.getState().hydrateStatus === "ready" &&
+    useRuntimeEnvironments.getState().hydrated &&
     !persistenceIssues().some((issue) =>
-      issue.name === "missions" || issue.name === "missionOutbox" || issue.name === "vibeSessions",
+      issue.name === "missions" || issue.name === "missionOutbox" ||
+      issue.name === "vibeSessions" || issue.name === "runtimeEnvironments",
     );
+}
+
+function runtimeBindingForMission(missionId: string): MissionRuntimeBinding | null {
+  return useMissions.getState().projection.missions[missionId]?.policy.runtimeEnvironment ?? null;
+}
+
+function runtimeContextForAttempt(attempt: TaskAttempt): MissionRuntimeContext | null {
+  const spawn = spawnRecordForAttempt(attempt.id);
+  const mission = useMissions.getState().projection.missions[attempt.missionId];
+  if (!mission || !spawn || spawn.command.kind !== "spawn" || !spawn.command.payload.root) return null;
+  return {
+    projectId: mission.projectId,
+    mainRoot: spawn.command.payload.root,
+    projectRoot: spawn.command.payload.cwd,
+    missionId: attempt.missionId,
+    attemptId: attempt.id,
+  };
+}
+
+async function cleanupAttemptRuntimeBestEffort(attempt: TaskAttempt): Promise<void> {
+  const binding = runtimeBindingForMission(attempt.missionId);
+  const context = runtimeContextForAttempt(attempt);
+  if (!binding || !context) return;
+  const artifactId = safeId(attempt.id, "runtime-cleanup");
+  if (useMissions.getState().projection.artifacts[artifactId]) return;
+  try {
+    await cleanupBoundMissionRuntime(binding, context);
+    useMissions.getState().recordArtifact(attempt.missionId, {
+      id: artifactId,
+      taskId: attempt.taskId,
+      attemptId: attempt.id,
+      kind: "other",
+      label: "Runtime Environment cleaned",
+      uri: null,
+      metadata: {
+        environmentId: binding.environmentId,
+        specFingerprint: binding.specFingerprint,
+      },
+    }, { actor: "system", idempotencyKey: `runtime-cleanup:${attempt.id}` });
+    await flushMissionOrThrow();
+  } catch (error) {
+    console.warn("[missions] runtime cleanup will retry:", error instanceof Error ? error.message : "unknown error");
+  }
+}
+
+function runtimePreparedReceipt(
+  attemptId: string,
+  binding: MissionRuntimeBinding,
+  context: MissionRuntimeContext,
+): boolean {
+  const artifact = useMissions.getState().projection.artifacts[safeId(attemptId, "runtime-prepared")];
+  if (!artifact) return false;
+  const expectedInstance = runtimeEnvironmentInstanceId(context, binding.environmentId);
+  if (artifact.attemptId !== attemptId ||
+    artifact.metadata.environmentId !== binding.environmentId ||
+    artifact.metadata.specFingerprint !== binding.specFingerprint ||
+    artifact.metadata.instanceId !== expectedInstance ||
+    artifact.metadata.projectRoot !== context.projectRoot ||
+    artifact.metadata.mainRoot !== context.mainRoot ||
+    artifact.metadata.projectId !== context.projectId) {
+    throw new Error("durable Runtime Environment receipt conflicts with this attempt");
+  }
+  return true;
+}
+
+async function recordRuntimePrepared(
+  attempt: TaskAttempt,
+  binding: MissionRuntimeBinding,
+  context: MissionRuntimeContext,
+  result: RuntimeLaunchResult,
+): Promise<void> {
+  const id = safeId(attempt.id, "runtime-prepared");
+  if (useMissions.getState().projection.artifacts[id]) return;
+  useMissions.getState().recordArtifact(attempt.missionId, {
+    id,
+    taskId: attempt.taskId,
+    attemptId: attempt.id,
+    kind: "other",
+    label: "Runtime Environment prepared",
+    uri: null,
+    // Receipt intentionally excludes argv, env maps, secret references,
+    // output and port-variable names. All are resolved again from the
+    // fingerprint-checked spec and native service leases.
+    metadata: {
+      environmentId: binding.environmentId,
+      specFingerprint: binding.specFingerprint,
+      instanceId: result.instanceId,
+      projectId: context.projectId,
+      mainRoot: context.mainRoot,
+      projectRoot: context.projectRoot,
+      serviceIds: result.services.map((service) => service.serviceId).sort(),
+    },
+  }, { actor: "system", idempotencyKey: `runtime-prepared:${attempt.id}` });
+  await flushMissionOrThrow();
 }
 
 async function flushMissionOrThrow(): Promise<void> {
@@ -229,7 +340,13 @@ function branchPlacement(task: MissionTask, ordinal: number, resolvedRoot?: stri
   };
 }
 
-async function enqueueStart(scope: ApprovedMissionScope, task: MissionTask, command: ReturnType<typeof planMissionStarts>["commands"][number]): Promise<void> {
+async function enqueueStart(
+  scope: ApprovedMissionScope,
+  task: MissionTask,
+  command: StartAttemptCommand,
+  candidateBatchId: string | null = null,
+  candidateInstruction = "",
+): Promise<void> {
   if (!taskHasSafeMissionPlacement(task)) {
     throw new Error("autonomous Mission workers require a new or explicitly shared worktree");
   }
@@ -245,6 +362,9 @@ async function enqueueStart(scope: ApprovedMissionScope, task: MissionTask, comm
   const commands = requiredCommands(scope, useMissions.getState().projection.tasks[task.id]);
   const prompt = [
     missionAttemptPrompt(task, command.attemptId),
+    candidateBatchId
+      ? `Candidate comparison run ${candidateBatchId}. Produce an independent solution in this fresh worktree. Human comparison instruction: ${candidateInstruction}`
+      : "",
     `Approved base SHA: ${baseSha}\nFor report evidence use exactly this committed range: ${baseSha}..HEAD. Compute diff_sha256 from: git diff --no-ext-diff --no-textconv --binary ${baseSha}..HEAD | shasum -a 256. Compute files_changed from the same range.`,
     commands.length ? `Required verification commands (run exactly and report exit codes):\n${commands.map((item) => `- ${item}`).join("\n")}` : "",
   ].filter(Boolean).join("\n\n");
@@ -253,6 +373,7 @@ async function enqueueStart(scope: ApprovedMissionScope, task: MissionTask, comm
     id: command.attemptId,
     sessionId,
     workerLabel: command.worker.label,
+    candidateBatchId,
   }, {
     actor: "scheduler",
     idempotencyKey: command.operationId,
@@ -290,6 +411,7 @@ async function ensureSpawnWorktree(record: MissionOutboxRecord): Promise<void> {
     cwd: payload.root,
     branch: payload.branch,
     copyEnv: payload.copyEnv ?? false,
+    baseSha: payload.baseSha,
     gitBin,
   });
   if (created.path !== payload.cwd || created.branch !== payload.branch) {
@@ -327,6 +449,11 @@ async function dispatchSpawn(record: MissionOutboxRecord): Promise<void> {
   const claimed = await useMissionOutbox.getState().claim(record.id, OWNER_ID, { leaseMs: CLAIM_MS });
   if (!claimed || claimed.command.kind !== "spawn" || !claimed.lease) return;
   const payload = claimed.command.payload;
+  const runtimeBinding = runtimeBindingForMission(record.missionId);
+  let runtimeContext: MissionRuntimeContext | null = null;
+  let runtimeLaunched = false;
+  let turnStarted = false;
+  let runtimePreparedDurable = false;
   try {
     await ensureSpawnWorktree(claimed);
     const base = await gitEvidence(payload.cwd, null);
@@ -335,6 +462,33 @@ async function dispatchSpawn(record: MissionOutboxRecord): Promise<void> {
     }
     if (payload.branch && base.branch !== payload.branch) {
       throw new Error("worktree branch does not match the durable spawn command");
+    }
+    let effectivePrompt = payload.prompt;
+    if (runtimeBinding) {
+      const mission = useMissions.getState().projection.missions[record.missionId];
+      if (!mission) throw new Error("Mission runtime cannot resolve its project");
+      if (!payload.root) throw new Error("Mission runtime requires an owned main repository root");
+      const boundRuntimeContext: MissionRuntimeContext = {
+        projectId: mission.projectId,
+        mainRoot: payload.root,
+        projectRoot: payload.cwd,
+        missionId: record.missionId,
+        attemptId: payload.attemptId,
+      };
+      runtimeContext = boundRuntimeContext;
+      const prepared = runtimePreparedReceipt(payload.attemptId, runtimeBinding, boundRuntimeContext);
+      runtimePreparedDurable = prepared;
+      if (!prepared) {
+        const preparedResult = await prepareBoundMissionRuntime(runtimeBinding, boundRuntimeContext);
+        runtimeLaunched = true;
+        const attempt = useMissions.getState().projection.attempts[payload.attemptId];
+        if (!attempt) throw new Error("Mission runtime attempt disappeared before its receipt");
+        await recordRuntimePrepared(attempt, runtimeBinding, boundRuntimeContext, preparedResult);
+        runtimePreparedDurable = true;
+      }
+      const launched = await resumePreparedBoundMissionRuntime(runtimeBinding, boundRuntimeContext);
+      runtimeLaunched = true;
+      effectivePrompt = `${payload.prompt}\n\n${launched.prompt}`;
     }
     const sessionId = payload.sessionId ?? safeId(payload.attemptId, "ms");
     if (!useVibe.getState().sessions[sessionId]) {
@@ -354,9 +508,9 @@ async function dispatchSpawn(record: MissionOutboxRecord): Promise<void> {
       });
     }
     let turnId: string | null = null;
-    const persistedTurnId = promptTurnId(sessionId, payload.prompt);
+    const persistedTurnId = promptTurnId(sessionId, effectivePrompt);
     if (persistedTurnId === undefined) {
-      const ack = await sendMessageStrict(sessionId, payload.prompt, {
+      const ack = await sendMessageStrict(sessionId, effectivePrompt, {
         outputSchema: MISSION_REPORT_V2_SCHEMA as unknown as Record<string, unknown>,
         via: "conductor",
         requireWorkspace: true,
@@ -371,6 +525,7 @@ async function dispatchSpawn(record: MissionOutboxRecord): Promise<void> {
       turnId = persistedTurnId;
     }
     if (!turnId) throw new Error("Mission turn start did not return a durable turn id");
+    turnStarted = true;
     await flushVibePersist();
     await useMissionOutbox.getState().deliver(claimed.id, claimed.lease.claimId, {
       sessionId,
@@ -380,6 +535,30 @@ async function dispatchSpawn(record: MissionOutboxRecord): Promise<void> {
       baseSha: payload.baseSha ?? base.head_sha,
     });
   } catch (error) {
+    // `recordArtifact` mutates the projection before its awaited save. If the
+    // save fails, that dirty prepared receipt may later become durable via the
+    // coordinator retry. Never tear setup down beneath such a receipt: doing
+    // so would persist a setup-done claim for an environment we just removed.
+    let preparedRecorded = runtimePreparedDurable;
+    if (!preparedRecorded && runtimeBinding && runtimeContext) {
+      try {
+        preparedRecorded = runtimePreparedReceipt(payload.attemptId, runtimeBinding, runtimeContext);
+      } catch {
+        preparedRecorded = true;
+      }
+    }
+    if (shouldCleanupRuntimeAfterSpawnFailure({
+      runtimeLaunched,
+      preparedRecorded,
+      turnStarted,
+    }) && runtimeBinding && runtimeContext) {
+      try {
+        await cleanupBoundMissionRuntime(runtimeBinding, runtimeContext);
+      } catch {
+        // Spawn remains retryable and the deterministic instance is reconciled
+        // on the next dispatch without touching unrelated processes.
+      }
+    }
     await useMissionOutbox.getState().fail(
       claimed.id,
       claimed.lease.claimId,
@@ -413,7 +592,12 @@ async function recordUsage(attempt: TaskAttempt): Promise<void> {
     kind: "other",
     label: "mission-usage",
     uri: null,
-    metadata: { tokens: tokenCount(attempt.sessionId), costUsd: null },
+    metadata: {
+      authority: "swarmz_native",
+      evidenceKind: "usage",
+      tokens: tokenCount(attempt.sessionId),
+      costUsd: null,
+    },
   }, { actor: "system", idempotencyKey: `usage:${attempt.id}` });
   await flushMissionOrThrow();
 }
@@ -423,7 +607,16 @@ async function recordCommitEvidence(
   evidence: MissionGitEvidence,
 ): Promise<void> {
   const id = safeId(attempt.id, "commit");
-  if (useMissions.getState().projection.artifacts[id]) return;
+  const existing = useMissions.getState().projection.artifacts[id];
+  if (existing) {
+    if (existing.metadata.commit !== evidence.head_sha ||
+      existing.metadata.baseSha !== evidence.base_sha ||
+      existing.metadata.diffSha256 !== evidence.diff_sha256 ||
+      JSON.stringify(existing.metadata.filesChanged) !== JSON.stringify(evidence.files_changed)) {
+      throw new Error("attempt commit evidence conflicts with the previously durable final HEAD");
+    }
+    return;
+  }
   useMissions.getState().recordArtifact(attempt.missionId, {
     id,
     taskId: attempt.taskId,
@@ -432,7 +625,10 @@ async function recordCommitEvidence(
     label: "Verified attempt commit",
     uri: `git:${evidence.head_sha}`,
     metadata: {
+      authority: "swarmz_native",
+      evidenceKind: "commit",
       commit: evidence.head_sha,
+      finalHead: evidence.head_sha,
       baseSha: evidence.base_sha,
       diffSha256: evidence.diff_sha256,
       filesChanged: evidence.files_changed,
@@ -441,21 +637,218 @@ async function recordCommitEvidence(
   await flushMissionOrThrow();
 }
 
-async function passRequiredGates(task: MissionTask, commands: Record<string, number>): Promise<void> {
-  const store = useMissions.getState();
-  const pending = task.qualityGateIds
-    .map((gateId) => store.projection.qualityGates[gateId])
-    .filter((gate) => gate?.required && gate.status !== "passed" && gate.status !== "waived");
-  // Phase one is read-only. A later failed command must not leave the first
-  // gate green and accidentally let a retry inherit another attempt's proof.
-  const results = verifiedGateResults(pending, commands);
-  // Phase two appends every result as one reducer batch and one durable flush.
-  const latestAttemptId = task.attemptIds[task.attemptIds.length - 1] ?? "none";
-  store.settleQualityGates(task.missionId, results, {
-    actor: "system",
-    idempotencyKey: `gate-results:${task.id}:${latestAttemptId}`,
-  });
+interface IndependentGateEvidence {
+  commands: Record<string, number>;
+  failed: string[];
+}
+
+function exactAttemptArtifact(
+  attemptId: string,
+  label: string,
+  finalHead: string,
+): MissionArtifact | null {
+  return Object.values(useMissions.getState().projection.artifacts).find((artifact) =>
+    artifact.attemptId === attemptId &&
+    artifact.label === label &&
+    artifact.metadata.authority === "swarmz_native" &&
+    artifact.metadata.finalHead === finalHead,
+  ) ?? null;
+}
+
+async function recordIndependentReview(
+  attempt: TaskAttempt,
+  task: MissionTask,
+  evidence: MissionGitEvidence,
+): Promise<string> {
+  const label = "Independent final-HEAD review";
+  const existing = exactAttemptArtifact(attempt.id, label, evidence.head_sha);
+  if (existing) {
+    if (existing.metadata.evidenceKind !== "review" ||
+      existing.metadata.baseSha !== evidence.base_sha ||
+      existing.metadata.diffSha256 !== evidence.diff_sha256) {
+      throw new Error("independent review artifact conflicts with the durable final HEAD");
+    }
+    return existing.id;
+  }
+  let reviewStatus: "passed" | "failed" = "passed";
+  let reviewDetail = "Independent clean/scope/ancestry verification passed";
+  let reviewThreadId: string | null = null;
+  if (attempt.candidateBatchId && attempt.sessionId) {
+    try {
+      const result = await reviewSession(attempt.sessionId, `commit:${evidence.head_sha}`, {
+        requireWorkspace: true,
+      });
+      reviewThreadId = result.review_thread_id;
+      const text = result.review?.slice(0, 4_000) ?? "Detached review returned no findings";
+      const hasFinding = /\[P[0-3]\]/i.test(text) || /"findings"\s*:\s*\[\s*\{/i.test(text);
+      reviewStatus = result.status === "completed" && !hasFinding ? "passed" : "failed";
+      reviewDetail = result.status !== "completed"
+        ? `Detached review ended as ${result.status}`
+        : hasFinding
+          ? "Detached review found actionable P0-P3 findings"
+          : "Detached review completed without actionable P0-P3 findings";
+    } catch (error) {
+      reviewStatus = "failed";
+      reviewDetail = error instanceof Error ? error.message : String(error);
+    }
+  }
+  const id = safeId(`${attempt.id}:review:${evidence.head_sha}`, "review");
+  useMissions.getState().recordArtifact(attempt.missionId, {
+    id,
+    taskId: task.id,
+    attemptId: attempt.id,
+    kind: "other",
+    label,
+    uri: null,
+    metadata: {
+      authority: "swarmz_native",
+      evidenceKind: "review",
+      status: reviewStatus,
+      finalHead: evidence.head_sha,
+      baseSha: evidence.base_sha,
+      diffSha256: evidence.diff_sha256,
+      filesChanged: evidence.files_changed,
+      allowNoop: task.allowNoop === true,
+      clean: !evidence.dirty,
+      baseIsAncestor: evidence.base_is_ancestor,
+      reviewThreadId,
+      detail: reviewDetail,
+    },
+  }, { actor: "system", idempotencyKey: `review-evidence:${attempt.id}:${evidence.head_sha}` });
   await flushMissionOrThrow();
+  return id;
+}
+
+/** Run every required command through the native argv-only acceptance runner.
+ * Worker transcript command items are intentionally ignored as authority. */
+async function runIndependentGates(
+  scope: ApprovedMissionScope,
+  attempt: TaskAttempt,
+  task: MissionTask,
+  evidence: MissionGitEvidence,
+  reviewArtifactId: string,
+): Promise<IndependentGateEvidence> {
+  const gates = task.qualityGateIds
+    .map((gateId) => useMissions.getState().projection.qualityGates[gateId])
+    .filter((gate) => gate?.required && gate.status !== "waived");
+  const byCommand = new Map<string, typeof gates>();
+  for (const gate of gates) {
+    if (!gate.command?.trim()) continue;
+    const command = gate.command.trim();
+    byCommand.set(command, [...(byCommand.get(command) ?? []), gate]);
+  }
+  const commands: Record<string, number> = Object.create(null);
+  const results: Array<{
+    gateId: string;
+    status: "passed" | "failed";
+    details: string;
+    artifactIds: string[];
+  }> = [];
+  const failed: string[] = [];
+
+  for (const [command, commandGates] of byCommand) {
+    const label = `Native acceptance · ${command.slice(0, 220)}`;
+    let artifact = exactAttemptArtifact(attempt.id, label, evidence.head_sha);
+    if (artifact && (artifact.metadata.evidenceKind !== "test" ||
+      artifact.metadata.command !== command ||
+      artifact.metadata.baseSha !== evidence.base_sha)) {
+      throw new Error("native quality artifact conflicts with the approved command or final HEAD");
+    }
+    if (!artifact) {
+      let status: "passed" | "failed" = "failed";
+      let exitCode: number | null = null;
+      let durationMs = 0;
+      let detail = "native acceptance command failed before completion";
+      try {
+        const cwd = baseShaForAttempt(attempt.id)?.cwd ?? task.root.path;
+        const before = await gitEvidence(cwd, evidence.base_sha);
+        if (!finalHeadEvidenceMatches(evidence, before)) {
+          throw new Error("final HEAD changed before native quality verification");
+        }
+        const argv = parseApprovedArgv(command);
+        const result = await runAcceptanceCommand({
+          runId: safeId(`${attempt.id}:${evidence.head_sha}:${command}`, "mission-gate"),
+          approvalId: scope.approvalEventId,
+          cwd,
+          // The generated worktree itself is the native sandbox authority;
+          // the quality process cannot touch the mutable main checkout.
+          approvedRoots: [cwd],
+          argv,
+          timeoutMs: 15 * 60_000,
+        });
+        exitCode = result.exitCode;
+        durationMs = result.durationMs;
+        status = result.status === "completed" && result.exitCode === 0 ? "passed" : "failed";
+        detail = result.status === "completed"
+          ? `native argv exited ${result.exitCode ?? "without code"}`
+          : `native argv ${result.status}`;
+        const after = await gitEvidence(cwd, evidence.base_sha);
+        if (!finalHeadEvidenceMatches(evidence, after)) {
+          status = "failed";
+          detail = "quality command changed the verified final HEAD or tracked diff";
+        }
+      } catch (error) {
+        detail = error instanceof Error ? error.message : String(error);
+      }
+      const id = safeId(`${attempt.id}:gate:${command}:${evidence.head_sha}`, "test");
+      useMissions.getState().recordArtifact(attempt.missionId, {
+        id,
+        taskId: task.id,
+        attemptId: attempt.id,
+        kind: "test_result",
+        label,
+        uri: null,
+        metadata: {
+          authority: "swarmz_native",
+          evidenceKind: "test",
+          status,
+          command,
+          exitCode,
+          durationMs,
+          finalHead: evidence.head_sha,
+          baseSha: evidence.base_sha,
+          detail: detail.slice(0, 1_000),
+        },
+      }, { actor: "system", idempotencyKey: `gate-evidence:${attempt.id}:${evidence.head_sha}:${safeId(command, "cmd")}` });
+      await flushMissionOrThrow();
+      artifact = useMissions.getState().projection.artifacts[id] ?? null;
+    }
+    if (!artifact) throw new Error("native gate artifact was not persisted");
+    const exitCode = typeof artifact.metadata.exitCode === "number" ? artifact.metadata.exitCode : 1;
+    const passed = artifact.metadata.status === "passed" && exitCode === 0;
+    commands[command] = exitCode;
+    if (!passed) failed.push(command);
+    for (const gate of commandGates) {
+      results.push({
+        gateId: gate.id,
+        status: passed ? "passed" : "failed",
+        details: `${passed ? "Passed" : "Failed"} natively at ${evidence.head_sha.slice(0, 12)} · ${String(artifact.metadata.detail ?? "direct argv")}`,
+        artifactIds: [artifact.id],
+      });
+    }
+  }
+  for (const gate of gates.filter((candidate) => !candidate.command?.trim())) {
+    results.push({
+      gateId: gate.id,
+      status: "passed",
+      details: `Independent clean/scope/ancestry review at ${evidence.head_sha.slice(0, 12)}`,
+      artifactIds: [reviewArtifactId],
+    });
+  }
+  const changedResults = results.filter((result) => {
+    const gate = useMissions.getState().projection.qualityGates[result.gateId];
+    return gate?.status !== result.status ||
+      gate.details !== result.details ||
+      gate.artifactIds.join("\u001f") !== result.artifactIds.join("\u001f");
+  });
+  if (changedResults.length) {
+    useMissions.getState().settleQualityGates(task.missionId, changedResults, {
+      actor: "system",
+      idempotencyKey: `gate-results:${attempt.id}:${evidence.head_sha}`,
+    });
+    await flushMissionOrThrow();
+  }
+  return { commands, failed };
 }
 
 async function durableSettle(
@@ -552,6 +945,7 @@ async function dispatchSettle(record: MissionOutboxRecord): Promise<void> {
       }, { actor: "system", idempotencyKey: `settle-event:${payload.completionId}` });
       await flushMissionOrThrow();
     }
+    if (current) await cleanupAttemptRuntimeBestEffort(current);
     if (current?.sessionId && useVibe.getState().sessions[current.sessionId]) {
       await closeSession(current.sessionId);
       await flushVibePersist();
@@ -580,6 +974,7 @@ async function dispatchSettle(record: MissionOutboxRecord): Promise<void> {
       attemptId: payload.attemptId,
       status: payload.status,
     });
+    await cleanupAttemptRuntimeBestEffort(current);
     if (current.sessionId && useVibe.getState().sessions[current.sessionId]) {
       await closeSession(current.sessionId);
       await flushVibePersist();
@@ -667,14 +1062,26 @@ async function settleCompletedAttempt(attempt: TaskAttempt): Promise<void> {
     if (outsideScope.length > 0) {
       throw new Error(`worker changed files outside the approved task scope: ${outsideScope.slice(0, 20).join(", ")}`);
     }
-    const commands = turnEvidence.commands;
+    const changeIssue = missionTaskChangeIssue(task, evidence);
+    if (changeIssue) throw new Error(changeIssue);
     const required = requiredCommands(scope, task);
+    // Persist Git/review evidence before running commands. Both are bound to
+    // the exact final HEAD and remain immutable attempt history.
+    await recordCommitEvidence(attempt, evidence);
+    const reviewArtifactId = await recordIndependentReview(attempt, task, evidence);
+    const gateEvidence = await runIndependentGates(
+      scope,
+      attempt,
+      task,
+      evidence,
+      reviewArtifactId,
+    );
     const observation: MissionReportObservation = {
       headSha: evidence.head_sha,
       baseSha: evidence.base_sha,
       diffSha256: evidence.diff_sha256,
       filesChanged: evidence.files_changed,
-      commands,
+      commands: gateEvidence.commands,
       requiredCommands: required,
     };
     const decision = planReportSettlement({
@@ -686,11 +1093,9 @@ async function settleCompletedAttempt(attempt: TaskAttempt): Promise<void> {
       completedOperationIds: new Set(),
     });
     if (!decision.ok) throw new Error(decision.reason);
-    // Integration trains only consume commit evidence bound to this exact
-    // successful attempt. Persist it before gates/settlement so a crash can
-    // never expose success without its independently observed commit.
-    await recordCommitEvidence(attempt, evidence);
-    await passRequiredGates(task, commands);
+    if (gateEvidence.failed.length > 0) {
+      throw new Error(`native quality gates failed: ${gateEvidence.failed.join(", ")}`);
+    }
     await durableSettle(attempt, "succeeded", report.summary, report as unknown as Record<string, unknown>);
   } catch (error) {
     await settleFailure(
@@ -722,6 +1127,7 @@ async function recoverOutboxAndAttempts(): Promise<void> {
 
   for (const attempt of Object.values(useMissions.getState().projection.attempts)) {
     if (attempt.status !== "running") {
+      await cleanupAttemptRuntimeBestEffort(attempt);
       const spawn = spawnRecordForAttempt(attempt.id);
       const ownedSessionId = spawn?.command.kind === "spawn"
         ? (spawn.command.payload.sessionId ?? safeId(attempt.id, "ms"))
@@ -749,6 +1155,38 @@ function isOwnedMissionAttempt(attempt: TaskAttempt): boolean {
     attempt.sessionId === (spawn.command.payload.sessionId ?? safeId(attempt.id, "ms"));
 }
 
+async function pauseMissionsWithRuntimeDrift(): Promise<void> {
+  for (const scope of approvedScopes()) {
+    const binding = scope.mission.policy.runtimeEnvironment;
+    if (!binding) continue;
+    try {
+      resolveProjectMissionRuntime(scope.mission.projectId, binding);
+    } catch (error) {
+      const artifactId = safeId(`${scope.missionId}:${binding.environmentId}`, "runtime-drift");
+      if (!useMissions.getState().projection.artifacts[artifactId]) {
+        useMissions.getState().recordArtifact(scope.missionId, {
+          id: artifactId,
+          taskId: null,
+          attemptId: null,
+          kind: "other",
+          label: "Runtime Environment approval drift",
+          uri: null,
+          metadata: {
+            environmentId: binding.environmentId,
+            expectedFingerprint: binding.specFingerprint,
+            reason: error instanceof Error ? error.message : "runtime binding could not be verified",
+          },
+        }, { actor: "system", idempotencyKey: `runtime-drift:${scope.missionId}:${binding.specFingerprint}` });
+      }
+      useMissions.getState().pauseMission(scope.missionId, {
+        actor: "system",
+        idempotencyKey: `runtime-drift-pause:${scope.missionId}:${binding.specFingerprint}`,
+      });
+      await flushMissionOrThrow();
+    }
+  }
+}
+
 async function enforceRunningStops(): Promise<void> {
   const state = useMissions.getState();
   for (const mission of Object.values(state.projection.missions)) {
@@ -771,19 +1209,98 @@ async function enforceRunningStops(): Promise<void> {
         stop = true;
       }
     }
-    if (stop) for (const attempt of running) if (attempt.sessionId) interrupt(attempt.sessionId);
+    if (stop) for (const attempt of running) {
+      // Do not tear services away from a turn that has not acknowledged the
+      // interrupt yet. Terminal settlement/recovery owns cleanup.
+      if (attempt.sessionId) interrupt(attempt.sessionId);
+    }
+  }
+}
+
+function candidateStartCommand(
+  scope: ApprovedMissionScope,
+  task: MissionTask,
+  batchId: string,
+  candidateIndex: number,
+): StartAttemptCommand {
+  const ordinal = task.attemptIds.length + 1;
+  const stem = `${scope.missionId}:${task.id}:${batchId}:${candidateIndex}:r${scope.approvalRevision}`;
+  const operationId = `candidate-start:${safeId(stem, "op")}`;
+  return {
+    kind: "start_fresh_attempt",
+    operationId,
+    missionId: scope.missionId,
+    taskId: task.id,
+    attemptId: safeId(`${operationId}:attempt`, "ma"),
+    ordinal,
+    envelopeId: `mission-envelope:${scope.missionId}:r${scope.approvalRevision}`,
+    envelopeRevision: scope.approvalRevision,
+    rootPath: task.root.path,
+    lockKeys: [],
+    worker: {
+      lifecycle: "temporary_one_assignment",
+      assignmentTaskId: task.id,
+      resumeExistingSession: false,
+      durableMemory: false,
+      persona: false,
+      workspaceOnly: true,
+      closeAfterTerminalReport: true,
+      label: `Task ${task.id} · candidate ${candidateIndex}`,
+    },
+  };
+}
+
+/** Admit explicitly human-approved A/B(/N) lanes without pretending they are
+ * independent tasks. Each lane still passes the same revisioned envelope and
+ * gets its own worktree/session/turn. */
+async function admitCandidateStarts(scopes: readonly ApprovedMissionScope[]): Promise<void> {
+  const scopeByMission = new Map(scopes.map((scope) => [scope.missionId, scope]));
+  const batches = Object.values(useMissions.getState().projection.candidateBatches)
+    .filter((batch) => !batch.selectedAttemptId && batch.attemptIds.length < batch.count)
+    .sort((left, right) => left.requestedAt - right.requestedAt || left.id.localeCompare(right.id));
+  for (const candidate of batches) {
+    const scope = scopeByMission.get(candidate.missionId);
+    if (!scope || autonomyTripped(scope.mission.projectId)) continue;
+    const envelope = envelopeFromApprovedScope(scope);
+    if (!envelope) continue;
+    while (true) {
+      const projection = useMissions.getState().projection;
+      const batch = projection.candidateBatches[candidate.id];
+      const task = projection.tasks[candidate.taskId];
+      if (!batch || !task || batch.selectedAttemptId || batch.attemptIds.length >= batch.count ||
+        !taskIsInsideApprovedScope(scope, task) || !taskHasSafeMissionPlacement(task)) break;
+      const globalActive = Object.values(projection.attempts).filter((attempt) => attempt.status === "running").length;
+      const usage = missionUsage(scope, Date.now());
+      if (globalActive >= 8 || useVibe.getState().order.length >= 48 ||
+        usage.activeAttempts >= Math.min(8, scope.mission.policy.maxParallelAttempts)) break;
+      const verdict = authorizeEnvelopeStart(envelope, usage, {
+        missionId: scope.missionId,
+        envelopeRevision: envelope.revision,
+        rootPath: task.root.path,
+        requiredTools: ["workspace_sandbox"],
+        isFirstTaskStart: task.attemptIds.length === 0,
+        now: Date.now(),
+        breakerOpen: false,
+      });
+      if (!verdict.ok) break;
+      const command = candidateStartCommand(scope, task, batch.id, batch.attemptIds.length + 1);
+      await enqueueStart(scope, task, command, batch.id, batch.instruction);
+    }
   }
 }
 
 async function admitStarts(): Promise<void> {
-  const missionState = useMissions.getState();
   const scopes = approvedScopes();
   if (!scopes.length) return;
+  await admitCandidateStarts(scopes);
+  const missionState = useMissions.getState();
   const scopeByMission = new Map(scopes.map((scope) => [scope.missionId, scope]));
   const candidates: SchedulableTask[] = [];
   for (const task of Object.values(missionState.projection.tasks)) {
     const scope = scopeByMission.get(task.missionId);
-    if (!scope || !taskIsInsideApprovedScope(scope, task) || !taskHasSafeMissionPlacement(task)) continue;
+    const openCandidateBatch = Object.values(missionState.projection.candidateBatches)
+      .some((batch) => batch.taskId === task.id && !batch.selectedAttemptId);
+    if (openCandidateBatch || !scope || !taskIsInsideApprovedScope(scope, task) || !taskHasSafeMissionPlacement(task)) continue;
     const ordinal = task.attemptIds.length + 1;
     let placement: ReturnType<typeof branchPlacement>;
     try {
@@ -878,6 +1395,7 @@ async function controllerTick(): Promise<void> {
   if (tickRunning || !missionPersistenceReady()) return;
   tickRunning = true;
   try {
+    await pauseMissionsWithRuntimeDrift();
     await enforceRunningStops();
     await recoverOutboxAndAttempts();
     for (const attempt of Object.values(useMissions.getState().projection.attempts)) {
@@ -901,6 +1419,7 @@ export function startMissionController(): () => void {
   const missionUnsub = useMissions.subscribe(wake);
   const outboxUnsub = useMissionOutbox.subscribe(wake);
   const vibeUnsub = useVibe.subscribe(wake);
+  const runtimeUnsub = useRuntimeEnvironments.subscribe(wake);
   const timer = setInterval(wake, TICK_MS);
   wake();
   const stop = () => {
@@ -910,6 +1429,7 @@ export function startMissionController(): () => void {
     missionUnsub();
     outboxUnsub();
     vibeUnsub();
+    runtimeUnsub();
     stopActiveController = null;
   };
   stopActiveController = stop;

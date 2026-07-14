@@ -44,6 +44,13 @@ export type AttemptStatus =
 export type MissionPriority = number;
 export type MissionRisk = "low" | "medium" | "high" | "critical";
 
+export interface MissionRuntimeBinding {
+  /** Project-scoped Runtime Environment id selected by the human. */
+  environmentId: string;
+  /** Stable digest of the complete reference-only Runtime spec at approval. */
+  specFingerprint: string;
+}
+
 export interface MissionPolicy {
   /** Hard scheduler admission limit for this mission. */
   maxParallelAttempts: number;
@@ -58,6 +65,8 @@ export interface MissionPolicy {
   qualityCommands?: string[];
   stopOnRegression?: "continue" | "pause_mission" | "needs_human" | "cancel_mission";
   stopOnConflict?: "continue" | "pause_mission" | "needs_human" | "cancel_mission";
+  /** Null means this mission intentionally runs without a prepared runtime. */
+  runtimeEnvironment?: MissionRuntimeBinding | null;
 }
 
 export interface MissionBudget {
@@ -135,6 +144,9 @@ export interface MissionTask {
   /** Human-provided context consumed by the next fresh retry attempt. */
   resumeInstruction?: string | null;
   requeuedAfterAttemptId?: string | null;
+  selectedCandidateAttemptId?: string | null;
+  /** Human-approved exception for analysis/documentation tasks that may prove no code change is needed. */
+  allowNoop?: boolean;
 }
 
 export interface TaskAttempt {
@@ -152,6 +164,39 @@ export interface TaskAttempt {
   error: string | null;
   report: Record<string, unknown> | null;
   artifactIds: string[];
+  /** Present only for human-approved A/B(/N) comparison runs. */
+  candidateBatchId?: string | null;
+}
+
+export interface CandidateBatch {
+  id: string;
+  missionId: string;
+  taskId: string;
+  count: number;
+  instruction: string;
+  minimumEvidenceCount: number;
+  minimumScoreMargin: number;
+  attemptIds: string[];
+  selectedAttemptId: string | null;
+  requestedAt: number;
+  selectedAt: number | null;
+}
+
+export interface MissionSchedule {
+  id: string;
+  missionId: string;
+  projectId: string;
+  note: string;
+  at: number;
+  createdAt: number;
+  cancelledAt: number | null;
+  /** Durable at-most-once claim; a claimed reminder is never fired again. */
+  claimedAt: number | null;
+  firedAt: number | null;
+  /** Failed native delivery is retryable and remains visible; a claimed-only record is uncertain. */
+  deliveryAttempts?: number;
+  lastDeliveryError?: string | null;
+  nextAttemptAt?: number | null;
 }
 
 export type ArtifactKind =
@@ -235,6 +280,8 @@ export interface MissionProjection {
   artifacts: Record<string, MissionArtifact>;
   qualityGates: Record<string, QualityGate>;
   integrationTrains: Record<string, IntegrationTrain>;
+  candidateBatches: Record<string, CandidateBatch>;
+  schedules: Record<string, MissionSchedule>;
   /** Event id -> stable fingerprint; used for exact idempotency checks. */
   appliedEventIds: Record<string, string>;
   /** Optional command idempotency key -> event fingerprint. */
@@ -262,6 +309,7 @@ export type MissionTaskInput = Omit<
   | "pausedAt"
   | "resumeInstruction"
   | "requeuedAfterAttemptId"
+  | "selectedCandidateAttemptId"
 > & { createdAt: number };
 
 export type MissionEventPayload =
@@ -292,6 +340,7 @@ export type MissionEventPayload =
             | "declaredFiles"
             | "declaredGlobs"
             | "maxAttempts"
+            | "allowNoop"
           >
         >;
       };
@@ -313,6 +362,7 @@ export type MissionEventPayload =
       data: {
         id: string;
         taskId: string;
+        candidateBatchId?: string | null;
         sessionId?: string | null;
         workerLabel?: string | null;
         startedAt: number;
@@ -353,7 +403,27 @@ export type MissionEventPayload =
         entries?: IntegrationTrainEntry[];
         updatedAt: number;
       };
-    };
+    }
+  | {
+      type: "candidate_batch.requested";
+      data: Omit<CandidateBatch, "attemptIds" | "selectedAttemptId" | "selectedAt">;
+    }
+  | {
+      type: "candidate_batch.selected";
+      data: { batchId: string; attemptId: string; selectedAt: number };
+    }
+  | {
+      type: "candidate_batch.overridden";
+      data: { batchId: string; attemptId: string; reason: string; selectedAt: number };
+    }
+  | { type: "schedule.created"; data: MissionSchedule }
+  | { type: "schedule.cancelled"; data: { scheduleId: string; cancelledAt: number } }
+  | { type: "schedule.claimed"; data: { scheduleId: string; claimedAt: number } }
+  | {
+      type: "schedule.delivery_failed";
+      data: { scheduleId: string; failedAt: number; error: string; nextAttemptAt: number };
+    }
+  | { type: "schedule.fired"; data: { scheduleId: string; firedAt: number } };
 
 export type MissionEventType = MissionEventPayload["type"];
 

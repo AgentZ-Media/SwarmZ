@@ -1,3 +1,5 @@
+import type { CandidateBatch, MissionArtifact, MissionProjection, TaskAttempt } from "./types";
+
 export const MAX_CANDIDATE_ATTEMPTS = 8;
 export const MAX_EVIDENCE_PER_CANDIDATE = 64;
 
@@ -51,6 +53,94 @@ export class CandidateSelectionError extends Error {
     super(message);
     this.name = "CandidateSelectionError";
   }
+}
+
+function artifactEvidence(artifact: MissionArtifact): CandidateEvidence | null {
+  // Candidate ranking consumes controller-observed evidence only. Agent
+  // reports and arbitrary artifact labels are presentation data, not authority.
+  if (artifact.metadata.authority !== "swarmz_native") return null;
+  const evidenceKind = typeof artifact.metadata.evidenceKind === "string"
+    ? artifact.metadata.evidenceKind
+    : null;
+  const weights: Partial<Record<MissionArtifact["kind"], number>> = {
+    commit: 50,
+    test_result: 45,
+    report: 25,
+    diff: 20,
+    pull_request: 15,
+  };
+  const weight = evidenceKind === "review" ? 40 : weights[artifact.kind];
+  if (!weight) return null;
+  const rawStatus = typeof artifact.metadata.status === "string"
+    ? artifact.metadata.status.toLowerCase()
+    : null;
+  const exitCode = typeof artifact.metadata.exitCode === "number"
+    ? artifact.metadata.exitCode
+    : typeof artifact.metadata.exit_code === "number" ? artifact.metadata.exit_code : null;
+  const status: CandidateEvidenceStatus = artifact.kind === "commit" || artifact.kind === "diff" || artifact.kind === "pull_request"
+    ? "passed"
+    : rawStatus === "passed" || rawStatus === "success" || exitCode === 0
+      ? "passed"
+      : rawStatus === "failed" || rawStatus === "failure" || (exitCode !== null && exitCode !== 0)
+        ? "failed"
+        : "missing";
+  return {
+    id: artifact.id,
+    label: artifact.label,
+    kind: evidenceKind === "review" ? "review" : artifact.kind === "test_result" ? "test" : "custom",
+    status,
+    required: artifact.kind === "commit",
+    weight,
+    artifactId: status === "missing" ? null : artifact.id,
+  };
+}
+
+/** Convert durable attempt artifacts into the selector's untrusted input. */
+export function candidatesForBatch(
+  projection: MissionProjection,
+  batch: CandidateBatch,
+): CandidateAttempt[] {
+  return batch.attemptIds.map((attemptId) => {
+    const attempt = projection.attempts[attemptId];
+    if (!attempt || attempt.taskId !== batch.taskId) {
+      throw new CandidateSelectionError(`candidate attempt ${attemptId} is missing`);
+    }
+    const evidence = Object.values(projection.artifacts)
+      .filter((artifact) => artifact.attemptId === attempt.id && artifact.taskId === batch.taskId)
+      .map(artifactEvidence)
+      .filter((item): item is CandidateEvidence => !!item);
+    if (!evidence.some((item) => item.required)) {
+      evidence.unshift({
+        id: `missing-commit-${attempt.id}`,
+        label: "Verified attempt commit",
+        kind: "custom",
+        status: "missing",
+        required: true,
+        weight: 50,
+        artifactId: null,
+      });
+    }
+    const usage = Object.values(projection.artifacts).find((artifact) =>
+      artifact.attemptId === attempt.id && artifact.label === "mission-usage" &&
+      artifact.metadata.authority === "swarmz_native");
+    return {
+      attemptId: attempt.id,
+      taskId: batch.taskId,
+      terminalStatus: terminalCandidateStatus(attempt),
+      evidence,
+      tokensUsed: typeof usage?.metadata.tokens === "number" ? Math.max(0, Math.floor(usage.metadata.tokens)) : null,
+      durationMs: attempt.startedAt !== null && attempt.finishedAt !== null
+        ? Math.max(0, attempt.finishedAt - attempt.startedAt)
+        : null,
+    };
+  });
+}
+
+function terminalCandidateStatus(attempt: TaskAttempt): CandidateAttempt["terminalStatus"] {
+  if (attempt.status === "succeeded" || attempt.status === "failed" || attempt.status === "blocked" || attempt.status === "cancelled") {
+    return attempt.status;
+  }
+  return "blocked";
 }
 
 function validateCandidate(candidate: CandidateAttempt): void {

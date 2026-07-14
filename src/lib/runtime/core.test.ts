@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   allocateRuntimePort,
   buildRuntimeExecutionPlan,
+  runtimeSpecFingerprint,
+  sha256Hex,
   type RuntimeEnvironmentSpec,
   validateRuntimeEnvironment,
 } from "./core";
@@ -41,6 +43,20 @@ const spec: RuntimeEnvironmentSpec = {
 };
 
 describe("runtime environment contracts", () => {
+  it("uses standard SHA-256 and a key-order-independent spec fingerprint", () => {
+    expect(sha256Hex("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    const reordered = {
+      databaseNamespacePrefix: spec.databaseNamespacePrefix,
+      secrets: spec.secrets,
+      services: spec.services,
+      cleanup: spec.cleanup,
+      setup: spec.setup,
+      name: spec.name,
+      id: spec.id,
+    } as RuntimeEnvironmentSpec;
+    expect(runtimeSpecFingerprint(reordered)).toBe(runtimeSpecFingerprint(spec));
+  });
+
   it("builds deterministic isolated port and database assignments", () => {
     const first = buildRuntimeExecutionPlan(
       spec,

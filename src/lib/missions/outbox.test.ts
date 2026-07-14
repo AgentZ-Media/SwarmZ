@@ -7,6 +7,9 @@ import {
   emptyMissionOutbox,
   enqueueMissionCommand,
   failMissionCommand,
+  MAX_OUTBOX_PRUNE_BATCH,
+  OUTBOX_ADMISSION_SOFT_LIMIT,
+  pruneDeliveredCommandsForArchivedMissions,
   reapExpiredClaims,
   retryDeadLetter,
   type EnqueueMissionCommand,
@@ -168,11 +171,199 @@ describe("mission durable outbox", () => {
     expect(serializeMissionOutbox(restored)).toEqual(serializeMissionOutbox(snapshot));
   });
 
+  it("prunes only receipted delivered records owned by archived missions", () => {
+    let snapshot = emptyMissionOutbox();
+    for (let index = 1; index <= 5; index += 1) {
+      snapshot = enqueue(snapshot, {
+        ...spawn(index),
+        missionId: index === 5 ? "active-mission" : "archived-mission",
+      }, index, NOW + index);
+    }
+    for (const index of [1, 2, 5]) {
+      const claim = claimMissionCommandById(
+        snapshot,
+        `record-${index}`,
+        "worker",
+        `claim-${index}`,
+        NOW + 10,
+        5_000,
+      );
+      snapshot = deliverMissionCommand(
+        claim.snapshot,
+        `record-${index}`,
+        `claim-${index}`,
+        { accepted: true },
+        NOW + 20 + index,
+      ).snapshot;
+    }
+    const failedClaim = claimMissionCommandById(
+      snapshot,
+      "record-3",
+      "worker",
+      "claim-3",
+      NOW + 10,
+      5_000,
+    );
+    snapshot = failMissionCommand(
+      failedClaim.snapshot,
+      "record-3",
+      "claim-3",
+      "keep evidence",
+      NOW + 30,
+      false,
+    ).snapshot;
+
+    const decision = pruneDeliveredCommandsForArchivedMissions(
+      snapshot,
+      new Set(["archived-mission"]),
+      new Map(Object.entries(snapshot.records)),
+    );
+    expect(decision.removedRecordIds).toEqual(["record-1", "record-2"]);
+    expect(Object.keys(decision.snapshot.records).sort()).toEqual([
+      "record-3",
+      "record-4",
+      "record-5",
+    ]);
+    expect(decision.snapshot.records["record-3"].status).toBe("dead_letter");
+    expect(decision.snapshot.records["record-4"].status).toBe("pending");
+    expect(decision.snapshot.records["record-5"].status).toBe("delivered");
+  });
+
+  it("prunes deterministically in hard-bounded batches", () => {
+    let snapshot = emptyMissionOutbox();
+    for (let index = 1; index <= 4; index += 1) {
+      snapshot = enqueue(snapshot, spawn(index), index, NOW + index);
+      const claim = claimMissionCommandById(
+        snapshot,
+        `record-${index}`,
+        "worker",
+        `claim-${index}`,
+        NOW + 10,
+        5_000,
+      );
+      snapshot = deliverMissionCommand(
+        claim.snapshot,
+        `record-${index}`,
+        `claim-${index}`,
+        {},
+        NOW + 30 - index,
+      ).snapshot;
+    }
+    const first = pruneDeliveredCommandsForArchivedMissions(
+      snapshot,
+      new Set(["mission"]),
+      new Map(Object.entries(snapshot.records)),
+      2,
+    );
+    expect(first.removedRecordIds).toEqual(["record-4", "record-3"]);
+    expect(Object.keys(first.snapshot.records)).toHaveLength(2);
+
+    const capped = pruneDeliveredCommandsForArchivedMissions(
+      snapshot,
+      new Set(["mission"]),
+      new Map(Object.entries(snapshot.records)),
+      Number.MAX_SAFE_INTEGER,
+    );
+    expect(capped.removedRecordIds.length).toBeLessThanOrEqual(MAX_OUTBOX_PRUNE_BATCH);
+  });
+
+  it("retains delivered records whose Mission effect lacks durable projection proof", () => {
+    let snapshot = enqueue(emptyMissionOutbox(), spawn(), 1);
+    const claimed = claimMissionCommandById(
+      snapshot,
+      "record-1",
+      "worker",
+      "claim-1",
+      NOW,
+      5_000,
+    );
+    snapshot = deliverMissionCommand(
+      claimed.snapshot,
+      "record-1",
+      "claim-1",
+      { sessionId: "session-1" },
+      NOW + 1,
+    ).snapshot;
+    const decision = pruneDeliveredCommandsForArchivedMissions(
+      snapshot,
+      new Set(["mission"]),
+      new Map(),
+    );
+    expect(decision.changed).toBe(false);
+    expect(decision.snapshot.records["record-1"]).toBe(snapshot.records["record-1"]);
+  });
+
+  it("fences pruning against same-id record replacement after proof capture", () => {
+    let snapshot = enqueue(emptyMissionOutbox(), spawn(), 1);
+    const claimed = claimMissionCommandById(snapshot, "record-1", "worker", "claim-1", NOW, 5_000);
+    snapshot = deliverMissionCommand(
+      claimed.snapshot,
+      "record-1",
+      "claim-1",
+      { ok: true },
+      NOW + 1,
+    ).snapshot;
+    const proof = new Map([["record-1", snapshot.records["record-1"]]]);
+    const replacement = {
+      ...snapshot,
+      records: {
+        ...snapshot.records,
+        "record-1": { ...snapshot.records["record-1"] },
+      },
+    };
+    const decision = pruneDeliveredCommandsForArchivedMissions(
+      replacement,
+      new Set(["mission"]),
+      proof,
+    );
+    expect(decision.changed).toBe(false);
+  });
+
   it("fails closed for unknown persistence and corrupt envelopes", () => {
     expect(() => enqueueMissionCommand(emptyMissionOutbox("unknown"), spawn(), "record-1", NOW)).toThrow(/not safely hydrated/);
     expect(() => claimNextMissionCommand(emptyMissionOutbox("failed"), "worker", "claim", NOW, 1_000)).toThrow(/not safely hydrated/);
     expect(() => migrateMissionOutbox({ version: 99, records: [] })).toThrow(/unsupported/);
     expect(() => migrateMissionOutbox({ version: 1, records: [{ id: "broken" }] })).toThrow(/malformed/);
+  });
+
+  it("reserves capacity for terminal settlement under admission backpressure", () => {
+    const seed = enqueueMissionCommand(emptyMissionOutbox(), spawn(), "seed", NOW).record;
+    const records: Record<string, typeof seed> = Object.create(null);
+    for (let index = 0; index < OUTBOX_ADMISSION_SOFT_LIMIT; index += 1) {
+      const id = `capacity-${index}`;
+      records[id] = {
+        ...seed,
+        id,
+        idempotencyKey: `capacity:${index}`,
+      };
+    }
+    const saturated = { ...emptyMissionOutbox(), records };
+    expect(() => enqueueMissionCommand(
+      saturated,
+      spawn(99),
+      "new-spawn",
+      NOW,
+    )).toThrow(/backpressure.*archive completed missions/i);
+    const settlement = enqueueMissionCommand(
+      saturated,
+      {
+        missionId: "mission",
+        idempotencyKey: "settle:capacity",
+        kind: "settle",
+        payload: {
+          taskId: "task-capacity",
+          attemptId: "attempt-capacity",
+          status: "failed",
+          completionId: "completion-capacity",
+        },
+      },
+      "settle-capacity",
+      NOW,
+    );
+    expect(settlement.record.status).toBe("pending");
+    expect(Object.keys(settlement.snapshot.records)).toHaveLength(
+      OUTBOX_ADMISSION_SOFT_LIMIT + 1,
+    );
   });
 
   it("rejects unknown runtime command kinds and environment-copy spawns", () => {

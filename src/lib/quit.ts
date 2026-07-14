@@ -23,9 +23,21 @@ async function ghWritesInFlight(): Promise<number> {
   }
 }
 
+async function runtimeOperationsInFlight(): Promise<number> {
+  try {
+    return (await invoke<number>("runtime_operations_in_flight")) || 0;
+  } catch {
+    return -1;
+  }
+}
+
 /** Gather everything that would be interrupted by quitting right now. */
 async function gatherBlockers(): Promise<QuitBlockers> {
   const timers = useConductorTimers.getState().timers;
+  const [ghWrites, runtimeOps] = await Promise.all([
+    ghWritesInFlight(),
+    runtimeOperationsInFlight(),
+  ]);
   return {
     sessionIds: vibeBusyIds(),
     conductorProjects: busyConductorProjectNames(),
@@ -33,9 +45,10 @@ async function gatherBlockers(): Promise<QuitBlockers> {
     // mid-fire (durable claim stamped, delivery not finished): quitting now
     // would drop the timer on the next hydrate — a HARD blocker
     claimedTimers: timers.filter((t) => t.firedAt !== undefined).length,
-    ghWrites: await ghWritesInFlight(),
+    ghWrites,
     reviews: inflightCount("review"),
     worktreeOps: inflightCount("worktree"),
+    runtimeOps,
   };
 }
 

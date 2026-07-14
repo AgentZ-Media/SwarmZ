@@ -135,6 +135,11 @@ fn runtime_command_cancel(run_id: String) -> bool {
 }
 
 #[tauri::command]
+fn runtime_operations_in_flight() -> usize {
+    runtime_native::operations_in_flight()
+}
+
+#[tauri::command]
 async fn runtime_service_start(
     app: AppHandle,
     request: runtime_native::RuntimeServiceStartRequest,
@@ -150,10 +155,11 @@ async fn runtime_service_stop(
     app: AppHandle,
     instance_id: String,
     service_id: String,
+    project_root: String,
 ) -> Result<bool, String> {
     let leases = runtime_lease_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        runtime_native::service_stop(&leases, &instance_id, &service_id)
+        runtime_native::service_stop(&leases, &instance_id, &service_id, &project_root)
     })
     .await
     .map_err(|error| format!("runtime service stop worker failed: {error}"))?
@@ -166,7 +172,7 @@ async fn runtime_service_list(
     let leases = runtime_lease_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || runtime_native::service_list(&leases))
         .await
-        .map_err(|error| format!("runtime service list worker failed: {error}"))
+        .map_err(|error| format!("runtime service list worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -176,7 +182,7 @@ async fn runtime_service_reconcile(
     let leases = runtime_lease_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || runtime_native::service_reconcile(&leases))
         .await
-        .map_err(|error| format!("runtime reconcile worker failed: {error}"))
+        .map_err(|error| format!("runtime reconcile worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -186,7 +192,7 @@ async fn runtime_service_stop_all(
     let leases = runtime_lease_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || runtime_native::service_stop_all(&leases))
         .await
-        .map_err(|error| format!("runtime stop-all worker failed: {error}"))
+        .map_err(|error| format!("runtime stop-all worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -194,11 +200,12 @@ async fn worktree_add(
     cwd: String,
     branch: String,
     copy_env: bool,
+    base_sha: Option<String>,
     bin: Option<String>,
 ) -> Result<worktree::WorktreeInfo, String> {
     // git subprocesses + file copies — keep them off the async runtime's core threads
     tauri::async_runtime::spawn_blocking(move || {
-        worktree::add(&cwd, &branch, copy_env, bin.as_deref())
+        worktree::add(&cwd, &branch, copy_env, base_sha.as_deref(), bin.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -973,6 +980,7 @@ pub fn run() {
             acceptance_command_cancel,
             runtime_command_run,
             runtime_command_cancel,
+            runtime_operations_in_flight,
             runtime_service_start,
             runtime_service_stop,
             runtime_service_list,

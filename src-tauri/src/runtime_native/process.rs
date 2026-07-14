@@ -41,6 +41,21 @@ pub(super) fn cancel_all_commands() {
     }
 }
 
+pub(super) fn wait_for_all_commands(timeout: Duration) -> Vec<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let active: Vec<_> = ACTIVE_COMMANDS.lock().keys().cloned().collect();
+        if active.is_empty() || Instant::now() >= deadline {
+            return active;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+pub(super) fn active_command_count() -> usize {
+    ACTIVE_COMMANDS.lock().len()
+}
+
 pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -349,24 +364,148 @@ pub(super) struct PreparedCommand {
     pub(super) cwd_handle: std::fs::File,
 }
 
+#[cfg(target_os = "macos")]
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// Fixed, application-owned SBPL. The only substituted value is the
+/// separately supplied, canonical `SWARMZ_ROOT` parameter; no environment
+/// value, secret, command argument or project text is interpolated here.
+///
+/// `system.sb` supplies the minimum platform/dyld plumbing required to start
+/// normal macOS executables. The rules below add read/write access to the
+/// attempt worktree and read/exec access to immutable platform/toolchain
+/// locations. Network remains denied unless the service-only profile adds
+/// loopback. In particular, the user's home, Keychain, Unix sockets and
+/// non-loopback IP traffic are not reachable by the child.
+#[cfg(target_os = "macos")]
+const SANDBOX_PROFILE_BASE: &str = r#"
+(version 1)
+(import "system.sb")
+(deny default)
+(allow process-fork)
+(allow process-exec*
+  (subpath (param "SWARMZ_ROOT"))
+  (subpath "/System")
+  (subpath "/usr")
+  (subpath "/bin")
+  (subpath "/sbin")
+  (subpath "/opt/homebrew")
+  (subpath "/Library/Apple")
+  (subpath "/Library/Developer/CommandLineTools")
+  (subpath "/Applications/Xcode.app"))
+(allow file-read* file-test-existence file-map-executable
+  (subpath (param "SWARMZ_ROOT"))
+  (subpath "/usr/bin")
+  (subpath "/bin")
+  (subpath "/usr/sbin")
+  (subpath "/sbin")
+  (subpath "/opt/homebrew")
+  (subpath "/Library/Developer/CommandLineTools")
+  (subpath "/Applications/Xcode.app")
+  (literal "/private/var/select/developer_dir"))
+(allow file-read-metadata file-test-existence
+  (path-ancestors "/Library/Developer/CommandLineTools")
+  (path-ancestors "/Applications/Xcode.app"))
+(allow file-write* (subpath (param "SWARMZ_ROOT")))
+"#;
+
+#[cfg(target_os = "macos")]
+const SANDBOX_PROFILE_LOOPBACK: &str = r#"
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+"#;
+
+#[cfg(target_os = "macos")]
+fn sandbox_profile(allow_loopback: bool) -> String {
+    let mut profile = String::from(SANDBOX_PROFILE_BASE);
+    if allow_loopback {
+        profile.push_str(SANDBOX_PROFILE_LOOPBACK);
+    }
+    profile
+}
+
+#[cfg(target_os = "macos")]
+fn verify_sandbox_exec() -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(SANDBOX_EXEC)
+        .map_err(|_| "refused: the macOS process sandbox is unavailable".to_string())?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err("refused: the macOS process sandbox is not a trusted system binary".into());
+    }
+    Ok(())
+}
+
+fn runtime_private_dirs(root: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let state = root.join(".swarmz").join("runtime-process");
+    let home = state.join("home");
+    let tmp = state.join("tmp");
+    fs::create_dir_all(&home)
+        .and_then(|_| fs::create_dir_all(&tmp))
+        .map_err(|error| format!("could not create confined runtime state: {error}"))?;
+    let home = fs::canonicalize(home)
+        .map_err(|_| "refused: runtime HOME could not be confined".to_string())?;
+    let tmp = fs::canonicalize(tmp)
+        .map_err(|_| "refused: runtime TMPDIR could not be confined".to_string())?;
+    if !home.starts_with(root) || !tmp.starts_with(root) {
+        return Err("refused: runtime state escapes the worktree".into());
+    }
+    Ok((home, tmp))
+}
+
 pub(super) fn prepare_command(
+    root: &Path,
     cwd: &Path,
     argv: &[String],
     env: &BTreeMap<String, String>,
+    allow_loopback: bool,
 ) -> Result<PreparedCommand, String> {
     validate_argv(argv)?;
-    let mut command = Command::new(&argv[0]);
+    let (runtime_home, runtime_tmp) = runtime_private_dirs(root)?;
+    #[cfg(target_os = "macos")]
+    verify_sandbox_exec()?;
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new(SANDBOX_EXEC);
+        command
+            .arg("-D")
+            .arg(format!("SWARMZ_ROOT={}", root.to_string_lossy()))
+            .arg("-p")
+            .arg(sandbox_profile(allow_loopback))
+            .arg("--")
+            .args(argv);
+        command
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut command = {
+        let _ = (allow_loopback, argv, env, runtime_home, runtime_tmp);
+        return Err(
+            "refused: Runtime Environments require the native macOS process sandbox".into(),
+        );
+    };
+
     command
-        .args(&argv[1..])
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CODEX_HOME"] {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
+    command
+        .env(
+            "PATH",
+            format!(
+                "{}/node_modules/.bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                root.to_string_lossy()
+            ),
+        )
+        .env("HOME", &runtime_home)
+        .env("TMPDIR", &runtime_tmp)
+        .env("LANG", "C.UTF-8")
+        .env("LC_ALL", "C");
     command.envs(env);
     #[cfg(unix)]
     {
@@ -394,8 +533,25 @@ pub(super) fn prepare_command(
     }
 }
 
+pub(crate) fn spawn_sandboxed_process(
+    root: &Path,
+    cwd: &Path,
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    allow_loopback: bool,
+) -> Result<std::process::Child, String> {
+    let mut prepared = prepare_command(root, cwd, argv, env, allow_loopback)?;
+    let child = prepared
+        .command
+        .spawn()
+        .map_err(|error| format!("could not start sandboxed process: {error}"))?;
+    #[cfg(unix)]
+    drop(prepared.cwd_handle);
+    Ok(child)
+}
+
 pub fn command_run(request: RuntimeCommandRequest) -> Result<RuntimeCommandResult, String> {
-    let (_root, cwd) = confined_cwd(&request.project_root, &request.cwd_relative)?;
+    let (root, cwd) = confined_cwd(&request.project_root, &request.cwd_relative)?;
     if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&request.timeout_ms)
         || !(MIN_OUTPUT_BYTES..=MAX_OUTPUT_BYTES).contains(&request.max_output_bytes)
     {
@@ -403,14 +559,10 @@ pub fn command_run(request: RuntimeCommandRequest) -> Result<RuntimeCommandResul
     }
     let (env, secrets) = resolved_env(&request.env, &request.secret_bindings)?;
     let (cancel, _active_guard) = register_command(&request.run_id)?;
-    let mut prepared = prepare_command(&cwd, &request.argv, &env)?;
+    // One-shot setup/cleanup commands have no network authority. Only owned
+    // background services receive the explicit loopback-only exception.
+    let mut child = spawn_sandboxed_process(&root, &cwd, &request.argv, &env, false)?;
     let started = Instant::now();
-    let mut child = prepared
-        .command
-        .spawn()
-        .map_err(|error| format!("could not start runtime command: {error}"))?;
-    #[cfg(unix)]
-    drop(prepared.cwd_handle);
     let stdout = drain_bounded(child.stdout.take(), request.max_output_bytes);
     let stderr = drain_bounded(child.stderr.take(), request.max_output_bytes);
     let deadline = started + Duration::from_millis(request.timeout_ms);

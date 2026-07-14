@@ -32,6 +32,8 @@ import {
 } from "./lib/vibe/controller";
 import { ensureNotifyPermission, notify } from "./lib/transport";
 import { startMissionController } from "./lib/missions/controller";
+import { startMissionSchedules } from "./lib/missions/schedules";
+import { startMissionOutboxCompaction } from "./lib/missions/outbox-compaction";
 import { useProjects } from "./lib/projects/store";
 import { startIntegrationController } from "./lib/integration/controller";
 
@@ -126,6 +128,8 @@ export default function App() {
     // Durable Mission scheduler: remains fail-closed until missions, outbox
     // and session stores hydrate; owns only temporary one-assignment workers.
     const stopMissions = startMissionController();
+    const stopMissionSchedules = startMissionSchedules();
+    const stopMissionOutboxCompaction = startMissionOutboxCompaction();
     // Integration trains consume only independently verified attempt commits
     // and execute combined regression behind the durable outbox boundary.
     const stopIntegration = startIntegrationController();
@@ -137,6 +141,8 @@ export default function App() {
       stopVibePings();
       stopGithub();
       stopMissions();
+      stopMissionSchedules();
+      stopMissionOutboxCompaction();
       stopIntegration();
     };
   }, [hydrate]);

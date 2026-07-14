@@ -90,10 +90,76 @@ fn host_secret_is_late_bound_and_redacted() {
     fs::remove_dir_all(root).ok();
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_denies_host_files_outside_writes_and_external_network() {
+    let root = temp_dir();
+    let outside = temp_dir().join("host-secret.txt");
+    fs::write(&outside, "must-not-be-readable").unwrap();
+
+    let read = command_run(command(&root, vec!["/bin/cat", outside.to_str().unwrap()])).unwrap();
+    assert_ne!(read.exit_code, Some(0));
+    assert!(!read.stdout.contains("must-not-be-readable"));
+
+    let write_target = outside.with_file_name("sandbox-escape.txt");
+    let write = command_run(command(
+        &root,
+        vec!["/usr/bin/touch", write_target.to_str().unwrap()],
+    ))
+    .unwrap();
+    assert_ne!(write.exit_code, Some(0));
+    assert!(!write_target.exists());
+
+    let network = command_run(command(
+        &root,
+        vec!["/usr/bin/nc", "-w", "1", "1.1.1.1", "80"],
+    ))
+    .unwrap();
+    assert_ne!(network.exit_code, Some(0));
+
+    fs::remove_dir_all(root).ok();
+    fs::remove_dir_all(outside.parent().unwrap()).ok();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_uses_confined_ambient_env_and_never_puts_secret_in_profile_or_argv() {
+    let root = temp_dir();
+    let (_, cwd) = confined_cwd(root.to_str().unwrap(), ".").unwrap();
+    let secret = "never-in-sandbox-profile-or-arguments";
+    let env = BTreeMap::from([("TARGET_SECRET".to_string(), secret.to_string())]);
+    let argv = vec!["/usr/bin/printenv".to_string(), "HOME".to_string()];
+    let prepared = prepare_command(&root, &cwd, &argv, &env, false).unwrap();
+    let rendered_args = prepared
+        .command
+        .get_args()
+        .map(|value| value.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered_args.contains(secret));
+    assert!(rendered_args.contains("(deny default)"));
+    assert!(!rendered_args.contains("network-outbound"));
+    let inherited = prepared
+        .command
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        *inherited.get(std::ffi::OsStr::new("HOME")).unwrap(),
+        root.join(".swarmz/runtime-process/home").as_os_str()
+    );
+    assert!(!inherited.contains_key(std::ffi::OsStr::new("CODEX_HOME")));
+    fs::remove_dir_all(root).ok();
+}
+
 fn service_request(root: &Path, instance: &str) -> RuntimeServiceStartRequest {
     RuntimeServiceStartRequest {
         instance_id: instance.into(),
         service_id: "api".into(),
+        owner_project_id: "project".into(),
+        owner_mission_id: "mission".into(),
+        owner_attempt_id: instance.into(),
+        main_root: root.to_string_lossy().into_owned(),
         project_root: root.to_string_lossy().into_owned(),
         cwd_relative: ".".into(),
         argv: vec!["/bin/sleep".into(), "10".into()],
@@ -116,11 +182,11 @@ fn service_ports_are_deterministic_and_lifecycle_is_owned() {
     let first = service_start(&leases, service_request(&root, "attempt_one")).unwrap();
     assert_eq!(first.state, RuntimeServiceState::Running);
     let port = first.ports["API_PORT"];
-    assert!(service_stop(&leases, "attempt_one", "api").unwrap());
+    assert!(service_stop(&leases, "attempt_one", "api", root.to_str().unwrap()).unwrap());
     let second = service_start(&leases, service_request(&root, "attempt_one")).unwrap();
     assert_eq!(second.ports["API_PORT"], port);
-    assert!(service_stop(&leases, "attempt_one", "api").unwrap());
-    assert!(service_list(&leases).is_empty());
+    assert!(service_stop(&leases, "attempt_one", "api", root.to_str().unwrap()).unwrap());
+    assert!(service_list(&leases).unwrap().is_empty());
     fs::remove_dir_all(root).ok();
     fs::remove_dir_all(leases).ok();
 }
@@ -130,9 +196,13 @@ fn reconcile_drops_stale_leases_without_killing_unknown_pids() {
     let leases = temp_dir();
     let lease = ServiceLease {
         version: 1,
-        key: "old:api".into(),
+        key: service_key("old", "api"),
         instance_id: "old".into(),
         service_id: "api".into(),
+        owner_project_id: "project".into(),
+        owner_mission_id: "mission".into(),
+        owner_attempt_id: "old".into(),
+        main_root: "/tmp".into(),
         project_root: "/tmp".into(),
         pid: u32::MAX,
         process_identity: Some("never".into()),
@@ -140,9 +210,9 @@ fn reconcile_drops_stale_leases_without_killing_unknown_pids() {
         started_at: 0,
     };
     write_lease(&leases, &lease).unwrap();
-    let result = service_reconcile(&leases);
-    assert_eq!(result.stale, vec!["old:api"]);
-    assert!(read_leases(&leases).is_empty());
+    let result = service_reconcile(&leases).unwrap();
+    assert_eq!(result.stale, vec![service_key("old", "api")]);
+    assert!(read_leases(&leases).unwrap().is_empty());
     fs::remove_dir_all(leases).ok();
 }
 
@@ -168,7 +238,7 @@ fn healthcheck_is_local_owned_and_waits_for_readiness() {
     request.healthcheck_url = Some("http://127.0.0.1:${API_PORT}/".into());
     let service = service_start(&leases, request).unwrap();
     assert_eq!(service.state, RuntimeServiceState::Running);
-    assert!(service_stop(&leases, "attempt_health", "api").unwrap());
+    assert!(service_stop(&leases, "attempt_health", "api", root.to_str().unwrap()).unwrap());
     fs::remove_dir_all(root).ok();
     fs::remove_dir_all(leases).ok();
 }
@@ -180,7 +250,7 @@ fn reconcile_kills_only_identity_verified_orphan_group() {
     let service = service_start(&leases, service_request(&root, "attempt_orphan")).unwrap();
     let key = service_key(&service.instance_id, &service.service_id);
     ACTIVE_SERVICES.lock().remove(&key);
-    let result = service_reconcile(&leases);
+    let result = service_reconcile(&leases).unwrap();
     assert_eq!(result.cleaned, vec![key]);
     assert!(result.unresolved.is_empty());
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -192,5 +262,31 @@ fn reconcile_kills_only_identity_verified_orphan_group() {
         std::thread::sleep(Duration::from_millis(20));
     }
     fs::remove_dir_all(root).ok();
+    fs::remove_dir_all(leases).ok();
+}
+
+#[test]
+fn orphan_lease_cannot_be_overwritten_and_stop_is_root_scoped() {
+    let root = temp_dir();
+    let foreign = temp_dir();
+    let leases = temp_dir();
+    let service = service_start(&leases, service_request(&root, "attempt_owned")).unwrap();
+    let key = service_key(&service.instance_id, &service.service_id);
+    assert!(
+        service_stop(&leases, "attempt_owned", "api", foreign.to_str().unwrap())
+            .unwrap_err()
+            .contains("another worktree")
+    );
+    ACTIVE_SERVICES.lock().remove(&key);
+    assert!(
+        service_start(&leases, service_request(&root, "attempt_owned"))
+            .unwrap_err()
+            .contains("existing durable lease")
+    );
+    let result = service_reconcile(&leases).unwrap();
+    assert!(result.cleaned.contains(&key));
+    assert!(result.unresolved.is_empty());
+    fs::remove_dir_all(root).ok();
+    fs::remove_dir_all(foreign).ok();
     fs::remove_dir_all(leases).ok();
 }
