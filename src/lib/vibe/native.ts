@@ -104,6 +104,10 @@ export function closeNativeSession(sessionId: string): Promise<void> {
   return invoke("vibe_session_close", { sessionId });
 }
 
+export function nativeLiveBackendCount(): Promise<number> {
+  return invoke("vibe_session_live_backend_count");
+}
+
 export function steerNativeTurn(
   sessionId: string,
   text: string,

@@ -2,7 +2,7 @@ import { retryAfterFailure, schedule } from "@/lib/scheduler/core";
 import type { ActiveLease, SchedulableTask } from "@/lib/scheduler/types";
 import { autonomyTripped } from "@/lib/orchestrator/autonomy";
 import { interrupt } from "@/lib/vibe/controller";
-import { useVibe } from "@/lib/vibe/session-store";
+import { nativeLiveBackendCount } from "@/lib/vibe/native";
 import { useMissions } from "./store";
 import { useMissionOutbox } from "./outbox-store";
 import { planMissionStarts, type StartAttemptCommand } from "./runner-core";
@@ -86,6 +86,12 @@ export async function enforceRunningStops(): Promise<void> {
       // interrupt yet. Terminal settlement/recovery owns cleanup.
       if (attempt.sessionId) interrupt(attempt.sessionId);
     }
+    for (const attempt of running) {
+      const task = state.projection.tasks[attempt.taskId];
+      if (!stop && task?.pausedAt !== null && attempt.sessionId) {
+        interrupt(attempt.sessionId);
+      }
+    }
   }
 }
 
@@ -126,6 +132,7 @@ function candidateStartCommand(
  * independent tasks. Each lane still passes the same revisioned envelope and
  * gets its own worktree/session/turn. */
 async function admitCandidateStarts(scopes: readonly ApprovedMissionScope[]): Promise<void> {
+  let backendActiveCount = await nativeLiveBackendCount();
   const scopeByMission = new Map(scopes.map((scope) => [scope.missionId, scope]));
   const batches = Object.values(useMissions.getState().projection.candidateBatches)
     .filter((batch) => !batch.selectedAttemptId && batch.attemptIds.length < batch.count)
@@ -143,7 +150,7 @@ async function admitCandidateStarts(scopes: readonly ApprovedMissionScope[]): Pr
         !taskIsInsideApprovedScope(scope, task) || !taskHasSafeMissionPlacement(task)) break;
       const globalActive = Object.values(projection.attempts).filter((attempt) => attempt.status === "running").length;
       const usage = missionUsage(scope, Date.now());
-      if (globalActive >= 8 || useVibe.getState().order.length >= 48 ||
+      if (globalActive >= 8 || backendActiveCount >= 48 ||
         usage.activeAttempts >= Math.min(8, scope.mission.policy.maxParallelAttempts)) break;
       const verdict = authorizeEnvelopeStart(envelope, usage, {
         missionId: scope.missionId,
@@ -157,6 +164,7 @@ async function admitCandidateStarts(scopes: readonly ApprovedMissionScope[]): Pr
       if (!verdict.ok) break;
       const command = candidateStartCommand(scope, task, batch.id, batch.attemptIds.length + 1);
       await enqueueStart(scope, task, command, batch.id, batch.instruction);
+      backendActiveCount += 1;
     }
   }
 }
@@ -165,6 +173,7 @@ export async function admitStarts(): Promise<void> {
   const scopes = approvedScopes();
   if (!scopes.length) return;
   await admitCandidateStarts(scopes);
+  const backendActiveCount = await nativeLiveBackendCount();
   const missionState = useMissions.getState();
   const scopeByMission = new Map(scopes.map((scope) => [scope.missionId, scope]));
   const candidates: SchedulableTask[] = [];
@@ -206,12 +215,11 @@ export async function admitStarts(): Promise<void> {
   const recentFailureRatio = recentTerminal.length === 0
     ? 0
     : recentTerminal.filter((attempt) => attempt.status === "failed").length / recentTerminal.length;
-  const vibe = useVibe.getState();
   const decision = schedule({
     tasks: candidates,
     attempts: Object.values(missionState.projection.attempts),
     activeLeases: leases,
-    backendActiveCount: vibe.order.length,
+    backendActiveCount,
     now: Date.now(),
     limits: {
       globalConcurrency: 8,

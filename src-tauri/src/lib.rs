@@ -853,6 +853,13 @@ async fn vibe_session_close(session_id: String) -> Result<(), String> {
     codex::sessions::session_close(&session_id).await
 }
 
+/// Real native process occupancy for scheduler admission. Persisted session
+/// rows and dead/reaped process slots do not consume this hard cap.
+#[tauri::command]
+async fn vibe_session_live_backend_count() -> usize {
+    codex::sessions::live_backend_count().await
+}
+
 /// Steer the session's RUNNING turn (turn/steer, race-safe via
 /// expectedTurnId). Errors when no turn runs — callers send normally then.
 /// `require_workspace: true` is the STRICT Conductor path (final hardening
@@ -1029,6 +1036,7 @@ pub fn run() {
             vibe_session_set_access,
             vibe_session_set_model_effort,
             vibe_session_close,
+            vibe_session_live_backend_count,
             vibe_session_steer,
             vibe_session_set_cwd,
             vibe_session_review,

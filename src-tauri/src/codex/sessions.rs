@@ -185,6 +185,25 @@ static SESSIONS: Lazy<Mutex<HashMap<String, SessionState>>> = Lazy::new(Mutex::d
 
 static APPROVAL_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Number of process slots that are alive right now. Registry entries and
+/// persisted thread history are deliberately not capacity: a closed/crashed
+/// host becomes free immediately and will be counted again only after a lazy
+/// resume actually spawns it.
+pub async fn live_backend_count() -> usize {
+    let hosts: Vec<Arc<ProcessHost>> = SESSIONS
+        .lock()
+        .values()
+        .map(|state| state.host.clone())
+        .collect();
+    let mut live = 0usize;
+    for host in hosts {
+        if host.alive().await.is_some() {
+            live = live.saturating_add(1);
+        }
+    }
+    live
+}
+
 fn emit_session_event(app: &AppHandle, session_id: &str, kind: &str, data: Value) {
     let _ = app.emit(
         "vibe://session-event",

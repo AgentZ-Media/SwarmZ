@@ -9,6 +9,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@/store", () => ({ useSwarm: { getState } }));
 
 import {
+  nativeLiveBackendCount,
   resumeNativeSession,
   reviewNativeSession,
   sendNativeTurn,
@@ -88,5 +89,11 @@ describe("native vibe session boundary", () => {
       target: "branch:main",
       requireWorkspace: true,
     });
+  });
+
+  it("reads native process occupancy without session-history arguments", async () => {
+    invoke.mockResolvedValue(7);
+    await expect(nativeLiveBackendCount()).resolves.toBe(7);
+    expect(invoke).toHaveBeenCalledWith("vibe_session_live_backend_count");
   });
 });
