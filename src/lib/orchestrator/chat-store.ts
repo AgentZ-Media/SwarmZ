@@ -151,6 +151,8 @@ export interface OrchestratorState {
   setChatTitle: (chatId: string, title: string) => void;
   /** append a message (stamps id + timestamp, enforces the message cap) */
   appendMessage: (chatId: string, msg: NewOrchestratorMessage) => string;
+  /** rollback a visible message whose backend turn definitively never began */
+  removeMessage: (chatId: string, messageId: string) => void;
   patchMessage: (
     chatId: string,
     messageId: string,
@@ -167,6 +169,11 @@ export interface OrchestratorState {
   ) => void;
   /** mark the chat's undelivered pings delivered and return them (in order) */
   takePendingPings: (chatId: string) => OrchestratorPingRecord[];
+  /** put an undelivered batch back after a definitive pre-start failure */
+  restorePendingPings: (
+    chatId: string,
+    pings: OrchestratorPingRecord[],
+  ) => void;
 }
 
 /**
@@ -347,6 +354,25 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
     return id;
   },
 
+  removeMessage: (chatId, messageId) => {
+    const s = get();
+    const chat = s.chats.find((c) => c.id === chatId);
+    if (!chat?.messages.some((message) => message.id === messageId)) return;
+    set({
+      chats: s.chats.map((candidate) =>
+        candidate.id === chatId
+          ? {
+              ...candidate,
+              messages: candidate.messages.filter(
+                (message) => message.id !== messageId,
+              ),
+            }
+          : candidate,
+      ),
+    });
+    schedulePersist();
+  },
+
   patchMessage: (chatId, messageId, patch) => {
     const s = get();
     const chat = s.chats.find((c) => c.id === chatId);
@@ -426,6 +452,31 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
     });
     schedulePersist();
     return undelivered;
+  },
+
+  restorePendingPings: (chatId, pings) => {
+    if (pings.length === 0) return;
+    const keys = new Set(
+      pings.map((ping) => `${ping.paneId}|${ping.activity}|${ping.at}`),
+    );
+    const s = get();
+    const chat = s.chats.find((candidate) => candidate.id === chatId);
+    if (!chat) return;
+    set({
+      chats: s.chats.map((candidate) =>
+        candidate.id === chatId
+          ? {
+              ...candidate,
+              pendingPings: candidate.pendingPings.map((ping) =>
+                keys.has(`${ping.paneId}|${ping.activity}|${ping.at}`)
+                  ? { ...ping, delivered: false }
+                  : ping,
+              ),
+            }
+          : candidate,
+      ),
+    });
+    schedulePersist();
   },
 }));
 

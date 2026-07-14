@@ -1012,35 +1012,65 @@ function errorText(err: unknown): string {
  * stay — the fleet line is the current snapshot, the status block is what
  * happened since the last turn.
  */
+const humanDeliveryClaims = new Set<string>();
+
 export async function sendMessage(chatId: string, text: string): Promise<void> {
   const trimmed = text.trim();
   if (!trimmed) return;
   const store = useOrchestrator.getState();
   const chat = store.chats.find((c) => c.id === chatId);
-  if (!chat || store.busy[chatId]) return;
-  ensureEvents();
-  // auto-title once, from the first user message
-  if (!chat.messages.some((m) => m.role === "user")) {
-    const firstLine = trimmed.split("\n")[0];
-    store.setChatTitle(
-      chatId,
-      firstLine.length > TITLE_MAX_CHARS
-        ? `${firstLine.slice(0, TITLE_MAX_CHARS).trimEnd()}…`
-        : firstLine,
-    );
+  if (!chat) throw new Error("The Orchestrator chat no longer exists.");
+  // Claim synchronously, before the first append/await. Two same-tick sends
+  // can no longer both pass the busy check and create a phantom user bubble.
+  if (store.busy[chatId] || humanDeliveryClaims.has(chatId)) {
+    throw new Error("The Orchestrator is busy — one turn at a time.");
   }
-  store.appendMessage(chatId, { role: "user", text: trimmed });
-  // a human message resets the project's autonomy budget (consecutive cap +
-  // a latched circuit breaker) — the human is back in the loop
-  const projectId = chatProjectId(chatId);
-  if (projectId) noteHumanTurn(projectId);
-  const result = await dispatchTurn(chatId, trimmed);
-  if (result !== "completed") {
-    throw new Error(
-      result === "never-started"
-        ? "The Orchestrator turn could not start. Your draft was kept."
-        : "The Orchestrator turn failed. Your draft was kept.",
-    );
+  humanDeliveryClaims.add(chatId);
+  ensureEvents();
+  const firstUserMessage = !chat.messages.some((m) => m.role === "user");
+  const userMessageId = store.appendMessage(chatId, {
+    role: "user",
+    text: trimmed,
+  });
+  let turnStarted = false;
+  try {
+    // A human intent re-arms only this project's known breaker. A globally
+    // unreadable budget remains fail-closed until verified rehydration.
+    const projectId = chatProjectId(chatId);
+    if (projectId) noteHumanTurn(projectId);
+    const result = await dispatchTurn(chatId, trimmed);
+    turnStarted = result !== "never-started";
+    if (result === "never-started") {
+      useOrchestrator.getState().removeMessage(chatId, userMessageId);
+    } else if (firstUserMessage) {
+      const firstLine = trimmed.split("\n")[0];
+      useOrchestrator.getState().setChatTitle(
+        chatId,
+        firstLine.length > TITLE_MAX_CHARS
+          ? `${firstLine.slice(0, TITLE_MAX_CHARS).trimEnd()}…`
+          : firstLine,
+      );
+    }
+    if (result !== "completed") {
+      throw new Error(
+        result === "never-started"
+          ? "The Orchestrator turn could not start. Your draft was kept."
+          : "The Orchestrator turn failed. Your draft was kept.",
+      );
+    }
+  } catch (error) {
+    // Pre-dispatch failures outside dispatchTurn's guarded section (for
+    // example compaction setup) are also definitive non-deliveries.
+    const current = useOrchestrator.getState();
+    const stillVisible = current.chats
+      .find((candidate) => candidate.id === chatId)
+      ?.messages.some((message) => message.id === userMessageId);
+    if (stillVisible && !turnStarted && !current.busy[chatId]) {
+      current.removeMessage(chatId, userMessageId);
+    }
+    throw error;
+  } finally {
+    humanDeliveryClaims.delete(chatId);
   }
 }
 
@@ -1095,6 +1125,9 @@ async function dispatchTurn(
         role: "warning",
         text: `Send failed: ${errorText(err)}`,
       });
+    }
+    if (!st.turnStarted && !st.turnFailed) {
+      useOrchestrator.getState().restorePendingPings(chatId, pings);
     }
     // turn_started/turn_failed seen = real work ran before the failure
     return st.turnStarted || st.turnFailed ? "failed" : "never-started";

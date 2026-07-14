@@ -56,10 +56,8 @@ const budgets = new Map<string, ProjectBudget>();
  * Fail-closed latch for a persisted-budget LOAD FAILURE. When the
  * `autonomyBudgets` store key is unreadable (corrupt/IO error — as opposed to
  * genuinely absent) we cannot know whether a breaker was tripped, so autonomy
- * is paused GLOBALLY until a human takes the wheel. Only a real human message
- * (`noteHumanTurn`) clears it — the same authority that re-arms a per-project
- * breaker. A relaunch on a corrupt store therefore never runs an unattended
- * autonomous turn against un-known budget state.
+ * is paused GLOBALLY until a verified rehydrate/restart. A message in one
+ * project cannot prove the unknown budgets of every other project safe.
  */
 let budgetsUnavailable = false;
 
@@ -239,23 +237,13 @@ export function releaseAutonomousTurn(projectId: string, at: number): void {
  * is about volume, not lineage).
  */
 export function noteHumanTurn(projectId: string): void {
-  // a human is back in the loop — clear the global fail-closed latch too (a
-  // load-failure pause is lifted the moment a human takes the wheel)
-  let announce = false;
-  if (budgetsUnavailable) {
-    budgetsUnavailable = false;
-    announce = true;
-  }
   const b = budgets.get(projectId);
-  if (!b) {
-    if (announce) notifyAutonomyChange();
-    return;
-  }
+  if (!b) return;
   const wasTripped = b.tripped;
   const changed = wasTripped || b.consecutive !== 0;
   b.consecutive = 0;
   b.tripped = false;
-  if (wasTripped || announce) notifyAutonomyChange();
+  if (wasTripped) notifyAutonomyChange();
   if (changed) markDirty();
 }
 
