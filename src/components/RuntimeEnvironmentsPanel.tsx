@@ -45,6 +45,11 @@ const inputClass =
   "focus-ring h-8 w-full rounded-md border border-line bg-card px-2.5 font-mono text-11 text-txt placeholder:text-fnt focus:border-acc/55";
 const textareaClass =
   "focus-ring min-h-20 w-full resize-y rounded-md border border-line bg-card px-2.5 py-2 font-mono text-11 leading-relaxed text-txt placeholder:text-fnt focus:border-acc/55";
+// Zustand's React 19 subscription bridge requires a referentially stable
+// snapshot when a project has no saved environments. Returning a fresh `[]`
+// from the selector makes `useSyncExternalStore` treat every read as a state
+// change and can tear down the whole React tree as soon as this drawer mounts.
+const EMPTY_RUNTIME_SPECS: RuntimeEnvironmentSpec[] = [];
 
 function cloneSpec(spec: RuntimeEnvironmentSpec): RuntimeEnvironmentSpec {
   return JSON.parse(JSON.stringify(spec)) as RuntimeEnvironmentSpec;
@@ -81,7 +86,7 @@ export function RuntimeEnvironmentsPanel({
   const hydrated = useRuntimeEnvironments((state) => state.hydrated);
   const hydrateError = useRuntimeEnvironments((state) => state.hydrateError);
   const specs = useRuntimeEnvironments((state) =>
-    projectId ? (state.byProject[projectId] ?? []) : [],
+    projectId ? (state.byProject[projectId] ?? EMPTY_RUNTIME_SPECS) : EMPTY_RUNTIME_SPECS,
   );
   const selectedId = useRuntimeEnvironments((state) =>
     projectId ? (state.selectedByProject[projectId] ?? null) : null,
