@@ -1436,7 +1436,7 @@ function alignStageToProject(projectId: string | null): void {
   const v = useVibe.getState();
   if (projectId === null) {
     v.setActive(null);
-    useVibeUi.getState().setStageMode("conductor");
+    useVibeUi.getState().setStageMode("workspace");
     return;
   }
   const activeBelongs =
@@ -1449,7 +1449,7 @@ function alignStageToProject(projectId: string | null): void {
       : v.order.find((id) => v.sessions[id]?.session.projectId === projectId);
   v.setActive(target ?? null);
   if (!target && useVibeUi.getState().stageMode === "session")
-    useVibeUi.getState().setStageMode("conductor");
+    useVibeUi.getState().setStageMode("workspace");
 }
 
 /**

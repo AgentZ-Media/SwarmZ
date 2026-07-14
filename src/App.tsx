@@ -26,11 +26,9 @@ import {
 } from "./lib/orchestrator/timers";
 import { registerAutonomousRunner } from "./lib/orchestrator/triggers";
 import { startGithubController } from "./lib/github/controller";
-import { vibeTriageEntries } from "./lib/vibe/triage";
 import {
   activateProjectByIndex,
   closeSession,
-  focusSession,
 } from "./lib/vibe/controller";
 import { ensureNotifyPermission, notify } from "./lib/transport";
 
@@ -219,6 +217,10 @@ export default function App() {
         // new native Codex agent
         e.preventDefault();
         useVibeUi.getState().setNewSessionOpen(true);
+      } else if (k === "m" && e.shiftKey) {
+        // mission intake is intentionally distinct from the low-level worker
+        e.preventDefault();
+        useVibeUi.getState().setMissionCreateOpen(true);
       } else if (k === "b") {
         // ⌘B — toggle the Conductor sidebar
         e.preventDefault();
@@ -228,10 +230,9 @@ export default function App() {
         e.preventDefault();
         useVibeUi.getState().showConductor();
       } else if (k === "a" && e.shiftKey) {
-        // jump to the oldest session waiting on the human
+        // unified queue: mission blockers and live worker approvals
         e.preventDefault();
-        const entries = vibeTriageEntries(useVibe.getState());
-        if (entries.length) focusSession(entries[0].id);
+        useVibeUi.getState().setAttentionOpen(true);
       } else if (k === "n") {
         // quick notes drawer (closing while open is handled in the dialog branch)
         e.preventDefault();

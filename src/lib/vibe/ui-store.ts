@@ -5,14 +5,14 @@
 
 import { create } from "zustand";
 
-/**
- * What the right-hand stage shows: the FLEET GRID ("conductor" — the
- * Orchestrator-first home view; the Conductor lives in the persistent left
- * sidebar) or one focused native session. The historical value "conductor"
- * is kept because controller logic (focusSession / alignStageToProject)
- * routes on it: "conductor" = no session focused.
- */
-export type VibeStageMode = "conductor" | "session";
+/** What the right-hand stage shows: Mission Control or one focused worker. */
+export type VibeStageMode = "workspace" | "session";
+export type WorkspaceView =
+  | "board"
+  | "graph"
+  | "fleet"
+  | "integration"
+  | "timeline";
 
 /** Fleet-grid filter chips (the reference's All/working/needs/finished/idle). */
 export type FleetFilter = "all" | "working" | "needs" | "finished" | "idle";
@@ -25,6 +25,9 @@ interface VibeUiState {
   /** the New-Session dialog is open */
   newSessionOpen: boolean;
   setNewSessionOpen: (open: boolean) => void;
+  /** mission intake / policy dialog */
+  missionCreateOpen: boolean;
+  setMissionCreateOpen: (open: boolean) => void;
   /** session id awaiting a busy-close confirmation (null = no dialog) */
   closeConfirmId: string | null;
   setCloseConfirmId: (id: string | null) => void;
@@ -37,6 +40,14 @@ interface VibeUiState {
   /** fleet grid vs. one focused session (see VibeStageMode) */
   stageMode: VibeStageMode;
   setStageMode: (mode: VibeStageMode) => void;
+  workspaceView: WorkspaceView;
+  setWorkspaceView: (view: WorkspaceView) => void;
+  selectedMissionId: string | null;
+  setSelectedMissionId: (id: string | null) => void;
+  selectedMissionTaskId: string | null;
+  setSelectedMissionTaskId: (id: string | null) => void;
+  attentionOpen: boolean;
+  setAttentionOpen: (open: boolean) => void;
   /** "show me the Conductor" (⌘⇧O, Deck dot, title bar, palette): land on
    * the fleet AND make sure the sidebar is visible */
   showConductor: () => void;
@@ -60,16 +71,30 @@ interface VibeUiState {
 export const useVibeUi = create<VibeUiState>((set) => ({
   newSessionOpen: false,
   setNewSessionOpen: (open) => set({ newSessionOpen: open }),
+  missionCreateOpen: false,
+  setMissionCreateOpen: (open) => set({ missionCreateOpen: open }),
   closeConfirmId: null,
   setCloseConfirmId: (id) => set({ closeConfirmId: id }),
   closeProjectConfirm: null,
   setCloseProjectConfirm: (confirm) => set({ closeProjectConfirm: confirm }),
-  stageMode: "conductor",
+  stageMode: "workspace",
   setStageMode: (mode) =>
-    set(mode === "conductor" ? { stageMode: mode, wide: false } : { stageMode: mode }),
+    set(mode === "workspace" ? { stageMode: mode, wide: false } : { stageMode: mode }),
+  workspaceView: "board",
+  setWorkspaceView: (workspaceView) =>
+    set({ workspaceView, stageMode: "workspace", wide: false }),
+  selectedMissionId: null,
+  setSelectedMissionId: (selectedMissionId) =>
+    set({ selectedMissionId, selectedMissionTaskId: null }),
+  selectedMissionTaskId: null,
+  setSelectedMissionTaskId: (selectedMissionTaskId) =>
+    set({ selectedMissionTaskId }),
+  attentionOpen: false,
+  setAttentionOpen: (attentionOpen) => set({ attentionOpen }),
   showConductor: () =>
-    set({ stageMode: "conductor", conductorOpen: true, wide: false }),
-  backToFleet: () => set({ stageMode: "conductor", wide: false }),
+    set({ stageMode: "workspace", conductorOpen: true, wide: false }),
+  backToFleet: () =>
+    set({ stageMode: "workspace", workspaceView: "fleet", wide: false }),
   conductorOpen: true,
   setConductorOpen: (open) => set({ conductorOpen: open }),
   toggleConductor: () => set((s) => ({ conductorOpen: !s.conductorOpen })),

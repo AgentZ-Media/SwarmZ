@@ -9,6 +9,7 @@ import {
   Search,
   Settings,
   StickyNote,
+  Workflow,
   X,
 } from "lucide-react";
 import { useSwarm } from "@/store";
@@ -18,7 +19,6 @@ import { hasHumanAttention } from "@/lib/vibe/attention";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import {
   activateProject,
-  focusSession,
   requestCloseProject,
 } from "@/lib/vibe/controller";
 import { vibeTriageEntries } from "@/lib/vibe/triage";
@@ -36,6 +36,7 @@ import {
 } from "./ui/dropdown-menu";
 import { cn, shortPath } from "@/lib/utils";
 import { IS_TAURI, pickDirectory } from "@/lib/transport";
+import { useMissions } from "@/lib/missions/store";
 import type { ProjectEntry } from "@/lib/orchestrator/types";
 
 /** Shared 32px icon-button treatment for the title-bar actions. */
@@ -134,12 +135,12 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
           </button>
         </Tip>
 
-        <Tip label="New worker (⌘T)">
+        <Tip label="New mission">
           <button
-            onClick={() => useVibeUi.getState().setNewSessionOpen(true)}
+            onClick={() => useVibeUi.getState().setMissionCreateOpen(true)}
             className="no-drag focus-ring ml-1 flex h-8 items-center gap-1.5 rounded-md bg-acc px-3 text-12 font-semibold text-white hover:brightness-110"
           >
-            <Plus size={13} strokeWidth={2.8} /> New worker
+            <Workflow size={13} strokeWidth={2.5} /> New mission
           </button>
         </Tip>
       </div>
@@ -171,16 +172,21 @@ function GitHubButton() {
 function NeedsYouPill() {
   // primitive count — vibeTriageEntries builds fresh arrays, so only its
   // length may leave the selector (AGENTS.md)
-  const count = useVibe((s) => vibeTriageEntries(s).length);
+  const workerCount = useVibe((s) => vibeTriageEntries(s).length);
+  const missionCount = useMissions((state) =>
+    Object.values(state.projection.tasks).filter((task) =>
+      ["needs_human", "blocked", "failed"].includes(task.status),
+    ).length,
+  );
+  const count = workerCount + missionCount;
   if (count === 0) return null;
   const jump = () => {
-    const entries = vibeTriageEntries(useVibe.getState());
-    if (entries.length) focusSession(entries[0].id);
+    useVibeUi.getState().setAttentionOpen(true);
   };
   return (
     <button
       onClick={jump}
-      title="Jump to the next worker that needs you (⌘⇧A)"
+      title="Open the attention inbox (⌘⇧A)"
       className="no-drag focus-ring mr-1 flex h-8 items-center gap-1.5 rounded-md border border-attn/30 bg-attn/10 px-3 font-mono text-12 font-semibold text-attn hover:bg-attn/15"
     >
       <span aria-hidden className="animate-zattn">

@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { useVibe } from "@/lib/vibe/session-store";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { ConductorSidebar } from "./ConductorSidebar";
-import { FleetGrid } from "./FleetGrid";
+import { MissionWorkspace } from "@/components/missions/MissionWorkspace";
 import { PersistenceHealthBanner } from "@/components/PersistenceHealthBanner";
 import {
   CloseProjectConfirm,
@@ -15,6 +15,11 @@ const FocusStage = lazy(() =>
 const NewVibeSessionDialog = lazy(() =>
   import("./NewVibeSessionDialog").then((module) => ({
     default: module.NewVibeSessionDialog,
+  })),
+);
+const MissionCreateDialog = lazy(() =>
+  import("@/components/missions/MissionCreateDialog").then((module) => ({
+    default: module.MissionCreateDialog,
   })),
 );
 
@@ -31,6 +36,7 @@ export function VibeLayer() {
   const focused = useVibeUi((s) => s.stageMode === "session");
   const hasActive = useVibe((s) => !!(s.activeId && s.sessions[s.activeId]));
   const newSessionOpen = useVibeUi((state) => state.newSessionOpen);
+  const missionCreateOpen = useVibeUi((state) => state.missionCreateOpen);
   const [newSessionRequested, setNewSessionRequested] = useState(newSessionOpen);
   useEffect(() => {
     if (newSessionOpen) setNewSessionRequested(true);
@@ -54,7 +60,7 @@ export function VibeLayer() {
             <FocusStage />
           </Suspense>
         ) : (
-          <FleetGrid />
+          <MissionWorkspace />
         )}
       </div>
       {(newSessionRequested || newSessionOpen) && (
@@ -62,8 +68,24 @@ export function VibeLayer() {
           <NewVibeSessionDialog />
         </Suspense>
       )}
+      {missionCreateOpen && (
+        <Suspense fallback={<MissionLoading />}>
+          <MissionCreateDialog />
+        </Suspense>
+      )}
       <CloseSessionConfirm />
       <CloseProjectConfirm />
+    </div>
+  );
+}
+
+function MissionLoading() {
+  return (
+    <div role="dialog" aria-modal="true" aria-label="Opening mission intake" className="fixed inset-0 z-[70] flex bg-black/45">
+      <div role="status" aria-live="polite" className="m-auto flex h-24 w-[min(88vw,30rem)] items-center justify-center rounded-xl border border-line bg-panel shadow-2xl">
+        <span aria-hidden className="mr-2 h-2 w-2 animate-pulse rounded-full bg-acc" />
+        <span className="font-mono text-12 text-mut">Opening mission intake…</span>
+      </div>
     </div>
   );
 }
