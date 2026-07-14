@@ -127,7 +127,21 @@ fn validate_env(env: &BTreeMap<String, String>) -> Result<(), String> {
             || upper.starts_with("SSH_")
             || matches!(
                 upper.as_str(),
-                "BASH_ENV" | "ENV" | "NODE_OPTIONS" | "PYTHONPATH" | "RUSTC_WRAPPER"
+                "BASH_ENV"
+                    | "ENV"
+                    | "NODE_OPTIONS"
+                    | "PYTHONPATH"
+                    | "RUSTC_WRAPPER"
+                    | "PATH"
+                    | "HOME"
+                    | "TMPDIR"
+                    | "CODEX_HOME"
+                    | "CARGO_HOME"
+                    | "RUSTUP_HOME"
+                    | "RUSTUP_TOOLCHAIN"
+                    | "COREPACK_HOME"
+                    | "PNPM_HOME"
+                    | "NODE_PATH"
             )
         {
             return Err("refused: dangerous runtime environment variable".into());
@@ -366,10 +380,12 @@ pub(super) struct PreparedCommand {
 
 #[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+#[cfg(target_os = "macos")]
+const MAX_SANDBOX_READ_ROOTS: usize = 16;
 
-/// Fixed, application-owned SBPL. The only substituted value is the
-/// separately supplied, canonical `SWARMZ_ROOT` parameter; no environment
-/// value, secret, command argument or project text is interpolated here.
+/// Fixed, application-owned SBPL. Canonical paths are supplied through a
+/// fixed set of `sandbox-exec -D` parameters; no environment value, secret,
+/// command argument or project text is interpolated into SBPL source.
 ///
 /// `system.sb` supplies the minimum platform/dyld plumbing required to start
 /// normal macOS executables. The rules below add read/write access to the
@@ -399,13 +415,17 @@ const SANDBOX_PROFILE_BASE: &str = r#"
   (subpath "/bin")
   (subpath "/usr/sbin")
   (subpath "/sbin")
+  (subpath "/private/etc/ssl")
   (subpath "/opt/homebrew")
   (subpath "/Library/Developer/CommandLineTools")
   (subpath "/Applications/Xcode.app")
   (literal "/private/var/select/developer_dir"))
 (allow file-read-metadata file-test-existence
+  (path-ancestors (param "SWARMZ_ROOT"))
   (path-ancestors "/Library/Developer/CommandLineTools")
   (path-ancestors "/Applications/Xcode.app"))
+(allow file-read* file-test-existence file-map-executable
+  (literal "/private/var/select/sh"))
 (allow file-write* (subpath (param "SWARMZ_ROOT")))
 "#;
 
@@ -418,10 +438,178 @@ const SANDBOX_PROFILE_LOOPBACK: &str = r#"
 #[cfg(target_os = "macos")]
 fn sandbox_profile(allow_loopback: bool) -> String {
     let mut profile = String::from(SANDBOX_PROFILE_BASE);
+    // The clauses are generated exclusively from this fixed numeric range.
+    // User/project text is supplied only as sandbox-exec `-D` values and is
+    // never interpolated into SBPL source.
+    for index in 0..MAX_SANDBOX_READ_ROOTS {
+        profile.push_str(&format!(
+            "\n(allow file-read* file-test-existence file-map-executable (subpath (param \"SWARMZ_READ_{index}\")))\n"
+        ));
+        profile.push_str(&format!(
+            "\n(allow file-read-metadata file-test-existence (path-ancestors (param \"SWARMZ_READ_{index}\")))\n"
+        ));
+        profile.push_str(&format!(
+            "\n(allow process-exec* (subpath (param \"SWARMZ_EXEC_{index}\")))\n"
+        ));
+    }
     if allow_loopback {
         profile.push_str(SANDBOX_PROFILE_LOOPBACK);
     }
     profile
+}
+
+#[derive(Default)]
+struct SandboxCapabilities {
+    read_roots: Vec<PathBuf>,
+    exec_roots: Vec<PathBuf>,
+    path_dirs: Vec<PathBuf>,
+    internal_env: BTreeMap<String, String>,
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_dir(path: PathBuf, owner_uid: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let canonical = fs::canonicalize(path).ok()?;
+    let metadata = fs::metadata(&canonical).ok()?;
+    (metadata.is_dir() && metadata.uid() == owner_uid && metadata.mode() & 0o022 == 0)
+        .then_some(canonical)
+}
+
+#[cfg(target_os = "macos")]
+fn active_rust_toolchain(home: &Path, owner_uid: u32) -> Option<PathBuf> {
+    let rustup = home.join(".rustup");
+    let settings = fs::read_to_string(rustup.join("settings.toml")).ok()?;
+    if settings.len() > 32 * 1024 {
+        return None;
+    }
+    let name = settings.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("default_toolchain")?.trim();
+        let value = value.strip_prefix('=')?.trim();
+        value.strip_prefix('"')?.strip_suffix('"')
+    })?;
+    if name.is_empty()
+        || name.len() > 120
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    let toolchains = fs::canonicalize(rustup.join("toolchains")).ok()?;
+    let selected = trusted_dir(toolchains.join(name), owner_uid)?;
+    selected.starts_with(&toolchains).then_some(selected)
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_capabilities(main_root: &Path) -> Result<SandboxCapabilities, String> {
+    let main_root = fs::canonicalize(main_root)
+        .map_err(|_| "refused: sandbox main root does not exist".to_string())?;
+    if !main_root.is_dir() {
+        return Err("refused: sandbox main root is not a directory".into());
+    }
+    let mut capabilities = SandboxCapabilities::default();
+
+    let dependency = main_root.join("node_modules");
+    if dependency.exists() {
+        let metadata = fs::symlink_metadata(&dependency)
+            .map_err(|_| "refused: main dependency root could not be inspected".to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("refused: main node_modules must be a real directory".into());
+        }
+        let canonical = fs::canonicalize(&dependency)
+            .map_err(|_| "refused: main dependency root could not be canonicalized".to_string())?;
+        if canonical.parent() != Some(main_root.as_path())
+            || canonical.file_name().and_then(|value| value.to_str()) != Some("node_modules")
+        {
+            return Err("refused: dependency root escapes the canonical main project".into());
+        }
+        capabilities.path_dirs.push(canonical.join(".bin"));
+        capabilities
+            .internal_env
+            .insert("NODE_PATH".into(), canonical.to_string_lossy().into_owned());
+        capabilities.exec_roots.push(canonical.clone());
+        capabilities.read_roots.push(canonical);
+    }
+
+    let root_uid = 0;
+    for path in [
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/local/lib/node_modules/corepack"),
+    ] {
+        if let Some(path) = trusted_dir(path, root_uid) {
+            if path.ends_with("bin") {
+                capabilities.path_dirs.push(path.clone());
+            }
+            capabilities.exec_roots.push(path.clone());
+            capabilities.read_roots.push(path);
+        }
+    }
+
+    let owner_uid = unsafe { libc::geteuid() };
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let home = fs::canonicalize(home).map_err(|_| {
+            "refused: host home could not be canonicalized for tool discovery".to_string()
+        })?;
+        let local_bin = trusted_dir(home.join(".local/bin"), owner_uid);
+        if let Some(path) = local_bin {
+            capabilities.path_dirs.push(path.clone());
+            capabilities.exec_roots.push(path.clone());
+            capabilities.read_roots.push(path);
+        }
+        if let Some(path) = trusted_dir(home.join(".cache/node/corepack"), owner_uid) {
+            capabilities
+                .internal_env
+                .insert("COREPACK_HOME".into(), path.to_string_lossy().into_owned());
+            capabilities.read_roots.push(path);
+        }
+        if let Some(path) = trusted_dir(home.join(".cargo/registry"), owner_uid) {
+            capabilities.read_roots.push(path);
+        }
+        if let Some(path) = trusted_dir(home.join(".cargo/git"), owner_uid) {
+            capabilities.read_roots.push(path);
+        }
+        if let Some(toolchain) = active_rust_toolchain(&home, owner_uid) {
+            capabilities.path_dirs.push(toolchain.join("bin"));
+            capabilities.exec_roots.push(toolchain.clone());
+            capabilities.read_roots.push(toolchain);
+        }
+        // CARGO_HOME is useful for registry lookup, but the sandbox grants no
+        // read access to credentials/config files in that directory.
+        capabilities.internal_env.insert(
+            "CARGO_HOME".into(),
+            home.join(".cargo").to_string_lossy().into_owned(),
+        );
+    }
+    capabilities
+        .internal_env
+        .insert("CARGO_NET_OFFLINE".into(), "true".into());
+    capabilities
+        .internal_env
+        .insert("COREPACK_ENABLE_DOWNLOAD_PROMPT".into(), "0".into());
+    capabilities
+        .internal_env
+        .insert("COREPACK_ENABLE_NETWORK".into(), "0".into());
+
+    let mut read_seen = HashSet::new();
+    capabilities
+        .read_roots
+        .retain(|path| read_seen.insert(path.clone()));
+    let mut exec_seen = HashSet::new();
+    capabilities
+        .exec_roots
+        .retain(|path| exec_seen.insert(path.clone()));
+    capabilities.path_dirs.retain(|path| path.is_dir());
+    let mut path_seen = HashSet::new();
+    capabilities
+        .path_dirs
+        .retain(|path| path_seen.insert(path.clone()));
+    if capabilities.read_roots.len() > MAX_SANDBOX_READ_ROOTS
+        || capabilities.exec_roots.len() > MAX_SANDBOX_READ_ROOTS
+    {
+        return Err("refused: sandbox read capability cap is exceeded".into());
+    }
+    Ok(capabilities)
 }
 
 #[cfg(target_os = "macos")]
@@ -460,21 +648,49 @@ fn runtime_private_dirs(root: &Path) -> Result<(PathBuf, PathBuf), String> {
 pub(super) fn prepare_command(
     root: &Path,
     cwd: &Path,
+    main_root: &Path,
     argv: &[String],
     env: &BTreeMap<String, String>,
     allow_loopback: bool,
 ) -> Result<PreparedCommand, String> {
     validate_argv(argv)?;
+    validate_env(env)?;
     let (runtime_home, runtime_tmp) = runtime_private_dirs(root)?;
     #[cfg(target_os = "macos")]
     verify_sandbox_exec()?;
+    #[cfg(target_os = "macos")]
+    let capabilities = sandbox_capabilities(main_root)?;
 
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new(SANDBOX_EXEC);
         command
             .arg("-D")
-            .arg(format!("SWARMZ_ROOT={}", root.to_string_lossy()))
+            .arg(format!("SWARMZ_ROOT={}", root.to_string_lossy()));
+        for index in 0..MAX_SANDBOX_READ_ROOTS {
+            let read_path: &Path = capabilities
+                .read_roots
+                .get(index)
+                .map(PathBuf::as_path)
+                .unwrap_or(root);
+            let exec_path: &Path = capabilities
+                .exec_roots
+                .get(index)
+                .map(PathBuf::as_path)
+                .unwrap_or(root);
+            command
+                .arg("-D")
+                .arg(format!(
+                    "SWARMZ_READ_{index}={}",
+                    read_path.to_string_lossy()
+                ))
+                .arg("-D")
+                .arg(format!(
+                    "SWARMZ_EXEC_{index}={}",
+                    exec_path.to_string_lossy()
+                ));
+        }
+        command
             .arg("-p")
             .arg(sandbox_profile(allow_loopback))
             .arg("--")
@@ -483,7 +699,14 @@ pub(super) fn prepare_command(
     };
     #[cfg(not(target_os = "macos"))]
     let mut command = {
-        let _ = (allow_loopback, argv, env, runtime_home, runtime_tmp);
+        let _ = (
+            main_root,
+            allow_loopback,
+            argv,
+            env,
+            runtime_home,
+            runtime_tmp,
+        );
         return Err(
             "refused: Runtime Environments require the native macOS process sandbox".into(),
         );
@@ -494,19 +717,30 @@ pub(super) fn prepare_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let mut path_entries: Vec<String> = capabilities
+        .path_dirs
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    path_entries.extend(
+        [
+            "/opt/homebrew/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
     command
-        .env(
-            "PATH",
-            format!(
-                "{}/node_modules/.bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-                root.to_string_lossy()
-            ),
-        )
+        .env("PATH", path_entries.join(":"))
         .env("HOME", &runtime_home)
         .env("TMPDIR", &runtime_tmp)
         .env("LANG", "C.UTF-8")
         .env("LC_ALL", "C");
     command.envs(env);
+    command.envs(capabilities.internal_env);
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
@@ -536,11 +770,12 @@ pub(super) fn prepare_command(
 pub(crate) fn spawn_sandboxed_process(
     root: &Path,
     cwd: &Path,
+    main_root: &Path,
     argv: &[String],
     env: &BTreeMap<String, String>,
     allow_loopback: bool,
 ) -> Result<std::process::Child, String> {
-    let mut prepared = prepare_command(root, cwd, argv, env, allow_loopback)?;
+    let mut prepared = prepare_command(root, cwd, main_root, argv, env, allow_loopback)?;
     let child = prepared
         .command
         .spawn()
@@ -561,7 +796,12 @@ pub fn command_run(request: RuntimeCommandRequest) -> Result<RuntimeCommandResul
     let (cancel, _active_guard) = register_command(&request.run_id)?;
     // One-shot setup/cleanup commands have no network authority. Only owned
     // background services receive the explicit loopback-only exception.
-    let mut child = spawn_sandboxed_process(&root, &cwd, &request.argv, &env, false)?;
+    let main_root = fs::canonicalize(&request.main_root)
+        .map_err(|_| "refused: runtime main root does not exist".to_string())?;
+    if !main_root.is_dir() || (!root.starts_with(&main_root) && root != main_root) {
+        return Err("refused: runtime worktree is outside its owner main root".into());
+    }
+    let mut child = spawn_sandboxed_process(&root, &cwd, &main_root, &request.argv, &env, false)?;
     let started = Instant::now();
     let stdout = drain_bounded(child.stdout.take(), request.max_output_bytes);
     let stderr = drain_bounded(child.stderr.take(), request.max_output_bytes);

@@ -101,6 +101,7 @@ pub struct AcceptanceCommandRequest {
     pub run_id: String,
     pub approval_id: String,
     pub cwd: String,
+    pub main_root: String,
     pub approved_roots: Vec<String>,
     pub argv: Vec<String>,
     pub timeout_ms: Option<u64>,
@@ -618,14 +619,26 @@ fn validate_acceptance(
     if !cwd.is_dir() || request.approved_roots.is_empty() {
         return Err("refused: acceptance cwd is not inside an approved root".into());
     }
-    let approved_root = request
+    let cwd_is_approved = request
         .approved_roots
         .iter()
         .filter_map(|root| fs::canonicalize(root.trim()).ok())
-        .filter(|root| root.is_dir() && cwd.starts_with(root))
-        // Narrowest matching authority wins when callers supplied nested roots.
-        .max_by_key(|root| root.components().count())
-        .ok_or_else(|| "refused: acceptance cwd is not inside an approved root".to_string())?;
+        .any(|root| root.is_dir() && cwd.starts_with(root));
+    if !cwd_is_approved {
+        return Err("refused: acceptance cwd is not inside an approved root".into());
+    }
+    let main_root = fs::canonicalize(request.main_root.trim())
+        .map_err(|_| "refused: acceptance main root does not exist".to_string())?;
+    if !main_root.is_dir()
+        || !cwd.starts_with(&main_root)
+        || !request.approved_roots.iter().any(|root| {
+            fs::canonicalize(root.trim())
+                .ok()
+                .is_some_and(|root| root == main_root)
+        })
+    {
+        return Err("refused: acceptance main root is outside approved authority".into());
+    }
     let timeout_ms = request.timeout_ms.unwrap_or(ACCEPTANCE_DEFAULT_TIMEOUT_MS);
     if !(ACCEPTANCE_MIN_TIMEOUT_MS..=ACCEPTANCE_MAX_TIMEOUT_MS).contains(&timeout_ms) {
         return Err("refused: acceptance timeout must be between 100 ms and 15 minutes".into());
@@ -663,7 +676,7 @@ fn validate_acceptance(
     if env_bytes > ACCEPTANCE_MAX_ENV_BYTES {
         return Err("refused: acceptance environment exceeds 16 KiB".into());
     }
-    Ok((approved_root, cwd, timeout_ms))
+    Ok((main_root, cwd, timeout_ms))
 }
 
 #[cfg(unix)]
@@ -710,7 +723,7 @@ pub fn acceptance_command_cancel(run_id: &str) -> bool {
 pub fn acceptance_command_run(
     request: AcceptanceCommandRequest,
 ) -> Result<AcceptanceCommandResult, String> {
-    let (_approved_root, cwd, timeout_ms) = validate_acceptance(&request)?;
+    let (main_root, cwd, timeout_ms) = validate_acceptance(&request)?;
     #[cfg(unix)]
     let _cwd_handle = open_acceptance_cwd(&cwd)?;
     let run_id = checked_id(&request.run_id, "run id")?;
@@ -732,6 +745,7 @@ pub fn acceptance_command_run(
         let mut child = crate::runtime_native::spawn_sandboxed_process(
             &cwd,
             &cwd,
+            &main_root,
             &request.argv,
             &request.env,
             false,
@@ -955,6 +969,7 @@ mod tests {
             run_id: run_id.into(),
             approval_id: "approval:test".into(),
             cwd: cwd.to_string_lossy().into_owned(),
+            main_root: cwd.to_string_lossy().into_owned(),
             approved_roots: vec![cwd.to_string_lossy().into_owned()],
             argv,
             timeout_ms: Some(2_000),
@@ -999,6 +1014,7 @@ mod tests {
                 outside.to_string_lossy().into_owned(),
             ],
         );
+        request.main_root = dir.to_string_lossy().into_owned();
         request.approved_roots = vec![dir.to_string_lossy().into_owned()];
         let result = acceptance_command_run(request).unwrap();
         assert_eq!(result.status, AcceptanceCommandStatus::Completed);

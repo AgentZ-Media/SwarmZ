@@ -56,6 +56,7 @@ pub struct RuntimeSecretBinding {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeCommandRequest {
     pub run_id: String,
+    pub main_root: String,
     pub project_root: String,
     pub cwd_relative: String,
     pub argv: Vec<String>,
@@ -459,7 +460,7 @@ pub fn service_start(
     let (env, secrets) = resolved_env(&explicit, &request.secret_bindings)?;
     // Services may bind/connect only on loopback for their declared local
     // health surface. Non-loopback IPs and Unix sockets remain denied.
-    let mut child = spawn_sandboxed_process(&root, &cwd, &request.argv, &env, true)
+    let mut child = spawn_sandboxed_process(&root, &cwd, &main_root, &request.argv, &env, true)
         .map_err(|error| format!("could not start runtime service: {error}"))?;
     let pid = child.id();
     let stdout = drain_bounded(child.stdout.take(), request.max_output_bytes);

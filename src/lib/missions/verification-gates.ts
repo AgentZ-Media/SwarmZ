@@ -217,9 +217,10 @@ export async function runIndependentGates(
           runId: safeId(`${attempt.id}:${evidence.head_sha}:${command}`, "mission-gate"),
           approvalId: scope.approvalEventId,
           cwd,
+          mainRoot: task.root.path,
           // The generated worktree itself is the native sandbox authority;
           // the quality process cannot touch the mutable main checkout.
-          approvedRoots: [cwd],
+          approvedRoots: [...new Set([cwd, task.root.path])],
           argv,
           timeoutMs: 15 * 60_000,
         });

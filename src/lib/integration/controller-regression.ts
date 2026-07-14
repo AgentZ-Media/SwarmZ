@@ -77,6 +77,7 @@ export async function runRegressionPlan(
         runId: stableId("accept", plan.planId, step.stepId),
         approvalId: context.approvalId,
         cwd: context.worktreePath,
+        mainRoot: context.root,
         approvedRoots: [context.root],
         argv,
         timeoutMs: 15 * 60_000,

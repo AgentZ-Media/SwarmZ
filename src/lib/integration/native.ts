@@ -46,6 +46,7 @@ export interface AcceptanceCommandRequest {
   runId: string;
   approvalId: string;
   cwd: string;
+  mainRoot: string;
   approvedRoots: string[];
   /** Direct process argv. It is never parsed by a shell. */
   argv: string[];

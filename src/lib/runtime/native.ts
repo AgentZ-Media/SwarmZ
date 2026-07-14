@@ -3,6 +3,7 @@ import type { RuntimeSecretBinding } from "./core";
 
 export interface NativeRuntimeCommandRequest {
   runId: string;
+  mainRoot: string;
   projectRoot: string;
   cwdRelative: string;
   argv: string[];

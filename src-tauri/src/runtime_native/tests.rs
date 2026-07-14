@@ -16,6 +16,7 @@ fn temp_dir() -> PathBuf {
 fn command(root: &Path, argv: Vec<&str>) -> RuntimeCommandRequest {
     RuntimeCommandRequest {
         run_id: format!("run-{}", SEQ.fetch_add(1, AtomicOrdering::Relaxed)),
+        main_root: root.to_string_lossy().into_owned(),
         project_root: root.to_string_lossy().into_owned(),
         cwd_relative: ".".into(),
         argv: argv.into_iter().map(str::to_string).collect(),
@@ -24,6 +25,12 @@ fn command(root: &Path, argv: Vec<&str>) -> RuntimeCommandRequest {
         timeout_ms: 2_000,
         max_output_bytes: 4_096,
     }
+}
+
+fn worktree_command(main_root: &Path, worktree: &Path, argv: Vec<&str>) -> RuntimeCommandRequest {
+    let mut request = command(worktree, argv);
+    request.main_root = main_root.to_string_lossy().into_owned();
+    request
 }
 
 #[test]
@@ -123,13 +130,145 @@ fn sandbox_denies_host_files_outside_writes_and_external_network() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn sandbox_reads_main_dependencies_but_not_main_source_or_secrets() {
+    let main_root = temp_dir();
+    let worktree = main_root.join(".worktrees").join("attempt");
+    let sibling = main_root.join(".worktrees").join("sibling");
+    let module = main_root.join("node_modules/swarmz-sandbox-probe");
+    fs::create_dir_all(&worktree).unwrap();
+    fs::create_dir_all(&sibling).unwrap();
+    fs::create_dir_all(&module).unwrap();
+    fs::create_dir_all(main_root.join(".git")).unwrap();
+    fs::write(
+        module.join("index.js"),
+        "module.exports = 'dependency-ok';\n",
+    )
+    .unwrap();
+    fs::write(main_root.join("package.json"), "{\"private\":true}\n").unwrap();
+    fs::write(main_root.join(".env"), "MAIN_SECRET=must-not-leak\n").unwrap();
+    fs::write(main_root.join(".git/config"), "git-secret=must-not-leak\n").unwrap();
+    fs::write(
+        worktree.join("probe.js"),
+        "console.log(require('swarmz-sandbox-probe'));\n",
+    )
+    .unwrap();
+
+    let dependency = command_run(worktree_command(
+        &main_root,
+        &worktree,
+        vec!["node", "probe.js"],
+    ))
+    .unwrap();
+    assert_eq!(dependency.exit_code, Some(0), "{}", dependency.stderr);
+    assert_eq!(dependency.stdout, "dependency-ok");
+
+    for protected in [
+        main_root.join("package.json"),
+        main_root.join(".env"),
+        main_root.join(".git/config"),
+    ] {
+        let read = command_run(worktree_command(
+            &main_root,
+            &worktree,
+            vec!["/bin/cat", protected.to_str().unwrap()],
+        ))
+        .unwrap();
+        assert_ne!(read.exit_code, Some(0));
+        assert!(!read.stdout.contains("must-not-leak"));
+    }
+
+    let mutation = main_root.join("main-mutation.txt");
+    let write = command_run(worktree_command(
+        &main_root,
+        &worktree,
+        vec!["/usr/bin/touch", mutation.to_str().unwrap()],
+    ))
+    .unwrap();
+    assert_ne!(write.exit_code, Some(0));
+    assert!(!mutation.exists());
+    let sibling_mutation = sibling.join("sibling-mutation.txt");
+    let write = command_run(worktree_command(
+        &main_root,
+        &worktree,
+        vec!["/usr/bin/touch", sibling_mutation.to_str().unwrap()],
+    ))
+    .unwrap();
+    assert_ne!(write.exit_code, Some(0));
+    assert!(!sibling_mutation.exists());
+    fs::remove_dir_all(main_root).ok();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_runs_local_node_pnpm_and_rust_toolchains() {
+    let main_root = temp_dir();
+    let worktree = main_root.join(".worktrees").join("toolchain");
+    fs::create_dir_all(&worktree).unwrap();
+    for executable in ["node", "pnpm", "cargo", "rustc"] {
+        let result = command_run(worktree_command(
+            &main_root,
+            &worktree,
+            vec![executable, "--version"],
+        ))
+        .unwrap();
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "{executable} failed in sandbox: {}",
+            result.stderr
+        );
+        assert!(
+            !result.stdout.trim().is_empty(),
+            "{executable} had no version output"
+        );
+    }
+    fs::create_dir_all(worktree.join("src")).unwrap();
+    fs::write(
+        worktree.join("Cargo.toml"),
+        "[package]\nname = \"sandbox_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(worktree.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let mut cargo_check =
+        worktree_command(&main_root, &worktree, vec!["cargo", "check", "--offline"]);
+    cargo_check.timeout_ms = 30_000;
+    cargo_check.max_output_bytes = 16_384;
+    let result = command_run(cargo_check).unwrap();
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "cargo check failed in sandbox: {}",
+        result.stderr
+    );
+    assert!(worktree.join("target").is_dir());
+    fs::remove_dir_all(main_root).ok();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_rejects_reserved_environment_overrides_at_shared_boundary() {
+    let root = temp_dir();
+    for key in ["PATH", "HOME", "TMPDIR", "CARGO_HOME", "NODE_PATH"] {
+        let mut request = command(&root, vec!["/usr/bin/true"]);
+        request
+            .env
+            .insert(key.into(), "/tmp/host-controlled".into());
+        assert!(command_run(request)
+            .unwrap_err()
+            .contains("dangerous runtime environment"));
+    }
+    fs::remove_dir_all(root).ok();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn sandbox_uses_confined_ambient_env_and_never_puts_secret_in_profile_or_argv() {
     let root = temp_dir();
     let (_, cwd) = confined_cwd(root.to_str().unwrap(), ".").unwrap();
     let secret = "never-in-sandbox-profile-or-arguments";
     let env = BTreeMap::from([("TARGET_SECRET".to_string(), secret.to_string())]);
     let argv = vec!["/usr/bin/printenv".to_string(), "HOME".to_string()];
-    let prepared = prepare_command(&root, &cwd, &argv, &env, false).unwrap();
+    let prepared = prepare_command(&root, &cwd, &root, &argv, &env, false).unwrap();
     let rendered_args = prepared
         .command
         .get_args()

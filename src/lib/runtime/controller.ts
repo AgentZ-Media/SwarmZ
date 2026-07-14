@@ -42,12 +42,14 @@ export function runtimeEnvironmentInstanceId(
 async function runCommand(
   runId: string,
   root: string,
+  mainRoot: string,
   command: RuntimeCommandSpec,
   env: Record<string, string>,
   spec: RuntimeEnvironmentSpec,
 ): Promise<NativeRuntimeCommandResult> {
   return runRuntimeCommand({
     runId,
+    mainRoot,
     projectRoot: root,
     cwdRelative: command.cwdRelative,
     argv: command.argv,
@@ -91,6 +93,7 @@ async function stopServicesStrict(
 async function runCleanupStrict(
   id: string,
   root: string,
+  mainRoot: string,
   commands: readonly RuntimeCommandSpec[],
   env: Record<string, string>,
   spec: RuntimeEnvironmentSpec,
@@ -100,7 +103,14 @@ async function runCleanupStrict(
   const failures: string[] = [];
   for (const command of commands) {
     try {
-      const result = await runCommand(`${id}:${phase}:${command.id}`, root, command, env, spec);
+      const result = await runCommand(
+        `${id}:${phase}:${command.id}`,
+        root,
+        mainRoot,
+        command,
+        env,
+        spec,
+      );
       results.push({ commandId: command.id, result });
       if (result.status !== "completed" || result.exitCode !== 0) {
         failures.push(`${command.id}: ${result.status}/exit ${result.exitCode ?? "none"}`);
@@ -147,11 +157,26 @@ export async function prepareRuntimeEnvironment(
   }
   const setup: RuntimeLaunchResult["setup"] = [];
   const cleanupPartialSetup = () =>
-    runCleanupStrict(id, context.projectRoot, plan.cleanup, runtimeEnv, spec, "prepare-failure-cleanup");
+    runCleanupStrict(
+      id,
+      context.projectRoot,
+      context.mainRoot,
+      plan.cleanup,
+      runtimeEnv,
+      spec,
+      "prepare-failure-cleanup",
+    );
   for (const command of plan.setup) {
     let result: NativeRuntimeCommandResult;
     try {
-      result = await runCommand(`${id}:prepare:${command.id}`, context.projectRoot, command, runtimeEnv, spec);
+      result = await runCommand(
+        `${id}:prepare:${command.id}`,
+        context.projectRoot,
+        context.mainRoot,
+        command,
+        runtimeEnv,
+        spec,
+      );
     } catch (error) {
       try {
         await cleanupPartialSetup();
@@ -205,6 +230,7 @@ export async function launchRuntimeEnvironment(
     await runCleanupStrict(
       id,
       context.projectRoot,
+      context.mainRoot,
       plan.cleanup,
       runtimeEnv,
       spec,
@@ -217,6 +243,7 @@ export async function launchRuntimeEnvironment(
       result = await runCommand(
         `${id}:setup:${command.id}`,
         context.projectRoot,
+        context.mainRoot,
         command,
         runtimeEnv,
         spec,
@@ -349,5 +376,13 @@ export async function cleanupRuntimeEnvironment(
     throw new Error("refused to clean a runtime instance owned by another root or service set");
   }
   await stopServicesStrict(id, context.projectRoot, prior.map((service) => service.serviceId));
-  return runCleanupStrict(id, context.projectRoot, plan.cleanup, runtimeEnv, spec, "cleanup");
+  return runCleanupStrict(
+    id,
+    context.projectRoot,
+    context.mainRoot,
+    plan.cleanup,
+    runtimeEnv,
+    spec,
+    "cleanup",
+  );
 }
