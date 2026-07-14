@@ -19,6 +19,7 @@ import {
   ChevronRight,
   CircleStop,
   ClipboardCheck,
+  Cpu,
   FileText,
   FolderGit2,
   FolderSearch,
@@ -52,7 +53,11 @@ import {
   toolActivityLabel,
 } from "@/lib/orchestrator/tool-labels";
 import { recentCodexModels } from "@/lib/orchestrator/models";
-import { VIBE_CTX_WARN, contextTokens } from "@/lib/vibe/ui";
+import {
+  VIBE_CTX_WARN,
+  agentRuntimeLabel,
+  contextTokens,
+} from "@/lib/vibe/ui";
 import { OrchestratorMarkdown } from "../OrchestratorMarkdown";
 import { ModelEffortPicker } from "./ModelEffortPicker";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
@@ -349,6 +354,7 @@ const STEP_ICON: Record<string, LucideIcon> = {
   read_notes: StickyNote,
   git_status: GitBranch,
   list_projects: FolderSearch,
+  list_models: Cpu,
   prompt_agent: MessageSquare,
   spawn_agents: Sparkles,
   interrupt_agent: CircleStop,
@@ -518,13 +524,17 @@ function StepRow({
 function PaneChip({ pane }: { pane: OrchestratorPaneRef }) {
   const name = useVibe((s) => s.sessions[pane.id]?.session.name);
   const busy = useVibe((s) => !!s.busy[pane.id]);
-  if (!name) return null;
-  return (
-    <button
-      onClick={() => focusSession(pane.id)}
-      title={`Jump to agent "${name}"`}
-      className="focus-ring flex shrink-0 items-center gap-1.5 rounded-sm border border-line bg-card px-2 py-px font-mono text-11 text-mut transition-colors hover:border-acc/55 hover:text-txt"
-    >
+  const liveModel = useVibe((s) => s.sessions[pane.id]?.session.model);
+  const liveEffort = useVibe((s) => s.sessions[pane.id]?.session.effort);
+  // Live config wins while the agent exists (set_agent_config can retune it);
+  // the immutable spawn snapshot keeps the audit trail after it is closed.
+  const runtime = name
+    ? { model: liveModel ?? null, effort: liveEffort ?? null }
+    : (pane.runtime ?? { model: null, effort: null });
+  const runtimeLabel = agentRuntimeLabel(runtime.model, runtime.effort);
+  const displayName = name ?? pane.name;
+  const content = (
+    <>
       <span
         aria-hidden
         className={cn(
@@ -532,7 +542,30 @@ function PaneChip({ pane }: { pane: OrchestratorPaneRef }) {
           busy ? "bg-acc" : "bg-fnt",
         )}
       />
-      → {name}
+      <span>→ {displayName}</span>
+      <span className="max-w-40 truncate text-10 text-fnt">
+        {runtimeLabel}
+      </span>
+    </>
+  );
+  if (!name) {
+    if (!pane.runtime) return null;
+    return (
+      <span
+        title={`Closed agent — spawned with ${runtimeLabel}`}
+        className="flex shrink-0 items-center gap-1.5 rounded-sm border border-line bg-card px-2 py-px font-mono text-11 text-fnt"
+      >
+        {content}
+      </span>
+    );
+  }
+  return (
+    <button
+      onClick={() => focusSession(pane.id)}
+      title={`Jump to agent "${name}" — ${runtimeLabel}`}
+      className="focus-ring flex shrink-0 items-center gap-1.5 rounded-sm border border-line bg-card px-2 py-px font-mono text-11 text-mut transition-colors hover:border-acc/55 hover:text-txt"
+    >
+      {content}
     </button>
   );
 }

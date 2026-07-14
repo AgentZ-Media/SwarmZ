@@ -607,7 +607,11 @@ function sanitizeSession(raw: unknown): VibeSession | null {
     worktree: sanitizeWorktree(s.worktree),
     projectDir: s.projectDir,
     ...(typeof s.model === "string" && s.model ? { model: s.model } : {}),
-    ...(typeof s.effort === "string" && s.effort ? { effort: s.effort } : {}),
+    ...(typeof s.effort === "string" &&
+    s.effort &&
+    s.effort.trim().toLowerCase() !== "ultra"
+      ? { effort: s.effort }
+      : {}),
     access,
     threadId: typeof s.threadId === "string" ? s.threadId : null,
     createdAt: typeof s.createdAt === "number" ? s.createdAt : Date.now(),

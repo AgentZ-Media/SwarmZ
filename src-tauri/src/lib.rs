@@ -339,8 +339,9 @@ async fn orchestrator_tools(
     let persona = persona.unwrap_or_default();
     let project = project.unwrap_or_default();
     let memory = orchestrator_memory_blocks(&app, &project.id).await;
+    let models = orchestrator::model_catalog(&app).await.unwrap_or_default();
     serde_json::json!({
-        "instructions": orchestrator::build_instructions(&persona, &project, &memory),
+        "instructions": orchestrator::build_instructions_with_models(&persona, &project, &memory, Some(&models)),
         "tools": orchestrator::tool_definitions(),
     })
 }
@@ -545,6 +546,14 @@ async fn orchestrator_chat_status(
 #[tauri::command]
 async fn codex_list_models(app: AppHandle) -> Result<Vec<String>, String> {
     orchestrator::list_models(&app).await
+}
+
+/// Rich live Codex catalog for Conductor routing and model-aware pickers.
+#[tauri::command]
+async fn codex_model_catalog(
+    app: AppHandle,
+) -> Result<Vec<orchestrator::ModelCatalogEntry>, String> {
+    orchestrator::model_catalog(&app).await
 }
 
 // ---- Native Codex sessions — see codex/sessions.rs ----
@@ -840,6 +849,7 @@ pub fn run() {
             orchestrator_chat_resume,
             orchestrator_chat_status,
             codex_list_models,
+            codex_model_catalog,
             vibe_session_start,
             vibe_session_resume,
             vibe_session_send,

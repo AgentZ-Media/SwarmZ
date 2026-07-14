@@ -49,7 +49,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::adapter;
 use super::memory::MemoryScope;
-use super::persona::{MemoryBlocks, PersonaSpec, ProjectContext};
+use super::persona::{
+    MemoryBlocks, ModelCatalogEntry, PersonaSpec, ProjectContext, ReasoningEffortEntry,
+};
 use crate::codex::host::{
     self, Connection, EventSink, ProcessHost, Responder, ThreadEvent, RPC_TIMEOUT_MS,
     THREAD_TIMEOUT_MS, TURN_TIMEOUT_MS,
@@ -362,16 +364,26 @@ async fn load_memory(app: &AppHandle, project_id: &str) -> MemoryBlocks {
 /// prompts (auto-declined anyway if one slips through), the compiled
 /// instructions (persona + project + memory + core) as developer message, and
 /// the whole registry as dynamic tools.
+#[cfg(test)]
 fn thread_start_params(
     persona: &PersonaSpec,
     project: &ProjectContext,
     memory: &MemoryBlocks,
 ) -> Value {
+    thread_start_params_with_models(persona, project, memory, None)
+}
+
+fn thread_start_params_with_models(
+    persona: &PersonaSpec,
+    project: &ProjectContext,
+    memory: &MemoryBlocks,
+    models: Option<&[ModelCatalogEntry]>,
+) -> Value {
     json!({
         "cwd": thread_cwd(project),
         "sandbox": "read-only",
         "approvalPolicy": "never",
-        "developerInstructions": super::build_instructions(persona, project, memory),
+        "developerInstructions": super::build_instructions_with_models(persona, project, memory, models),
         "dynamicTools": adapter::dynamic_tool_specs(),
     })
 }
@@ -379,18 +391,29 @@ fn thread_start_params(
 /// thread/resume params: dynamicTools are NOT re-declarable here — codex
 /// persists and restores them from the thread rollout (verified on 0.142.5).
 /// developerInstructions ARE re-sent, so memory changes land on the next resume.
+#[cfg(test)]
 fn thread_resume_params(
     thread_id: &str,
     persona: &PersonaSpec,
     project: &ProjectContext,
     memory: &MemoryBlocks,
 ) -> Value {
+    thread_resume_params_with_models(thread_id, persona, project, memory, None)
+}
+
+fn thread_resume_params_with_models(
+    thread_id: &str,
+    persona: &PersonaSpec,
+    project: &ProjectContext,
+    memory: &MemoryBlocks,
+    models: Option<&[ModelCatalogEntry]>,
+) -> Value {
     json!({
         "threadId": thread_id,
         "cwd": thread_cwd(project),
         "sandbox": "read-only",
         "approvalPolicy": "never",
-        "developerInstructions": super::build_instructions(persona, project, memory),
+        "developerInstructions": super::build_instructions_with_models(persona, project, memory, models),
     })
 }
 
@@ -890,10 +913,11 @@ pub async fn chat_start(
     let project = project.unwrap_or_default();
     let memory = load_memory(app, &project.id).await;
     let (conn, generation, sink) = ensure_conn(app, &project.id).await?;
+    let models = model_catalog_from_connection(&conn).await.unwrap_or_default();
     let res = conn
         .request(
             "thread/start",
-            thread_start_params(&persona, &project, &memory),
+            thread_start_params_with_models(&persona, &project, &memory, Some(&models)),
             THREAD_TIMEOUT_MS,
         )
         .await
@@ -922,9 +946,16 @@ pub async fn chat_resume(
     let project = project.unwrap_or_default();
     let memory = load_memory(app, &project.id).await;
     let (conn, generation, sink) = ensure_conn(app, &project.id).await?;
+    let models = model_catalog_from_connection(&conn).await.unwrap_or_default();
     conn.request(
         "thread/resume",
-        thread_resume_params(thread_id, &persona, &project, &memory),
+        thread_resume_params_with_models(
+            thread_id,
+            &persona,
+            &project,
+            &memory,
+            Some(&models),
+        ),
         THREAD_TIMEOUT_MS,
     )
     .await?;
@@ -944,6 +975,15 @@ pub async fn chat_send(
     model: Option<String>,
     effort: Option<String>,
 ) -> Result<Value, String> {
+    if effort
+        .as_deref()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("ultra"))
+    {
+        return Err(
+            "effort \"ultra\" is unavailable in SwarmZ — Ultra is a multi-agent mode, not a single-agent reasoning level"
+                .into(),
+        );
+    }
     // claim the chat's turn slot ATOMICALLY (check-and-set in one lock
     // section) — two parallel sends can no longer both pass the busy check
     // and overwrite each other's done_tx. The claim binds this operation to
@@ -981,9 +1021,16 @@ pub async fn chat_send(
         // turn/completed) must not touch this operation mid-respawn
         advance_fence(chat_id, generation);
         let memory = load_memory(app, &project.id).await;
+        let models = model_catalog_from_connection(&conn).await.unwrap_or_default();
         if let Err(e) = host::resume_thread(
             &conn,
-            thread_resume_params(&thread_id, &persona, &project, &memory),
+            thread_resume_params_with_models(
+                &thread_id,
+                &persona,
+                &project,
+                &memory,
+                Some(&models),
+            ),
         )
         .await
         {
@@ -1160,9 +1207,16 @@ pub async fn chat_compact(app: &AppHandle, chat_id: &str) -> Result<Value, Strin
     if needs_resume {
         advance_fence(chat_id, generation);
         let memory = load_memory(app, &project.id).await;
+        let models = model_catalog_from_connection(&conn).await.unwrap_or_default();
         if let Err(e) = host::resume_thread(
             &conn,
-            thread_resume_params(&thread_id, &persona, &project, &memory),
+            thread_resume_params_with_models(
+                &thread_id,
+                &persona,
+                &project,
+                &memory,
+                Some(&models),
+            ),
         )
         .await
         {
@@ -1300,34 +1354,153 @@ pub async fn chat_status(
     json!({ "running": true, "version": version, "account": account })
 }
 
-/// The model ids the installed codex actually offers (`model/list`,
-/// live-verified on 0.142.5) — the authoritative picker source, unlike the
-/// recently-used heuristic. Hidden entries are dropped; server order is kept
-/// (the default model comes first). The frontend caches per app run. Reuses
-/// any alive Conductor process, else spawns the neutral probe instance.
-pub async fn list_models(app: &AppHandle) -> Result<Vec<String>, String> {
+/// Rich, live model catalog from the installed Codex app-server. The protocol
+/// is paginated and model-specific effort values are open strings, so this is
+/// the single source used by the Conductor tool, prompt snapshot and pickers.
+/// Hidden entries are dropped; server order is preserved.
+pub async fn model_catalog(app: &AppHandle) -> Result<Vec<ModelCatalogEntry>, String> {
     let conn = match any_alive_connection().await {
         Some(conn) => conn,
         None => ensure_conn(app, "").await?.0,
     };
-    let res = conn
-        .request("model/list", json!({}), RPC_TIMEOUT_MS)
-        .await?;
-    Ok(parse_model_list(&res))
+    model_catalog_from_connection(&conn).await
 }
 
-/// Pure `model/list`-response → visible model ids (unit-tested).
-fn parse_model_list(res: &Value) -> Vec<String> {
-    res.get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter(|m| !m.get("hidden").and_then(|h| h.as_bool()).unwrap_or(false))
-                .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
-                .map(str::to_string)
+/// Compatibility surface for the existing UI picker callers.
+pub async fn list_models(app: &AppHandle) -> Result<Vec<String>, String> {
+    Ok(model_catalog(app)
+        .await?
+        .into_iter()
+        .map(|entry| entry.model)
+        .collect())
+}
+
+const MODEL_CATALOG_PAGE_LIMIT: u64 = 100;
+const MODEL_CATALOG_MAX_PAGES: usize = 8;
+const MODEL_CATALOG_MAX_MODELS: usize = 256;
+
+async fn model_catalog_from_connection(
+    conn: &Connection,
+) -> Result<Vec<ModelCatalogEntry>, String> {
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MODEL_CATALOG_MAX_PAGES {
+        let res = conn
+            .request(
+                "model/list",
+                json!({
+                    "cursor": cursor.clone(),
+                    "limit": MODEL_CATALOG_PAGE_LIMIT,
+                    "includeHidden": false,
+                }),
+                RPC_TIMEOUT_MS,
+            )
+            .await?;
+        let (mut page, next) = parse_model_page(&res)?;
+        let remaining = MODEL_CATALOG_MAX_MODELS.saturating_sub(out.len());
+        page.truncate(remaining);
+        out.extend(page);
+        if out.len() >= MODEL_CATALOG_MAX_MODELS {
+            break;
+        }
+        match next {
+            Some(next) if !next.is_empty() && cursor.as_deref() != Some(next.as_str()) => {
+                cursor = Some(next);
+            }
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Pure one-page parser. Required top-level `data` shape fails loudly;
+/// malformed individual entries degrade independently so one provider row
+/// cannot hide the rest of the catalog.
+fn parse_model_page(res: &Value) -> Result<(Vec<ModelCatalogEntry>, Option<String>), String> {
+    let data = res
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or("model/list: response has no data array")?;
+    let entries = data
+        .iter()
+        .filter(|item| !item.get("hidden").and_then(Value::as_bool).unwrap_or(false))
+        .filter_map(parse_model_entry)
+        .collect();
+    let next = res
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok((entries, next))
+}
+
+fn parse_model_entry(item: &Value) -> Option<ModelCatalogEntry> {
+    let id = item.get("id").and_then(Value::as_str)?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let model = item
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(id);
+    let efforts = item
+        .get("supportedReasoningEfforts")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|effort| {
+                    let value = effort
+                        .get("reasoningEffort")
+                        .and_then(Value::as_str)?
+                        .trim();
+                    if value.is_empty() {
+                        return None;
+                    }
+                    // Codex advertises Ultra through this protocol field, but
+                    // Ultra is a multi-agent execution mode, not a reasoning
+                    // effort for one SwarmZ agent. Never expose it as one.
+                    if value.eq_ignore_ascii_case("ultra") {
+                        return None;
+                    }
+                    Some(ReasoningEffortEntry {
+                        effort: value.to_string(),
+                        description: effort
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    Some(ModelCatalogEntry {
+        id: id.to_string(),
+        model: model.to_string(),
+        display_name: item
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .to_string(),
+        description: item
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        is_default: item
+            .get("isDefault")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        default_reasoning_effort: item
+            .get("defaultReasoningEffort")
+            .and_then(Value::as_str)
+            .filter(|value| !value.eq_ignore_ascii_case("ultra"))
+            .unwrap_or("")
+            .to_string(),
+        supported_reasoning_efforts: efforts,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1348,16 +1521,39 @@ mod tests {
     }
 
     #[test]
-    fn model_list_keeps_visible_ids_in_server_order() {
-        // shape from a live 0.142.5 `model/list` probe (fields trimmed)
+    fn model_list_keeps_routing_metadata_and_filters_hidden_and_ultra() {
+        // shape from the generated 0.144.1 `ModelListResponse` schema
         let res = json!({ "data": [
-            { "id": "gpt-5.5", "displayName": "GPT-5.5", "hidden": false },
+            {
+                "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                "displayName": "GPT-5.6 Sol", "description": "Frontier model",
+                "hidden": false, "isDefault": true,
+                "defaultReasoningEffort": "low",
+                "supportedReasoningEfforts": [
+                    { "reasoningEffort": "low", "description": "Fast" },
+                    { "reasoningEffort": "max", "description": "Deep" },
+                    { "reasoningEffort": "ultra", "description": "Multi-agent" }
+                ]
+            },
             { "id": "gpt-5.5-internal", "hidden": true },
-            { "id": "gpt-5.5-codex", "displayName": "GPT-5.5 Codex", "hidden": false },
+            { "id": "gpt-5.6-luna", "displayName": "GPT-5.6 Luna", "hidden": false },
             { "displayName": "no id — dropped", "hidden": false },
-        ]});
-        assert_eq!(parse_model_list(&res), vec!["gpt-5.5", "gpt-5.5-codex"]);
-        assert!(parse_model_list(&json!({})).is_empty());
+        ], "nextCursor": "page-2" });
+        let (models, next) = parse_model_page(&res).expect("valid page");
+        assert_eq!(next.as_deref(), Some("page-2"));
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].model, "gpt-5.6-sol");
+        assert!(models[0].is_default);
+        assert_eq!(models[0].default_reasoning_effort, "low");
+        assert_eq!(
+            models[0]
+                .supported_reasoning_efforts
+                .iter()
+                .map(|entry| entry.effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "max"]
+        );
+        assert!(parse_model_page(&json!({})).is_err());
     }
 
     #[test]
@@ -1394,6 +1590,29 @@ mod tests {
         let tools = start["dynamicTools"].as_array().unwrap();
         assert_eq!(tools.len(), crate::orchestrator::tool_definitions().len());
         assert!(tools.iter().any(|t| t["name"] == "spawn_agents"));
+        assert!(tools.iter().any(|t| t["name"] == "list_models"));
+
+        let catalog = vec![ModelCatalogEntry {
+            id: "gpt-5.6-terra".into(),
+            model: "gpt-5.6-terra".into(),
+            display_name: "GPT-5.6 Terra".into(),
+            description: "Balanced everyday model".into(),
+            is_default: false,
+            default_reasoning_effort: "medium".into(),
+            supported_reasoning_efforts: vec![ReasoningEffortEntry {
+                effort: "medium".into(),
+                description: String::new(),
+            }],
+        }];
+        let with_models = thread_start_params_with_models(
+            &persona,
+            &project,
+            &MemoryBlocks::default(),
+            Some(&catalog),
+        );
+        let model_instructions = with_models["developerInstructions"].as_str().unwrap();
+        assert!(model_instructions.contains("gpt-5.6-terra"));
+        assert!(model_instructions.contains("supported efforts [medium]"));
 
         // memory snapshots flow into developerInstructions when present
         let with_mem = thread_start_params(

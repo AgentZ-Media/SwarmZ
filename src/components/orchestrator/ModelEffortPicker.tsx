@@ -1,8 +1,9 @@
 // Shared model + reasoning-effort picker (Vibe session header, Conductor /
 // orchestrator-chat header, session-rail is display-only). A small popover of
 // sibling buttons — the model list is the machine's recently-used Codex models
-// (models.ts) plus a "Custom…" free-text escape hatch; effort is the fixed
-// codex enum. Selecting shows "applies from the next turn" — codex only picks
+// (models.ts) plus a "Custom…" free-text escape hatch; effort is derived per
+// catalog model (with a safe fallback list for Custom/default). Selecting shows
+// "applies from the next turn" — codex only picks
 // up model/effort as a per-turn override.
 
 import { type ReactNode, useState } from "react";
@@ -14,6 +15,7 @@ import {
 } from "../ui/popover";
 import {
   CODEX_EFFORTS,
+  catalogModel,
   ensureCodexModels,
   useCodexModels,
 } from "@/lib/orchestrator/models";
@@ -51,9 +53,10 @@ export function ModelEffortPicker({
   const [open, setOpen] = useState(false);
   const [custom, setCustom] = useState(false);
   const [draft, setDraft] = useState("");
-  // the authoritative account catalog (model/list via codex_list_models),
+  // the authoritative account catalog (model/list via codex_model_catalog),
   // fetched lazily on first open — recents/custom stay as the fallback
   const available = useCodexModels((s) => s.available);
+  const catalog = useCodexModels((s) => s.catalog);
 
   // one deduped list: current model first (even if unknown), then the
   // account's available catalog (default model first), then recents that
@@ -64,8 +67,19 @@ export function ModelEffortPicker({
     ...models,
   ].filter((m, i, arr) => arr.indexOf(m) === i);
 
+  const selectedCatalogModel = model ? catalogModel(catalog, model) : undefined;
+  const effortOptions = selectedCatalogModel?.supportedReasoningEfforts.length
+    ? selectedCatalogModel.supportedReasoningEfforts.map((item) => item.effort)
+    : [...CODEX_EFFORTS];
+
   const applyModel = (next?: string) => {
-    onApply({ model: next, effort });
+    const entry = next ? catalogModel(catalog, next) : undefined;
+    const supported = entry?.supportedReasoningEfforts.map((item) => item.effort);
+    const nextEffort =
+      effort && supported?.length && !supported.includes(effort)
+        ? entry?.defaultReasoningEffort || undefined
+        : effort;
+    onApply({ model: next, effort: nextEffort });
     setCustom(false);
     setDraft("");
   };
@@ -143,7 +157,7 @@ export function ModelEffortPicker({
                 label="default"
                 onClick={() => applyEffort(undefined)}
               />
-              {CODEX_EFFORTS.map((e) => (
+              {effortOptions.map((e) => (
                 <EffortButton
                   key={e}
                   selected={e === effort}

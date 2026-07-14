@@ -28,12 +28,15 @@ use tauri::{AppHandle, Emitter};
 
 pub use appserver::{
     chat_compact, chat_interrupt, chat_resume, chat_send, chat_start, chat_status, list_models,
+    model_catalog,
 };
 pub use memory::{
     append as memory_append, read_entries as memory_read, remove as memory_remove, AppendResult,
     MemoryEntry, MemoryScope,
 };
-pub use persona::{build_instructions, MemoryBlocks, PersonaSpec, ProjectContext};
+pub use persona::{
+    build_instructions_with_models, MemoryBlocks, ModelCatalogEntry, PersonaSpec, ProjectContext,
+};
 pub use registry::tool_definitions;
 
 /// Run one orchestrator tool end to end: validate against the registry,

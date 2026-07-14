@@ -76,6 +76,11 @@ import {
 import { discoverProjects, projectDocs } from "./native";
 import { appendMemory } from "./memory";
 import {
+  fetchCodexModelCatalog,
+  validateCatalogModelEffort,
+  type CodexModelCatalogEntry,
+} from "./models";
+import {
   cancelTimer,
   createTimer,
   listTimers,
@@ -534,19 +539,28 @@ async function spawnOneAgent(
   projectId: string,
   projectDir: string,
   reservedNames: Set<string>,
+  catalog: CodexModelCatalogEntry[],
 ): Promise<{
   result: SpawnAgentResult;
   task?: { id: string; text: string; expectReport: boolean };
 }> {
   const task = typeof spec.task === "string" ? spec.task.trim() : "";
   if (!task) throw new Error("task must not be empty");
-  const model = typeof spec.model === "string" ? spec.model.trim() : "";
+  let model = typeof spec.model === "string" ? spec.model.trim() : "";
   if (model && !MODEL_RE.test(model))
     throw new Error(`invalid model "${model}" — letters, digits and . _ : / - only`);
   const effort =
     typeof spec.effort === "string" && spec.effort.trim()
       ? spec.effort.trim()
       : "medium"; // swarm default: sub-agents run medium unless chosen otherwise
+  if (effort.toLowerCase() === "ultra")
+    throw new Error(
+      'effort "ultra" is unavailable in SwarmZ — Ultra is a multi-agent mode, not a single-agent reasoning level',
+    );
+  if (model) {
+    const entry = validateCatalogModelEffort(catalog, model, effort);
+    model = entry.model;
+  }
   const access: VibeAccess = resolveAgentAccess(spec.access);
   const explicit =
     typeof spec.name === "string" ? sanitizeAgentName(spec.name) : "";
@@ -712,6 +726,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         name: entry.session.name,
         cwd: entry.session.projectDir,
         model: entry.session.model ?? null,
+        effort: entry.session.effort ?? null,
         access: entry.session.access,
         worktree: entry.session.worktree,
       },
@@ -815,6 +830,15 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     return discoverProjects(scanRoots);
   },
 
+  list_models: async () => {
+    const models = await fetchCodexModelCatalog(true);
+    return {
+      catalog_default: models.find((entry) => entry.isDefault)?.model ?? null,
+      models,
+      note: "Use the exact model value and one of that model's supportedReasoningEfforts. Omit model to use the user's Codex configuration.",
+    };
+  },
+
   // ---- agents ----
 
   prompt_agent: async (args, ctx) => {
@@ -887,6 +911,13 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     if (!Array.isArray(specs) || specs.length < 1 || specs.length > 8)
       throw new Error("agents must contain 1–8 entries");
     const { id: projectId, dir: projectDir } = requireProject(ctx);
+    // Fetch once for the batch, before any worktree/session is created. Only
+    // explicit overrides need strict validation; default-config spawns keep
+    // working if model/list is temporarily unavailable.
+    const needsCatalog = specs.some(
+      (spec) => typeof spec.model === "string" && spec.model.trim().length > 0,
+    );
+    const catalog = needsCatalog ? await fetchCodexModelCatalog() : [];
 
     // case-insensitive name reservation for the whole batch: live sessions
     // of the project + every name this batch hands out — explicit duplicate
@@ -914,6 +945,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
           projectId,
           projectDir,
           reservedNames,
+          catalog,
         );
         results[i] = result;
         if (task) tasks.push({ index: i, ...task });
@@ -1047,7 +1079,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     const id = entry.session.id;
     const touched: string[] = [];
     if (args.model !== undefined || args.effort !== undefined) {
-      const model =
+      let model =
         args.model === undefined
           ? entry.session.model
           : String(args.model).trim() || undefined;
@@ -1057,6 +1089,15 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
         args.effort === undefined
           ? entry.session.effort
           : String(args.effort).trim() || undefined;
+      if (effort?.toLowerCase() === "ultra")
+        throw new Error(
+          'effort "ultra" is unavailable in SwarmZ — Ultra is a multi-agent mode, not a single-agent reasoning level',
+        );
+      if (model) {
+        const catalog = await fetchCodexModelCatalog();
+        const catalogEntry = validateCatalogModelEffort(catalog, model, effort);
+        model = catalogEntry.model;
+      }
       await setVibeModelEffort(id, model, effort);
       if (args.model !== undefined) touched.push("model");
       if (args.effort !== undefined) touched.push("effort");

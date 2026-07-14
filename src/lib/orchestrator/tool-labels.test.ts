@@ -9,6 +9,9 @@ import {
 import type { OrchestratorChatMessage } from "@/types";
 
 describe("toolActivityLabel", () => {
+  it("names the live model lookup", () => {
+    expect(toolActivityLabel("list_models")).toBe("Checked available models");
+  });
   it("maps the known tools to human verbs", () => {
     expect(toolActivityLabel("fleet_snapshot")).toBe("Checked the fleet");
     expect(toolActivityLabel("read_project_docs")).toBe("Read project docs");

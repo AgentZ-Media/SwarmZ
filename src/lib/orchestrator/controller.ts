@@ -40,6 +40,7 @@ import {
 } from "./chat";
 import { shouldAutoCompact } from "@/lib/compact";
 import {
+  ORCHESTRATOR_TOOLSET_VERSION,
   useOrchestrator,
   type OrchestratorMessagePatch,
 } from "./chat-store";
@@ -308,8 +309,17 @@ function handleEvent(chatId: string, event: OrchestratorChatEvent) {
         const v = useVibe.getState();
         const created: OrchestratorPaneRef[] = [];
         for (const id of projectSessionIds(chatProjectId(chatId)))
-          if (!before.has(id))
-            created.push({ id, name: v.sessions[id]?.session.name ?? id });
+          if (!before.has(id)) {
+            const session = v.sessions[id]?.session;
+            created.push({
+              id,
+              name: session?.name ?? id,
+              runtime: {
+                model: session?.model ?? null,
+                effort: session?.effort ?? null,
+              },
+            });
+          }
         if (created.length) {
           const message = useOrchestrator
             .getState()
@@ -950,11 +960,20 @@ async function ensureBackendChat(chatId: string): Promise<string> {
   if (existing) return existing;
   const chat = useOrchestrator.getState().chats.find((c) => c.id === chatId);
   const project = projectWire(chat?.projectId ?? "");
-  if (chat?.threadId) {
+  if (
+    chat?.threadId &&
+    chat.toolsetVersion === ORCHESTRATOR_TOOLSET_VERSION
+  ) {
     try {
       const ref = await chatResume(chat.threadId, project);
       link(chatId, ref.chat_id);
-      useOrchestrator.getState().setChatThreadId(chatId, ref.thread_id);
+      useOrchestrator
+        .getState()
+        .setChatThreadId(
+          chatId,
+          ref.thread_id,
+          ORCHESTRATOR_TOOLSET_VERSION,
+        );
       return ref.chat_id;
     } catch (err) {
       useOrchestrator.getState().appendMessage(chatId, {
@@ -962,10 +981,17 @@ async function ensureBackendChat(chatId: string): Promise<string> {
         text: `Couldn't resume the previous thread (${errorText(err)}) — starting a fresh one. The history above stays visible, but the model can't see it.`,
       });
     }
+  } else if (chat?.threadId) {
+    useOrchestrator.getState().appendMessage(chatId, {
+      role: "system",
+      text: "Conductor tools upgraded — starting a fresh backend context so this chat can use the current tool catalog. The visible history stays here.",
+    });
   }
   const ref = await chatStart(project);
   link(chatId, ref.chat_id);
-  useOrchestrator.getState().setChatThreadId(chatId, ref.thread_id);
+  useOrchestrator
+    .getState()
+    .setChatThreadId(chatId, ref.thread_id, ORCHESTRATOR_TOOLSET_VERSION);
   return ref.chat_id;
 }
 

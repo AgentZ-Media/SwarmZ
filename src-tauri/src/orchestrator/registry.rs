@@ -152,6 +152,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         },
+        ToolDefinition {
+            name: "list_models",
+            description: "Return the LIVE model catalog advertised by the installed Codex app-server for this account: exact model override values, display names, routing descriptions, the catalog default, and each model's supported/default reasoning efforts. Ultra is deliberately excluded because it is a multi-agent mode, not a single-agent effort. Use this before choosing or retuning an explicit model when the injected chat-start snapshot may be stale. Never invent model ids or assume efforts are universal.",
+            parameters: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        },
         // ---- agents ----
         ToolDefinition {
             name: "spawn_agents",
@@ -168,8 +177,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                             "properties": {
                                 "task": { "type": "string", "description": "the agent's first order — self-contained: context + goal + boundaries" },
                                 "worktree": { "type": "string", "description": "\"new\" | \"shared:<agentName>\" | \"none\" — where the agent works" },
-                                "model": { "type": "string", "description": "codex model id; OMIT for the default (gpt-5.6-sol)" },
-                                "effort": { "type": "string", "description": "reasoning effort (e.g. low, medium, high, xhigh); OMIT for medium" },
+                                "model": { "type": "string", "description": "exact `model` value from list_models; OMIT for the user's Codex configuration" },
+                                "effort": { "type": "string", "description": "reasoning effort advertised for the selected model by list_models; OMIT for SwarmZ medium" },
                                 // SECURITY (audit R1): "full" (danger-full-access, approvals off)
                                 // is deliberately NOT model-callable — only the human can grant
                                 // it via the session's access toggle. The bus validates against
@@ -228,8 +237,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "agent": agent_param(),
-                    "model": { "type": "string", "description": "codex model id (\"\" clears the override)" },
-                    "effort": { "type": "string", "description": "reasoning effort (\"\" clears the override)" },
+                    "model": { "type": "string", "description": "exact `model` value from list_models (\"\" clears the override)" },
+                    "effort": { "type": "string", "description": "effort advertised for the selected model by list_models (\"\" clears the override)" },
                     // SECURITY (audit R1): no "full" here either — see spawn_agents.
                     // The Conductor may re-confine an agent to workspace, never widen it.
                     "access": { "type": "string", "enum": ["workspace"], "description": "sandbox level — always the workspace sandbox; full access can only be granted by the human in the UI" }
@@ -569,7 +578,7 @@ mod tests {
 
     /// The frozen Phase-4 catalog + the Phase-7 GitHub tools + the
     /// mission-upgrade explore pair — a missing or extra tool fails loudly.
-    pub const EXPECTED_TOOLS: [&str; 32] = [
+    pub const EXPECTED_TOOLS: [&str; 33] = [
         "fleet_snapshot",
         "read_agent",
         "read_project_docs",
@@ -578,6 +587,7 @@ mod tests {
         "list_files",
         "read_file",
         "list_projects",
+        "list_models",
         "spawn_agents",
         "prompt_agent",
         "interrupt_agent",

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  agentRuntimeLabel,
   contextTokens,
   decayedSignal,
   shortAge,
@@ -15,6 +16,18 @@ import type { VibeItem } from "@/types";
 // boundary is what the tick-awareness fix relies on.
 
 const T0 = 1_700_000_000_000;
+
+describe("agentRuntimeLabel", () => {
+  it("shows exact model and effort without guessing defaults", () => {
+    expect(agentRuntimeLabel("gpt-5.6-sol", "max")).toBe("GPT-5.6-sol · max");
+    expect(agentRuntimeLabel(undefined, "medium")).toBe(
+      "Codex default · medium",
+    );
+    expect(agentRuntimeLabel(undefined, undefined)).toBe(
+      "Codex default · default effort",
+    );
+  });
+});
 
 describe("decayedSignal", () => {
   it("needs-you wins over busy", () => {

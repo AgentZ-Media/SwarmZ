@@ -339,7 +339,15 @@ export const useSwarm = create<SwarmState>((set, get) => ({
     }
     try {
       const settings = await loadSettings();
-      if (settings) set({ settings });
+      if (settings) {
+        // Ultra is a multi-agent mode, not a single-turn effort in SwarmZ.
+        // Drop stale persisted values before they can reach a chat/session.
+        const safeSettings =
+          settings.orchestratorCodexEffort?.trim().toLowerCase() === "ultra"
+            ? { ...settings, orchestratorCodexEffort: undefined }
+            : settings;
+        set({ settings: safeSettings });
+      }
     } catch {
       /* ignore */
     }

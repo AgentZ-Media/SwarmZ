@@ -22,6 +22,7 @@ import {
 import { useProjects } from "@/lib/projects/store";
 import {
   approvalCommand,
+  agentRuntimeLabel,
   commandExit,
   decayedSignal,
   diffStats,
@@ -234,6 +235,8 @@ const AgentCard = memo(function AgentCard({
   const branch = useVibe(
     (s) => s.sessions[id]?.session.worktree?.branch ?? "",
   );
+  const model = useVibe((s) => s.sessions[id]?.session.model);
+  const effort = useVibe((s) => s.sessions[id]?.session.effort);
   const busy = useVibe((s) => !!s.busy[id]);
   const diff = useVibe((s) => s.sessions[id]?.diff ?? null);
   const lastBusyEndAt = useVibe((s) => s.sessions[id]?.lastBusyEndAt ?? null);
@@ -251,6 +254,7 @@ const AgentCard = memo(function AgentCard({
   }, [state]);
 
   const where = branch ? `⎇ ${branch.split("/").pop()}` : folderName(projectDir);
+  const runtime = agentRuntimeLabel(model, effort);
 
   const onClose = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -277,31 +281,38 @@ const AgentCard = memo(function AgentCard({
       <div
         onClick={() => open()}
         title="Expand agent"
-        className="flex shrink-0 cursor-default items-center gap-2 border-b border-line py-2 pl-3 pr-2 hover:bg-pop"
+        className="flex shrink-0 cursor-default items-center gap-2 border-b border-line py-1.5 pl-3 pr-2 hover:bg-pop"
       >
         <span
           aria-hidden
           className={cn("h-[9px] w-[9px] shrink-0 rounded-full", STATE_DOT[state])}
         />
-        <span className="min-w-0 truncate text-13 font-semibold text-txt">
-          {name}
-        </span>
-        {fromConductor && (
-          // dezent — marks a lane the Conductor staffed vs. a self-spawned one.
-          // `//` is the Conductor's mark throughout the app (sidebar header),
-          // so it reads as attribution without stealing the name's width.
-          <span
-            aria-label="Spawned by the Conductor"
-            title="Spawned by the Conductor"
-            className="shrink-0 rounded-sm border border-acc/35 bg-acc/10 px-1 font-mono text-10 font-semibold leading-none text-acc/90"
-          >
-            //
-          </span>
-        )}
-        <span className="min-w-0 truncate font-mono text-10 text-fnt">
-          {where}
-        </span>
-        <span className="ml-auto flex shrink-0 items-center gap-0.5">
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="min-w-0 truncate text-13 font-semibold text-txt">
+              {name}
+            </span>
+            {fromConductor && (
+              <span
+                aria-label="Spawned by the Conductor"
+                title="Spawned by the Conductor"
+                className="shrink-0 rounded-sm border border-acc/35 bg-acc/10 px-1 font-mono text-10 font-semibold leading-none text-acc/90"
+              >
+                //
+              </span>
+            )}
+          </div>
+          <div className="flex min-w-0 items-center gap-1 font-mono text-10">
+            <span className="max-w-32 truncate text-mut" title={runtime}>
+              {runtime}
+            </span>
+            <span aria-hidden className="text-line2">·</span>
+            <span className="min-w-0 truncate text-fnt" title={where}>
+              {where}
+            </span>
+          </div>
+        </div>
+        <span className="ml-auto flex shrink-0 items-center gap-0.5 self-start">
           {state === "finished" && lastBusyEndAt !== null && (
             <span className="mr-1 font-mono text-10 text-ok">
               ✓ {shortAge(Date.now() - lastBusyEndAt)}

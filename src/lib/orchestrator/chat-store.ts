@@ -45,6 +45,9 @@ export const MAX_CHATS = 30;
 /** Per-chat ping cap (delivered + undelivered) — oldest drop first. */
 export const MAX_PENDING_PINGS = 20;
 export const DEFAULT_CHAT_TITLE = "New chat";
+/** Bump whenever the dynamic-tool registry changes. Codex restores tools from
+ * persisted rollouts on resume and cannot redeclare them there. */
+export const ORCHESTRATOR_TOOLSET_VERSION = 2;
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
   ? Omit<T, K>
@@ -141,7 +144,11 @@ export interface OrchestratorState {
 
   // controller internals
   setBusy: (chatId: string, busy: boolean) => void;
-  setChatThreadId: (chatId: string, threadId: string) => void;
+  setChatThreadId: (
+    chatId: string,
+    threadId: string,
+    toolsetVersion?: number,
+  ) => void;
   setChatTitle: (chatId: string, title: string) => void;
   /** append a message (stamps id + timestamp, enforces the message cap) */
   appendMessage: (chatId: string, msg: NewOrchestratorMessage) => string;
@@ -291,12 +298,22 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
     set({ busy: { ...s.busy, [chatId]: busy } });
   },
 
-  setChatThreadId: (chatId, threadId) => {
+  setChatThreadId: (
+    chatId,
+    threadId,
+    toolsetVersion = ORCHESTRATOR_TOOLSET_VERSION,
+  ) => {
     const s = get();
     const chat = s.chats.find((c) => c.id === chatId);
-    if (!chat || chat.threadId === threadId) return;
+    if (
+      !chat ||
+      (chat.threadId === threadId && chat.toolsetVersion === toolsetVersion)
+    )
+      return;
     set({
-      chats: s.chats.map((c) => (c.id === chatId ? { ...c, threadId } : c)),
+      chats: s.chats.map((c) =>
+        c.id === chatId ? { ...c, threadId, toolsetVersion } : c,
+      ),
     });
     schedulePersist();
   },
@@ -411,14 +428,38 @@ export const useOrchestrator = create<OrchestratorState>((set, get) => ({
 }));
 
 function sanitizePaneRefs(raw: unknown): OrchestratorPaneRef[] {
-  return Array.isArray(raw)
-    ? raw.filter(
-        (r): r is OrchestratorPaneRef =>
-          !!r &&
-          typeof (r as OrchestratorPaneRef).id === "string" &&
-          typeof (r as OrchestratorPaneRef).name === "string",
+  if (!Array.isArray(raw)) return [];
+  const out: OrchestratorPaneRef[] = [];
+  for (const value of raw) {
+    if (!value || typeof value !== "object") continue;
+    const ref = value as Record<string, unknown>;
+    if (typeof ref.id !== "string" || typeof ref.name !== "string") continue;
+    const runtimeRaw = ref.runtime;
+    let runtime: OrchestratorPaneRef["runtime"];
+    if (runtimeRaw && typeof runtimeRaw === "object") {
+      const candidate = runtimeRaw as Record<string, unknown>;
+      const model = candidate.model;
+      const effort = candidate.effort;
+      if (
+        (typeof model === "string" || model === null) &&
+        (typeof effort === "string" || effort === null)
       )
-    : [];
+        runtime = {
+          model,
+          effort:
+            typeof effort === "string" &&
+            effort.trim().toLowerCase() === "ultra"
+              ? null
+              : effort,
+        };
+    }
+    out.push({
+      id: ref.id,
+      name: ref.name,
+      ...(runtime ? { runtime } : {}),
+    });
+  }
+  return out;
 }
 
 /** One persisted message, hardened field by field. Unknown roles are dropped. */
@@ -624,10 +665,15 @@ export async function hydrateOrchestratorChats(
         // pre-Phase-3 chats carry no projectId — assigned below
         projectId: typeof raw.projectId === "string" ? raw.projectId : "",
         threadId: typeof raw.threadId === "string" ? raw.threadId : null,
+        ...(typeof raw.toolsetVersion === "number"
+          ? { toolsetVersion: raw.toolsetVersion }
+          : {}),
         ...(typeof raw.model === "string" && raw.model && !wasOpenRouter
           ? { model: raw.model }
           : {}),
-        ...(typeof raw.effort === "string" && raw.effort
+        ...(typeof raw.effort === "string" &&
+        raw.effort &&
+        raw.effort.trim().toLowerCase() !== "ultra"
           ? { effort: raw.effort }
           : {}),
         title:

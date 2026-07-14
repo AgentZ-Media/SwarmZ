@@ -1457,6 +1457,7 @@ pub async fn session_start(
     access: &str,
     codex_path: Option<String>,
 ) -> Result<Value, String> {
+    refuse_ultra_effort(effort.as_deref())?;
     if codex_path.is_some() {
         host::set_codex_override(codex_path);
     }
@@ -1513,6 +1514,7 @@ pub async fn session_resume(
     access: &str,
     codex_path: Option<String>,
 ) -> Result<Value, String> {
+    refuse_ultra_effort(effort.as_deref())?;
     if codex_path.is_some() {
         host::set_codex_override(codex_path);
     }
@@ -2245,12 +2247,23 @@ pub async fn session_set_model_effort(
     model: Option<String>,
     effort: Option<String>,
 ) -> Result<(), String> {
+    refuse_ultra_effort(effort.as_deref())?;
     let mut sessions = SESSIONS.lock();
     let st = sessions
         .get_mut(session_id)
         .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
     st.profile.model = model.filter(|s| !s.is_empty());
     st.profile.effort = effort.filter(|s| !s.is_empty());
+    Ok(())
+}
+
+fn refuse_ultra_effort(effort: Option<&str>) -> Result<(), String> {
+    if effort.is_some_and(|value| value.trim().eq_ignore_ascii_case("ultra")) {
+        return Err(
+            "effort \"ultra\" is unavailable in SwarmZ — Ultra is a multi-agent mode, not a single-agent reasoning level"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -2334,6 +2347,14 @@ mod tests {
         assert!(Access::parse("workspace").is_ok());
         assert!(Access::parse("full").is_ok());
         assert!(Access::parse("nonsense").is_err());
+    }
+
+    #[test]
+    fn ultra_is_never_accepted_as_a_single_agent_effort() {
+        assert!(refuse_ultra_effort(Some("ultra")).is_err());
+        assert!(refuse_ultra_effort(Some("ULTRA")).is_err());
+        assert!(refuse_ultra_effort(Some("max")).is_ok());
+        assert!(refuse_ultra_effort(None).is_ok());
     }
 
     #[test]

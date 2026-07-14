@@ -362,6 +362,9 @@ export interface OrchestratorPaneRef {
   id: string;
   /** session name captured at reference time (fallback when it closed) */
   name: string;
+  /** Optional immutable runtime snapshot for audit-trail tool messages.
+   * `null` model means the user's Codex configuration. */
+  runtime?: { model: string | null; effort: string | null };
 }
 
 /**
@@ -435,6 +438,9 @@ export interface OrchestratorChat {
   /** owning project (`Project.id`) — the Conductor stage scopes on this */
   projectId: string;
   threadId: string | null;
+  /** Dynamic-tool catalog version of the backend thread. Older/missing
+   * versions start a fresh thread so newly added Conductor tools are real. */
+  toolsetVersion?: number;
   /** codex model override (a per-turn override, editable mid-chat). Unset = the user's default. */
   model?: string;
   /** codex reasoning-effort override, e.g. "high". Unset = default. */

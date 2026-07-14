@@ -7,6 +7,7 @@
 import type { VibeItem } from "@/types";
 import type { VibeSessionEntry } from "./session-store";
 import { unifiedDiffStats } from "./diff";
+import { prettyModel } from "@/lib/utils";
 
 /** The ephemeral "✓ finished" window — same ~5 min as the fleet cards. */
 export const VIBE_FINISHED_WINDOW_MS = 5 * 60_000;
@@ -19,6 +20,16 @@ export type VibeSignal = "working" | "needsYou" | "finished" | "idle";
 /** Count unified-diff body lines — re-exported from `diff.ts`, the one source
  * for +/- counting (rail counter, fileChange cards, turn-diff chip). */
 export const diffStats = unifiedDiffStats;
+
+/** Human-readable current/spawn-time runtime label shared by Fleet cards and
+ * Conductor audit chips. Missing model means the user's Codex configuration,
+ * not a guessed catalog default. */
+export function agentRuntimeLabel(
+  model: string | null | undefined,
+  effort: string | null | undefined,
+): string {
+  return `${model ? prettyModel(model) : "Codex default"} · ${effort || "default effort"}`;
+}
 
 /** Pending approval items of a session, in transcript order (queue order). */
 export function pendingApprovals(

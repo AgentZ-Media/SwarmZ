@@ -35,6 +35,8 @@ export function toolActivityLabel(
       return "Read a file";
     case "list_projects":
       return "Looked up projects";
+    case "list_models":
+      return "Checked available models";
     case "prompt_agent":
       return first ? `Prompted «${first}»` : "Prompted an agent";
     case "spawn_agents":
