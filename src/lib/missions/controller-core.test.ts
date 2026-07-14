@@ -68,7 +68,6 @@ function history() {
         stopOnCriticalFailure: true,
         requireQualityGates: true,
         integrationMode: "train",
-        archiveCompletedWorkers: true,
         networkAuthority: "deny",
         githubAuthority: "deny",
         allowedTools: ["workspace_sandbox"],

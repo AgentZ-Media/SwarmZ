@@ -358,6 +358,23 @@ function assertTrainEntries(
     ) {
       throw new MissionInvariantError("integration train entries must be unique");
     }
+    if (!["queued", "integrating", "integrated", "failed", "skipped"].includes(entry.status)) {
+      throw new MissionInvariantError("integration train entry status is invalid");
+    }
+    if (entry.commit !== null && !/^[0-9a-f]{7,64}$/i.test(entry.commit)) {
+      throw new MissionInvariantError("integration train entry commit is invalid");
+    }
+    if (entry.detail !== null && (typeof entry.detail !== "string" || entry.detail.length > 2_000)) {
+      throw new MissionInvariantError("integration train entry detail is invalid");
+    }
+    if (entry.retryRevision !== undefined &&
+      (!Number.isSafeInteger(entry.retryRevision) || entry.retryRevision < 0 || entry.retryRevision > 1_000)) {
+      throw new MissionInvariantError("integration train retry revision is invalid");
+    }
+    if (entry.operationId !== undefined && entry.operationId !== null &&
+      (typeof entry.operationId !== "string" || !entry.operationId.trim() || entry.operationId.length > 240)) {
+      throw new MissionInvariantError("integration train operation id is invalid");
+    }
     positions.add(entry.position);
     tasks.add(entry.taskId);
   }
@@ -443,7 +460,6 @@ export function reduceMissionEvent(
     if (
       typeof event.data.policy.stopOnCriticalFailure !== "boolean" ||
       typeof event.data.policy.requireQualityGates !== "boolean" ||
-      typeof event.data.policy.archiveCompletedWorkers !== "boolean" ||
       !["manual", "train"].includes(event.data.policy.integrationMode)
     ) {
       throw new MissionInvariantError("mission policy is invalid");
@@ -652,7 +668,9 @@ export function reduceMissionEvent(
       case "task.archived": {
         const task = state.tasks[event.data.taskId];
         if (!task || task.missionId !== event.missionId) throw new MissionInvariantError("task is unknown");
-        if (task.status === "running") throw new MissionInvariantError("running task cannot be archived");
+        if (task.status === "running" || task.attemptIds.some((id) => state.attempts[id]?.status === "running")) {
+          throw new MissionInvariantError("task with a running attempt cannot be archived");
+        }
         state.tasks[task.id] = { ...task, archivedAt: event.data.archivedAt, updatedAt: event.occurredAt };
         break;
       }
@@ -665,7 +683,7 @@ export function reduceMissionEvent(
         }
         if (
           event.type === "task.paused" &&
-          ["running", "succeeded", "failed", "cancelled", "archived"].includes(task.status)
+          ["succeeded", "failed", "cancelled", "archived"].includes(task.status)
         ) {
           throw new MissionInvariantError(`task cannot be paused from ${task.status}`);
         }
@@ -874,6 +892,11 @@ export function reduceMissionEvent(
           batch.taskId === task.id && !batch.selectedAttemptId)) {
           throw new MissionInvariantError("task already has an open candidate batch");
         }
+        if (Object.values(state.integrationTrains).some((train) =>
+          train.missionId === event.missionId &&
+          train.entries.some((entry) => entry.taskId === task.id && entry.status === "integrated"))) {
+          throw new MissionInvariantError("integrated tasks cannot start a new candidate batch");
+        }
         assertString("candidate instruction", data.instruction, 4_000);
         if (!Number.isInteger(data.minimumEvidenceCount) || data.minimumEvidenceCount < 1 || data.minimumEvidenceCount > 64 ||
           !Number.isFinite(data.minimumScoreMargin) || data.minimumScoreMargin < 0 || data.minimumScoreMargin > 10_000) {
@@ -930,6 +953,44 @@ export function reduceMissionEvent(
           selectedCandidateAttemptId: attempt.id,
           updatedAt: event.data.selectedAt,
         };
+        // Quality gates are projected at task level for the normal one-attempt
+        // path. Candidate lanes produce independent, attempt-bound artifacts;
+        // selecting a winner must therefore rematerialize every task gate from
+        // that exact attempt instead of leaving the last-finishing candidate's
+        // result authoritative.
+        const selectedArtifacts = Object.values(state.artifacts)
+          .filter((artifact) => artifact.taskId === batch.taskId && artifact.attemptId === attempt.id)
+          .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+        for (const gateId of state.tasks[batch.taskId].qualityGateIds) {
+          const gate = state.qualityGates[gateId];
+          if (!gate || gate.status === "waived") continue;
+          const artifact = [...selectedArtifacts].reverse().find((candidate) => {
+            if (candidate.metadata.authority !== "swarmz_native") return false;
+            if (gate.command) {
+              return candidate.kind === "test_result" &&
+                candidate.metadata.evidenceKind === "test" &&
+                candidate.metadata.command === gate.command;
+            }
+            return candidate.metadata.evidenceKind === "review";
+          });
+          const raw = typeof artifact?.metadata.status === "string"
+            ? artifact.metadata.status.toLowerCase()
+            : null;
+          const exitCode = typeof artifact?.metadata.exitCode === "number"
+            ? artifact.metadata.exitCode
+            : null;
+          const passed = raw === "passed" || raw === "success" || exitCode === 0;
+          const failed = raw === "failed" || raw === "failure" || (exitCode !== null && exitCode !== 0);
+          state.qualityGates[gate.id] = {
+            ...gate,
+            status: passed ? "passed" : failed ? "failed" : "pending",
+            details: artifact
+              ? String(artifact.metadata.detail ?? `Selected candidate evidence: ${artifact.label}`).slice(0, 1_000)
+              : "Selected candidate has no matching native evidence for this gate",
+            artifactIds: artifact ? [artifact.id] : [],
+            updatedAt: event.data.selectedAt,
+          };
+        }
         break;
       }
       case "schedule.created": {

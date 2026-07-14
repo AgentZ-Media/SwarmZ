@@ -18,7 +18,6 @@ const created: MissionEvent = {
       stopOnCriticalFailure: true,
       requireQualityGates: true,
       integrationMode: "train",
-      archiveCompletedWorkers: true,
     },
     budget: {
       maxAttemptsTotal: null,

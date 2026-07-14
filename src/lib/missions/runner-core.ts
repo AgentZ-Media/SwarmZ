@@ -141,7 +141,6 @@ export function planMissionStarts(input: MissionRunnerInput): MissionRunnerPlan 
     }
     if (
       start.missionId !== mission.id ||
-      start.projectId !== mission.projectId ||
       task.missionId !== mission.id ||
       task.root.projectId !== start.projectId
     ) {

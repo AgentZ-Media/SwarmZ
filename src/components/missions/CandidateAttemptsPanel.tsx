@@ -10,7 +10,10 @@ export function CandidateAttemptsPanel({ taskId }: { taskId: string }) {
     const task = state.projection.tasks[taskId];
     const batches = Object.values(state.projection.candidateBatches).filter((item) => item.taskId === taskId);
     const attempts = task?.attemptIds.map((id) => state.projection.attempts[id]) ?? [];
-    return `${task?.status}:${task?.attemptIds.length}:${attempts.map((item) => `${item?.id}:${item?.status}:${item?.artifactIds.join(",")}`).join("|")}:${batches.map((item) => `${item.id}:${item.attemptIds.length}:${item.selectedAttemptId ?? ""}`).join("|")}`;
+    const integration = Object.values(state.projection.integrationTrains)
+      .flatMap((train) => train.entries.filter((entry) => entry.taskId === taskId)
+        .map((entry) => `${train.id}:${train.status}:${entry.status}:${entry.commit ?? ""}`));
+    return `${task?.status}:${task?.attemptIds.length}:${attempts.map((item) => `${item?.id}:${item?.status}:${item?.artifactIds.join(",")}`).join("|")}:${batches.map((item) => `${item.id}:${item.attemptIds.length}:${item.selectedAttemptId ?? ""}`).join("|")}:${integration.join("|")}`;
   });
   const snapshot = useMemo(() => readCandidateSnapshot(taskId), [taskId, signature]);
   const [open, setOpen] = useState(false);
@@ -21,7 +24,12 @@ export function CandidateAttemptsPanel({ taskId }: { taskId: string }) {
   const [error, setError] = useState<string | null>(null);
   if (!snapshot) return null;
   const { task, batch, attempts } = snapshot;
-  const canRequest = ["ready", "failed", "blocked", "needs_human", "succeeded"].includes(task.status) && !batch;
+  const alreadyIntegrated = Object.values(useMissions.getState().projection.integrationTrains)
+    .some((train) => train.missionId === task.missionId &&
+      train.entries.some((entry) => entry.taskId === task.id && entry.status === "integrated"));
+  const openBatch = batch && !batch.selectedAttemptId ? batch : null;
+  const displayedBatch = open && !openBatch ? null : batch;
+  const canRequest = !alreadyIntegrated && ["ready", "failed", "blocked", "needs_human", "succeeded"].includes(task.status) && !openBatch;
   const needed = task.attemptIds.length + count;
   const needsExtension = needed > task.maxAttempts;
 
@@ -35,7 +43,7 @@ export function CandidateAttemptsPanel({ taskId }: { taskId: string }) {
     }
   };
 
-  if (!batch && !open) {
+  if (!displayedBatch && !open) {
     return canRequest ? (
       <button type="button" onClick={() => setOpen(true)} className="focus-ring mt-2 flex w-full items-center justify-center gap-1.5 rounded-md border border-line2 py-2 text-11 text-mut hover:bg-pop hover:text-txt">
         <FlaskConical size={13} /> Compare 2–8 fresh candidates
@@ -43,7 +51,7 @@ export function CandidateAttemptsPanel({ taskId }: { taskId: string }) {
     ) : null;
   }
 
-  if (!batch) {
+  if (!displayedBatch) {
     return (
       <div className="mt-2 rounded-md border border-acc/25 bg-acc/5 p-3">
         <div className="flex items-center gap-2"><FlaskConical size={13} className="text-acc" /><p className="text-11 font-semibold text-txt">Approve a controlled candidate run</p></div>
@@ -60,22 +68,22 @@ export function CandidateAttemptsPanel({ taskId }: { taskId: string }) {
     );
   }
 
-  const terminal = attempts.length === batch.count && attempts.every((attempt) => attempt.status !== "running");
-  const selection = terminal ? selectCandidateAttempt(candidatesForBatch(useMissions.getState().projection, batch), {
-    minimumEvidenceCount: batch.minimumEvidenceCount,
-    minimumScoreMargin: batch.minimumScoreMargin,
+  const terminal = attempts.length === displayedBatch.count && attempts.every((attempt) => attempt.status !== "running");
+  const selection = terminal ? selectCandidateAttempt(candidatesForBatch(useMissions.getState().projection, displayedBatch), {
+    minimumEvidenceCount: displayedBatch.minimumEvidenceCount,
+    minimumScoreMargin: displayedBatch.minimumScoreMargin,
     tieBreakers: ["lower_tokens", "lower_duration", "attempt_id"],
   }) : null;
   return (
     <div className="mt-2 rounded-md border border-line2 bg-panel p-3">
-      <div className="flex items-center gap-2"><FlaskConical size={13} className="text-acc" /><p className="text-11 font-semibold text-txt">Candidate run</p><span className="ml-auto font-mono text-10 text-fnt">{attempts.length}/{batch.count} launched</span></div>
-      {batch.selectedAttemptId ? <p className="mt-2 flex items-center gap-1.5 text-10 text-ok"><ShieldCheck size={12} /> Human-selected winner: {batch.selectedAttemptId}</p> : !terminal ? <p className="mt-2 text-10 text-fnt">Fresh workers are still launching or producing independent evidence.</p> : selection && <>
+      <div className="flex items-center gap-2"><FlaskConical size={13} className="text-acc" /><p className="text-11 font-semibold text-txt">Candidate run</p><span className="ml-auto font-mono text-10 text-fnt">{attempts.length}/{displayedBatch.count} launched</span></div>
+      {displayedBatch.selectedAttemptId ? <><p className="mt-2 flex items-center gap-1.5 text-10 text-ok"><ShieldCheck size={12} /> Human-selected winner: {displayedBatch.selectedAttemptId}</p>{canRequest && <button type="button" onClick={() => setOpen(true)} className="focus-ring mt-2 h-7 w-full rounded-md border border-line2 text-10 text-mut hover:bg-card hover:text-txt"><FlaskConical size={11} className="mr-1 inline" />Compare another candidate batch</button>}</> : !terminal ? <p className="mt-2 text-10 text-fnt">Fresh workers are still launching or producing independent evidence.</p> : selection && <>
         <p className={cn("mt-2 text-10 leading-normal", selection.decision === "selected" ? "text-ok" : "text-attn")}>{selection.explanation}</p>
         <div className="mt-2 grid gap-2 sm:grid-cols-2">{selection.assessments.map((assessment) => {
           const attempt = attempts.find((item) => item.id === assessment.attemptId)!;
           const recommended = selection.selectedAttemptId === assessment.attemptId;
           const canOverride = selection.decision !== "selected" && attempt.status === "succeeded" && assessment.passedEvidence > 0;
-          return <div key={assessment.attemptId} className={cn("rounded-md border p-2", recommended ? "border-ok/35 bg-ok/5" : "border-line bg-card")}><div className="flex items-center gap-2"><span className="truncate font-mono text-10 text-txt">candidate {attempt.ordinal}</span><span className="ml-auto font-mono text-10 text-fnt">score {assessment.score}</span></div><p className="mt-1 text-10 text-fnt">{assessment.passedEvidence} evidence · {attempt.status}</p>{assessment.blockers.length > 0 && <p className="mt-1 break-words text-10 text-err">{assessment.blockers.join(" · ")}</p>}{recommended && <button type="button" onClick={() => void run(() => useMissions.getState().selectCandidate(task.missionId, batch.id, attempt.id))} className="focus-ring mt-2 h-7 w-full rounded-md bg-ok/15 text-10 font-semibold text-ok hover:bg-ok/20">Confirm evidence winner</button>}{canOverride && <button type="button" disabled={overrideReason.trim().length < 10} onClick={() => void run(() => useMissions.getState().overrideCandidate(task.missionId, batch.id, attempt.id, overrideReason.trim()))} className="focus-ring mt-2 h-7 w-full rounded-md border border-attn/35 text-10 font-medium text-attn disabled:opacity-35">Select with explicit override</button>}</div>;
+          return <div key={assessment.attemptId} className={cn("rounded-md border p-2", recommended ? "border-ok/35 bg-ok/5" : "border-line bg-card")}><div className="flex items-center gap-2"><span className="truncate font-mono text-10 text-txt">candidate {attempt.ordinal}</span><span className="ml-auto font-mono text-10 text-fnt">score {assessment.score}</span></div><p className="mt-1 text-10 text-fnt">{assessment.passedEvidence} evidence · {attempt.status}</p>{assessment.blockers.length > 0 && <p className="mt-1 break-words text-10 text-err">{assessment.blockers.join(" · ")}</p>}{recommended && <button type="button" onClick={() => void run(() => useMissions.getState().selectCandidate(task.missionId, displayedBatch.id, attempt.id))} className="focus-ring mt-2 h-7 w-full rounded-md bg-ok/15 text-10 font-semibold text-ok hover:bg-ok/20">Confirm evidence winner</button>}{canOverride && <button type="button" disabled={overrideReason.trim().length < 10} onClick={() => void run(() => useMissions.getState().overrideCandidate(task.missionId, displayedBatch.id, attempt.id, overrideReason.trim()))} className="focus-ring mt-2 h-7 w-full rounded-md border border-attn/35 text-10 font-medium text-attn disabled:opacity-35">Select with explicit override</button>}</div>;
         })}</div>
         {selection.decision !== "selected" && <label className="mt-2 block text-10 text-fnt">Required override rationale<textarea value={overrideReason} onChange={(event) => setOverrideReason(event.target.value)} maxLength={1_000} rows={2} placeholder="Explain why this candidate wins despite an ambiguous evidence margin…" className="focus-ring mt-1 w-full rounded-md border border-line2 bg-card px-2 py-1.5 text-10 text-txt placeholder:text-fnt" /></label>}
       </>}

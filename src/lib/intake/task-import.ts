@@ -22,6 +22,10 @@ export interface IntakeTaskDraft {
   dependencyRefs: string[];
   acceptanceCriteria: string[];
   labels: string[];
+  /** Repo-relative exact files the task is approved to modify. */
+  declaredFiles: string[];
+  /** Repo-relative glob scopes used by the conflict scheduler. */
+  declaredGlobs: string[];
 }
 
 export interface TaskImportResult {
@@ -61,6 +65,13 @@ function priorityOf(value: unknown): number {
     : 50;
 }
 
+function recordList(record: Record<string, unknown>, keys: readonly string[]): string[] {
+  const value = keys.map((key) => record[key]).find((candidate) => candidate !== undefined);
+  return Array.isArray(value)
+    ? value.map((item) => clean(item, 2_000)).filter(Boolean).slice(0, 1_000)
+    : splitList(value);
+}
+
 function taskFromRecord(record: Record<string, unknown>): IntakeTaskDraft | null {
   const title = clean(record.title ?? record.name ?? record.task, 300);
   if (!title) return null;
@@ -82,6 +93,8 @@ function taskFromRecord(record: Record<string, unknown>): IntakeTaskDraft | null
     labels: Array.isArray(record.labels)
       ? record.labels.map((value) => clean(value, 80)).filter(Boolean).slice(0, 30)
       : splitList(record.labels),
+    declaredFiles: recordList(record, ["files", "declaredFiles", "declared_files", "scopeFiles", "scope_files"]),
+    declaredGlobs: recordList(record, ["globs", "declaredGlobs", "declared_globs", "scopeGlobs", "scope_globs"]),
   };
 }
 
@@ -244,12 +257,20 @@ function parseText(text: string): TaskImportResult {
         dependencyRefs: dependencyMatch ? splitList(dependencyMatch[1]) : [],
         acceptanceCriteria: [],
         labels: [],
+        declaredFiles: [],
+        declaredGlobs: [],
       };
       continue;
     }
     if (!current) continue;
     const acceptance = line.match(/^(?:ac|acceptance|done when)\s*:\s*(.+)$/i);
     if (acceptance) current.acceptanceCriteria.push(clean(acceptance[1], 500));
+    else if (/^(?:files?|scope files?)\s*:/i.test(line)) {
+      current.declaredFiles.push(...splitList(line.replace(/^(?:files?|scope files?)\s*:\s*/i, "")));
+    }
+    else if (/^(?:globs?|scope globs?)\s*:/i.test(line)) {
+      current.declaredGlobs.push(...splitList(line.replace(/^(?:globs?|scope globs?)\s*:\s*/i, "")));
+    }
     else current.description = clean(`${current.description} ${line}`, 4_000);
   }
   push();

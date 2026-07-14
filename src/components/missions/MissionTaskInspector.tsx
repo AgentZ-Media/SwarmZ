@@ -29,6 +29,7 @@ export interface MissionTaskInspectorProps {
 interface InspectorSnapshot {
   task: MissionTask;
   missionTitle: string;
+  missionArchived: boolean;
   dependencies: MissionTask[];
   attempts: TaskAttempt[];
   artifacts: MissionArtifact[];
@@ -97,13 +98,14 @@ export function MissionTaskInspector({
     );
   }
 
-  const { task, missionTitle, dependencies, attempts, artifacts, gates } =
+  const { task, missionTitle, missionArchived, dependencies, attempts, artifacts, gates } =
     snapshot;
-  const canPause = canPauseTask(task.status);
-  const canResume = task.status === "paused";
-  const canArchive = task.status !== "archived" && task.status !== "running";
+  const canPause = !missionArchived && canPauseTask(task.status);
+  const canResume = !missionArchived && task.status === "paused";
   const latestAttempt = attempts[attempts.length - 1] ?? null;
-  const canRequeue = !!latestAttempt &&
+  const hasRunningAttempt = attempts.some((attempt) => attempt.status === "running");
+  const canArchive = !missionArchived && task.status !== "archived" && !hasRunningAttempt;
+  const canRequeue = !missionArchived && !!latestAttempt &&
     ["needs_human", "blocked", "failed", "cancelled"].includes(latestAttempt.status);
   const reportQuestion = latestAttempt?.report &&
     typeof latestAttempt.report.question === "string"
@@ -294,7 +296,7 @@ export function MissionTaskInspector({
               ))}
             </div>
           )}
-          <CandidateAttemptsPanel taskId={task.id} />
+          {!missionArchived && <CandidateAttemptsPanel taskId={task.id} />}
         </InspectorSection>
 
         <div
@@ -371,6 +373,7 @@ export function MissionTaskInspector({
           </p>
         )}
         <div className="flex flex-wrap items-center justify-end gap-2">
+          {missionArchived && <span className="mr-auto rounded-sm border border-line px-2 py-1 font-mono text-10 uppercase text-fnt">read-only archive</span>}
           <button
             type="button"
             onClick={() => runAction("pause")}
@@ -394,8 +397,8 @@ export function MissionTaskInspector({
             onClick={() => runAction("archive")}
             disabled={!canArchive}
             title={
-              task.status === "running"
-                ? "Stop or pause the running task before archiving"
+              hasRunningAttempt
+                ? "Pause the running task and wait for its worker to stop before archiving"
                 : "Archive this task"
             }
             className="focus-ring flex h-8 items-center gap-1.5 rounded-md border border-line2 px-3 text-11 font-medium text-mut hover:border-err/40 hover:bg-err/10 hover:text-err disabled:cursor-not-allowed disabled:opacity-35"
@@ -636,7 +639,6 @@ function humanizeStatus(status: string): string {
 function canPauseTask(status: TaskStatus): boolean {
   return ![
     "paused",
-    "running",
     "succeeded",
     "failed",
     "cancelled",
@@ -677,6 +679,7 @@ function inspectorSignature(
 ): string {
   const task = state.projection.tasks[taskId];
   if (!task) return "missing";
+  const missionStatus = state.projection.missions[task.missionId]?.status ?? "missing";
   const dependencies = task.dependencyIds
     .map((id) => state.projection.tasks[id])
     .filter((item): item is MissionTask => !!item)
@@ -695,7 +698,7 @@ function inspectorSignature(
     .filter((item): item is QualityGate => !!item)
     .map((item) => `${item.id}:${item.status}:${item.updatedAt}`)
     .join("|");
-  return `${task.id}:${task.status}:${task.updatedAt}:${task.artifactIds.join(",")}:${dependencies}:${attempts}:${gates}`;
+  return `${missionStatus}:${task.id}:${task.status}:${task.updatedAt}:${task.artifactIds.join(",")}:${dependencies}:${attempts}:${gates}`;
 }
 
 function readSnapshot(taskId: string): InspectorSnapshot | null {
@@ -712,6 +715,7 @@ function readSnapshot(taskId: string): InspectorSnapshot | null {
   return {
     task,
     missionTitle: projection.missions[task.missionId]?.title ?? "Unknown mission",
+    missionArchived: projection.missions[task.missionId]?.status === "archived",
     dependencies: task.dependencyIds
       .map((id) => projection.tasks[id])
       .filter((item): item is MissionTask => !!item),

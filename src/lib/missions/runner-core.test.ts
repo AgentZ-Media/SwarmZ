@@ -33,7 +33,6 @@ function buildProjection(count: number): MissionProjection {
         stopOnCriticalFailure: true,
         requireQualityGates: true,
         integrationMode: "train",
-        archiveCompletedWorkers: true,
       },
       budget: {
         maxAttemptsTotal: null,
@@ -158,6 +157,34 @@ describe("mission runner core", () => {
       tasksStarted: 5,
       attemptsStarted: 5,
       activeAttempts: 5,
+    });
+  });
+
+  it("admits a task owned by an approved secondary project root", () => {
+    const projection = buildProjection(1);
+    projection.tasks["task-0"] = {
+      ...projection.tasks["task-0"],
+      root: { projectId: "project-2", path: "/repo-secondary" },
+    };
+    const approved = envelope();
+    approved.capabilities = {
+      ...approved.capabilities,
+      allowedRoots: ["/repo", "/repo-secondary"],
+    };
+    const plan = planMissionStarts({
+      projection,
+      scheduler: schedulerFor(projection),
+      envelope: approved,
+      usage: zeroUsage,
+      now: 1_000,
+      breakerOpen: false,
+      completedOperationIds: new Set(),
+    });
+    expect(plan.rejected).toEqual([]);
+    expect(plan.commands).toHaveLength(1);
+    expect(plan.commands[0]).toMatchObject({
+      taskId: "task-0",
+      rootPath: "/repo-secondary",
     });
   });
 

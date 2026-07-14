@@ -17,7 +17,6 @@ const policy = {
   stopOnCriticalFailure: true,
   requireQualityGates: true,
   integrationMode: "manual" as const,
-  archiveCompletedWorkers: true,
 };
 const budget = {
   maxAttemptsTotal: null,

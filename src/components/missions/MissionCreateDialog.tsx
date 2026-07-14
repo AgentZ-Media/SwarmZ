@@ -143,20 +143,6 @@ export function MissionCreateDialog() {
       if (runtimeEnvironmentId && (!runtimeHydrated || !runtimeSpec)) {
         throw new Error("The selected Runtime Environment is not safely available.");
       }
-      const missionId = store.createMission({
-        projectId: activeProjectId,
-        title: title.trim(),
-        objective: objective.trim(),
-        policy: {
-          maxParallelAttempts: parallel,
-          networkAuthority,
-          githubAuthority,
-          qualityCommands: commands,
-          allowedTools: ["workspace_sandbox"],
-          runtimeEnvironment: runtimeSpec ? bindingForRuntimeSpec(runtimeSpec) : null,
-        },
-        budget: { maxTokens: tokenBudget, maxActiveMinutes: minuteBudget },
-      });
       const ids = parsed.tasks.map(() => nanoid(12));
       const referenceMap = new Map<string, string>();
       const availableProjects = Object.values(useProjects.getState().projects);
@@ -164,18 +150,25 @@ export function MissionCreateDialog() {
         const reference = labels.find((label) => label.toLowerCase().startsWith("root:"))?.slice(5).trim();
         if (!reference) return project;
         const normalized = reference.toLowerCase();
-        const match = availableProjects.find((candidate) =>
+        const exact = availableProjects.filter((candidate) =>
           candidate.id.toLowerCase() === normalized ||
+          candidate.dir.toLowerCase() === normalized);
+        const matches = exact.length > 0 ? exact : availableProjects.filter((candidate) =>
           candidate.name.toLowerCase() === normalized ||
-          candidate.dir.toLowerCase() === normalized ||
           candidate.dir.split("/").filter(Boolean).pop()?.toLowerCase() === normalized,
         );
-        if (!match) throw new Error(`Unknown mission root: ${reference}. Open that project first.`);
-        return match;
+        if (matches.length === 0) throw new Error(`Unknown mission root: ${reference}. Open that project first.`);
+        if (matches.length > 1) throw new Error(`Ambiguous mission root: ${reference}. Use the exact project id or path.`);
+        return matches[0];
       };
       parsed.tasks.forEach((task, index) => {
-        if (task.externalId) referenceMap.set(task.externalId.toLowerCase(), ids[index]);
-        referenceMap.set(task.title.toLowerCase(), ids[index]);
+        for (const reference of [task.externalId, task.title]) {
+          const key = reference?.trim().toLowerCase();
+          if (!key) continue;
+          const existing = referenceMap.get(key);
+          if (existing && existing !== ids[index]) throw new Error(`Duplicate task reference: ${reference}.`);
+          referenceMap.set(key, ids[index]);
+        }
       });
       const unresolved = [...new Set(parsed.tasks.flatMap((task) =>
         task.dependencyRefs.filter((reference) => !referenceMap.has(reference.toLowerCase())),
@@ -183,11 +176,9 @@ export function MissionCreateDialog() {
       if (unresolved.length) {
         throw new Error(`Unknown task dependencies: ${unresolved.slice(0, 5).join(", ")}`);
       }
-      store.addTasks(
-        missionId,
-        parsed.tasks.map((task, index) => {
+      const taskInputs = parsed.tasks.map((task, index) => {
           const root = rootFor(task.labels);
-          return ({
+          return {
           id: ids[index],
           title: task.title,
           description: task.description,
@@ -200,13 +191,25 @@ export function MissionCreateDialog() {
           dependencyIds: task.dependencyRefs
             .map((reference) => referenceMap.get(reference.toLowerCase()))
             .filter((id): id is string => !!id),
-          declaredFiles: [],
-          declaredGlobs: [],
+          declaredFiles: task.declaredFiles,
+          declaredGlobs: task.declaredGlobs,
           maxAttempts: 3,
-          });
-        }),
-      );
-      store.activateMission(missionId);
+          };
+        });
+      const { missionId } = store.createMissionWithTasks({
+        projectId: activeProjectId,
+        title: title.trim(),
+        objective: objective.trim(),
+        policy: {
+          maxParallelAttempts: parallel,
+          networkAuthority,
+          githubAuthority,
+          qualityCommands: commands,
+          allowedTools: ["workspace_sandbox"],
+          runtimeEnvironment: runtimeSpec ? bindingForRuntimeSpec(runtimeSpec) : null,
+        },
+        budget: { maxTokens: tokenBudget, maxActiveMinutes: minuteBudget },
+      }, taskInputs);
       useVibeUi.getState().setSelectedMissionId(missionId);
       useVibeUi.getState().setWorkspaceView("board");
       close();
@@ -271,6 +274,9 @@ export function MissionCreateDialog() {
                 </button>
               </div>
               <textarea id="mission-task-list" value={input} onChange={(event) => setInput(event.target.value)} rows={12} spellCheck={false} className="focus-ring mt-1.5 w-full resize-y rounded-md border border-line2 bg-bg px-3 py-2 font-mono text-12 normal-case leading-relaxed tracking-normal text-txt" />
+              <p className="mt-1.5 text-10 normal-case leading-normal tracking-normal text-fnt">
+                Declare write scopes with <code className="font-mono text-mut">files:</code> / <code className="font-mono text-mut">globs:</code> lines, or JSON/CSV fields <code className="font-mono text-mut">declared_files</code> and <code className="font-mono text-mut">declared_globs</code>. Overlaps are serialized before workers start.
+              </p>
             </div>
             {githubImportOpen && (
               <GitHubIssueImportPanel
@@ -289,7 +295,7 @@ export function MissionCreateDialog() {
             <div className="border-b border-line pb-4">
               <div className="flex items-center gap-2 text-12 font-semibold text-txt"><FileInput size={14} className="text-acc" /> Intake preview</div>
               <div className="mt-3 flex items-baseline gap-2"><span className="font-mono text-16 font-semibold text-txt">{parsed.tasks.length}</span><span className="text-12 text-mut">tasks · {parsed.source}</span></div>
-              <p className="mt-1 font-mono text-10 text-fnt">Use label <span className="text-mut">root:project-name</span> in JSON/CSV for multi-root work.</p>
+              <p className="mt-1 font-mono text-10 text-fnt">Use label <span className="text-mut">root:project-name</span> for multi-root work · {parsed.tasks.filter((task) => task.declaredFiles.length + task.declaredGlobs.length > 0).length}/{parsed.tasks.length} tasks declare write scope.</p>
               <div className="mt-2 max-h-36 overflow-y-auto text-11 leading-relaxed text-fnt">
                 {parsed.tasks.slice(0, 8).map((task, index) => <div key={`${task.title}-${index}`} className="truncate py-0.5"><span className="mr-1.5 font-mono text-acc">{index + 1}</span>{task.title}</div>)}
                 {parsed.tasks.length > 8 && <div className="pt-1 text-mut">+ {parsed.tasks.length - 8} more</div>}

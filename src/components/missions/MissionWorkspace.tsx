@@ -36,14 +36,14 @@ export function MissionWorkspace() {
   const selectedTaskId = useVibeUi((state) => state.selectedMissionTaskId);
   const recoveryOpen = useVibeUi((state) => state.recoveryOpen);
   const missionSignature = useMissions((state) => Object.values(state.projection.missions)
-    .filter((mission) => mission.projectId === projectId && mission.status !== "archived")
+    .filter((mission) => mission.projectId === projectId)
     .map((mission) => `${mission.id}:${mission.status}:${mission.updatedAt}:${mission.taskIds.length}`)
     .sort()
     .join("|"));
   const missions = useMemo(() => Object.values(useMissions.getState().projection.missions)
-    .filter((mission) => mission.projectId === projectId && mission.status !== "archived")
-    .sort((a, b) => b.updatedAt - a.updatedAt), [projectId, missionSignature]);
-  const mission = missions.find((item) => item.id === selectedId) ?? missions[0] ?? null;
+    .filter((mission) => mission.projectId === projectId)
+    .sort((a, b) => Number(a.status === "archived") - Number(b.status === "archived") || b.updatedAt - a.updatedAt), [projectId, missionSignature]);
+  const mission = missions.find((item) => item.id === selectedId) ?? missions.find((item) => item.status !== "archived") ?? missions[0] ?? null;
 
   useEffect(() => {
     if ((mission?.id ?? null) !== selectedId) useVibeUi.getState().setSelectedMissionId(mission?.id ?? null);
@@ -112,7 +112,8 @@ function MissionHeader({ mission, missions, onOpenInsights }: { mission: Mission
     return { total: tasks.length, done, running, attention, roots: new Set(tasks.map((task) => task.root.path)).size, percent: tasks.length ? Math.round(done / tasks.length * 100) : 0 };
   }, [mission.id, mission.taskIds, taskSignature]);
   const paused = mission.status === "paused";
-  const terminal = ["cancelled", "failed", "succeeded"].includes(mission.status);
+  const archived = mission.status === "archived";
+  const terminal = ["cancelled", "failed", "succeeded", "archived"].includes(mission.status);
   const recoveryCount = useMissionOutbox((state) => Object.values(state.snapshot.records)
     .filter((record) => record.missionId === mission.id && record.status !== "delivered").length);
 
@@ -140,8 +141,9 @@ function MissionHeader({ mission, missions, onOpenInsights }: { mission: Mission
         <div className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-2">
         <button onClick={onOpenInsights} title="Open evidence-based mission insights" className="focus-ring flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-line2 px-2.5 text-11 text-mut hover:bg-card hover:text-txt"><Activity size={12} />Insights</button>
         <button onClick={() => useVibeUi.getState().setRecoveryOpen(true)} title="Open durable delivery ledger" className={cn("focus-ring flex h-8 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-11 hover:bg-card", recoveryCount ? "border-attn/35 text-attn" : "border-line2 text-mut hover:text-txt")}><ShieldAlert size={12} />{recoveryCount ? `${recoveryCount} recovery` : "Ledger"}</button>
-        <MissionHeaderActions mission={mission} />
-        <button onClick={() => paused ? useMissions.getState().activateMission(mission.id) : useMissions.getState().pauseMission(mission.id)} disabled={terminal} className="focus-ring flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-line2 px-2.5 text-11 text-mut hover:bg-card hover:text-txt disabled:opacity-40">{paused ? <Play size={12} /> : <Pause size={12} />}{paused ? "Resume" : "Pause"}</button>
+        {!archived && <MissionHeaderActions mission={mission} />}
+        {!archived && <button onClick={() => paused ? useMissions.getState().activateMission(mission.id) : useMissions.getState().pauseMission(mission.id)} disabled={terminal} className="focus-ring flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-line2 px-2.5 text-11 text-mut hover:bg-card hover:text-txt disabled:opacity-40">{paused ? <Play size={12} /> : <Pause size={12} />}{paused ? "Resume" : "Pause"}</button>}
+        {archived && <span className="rounded-sm border border-line px-2 py-1 font-mono text-10 uppercase text-fnt">immutable · read only</span>}
         <button onClick={() => useVibeUi.getState().setMissionCreateOpen(true)} className="focus-ring flex h-8 shrink-0 items-center gap-1.5 rounded-md bg-acc px-3 text-11 font-semibold text-white hover:brightness-110"><Plus size={12} /> Mission</button>
         </div>
       </div>

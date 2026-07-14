@@ -38,7 +38,6 @@ export const DEFAULT_MISSION_POLICY: MissionPolicy = {
   stopOnCriticalFailure: true,
   requireQualityGates: true,
   integrationMode: "train",
-  archiveCompletedWorkers: true,
   networkAuthority: "deny",
   githubAuthority: "deny",
   allowedTools: ["workspace_sandbox"],
@@ -92,6 +91,11 @@ export interface MissionsState {
   appendEvent: (event: MissionEvent) => boolean;
   appendEvents: (events: readonly MissionEvent[]) => number;
   createMission: (input: CreateMissionInput, meta?: MissionCommandMeta) => string;
+  createMissionWithTasks: (
+    input: CreateMissionInput,
+    tasks: readonly AddMissionTaskInput[],
+    meta?: MissionCommandMeta,
+  ) => { missionId: string; taskIds: string[] };
   addTask: (missionId: string, task: AddMissionTaskInput, meta?: MissionCommandMeta) => string;
   addTasks: (missionId: string, tasks: readonly AddMissionTaskInput[], meta?: MissionCommandMeta) => string[];
   updateTask: (missionId: string, taskId: string, patch: TaskPatch, meta?: MissionCommandMeta) => void;
@@ -389,6 +393,47 @@ export const useMissions = create<MissionsState>((set, get) => ({
     return id;
   },
 
+  createMissionWithTasks: (input, inputs, meta) => {
+    const missionId = input.id ?? nanoid(12);
+    const at = meta?.occurredAt ?? Date.now();
+    const taskIds = inputs.map((task) => task.id || nanoid(12));
+    // Validate and topologically order the complete batch before reducing a
+    // single event. `appendPayloads` commits only after every reducer step
+    // succeeds, so an unknown root/dependency/invariant can never leave an
+    // empty draft Mission behind.
+    const ordered = orderTaskBatch(get().projection, missionId, inputs, taskIds);
+    const policy = { ...DEFAULT_MISSION_POLICY, ...input.policy };
+    appendPayloads(get, set, missionId, [
+      {
+        type: "mission.created",
+        data: {
+          projectId: input.projectId,
+          title: input.title,
+          objective: input.objective,
+          policy: {
+            ...policy,
+            runtimeEnvironment: policy.runtimeEnvironment
+              ? { ...policy.runtimeEnvironment }
+              : null,
+          },
+          budget: { ...DEFAULT_MISSION_BUDGET, ...input.budget },
+          createdAt: at,
+        },
+      },
+      ...ordered.map(({ input: task, id }) => ({
+        type: "task.added" as const,
+        data: {
+          ...task,
+          id,
+          missionId,
+          createdAt: task.createdAt ?? at,
+        },
+      })),
+      { type: "mission.activated" as const, data: { activatedAt: at } },
+    ], { ...meta, actor: "human", occurredAt: at });
+    return { missionId, taskIds };
+  },
+
   addTask: (missionId, input, meta) => {
     const id = input.id || nanoid(12);
     appendPayloads(get, set, missionId, [{
@@ -467,6 +512,12 @@ export const useMissions = create<MissionsState>((set, get) => ({
     const outbox = useMissionOutbox.getState();
     if (outbox.hydrateStatus !== "ready" || outbox.snapshot.hydration !== "ready") {
       throw new Error("Mission cannot be archived until its outbox audit is safely hydrated");
+    }
+    const unsettled = Object.values(outbox.snapshot.records)
+      .filter((record) => record.missionId === missionId && record.status !== "delivered");
+    if (unsettled.length > 0) {
+      const summary = [...new Set(unsettled.map((record) => record.status))].sort().join(", ");
+      throw new Error(`Mission cannot be archived with ${unsettled.length} unsettled outbox operation(s): ${summary}`);
     }
     const auditArtifacts = missionOutboxAuditArtifacts(
       missionId,
@@ -627,6 +678,12 @@ export const useMissions = create<MissionsState>((set, get) => ({
     const mission = get().projection.missions[missionId];
     const task = get().projection.tasks[taskId];
     if (!mission || !task || task.missionId !== missionId) throw new Error("task is unknown");
+    const alreadyIntegrated = Object.values(get().projection.integrationTrains)
+      .some((train) => train.missionId === missionId &&
+        train.entries.some((entry) => entry.taskId === taskId && entry.status === "integrated"));
+    if (alreadyIntegrated) {
+      throw new Error("candidate comparison is locked after this task was integrated; create a follow-up task instead");
+    }
     const needed = task.attemptIds.length + input.count;
     if (needed > 20) throw new Error("candidate attempts exceed the hard cap of 20");
     if (needed > task.maxAttempts && !input.extendAttemptBudget) {

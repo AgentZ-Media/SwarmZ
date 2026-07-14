@@ -23,7 +23,6 @@ function mission(): Mission {
       stopOnCriticalFailure: true,
       requireQualityGates: true,
       integrationMode: "train",
-      archiveCompletedWorkers: true,
     },
     budget: {
       maxAttemptsTotal: null,

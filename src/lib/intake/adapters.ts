@@ -164,6 +164,8 @@ export function normalizeGitHubIssues(
       ),
       acceptanceCriteria: [],
       labels,
+      declaredFiles: [],
+      declaredGlobs: [],
     });
   }
   return { source: "github_issues", tasks: dedupe(tasks, warnings), warnings };
@@ -207,6 +209,8 @@ export function normalizeJiraIssues(
       dependencyRefs: dependencyRefs(issue.fields.blockedBy),
       acceptanceCriteria: [],
       labels: [...new Set(labels)].slice(0, 30),
+      declaredFiles: [],
+      declaredGlobs: [],
     });
   }
   return { source: "jira", tasks: dedupe(tasks, warnings), warnings };
@@ -242,6 +246,8 @@ export function normalizeLinearIssues(
       dependencyRefs: dependencyRefs(issue.blockedBy),
       acceptanceCriteria: [],
       labels,
+      declaredFiles: [],
+      declaredGlobs: [],
     });
   }
   return { source: "linear", tasks: dedupe(tasks, warnings), warnings };

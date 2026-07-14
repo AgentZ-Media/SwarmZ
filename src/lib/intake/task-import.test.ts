@@ -31,6 +31,27 @@ describe("mission task intake", () => {
     expect(result.tasks[1].dependencyRefs).toEqual(["T-1"]);
   });
 
+  it("imports exact file and glob scopes for conflict-safe scheduling", () => {
+    const markdown = importTasks(`
+- [T-1] Change auth
+  files: src/auth/token.ts; src/auth/login.ts
+  globs: tests/auth/**
+`);
+    expect(markdown.tasks[0]).toMatchObject({
+      declaredFiles: ["src/auth/token.ts", "src/auth/login.ts"],
+      declaredGlobs: ["tests/auth/**"],
+    });
+    const json = importTasks(JSON.stringify({ tasks: [{
+      title: "Change billing",
+      declared_files: "src/billing.ts",
+      scope_globs: "tests/billing/**",
+    }] }));
+    expect(json.tasks[0]).toMatchObject({
+      declaredFiles: ["src/billing.ts"],
+      declaredGlobs: ["tests/billing/**"],
+    });
+  });
+
   it("parses quoted CSV fields and reports empty rows", () => {
     const result = importTasks(
       'id,title,description,priority,dependencies,acceptance\nT1,"API, v2",Ship it,high,,tests pass\nT2,,missing,low,T1,',

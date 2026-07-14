@@ -33,13 +33,13 @@ export function CommandPalette({
   const projects = useProjects((s) => s.projects);
   const activeProjectId = useProjects((s) => s.activeProjectId);
   const missionSig = useMissions((state) => Object.values(state.projection.missions)
-    .filter((mission) => mission.projectId === activeProjectId && mission.status !== "archived")
+    .filter((mission) => mission.projectId === activeProjectId)
     .map((mission) => `${mission.id}:${mission.title}:${mission.status}:${mission.updatedAt}`)
     .sort()
     .join("|"));
   const missions = useMemo(() => Object.values(useMissions.getState().projection.missions)
-    .filter((mission) => mission.projectId === activeProjectId && mission.status !== "archived")
-    .sort((a, b) => b.updatedAt - a.updatedAt), [activeProjectId, missionSig]);
+    .filter((mission) => mission.projectId === activeProjectId)
+    .sort((a, b) => Number(a.status === "archived") - Number(b.status === "archived") || b.updatedAt - a.updatedAt), [activeProjectId, missionSig]);
 
   const [search, setSearch] = useState("");
 

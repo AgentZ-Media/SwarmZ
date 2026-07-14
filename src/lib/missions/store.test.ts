@@ -61,6 +61,30 @@ describe("mission command store", () => {
     });
   });
 
+  it("creates, validates and activates a mission task batch atomically", () => {
+    const result = useMissions.getState().createMissionWithTasks({
+      id: "mission-atomic",
+      projectId: "project-1",
+      title: "Atomic mission",
+      objective: "Never leave an empty draft",
+    }, [task("leaf", ["root"]), task("root")], { occurredAt: 10 });
+    expect(result).toEqual({ missionId: "mission-atomic", taskIds: ["leaf", "root"] });
+    expect(useMissions.getState().projection.missions["mission-atomic"]).toMatchObject({
+      status: "active",
+      taskIds: ["root", "leaf"],
+    });
+    const before = useMissions.getState().events.length;
+    expect(() => useMissions.getState().createMissionWithTasks({
+      id: "mission-invalid",
+      projectId: "project-1",
+      title: "Invalid",
+      objective: "Must roll back",
+    }, [task("cycle-a", ["cycle-b"]), task("cycle-b", ["cycle-a"])]))
+      .toThrow(/cyclic/);
+    expect(useMissions.getState().events).toHaveLength(before);
+    expect(useMissions.getState().projection.missions["mission-invalid"]).toBeUndefined();
+  });
+
   it("validates mission title and objective before mutating the log", () => {
     expect(() => useMissions.getState().createMission({
       id: "mission-1",
@@ -118,6 +142,24 @@ describe("mission command store", () => {
     expect(projection.tasks["task-1"].attemptIds).toEqual(["attempt-1", "attempt-2"]);
     expect(projection.attempts["attempt-1"]).toMatchObject({ status: "failed", error: "red" });
     expect(projection.attempts["attempt-2"]).toMatchObject({ status: "succeeded", summary: "green" });
+  });
+
+  it("durably pauses a running task and refuses archive until its attempt settles", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
+    state.addTask("mission-1", task("task-1"));
+    state.createAttempt("mission-1", "task-1", { id: "attempt-1", sessionId: "session-1" }, { occurredAt: 10 });
+    expect(useMissions.getState().projection.tasks["task-1"].status).toBe("running");
+    state.pauseTask("mission-1", "task-1", { occurredAt: 20 });
+    expect(useMissions.getState().projection.tasks["task-1"]).toMatchObject({
+      status: "paused",
+      pausedAt: 20,
+    });
+    expect(() => state.archiveTask("mission-1", "task-1", { occurredAt: 21 }))
+      .toThrow(/running attempt/);
+    state.settleAttempt("mission-1", "attempt-1", { status: "cancelled" }, { occurredAt: 22 });
+    state.archiveTask("mission-1", "task-1", { occurredAt: 23 });
+    expect(useMissions.getState().projection.tasks["task-1"].status).toBe("archived");
   });
 
   it("requeues a terminal intervention with an instruction for one fresh attempt", () => {
@@ -229,6 +271,26 @@ describe("mission command store", () => {
       .toBe("archived");
   });
 
+  it("refuses to archive while durable outbox work is unsettled", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
+    const pending = enqueueMissionCommand(emptyMissionOutbox(), {
+      missionId: "mission-1",
+      idempotencyKey: "pending:1",
+      kind: "settle",
+      payload: {
+        taskId: "task-1",
+        attemptId: "attempt-1",
+        status: "failed",
+        completionId: "completion-1",
+      },
+    }, "pending-1", 10).snapshot;
+    useMissionOutbox.setState({ snapshot: pending });
+    expect(() => state.archiveMission("mission-1", { occurredAt: 20 }))
+      .toThrow(/unsettled outbox operation/);
+    expect(useMissions.getState().projection.missions["mission-1"].status).toBe("draft");
+  });
+
   it("settles multiple quality gates in one event-log batch", () => {
     const state = useMissions.getState();
     state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
@@ -308,6 +370,56 @@ describe("mission command store", () => {
     expect(() => state.selectCandidate("mission-1", batchId, "candidate-1")).toThrow(/evidence decision/);
     state.selectCandidate("mission-1", batchId, "candidate-2");
     expect(useMissions.getState().projection.candidateBatches[batchId].selectedAttemptId).toBe("candidate-2");
+  });
+
+  it("projects quality gates from the selected candidate, not the last finisher", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
+    state.addTask("mission-1", { ...task("task-1"), maxAttempts: 4 });
+    state.addQualityGate("mission-1", {
+      id: "gate-test", taskId: "task-1", kind: "unit_tests", label: "Unit tests",
+      command: "pnpm test", required: true,
+    });
+    const batchId = state.requestCandidateBatch("mission-1", "task-1", { count: 2, instruction: "Compare" });
+    for (const [id, score, status] of [
+      ["candidate-a", 2, "passed"],
+      ["candidate-b", 1, "failed"],
+    ] as const) {
+      state.createAttempt("mission-1", "task-1", { id, candidateBatchId: batchId });
+      state.recordArtifact("mission-1", {
+        id: `commit-${id}`, taskId: "task-1", attemptId: id, kind: "commit",
+        label: "Verified commit", uri: null,
+        metadata: { authority: "swarmz_native", evidenceKind: "commit", commit: id.padEnd(40, "a") },
+      });
+      state.recordArtifact("mission-1", {
+        id: `test-${id}`, taskId: "task-1", attemptId: id, kind: "test_result",
+        label: "Native acceptance", uri: null,
+        metadata: { authority: "swarmz_native", evidenceKind: "test", command: "pnpm test", status, exitCode: status === "passed" ? 0 : 1 },
+      });
+      for (let index = 0; index < score; index++) state.recordArtifact("mission-1", {
+        id: `extra-${id}-${index}`, taskId: "task-1", attemptId: id, kind: "diff",
+        label: `Evidence ${index}`, uri: null,
+        metadata: { authority: "swarmz_native", evidenceKind: "diff" },
+      });
+      state.settleAttempt("mission-1", id, { status: "succeeded" });
+    }
+    state.selectCandidate("mission-1", batchId, "candidate-a");
+    expect(useMissions.getState().projection.qualityGates["gate-test"]).toMatchObject({
+      status: "passed",
+      artifactIds: ["test-candidate-a"],
+    });
+  });
+
+  it("locks candidate experiments after a task entered the integration train", () => {
+    const state = useMissions.getState();
+    state.createMission({ id: "mission-1", projectId: "project-1", title: "M", objective: "O" });
+    state.addTask("mission-1", { ...task("task-1"), maxAttempts: 4 });
+    state.createIntegrationTrain("mission-1", {
+      id: "train-1", baseBranch: "main", integrationBranch: "swarmz/mission-1",
+      status: "running", entries: [{ taskId: "task-1", position: 0, status: "integrated", commit: "a".repeat(40), detail: null }],
+    });
+    expect(() => state.requestCandidateBatch("mission-1", "task-1", { count: 2, instruction: "Too late" }))
+      .toThrow(/locked after.*integrated/);
   });
 
   it("persists schedule create, cancellation and at-most-once claim lifecycle", () => {
