@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { changeToPatchText, hasFileHeader, toFileDiff } from "./diff-pierre";
+import { toFileDiff } from "./diff-pierre";
+import { changeToPatchText, hasFileHeader } from "./diff-patch";
 import type { VibeFileChange } from "@/types";
 
-// Pure patch-text logic of the @pierre/diffs adapter. Importing the module
-// registers the css-variables theme at load — safe in the node test env
-// (no DOM involved).
+// Patch construction stays engine-independent; one empty-file assertion also
+// crosses the lazy renderer boundary and verifies that Pierre can parse it.
 
 describe("hasFileHeader", () => {
   it("accepts a leading diff --git header", () => {

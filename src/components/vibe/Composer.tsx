@@ -9,7 +9,7 @@ import {
 } from "@/lib/vibe/controller";
 import { approvalCommand } from "@/lib/vibe/ui";
 import { splitUnifiedDiff } from "@/lib/vibe/diff";
-import { changeToPatchText } from "@/lib/vibe/diff-pierre";
+import { changeToPatchText } from "@/lib/vibe/diff-patch";
 import { cn } from "@/lib/utils";
 import type { VibeFileChange, VibeItem } from "@/types";
 import { CompactDiffPreview } from "./DiffCard";

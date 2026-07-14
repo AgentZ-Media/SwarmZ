@@ -222,7 +222,8 @@ accent stops, strings ok-tinted, functions warm, comments `--fnt`), and the
 structural `--diffs-*-override` variables pin the +/- washes to `--add`/
 `--del` at 11 % / 26 % emphasis, scoped to `.vibe-diff`. The engine is
 `shiki-js` (pure-JS RegExp — no Oniguruma WASM, the WKWebView-safe choice);
-highlighting runs in pierre's 2-worker pool mounted once in `VibeLayer`.
+highlighting is lazy-loaded with the first expanded diff; all mounted diff
+providers resolve to pierre's shared 2-worker singleton pool.
 Changing `--acc` re-themes diffs automatically. Never theme by patching the
 library — only through these variables.
 

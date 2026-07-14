@@ -1,16 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { TitleBar } from "./components/TitleBar";
 import { VibeLayer } from "./components/vibe/VibeLayer";
 import { Deck } from "./components/Deck";
 import { Toasts } from "./components/Toasts";
-import { CommandPalette } from "./components/CommandPalette";
 import { QuitConfirmDialog } from "./components/QuitConfirmDialog";
 import { CloseWorktreeDialog } from "./components/CloseWorktreeDialog";
-import { SettingsDialog } from "./components/SettingsDialog";
-import { QuickNotesPanel } from "./components/QuickNotesPanel";
-import { UsageDashboard } from "./components/UsageDashboard";
-import { GitHubPanel } from "./components/GitHubPanel";
 import { useSwarm } from "./store";
 import { useVibe } from "./lib/vibe/session-store";
 import { hasPendingApproval } from "./lib/vibe/ui";
@@ -39,6 +34,35 @@ import {
 } from "./lib/vibe/controller";
 import { ensureNotifyPermission, notify } from "./lib/transport";
 
+// Optional surfaces are sizeable and closed on a normal launch. Keep them out
+// of the startup graph; after first use they remain mounted so Radix can finish
+// close animations and restore focus correctly.
+const CommandPalette = lazy(() =>
+  import("./components/CommandPalette").then((module) => ({
+    default: module.CommandPalette,
+  })),
+);
+const SettingsDialog = lazy(() =>
+  import("./components/SettingsDialog").then((module) => ({
+    default: module.SettingsDialog,
+  })),
+);
+const QuickNotesPanel = lazy(() =>
+  import("./components/QuickNotesPanel").then((module) => ({
+    default: module.QuickNotesPanel,
+  })),
+);
+const UsageDashboard = lazy(() =>
+  import("./components/UsageDashboard").then((module) => ({
+    default: module.UsageDashboard,
+  })),
+);
+const GitHubPanel = lazy(() =>
+  import("./components/GitHubPanel").then((module) => ({
+    default: module.GitHubPanel,
+  })),
+);
+
 // dev-only orchestrator smoke-test hook (`window.__orch`) — the DEV guard
 // makes production builds drop the import entirely
 if (import.meta.env.DEV) void import("./lib/orchestrator/dev");
@@ -49,6 +73,15 @@ export default function App() {
   const hydrate = useSwarm((s) => s.hydrate);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const paletteOpen = useSwarm((s) => s.paletteOpen);
+  const dashboardOpen = useSwarm((s) => s.dashboardOpen);
+  const notesOpen = useSwarm((s) => s.notesOpen);
+  const githubOpen = useSwarm((s) => s.githubOpen);
+  const paletteRequested = useLoadOnce(paletteOpen);
+  const settingsRequested = useLoadOnce(settingsOpen);
+  const dashboardRequested = useLoadOnce(dashboardOpen);
+  const notesRequested = useLoadOnce(notesOpen);
+  const githubRequested = useLoadOnce(githubOpen);
   const notifyGranted = useRef(false);
   const prevPending = useRef<Set<string>>(new Set());
 
@@ -246,11 +279,71 @@ export default function App() {
       <Toasts />
       <QuitConfirmDialog />
       <CloseWorktreeDialog />
-      <CommandPalette onOpenSettings={() => setSettingsOpen(true)} />
-      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
-      <UsageDashboard />
-      <QuickNotesPanel />
-      <GitHubPanel />
+      {paletteRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening search" />}>
+          <CommandPalette onOpenSettings={() => setSettingsOpen(true)} />
+        </Suspense>
+      )}
+      {settingsRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening settings" />}>
+          <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+        </Suspense>
+      )}
+      {dashboardRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening usage" side />}>
+          <UsageDashboard />
+        </Suspense>
+      )}
+      {notesRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening notes" side />}>
+          <QuickNotesPanel />
+        </Suspense>
+      )}
+      {githubRequested && (
+        <Suspense fallback={<SurfaceLoading label="Opening GitHub" side />}>
+          <GitHubPanel />
+        </Suspense>
+      )}
     </TooltipProvider>
+  );
+}
+
+/** Request a lazy surface on first open, then keep it mounted permanently. */
+function useLoadOnce(open: boolean): boolean {
+  const [requested, setRequested] = useState(open);
+  useEffect(() => {
+    if (open) setRequested(true);
+  }, [open]);
+  return requested || open;
+}
+
+/** Branded, non-empty first-load state for optional dialogs and drawers. */
+function SurfaceLoading({
+  label,
+  side = false,
+}: {
+  label: string;
+  side?: boolean;
+}) {
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={label}
+      className="fixed inset-0 z-50 flex bg-black/45"
+    >
+      <div
+        role="status"
+        aria-live="polite"
+        className={
+          side
+            ? "ml-auto flex h-full w-[min(92vw,32rem)] items-center justify-center border-l border-line bg-panel"
+            : "m-auto flex h-24 w-[min(88vw,28rem)] items-center justify-center rounded-xl border border-line bg-panel shadow-2xl"
+        }
+      >
+        <span aria-hidden className="mr-2 h-2 w-2 animate-pulse rounded-full bg-acc" />
+        <span className="font-mono text-12 text-mut">{label}…</span>
+      </div>
+    </div>
   );
 }
