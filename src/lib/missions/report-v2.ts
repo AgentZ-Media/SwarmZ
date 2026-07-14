@@ -1,6 +1,7 @@
 export const MISSION_REPORT_V2_MAX_INPUT = 100_000;
 const SHA = /^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/;
 const SHA256 = /^[a-fA-F0-9]{64}$/;
+const FAILURE_FINGERPRINT = /^[a-z0-9][a-z0-9._:/-]{0,119}$/;
 
 export type MissionReportStatus =
   | "succeeded"
@@ -37,6 +38,10 @@ export interface MissionReportV2 {
   filesChanged: string[];
   commands: MissionReportCommand[];
   artifacts: MissionReportArtifact[];
+  /** Bounded, normalized agent observation; optional only for legacy v2 compatibility. */
+  failureFingerprint?: string | null;
+  /** Agent observation only; optional for legacy v2, never controller retry authority. */
+  retryable?: boolean | null;
   question: string | null;
 }
 
@@ -91,6 +96,16 @@ export const MISSION_REPORT_V2_SCHEMA = {
         required: ["kind", "label", "uri", "sha256"],
       },
     },
+    failure_fingerprint: {
+      type: ["string", "null"],
+      maxLength: 120,
+      pattern: "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$",
+      description: "Stable machine-oriented failure category, or null. This is an observation, not retry authority.",
+    },
+    retryable: {
+      type: ["boolean", "null"],
+      description: "Whether retry may help, or null when unknown. This is an observation only.",
+    },
     question: { type: ["string", "null"] },
   },
   required: [
@@ -104,6 +119,8 @@ export const MISSION_REPORT_V2_SCHEMA = {
     "files_changed",
     "commands",
     "artifacts",
+    "failure_fingerprint",
+    "retryable",
     "question",
   ],
 } as const;
@@ -199,6 +216,16 @@ export function parseMissionReportV2(text: string | null | undefined): MissionRe
       (sha256 !== null && !SHA256.test(sha256))) return null;
     artifacts.push({ kind, label, uri, sha256 });
   }
+  const failureFingerprintRaw = value.failure_fingerprint === undefined
+    ? null
+    : nullableLine(value.failure_fingerprint, 120);
+  if (failureFingerprintRaw === undefined) return null;
+  const failureFingerprint = failureFingerprintRaw?.toLowerCase() ?? null;
+  if (failureFingerprint !== null && !FAILURE_FINGERPRINT.test(failureFingerprint)) return null;
+  const retryable = value.retryable === undefined ? null : value.retryable;
+  if (retryable !== null && typeof retryable !== "boolean") return null;
+  const failureStatus = status === "failed" || status === "blocked" || status === "needs_human";
+  if (!failureStatus && (failureFingerprint !== null || retryable !== null)) return null;
   const question = nullableLine(value.question, 1_000);
   if (question === undefined || (status === "needs_human" && !question)) return null;
   return {
@@ -212,6 +239,8 @@ export function parseMissionReportV2(text: string | null | undefined): MissionRe
     filesChanged,
     commands,
     artifacts,
+    failureFingerprint,
+    retryable,
     question,
   };
 }

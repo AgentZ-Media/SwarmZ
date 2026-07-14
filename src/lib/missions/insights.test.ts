@@ -4,6 +4,7 @@ import {
   calculateMissionInsights,
   type MissionTaskObservation,
 } from "./insights";
+import { parseMissionReportV2 } from "./report-v2";
 
 function observation(index: number, status: MissionTaskObservation["status"]): MissionTaskObservation {
   return {
@@ -66,5 +67,39 @@ describe("mission insights", () => {
     expect(() => calculateMissionInsights([failed], 1)).toThrow(
       MissionInsightsError,
     );
+  });
+
+  it("clusters normalized report observations without treating retryable as policy", () => {
+    const report = parseMissionReportV2(JSON.stringify({
+      version: 2,
+      mission_id: "mission-1",
+      task_id: "task-0",
+      attempt_id: "attempt-0",
+      status: "failed",
+      summary: "The local service did not become ready",
+      evidence: { base_sha: null, head_sha: "a".repeat(40), diff_sha256: null },
+      files_changed: [],
+      commands: [],
+      artifacts: [],
+      failure_fingerprint: "Runtime:Healthcheck-Timeout",
+      retryable: true,
+      question: null,
+    }))!;
+    const failed = {
+      ...observation(0, "failed"),
+      attemptCount: 1,
+      failureFingerprint: report.failureFingerprint ?? null,
+      retryable: report.retryable ?? null,
+    };
+    const result = calculateMissionInsights([failed], 1);
+    expect(result.failureClusters).toEqual([{
+      fingerprint: "runtime:healthcheck-timeout",
+      count: 1,
+      taskIds: ["task-0"],
+      retryableCount: 1,
+      nonRetryableCount: 0,
+      unknownRetryabilityCount: 0,
+    }]);
+    expect(result.actual.retries).toBe(0);
   });
 });

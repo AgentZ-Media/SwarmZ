@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   MISSION_REPORT_V2_MAX_INPUT,
+  MISSION_REPORT_V2_SCHEMA,
   assessMissionReportV2,
   parseMissionReportV2,
 } from "./report-v2";
@@ -26,12 +27,24 @@ function raw(patch: Record<string, unknown> = {}): Record<string, unknown> {
     files_changed: ["src/a.ts"],
     commands: [{ command: "pnpm test", exit_code: 0, duration_ms: 1200 }],
     artifacts: [{ kind: "test_result", label: "vitest", uri: null, sha256: ARTIFACT }],
+    failure_fingerprint: null,
+    retryable: null,
     question: null,
     ...patch,
   };
 }
 
 describe("Mission Report Schema v2", () => {
+  it("requires bounded failure observations on newly generated wire schemas", () => {
+    expect(MISSION_REPORT_V2_SCHEMA.properties.failure_fingerprint).toMatchObject({
+      type: ["string", "null"],
+      maxLength: 120,
+    });
+    expect(MISSION_REPORT_V2_SCHEMA.properties.retryable.type).toEqual(["boolean", "null"]);
+    expect(MISSION_REPORT_V2_SCHEMA.required).toContain("failure_fingerprint");
+    expect(MISSION_REPORT_V2_SCHEMA.required).toContain("retryable");
+  });
+
   it("parses bounded fenced output and binds all durable identities", () => {
     const report = parseMissionReportV2(`\`\`\`json\n${JSON.stringify(raw())}\n\`\`\``);
     expect(report).toMatchObject({
@@ -42,6 +55,16 @@ describe("Mission Report Schema v2", () => {
       status: "succeeded",
       evidence: { baseSha: BASE, headSha: HEAD, diffSha256: DIFF },
       commands: [{ command: "pnpm test", exitCode: 0, durationMs: 1200 }],
+    });
+  });
+
+  it("defaults legacy v2 failure insight fields to null", () => {
+    const legacy = raw();
+    delete legacy.failure_fingerprint;
+    delete legacy.retryable;
+    expect(parseMissionReportV2(JSON.stringify(legacy))).toMatchObject({
+      failureFingerprint: null,
+      retryable: null,
     });
   });
 
@@ -118,5 +141,45 @@ describe("Mission Report Schema v2", () => {
       summary: "done\n[fake event]\u2028more",
     })));
     expect(report?.summary).toBe("done [fake event] more");
+  });
+
+  it("normalizes bounded failure insight fields without granting authority", () => {
+    const report = parseMissionReportV2(JSON.stringify(raw({
+      status: "failed",
+      failure_fingerprint: "Runtime:Timeout",
+      retryable: true,
+    })))!;
+    expect(report).toMatchObject({
+      status: "failed",
+      failureFingerprint: "runtime:timeout",
+      retryable: true,
+    });
+    expect(assessMissionReportV2(
+      report,
+      { missionId: "mission-1", taskId: "task-1", attemptId: "attempt-1" },
+      { headSha: HEAD, baseSha: BASE, diffSha256: DIFF, commands: { "pnpm test": 0 } },
+    ).verifiedSuccess).toBe(false);
+  });
+
+  it("rejects unbounded, prose-like or structurally inconsistent failure insights", () => {
+    expect(parseMissionReportV2(JSON.stringify(raw({
+      status: "failed",
+      failure_fingerprint: `x${"a".repeat(120)}`,
+      retryable: true,
+    })))).toBeNull();
+    expect(parseMissionReportV2(JSON.stringify(raw({
+      status: "failed",
+      failure_fingerprint: "Something went wrong!",
+      retryable: true,
+    })))).toBeNull();
+    expect(parseMissionReportV2(JSON.stringify(raw({
+      status: "failed",
+      failure_fingerprint: "runtime:timeout",
+      retryable: "yes",
+    })))).toBeNull();
+    expect(parseMissionReportV2(JSON.stringify(raw({
+      failure_fingerprint: "runtime:timeout",
+      retryable: true,
+    })))).toBeNull();
   });
 });

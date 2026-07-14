@@ -11,8 +11,9 @@ export interface MissionTaskObservation {
   activeDurationMs: number | null;
   tokensUsed: number | null;
   costUsd: number | null;
-  /** Explicit stable code from a gate/runtime, never inferred from prose. */
+  /** Explicit stable gate/runtime code or bounded agent observation; descriptive only. */
   failureFingerprint: string | null;
+  /** Untrusted observation used only for counts, never automatic retry authority. */
   retryable: boolean | null;
 }
 
