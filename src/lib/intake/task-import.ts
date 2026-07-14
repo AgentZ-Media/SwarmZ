@@ -1,4 +1,17 @@
-export type IntakeSource = "text" | "markdown" | "csv" | "json";
+import {
+  normalizeGitHubIssues,
+  normalizeJiraIssues,
+  normalizeLinearIssues,
+} from "./adapters";
+
+export type IntakeSource =
+  | "text"
+  | "markdown"
+  | "csv"
+  | "json"
+  | "github_issues"
+  | "jira"
+  | "linear";
 
 export interface IntakeTaskDraft {
   externalId: string | null;
@@ -160,6 +173,33 @@ function parseJson(text: string): TaskImportResult | null {
   }
 }
 
+function parseExternalJson(text: string): TaskImportResult | null {
+  if (!/^\s*[\[{]/.test(text)) return null;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    const values = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).issues)
+        ? (parsed as { issues: unknown[] }).issues
+        : null;
+    if (!values || values.length === 0) return null;
+    const first = values.find((value) => value && typeof value === "object") as Record<string, unknown> | undefined;
+    if (!first) return null;
+    if (Number.isSafeInteger(first.number) && typeof first.title === "string" && typeof first.state === "string") {
+      return normalizeGitHubIssues(values as Parameters<typeof normalizeGitHubIssues>[0]);
+    }
+    if (typeof first.key === "string" && first.fields && typeof first.fields === "object") {
+      return normalizeJiraIssues(values as Parameters<typeof normalizeJiraIssues>[0]);
+    }
+    if ((typeof first.identifier === "string" || typeof first.id === "string") && typeof first.title === "string") {
+      return normalizeLinearIssues(values as Parameters<typeof normalizeLinearIssues>[0]);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 const TASK_LINE = /^\s*(?:[-*+]\s+(?:\[[ xX]\]\s*)?|\d+[.)]\s+)(.+?)\s*$/;
 
 function parseText(text: string): TaskImportResult {
@@ -222,6 +262,11 @@ function parseText(text: string): TaskImportResult {
 export function importTasks(input: string): TaskImportResult {
   const text = input.slice(0, MAX_INPUT_CHARS);
   const clipped = input.length > MAX_INPUT_CHARS;
+  const external = parseExternalJson(text);
+  if (external) {
+    if (clipped) external.warnings.unshift("Input was clipped to 1 MB.");
+    return external;
+  }
   const json = parseJson(text);
   if (json) {
     if (clipped) json.warnings.unshift("Input was clipped to 1 MB.");

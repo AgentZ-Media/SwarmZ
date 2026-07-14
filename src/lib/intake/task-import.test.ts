@@ -69,6 +69,18 @@ describe("mission task intake", () => {
     });
   });
 
+  it("auto-detects a GitHub issue export", () => {
+    const result = importTasks(JSON.stringify([
+      { number: 12, title: "Harden login", body: "Reject replay", state: "OPEN", labels: [{ name: "security" }] },
+    ]));
+    expect(result.source).toBe("github_issues");
+    expect(result.tasks[0]).toMatchObject({
+      externalId: "GH-12",
+      title: "Harden login",
+      role: "security",
+    });
+  });
+
   it("caps bulk imports without silently accepting unlimited work", () => {
     const input = Array.from({ length: 550 }, (_, index) => `Task ${index}`).join("\n");
     const result = importTasks(input);
