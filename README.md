@@ -2,9 +2,12 @@
 
 # ⚡ SwarmZ
 
-**A native macOS swarm manager for Codex agents — with an autonomous AI Conductor per project.**
+**Native macOS Mission Control for large Codex engineering goals.**
 
-Run a swarm of native Codex sessions in project tabs. A Conductor per project decomposes your goals onto named sub-agents in git worktrees, steers and reviews them, sets its own follow-ups, and learns your preferences.
+Turn a backlog into a durable Mission: dependencies, fresh temporary workers,
+isolated worktrees, evidence-based quality gates, recovery and one integrated
+result. A single fixed Orchestrator per project coordinates and learns; workers
+never become reusable personalities.
 
 Your app state stays local · model traffic goes to OpenAI through the Codex CLI (your ChatGPT sign-in) · no OAuth, no tokens.
 
@@ -12,37 +15,74 @@ Your app state stays local · model traffic goes to OpenAI through the Codex CLI
 
 ---
 
-Each agent is a **native Codex session** driven directly through the `codex app-server` — no PTY, no terminal emulation. Work arrives as structured cards: streaming assistant messages (rendered as markdown), collapsible command output, syntax-highlighted **diff cards**, plans, and **approval prompts** you allow or decline right in the composer (`⏎` allow · `⎋` decline).
+Each worker is a **native Codex session** driven directly through the
+`codex app-server` — no PTY and no terminal emulation. Work arrives as
+structured cards: streaming assistant messages, collapsible command output,
+syntax-highlighted diffs, evidence reports and approval prompts you allow or
+decline in the composer (`⏎` allow · `⎋` decline).
 
-Sessions live in **project tabs** — one per folder, deduped by canonical path, resumable across restarts. Each project keeps its own swarm, its own Conductor and its own memory.
+Sessions and Missions live in **project tabs** — one per canonical folder,
+resumable across restarts. Each project keeps its own Mission state, fleet,
+fixed Orchestrator and scoped memory.
 
 Built with **React 19 + TypeScript + Tailwind v4** on Tauri 2 (Rust). Dark mode only — by design (`DESIGN.md`).
 
 ## ✨ Features
 
-- 🤖 **An Orchestrator per project** — each tab gets the same fixed AI engineering-lead identity, its own Codex process (spawned lazily, reaped after 15 idle minutes, transparently resumed), chats and scoped memory. Give it a goal and it **delegates by default** onto up to 8 temporary task lanes in git worktrees, then steers and reviews that assignment. Workers have no persona or durable memory and are retired after their task; only Orchestrator learns through the explicit `remember` tool.
-- 🧠 **Genuinely autonomous** — fleet events (an agent finishes, an agent asks for direction, a routine approval lands, a timer fires, a lane sits idle, a watched PR changes) wake the Conductor for a **budget-gated** turn: it judges the result, hands out follow-ups, reports back and learns. Agents deliver schema-forced status reports so it always knows what happened. A per-project circuit breaker (5 consecutive / 20 per hour, only a human message re-arms it) caps runaway cascades; every event payload is treated as untrusted data.
-- 🌳 **Git worktrees, managed** — the Conductor creates worktrees per lane, re-homes agents and cleans up under a safe gate that never force-removes work. A worktree panel (title bar) lists every SwarmZ worktree per repo with live dirty/ahead state, reveal-in-Finder, open-in-session and a safe bulk cleanup.
+- 🎯 **Durable Mission Control** — tasks, dependencies, attempts, artifacts,
+  policies, schedules and decisions live in an event-sourced model rather than
+  disappearing into chat. Board, Graph, Fleet, Integration and Timeline views
+  expose progress, critical dependencies and the next human decision.
+- 🤖 **One Orchestrator per project** — every tab gets the same product-owned
+  engineering-lead identity, its own Codex process, chats and scoped memory.
+  Persona presets and reusable worker profiles are gone. Only Orchestrator can
+  learn through the explicit `remember` tool.
+- ⚡ **Fresh bounded workers** — the scheduler admits up to 8 parallel,
+  one-assignment attempts against live process capacity and a human-approved
+  Mission Envelope. Every attempt receives its own deterministic worktree and
+  is closed after its evidence becomes durable.
+- ✅ **Evidence before success** — worker reports are untrusted. Native Git
+  snapshots, exact scoped diffs, direct-argv command exits, review and usage
+  artifacts must pass before a task becomes verified.
+- 🚂 **Integration Train and recovery** — successful branches integrate in
+  dependency order behind reproducible gates and durable checkpoints. Failed
+  entries expose explicit Retry, Skip and typed-confirm Rollback actions.
+- 🧪 **Runtime Environments** — configure direct-argv setup/cleanup, local
+  services, ports and database namespaces. Acceptance commands run in a
+  no-network macOS sandbox with a confined HOME and narrowly granted toolchains.
+- 🧩 **Large-task intake and reuse** — import text, Markdown, CSV, JSON or
+  GitHub Issues; apply playbooks and temporary task roles; coordinate multiple
+  project roots; compare evidence-bound candidate attempts.
+- 🧠 **Genuinely autonomous, visibly bounded** — worker completions, routine
+  approvals, timers, idle lanes and watched PR changes wake budget-gated
+  Orchestrator turns. A persisted circuit breaker caps runaway cascades.
+- 🌳 **Git worktrees, managed** — worktrees carry live dirty/ahead state,
+  reveal/open actions and safe cleanup that never silently force-removes work.
 - ✅ **Approvals stay human** — session approvals surface as cards in the composer. The Conductor gets a *fast lane* for genuinely routine approvals, but the classifier is **fail-closed and Rust-anchored**: any shell metasyntax, interpreter, foreign path, delete or rename is destructive and stays human-only, enforced server-side. In doubt, always the human.
 - 🐙 **GitHub, opt-in and local-only** — SwarmZ reads and (optionally) manages a project's GitHub context over your locally installed **`gh` CLI**. There is **no OAuth, no login flow, and no token ever touches SwarmZ**. Read-only detection and the PR panel work always; a single Settings toggle (default off) arms the Conductor's PR tools, the write gate, PR-approval routing and a PR watcher. Deliberately **no merge/close** command anywhere — merging stays yours.
-- 🗂️ **Fleet grid + focus stage** — a dot-grid of live agent cards for the active project (status, worktree branch, ±diff, mini feed, quick approvals) plus a focus stage to expand one agent full-window. `@agent` in the Conductor composer talks to a session directly.
-- 📊 **Deck** — a slim status bar: global needs-you triage queue (`⌘⇧A`), a fleet event ticker, account-level Codex plan meters, a PR indicator and the Conductor status dot.
+- 🗂️ **Fleet grid + focus stage** — live worker cards show status, branch,
+  diff, feed and approvals; focus expands one lane. `@lane` in the Orchestrator
+  composer continues that lane's one assignment.
+- 📊 **Attention and insights** — one global Attention Inbox combines worker,
+  task, integration and actionable PR/CI failures. Mission Insights summarizes
+  throughput, risk, retries, ETA and cost from durable evidence.
 - 📝 **Quick notes** (`⌘N`), **command palette** (`⌘K`), **usage dashboard** (all-time Codex history), in-app auto-updates.
 
 ## 🚀 Quick start
 
 1. Install the [Codex CLI](https://developers.openai.com/codex/cli) (≥ 0.144) and sign in with your ChatGPT account. Optionally install the [GitHub CLI](https://cli.github.com) (`gh`) for the GitHub integration.
 2. `pnpm install` · `pnpm tauri dev`
-3. `+` (title bar) opens a project folder · `⌘T` starts an agent · `⌘⇧O` (or `⌘B`) talks to the Conductor.
+3. `+` opens a project · create a Mission for a large backlog · `⌘⇧O` (or
+   `⌘B`) talks to Orchestrator · `⌘T` starts a manual temporary lane.
 
 ## ⌨️ Keyboard shortcuts
 
 | Shortcut | Action |
 | --- | --- |
-| `⌘T` | New agent (Codex session) |
-| `⌘B` | Toggle the Conductor sidebar |
-| `⌘⇧O` | Show the Conductor (sidebar + fleet) |
-| `⌘⇧A` | Jump to the oldest agent waiting for you |
+| `⌘T` | New temporary worker lane |
+| `⌘B` | Toggle the Orchestrator sidebar |
+| `⌘⇧O` | Show Orchestrator and Mission Control |
+| `⌘⇧A` | Open the global Attention Inbox |
 | `⌘1`–`⌘9` | Switch to the n-th project tab |
 | `⌘K` | Command palette |
 | `⌘N` | Quick notes |
@@ -52,11 +92,21 @@ Built with **React 19 + TypeScript + Tailwind v4** on Tauri 2 (Rust). Dark mode 
 
 ## 🔒 Privacy
 
-Your app state — sessions, chats, notes, settings, memory — stays on your machine (a local `swarmz.json` plus the Codex rollout files under `~/.codex`). Model traffic goes to OpenAI through the Codex CLI (your ChatGPT sign-in); GitHub actions go through your local `gh`. SwarmZ itself holds no account, no token and no server.
+Your app state — projects, Missions, event logs, outbox records, runtime specs,
+schedules, sessions, chats, notes, settings, budgets and Orchestrator memory —
+stays on your machine (a local `swarmz.json` plus Codex rollout files under
+`~/.codex`). Model traffic goes to OpenAI through the Codex CLI (your ChatGPT
+sign-in); optional GitHub actions go through your local `gh`. SwarmZ itself
+has no account, hosted service or OAuth flow.
 
 ## 🏗️ Architecture
 
-See `AGENTS.md` (map + invariants) and `docs/ARCHITECTURE.md` (per-subsystem deep dive). Short version: a generic `codex app-server` host in Rust (`src-tauri/src/codex/`) drives one private process per session and one process per project for that project's Conductor; the Conductor's tools are defined once in Rust (`orchestrator/registry.rs`) and execute in the webview against the Zustand stores, scoped to the calling Conductor's project. Design tokens and UI conventions live in `DESIGN.md`.
+See `AGENTS.md` (map + invariants) and `docs/ARCHITECTURE.md`
+(subsystem deep dive). A generic Rust `codex app-server` host drives private
+worker processes and one project Orchestrator. The frontend persists Mission
+events, schedules and a fenced outbox; Rust owns filesystem, Git, process,
+sandbox, evidence and GitHub authority. Design tokens and UI conventions live
+in `DESIGN.md`.
 
 ## 🛠️ Development
 

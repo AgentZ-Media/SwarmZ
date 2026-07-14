@@ -1,6 +1,6 @@
 # AGENTS.md
 
-SwarmZ — run and monitor a swarm of native Codex agents (`codex app-server` sessions), organized in project tabs, with an AI Conductor PER PROJECT on top. React frontend + native macOS app (Tauri 2 / Rust). Deep per-subsystem details live in `docs/ARCHITECTURE.md` — read the relevant section there (or the code) before changing a subsystem, and keep it in sync.
+SwarmZ — native macOS Mission Control for durable engineering goals, with temporary task-bound Codex workers (`codex app-server` sessions) and one fixed learning Orchestrator per project. React frontend + native macOS app (Tauri 2 / Rust). Deep per-subsystem details live in `docs/ARCHITECTURE.md` — read the relevant section there (or the code) before changing a subsystem, and keep it in sync.
 
 **A native Codex-only swarm manager.** SwarmZ is the codex-only application: the old terminal/PTY/grid subsystem, the Claude runtime, the OpenRouter brain and voice dictation were removed in the `rebuild/codex-only-v1` rebuild (git history and `main` preserve the former terminal-grid app; the rebuild plan is `docs/plans/rebuild-codex-only-v1.md`). What exists now is one coherent product:
 

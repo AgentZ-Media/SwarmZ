@@ -1,8 +1,8 @@
 [package]
 name = "swarmz"
-version = "1.0.3"
-description = "A Tauri App"
-authors = ["you"]
+version = "1.1.0"
+description = "Native macOS Mission Control for durable Codex engineering swarms"
+authors = ["AgentZ Media"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
