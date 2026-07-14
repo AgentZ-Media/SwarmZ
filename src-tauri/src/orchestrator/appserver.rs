@@ -48,10 +48,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, oneshot};
 
 use super::adapter;
+use super::instructions::{MemoryBlocks, ModelCatalogEntry, ProjectContext, ReasoningEffortEntry};
 use super::memory::MemoryScope;
-use super::persona::{
-    MemoryBlocks, ModelCatalogEntry, PersonaSpec, ProjectContext, ReasoningEffortEntry,
-};
 use crate::codex::host::{
     self, Connection, EventSink, ProcessHost, Responder, ThreadEvent, RPC_TIMEOUT_MS,
     THREAD_TIMEOUT_MS, TURN_TIMEOUT_MS,
@@ -69,12 +67,12 @@ const IDLE_REAP_SECS: u64 = 15 * 60;
 /// How often the reaper looks.
 const REAP_TICK_SECS: u64 = 60;
 
-// System instructions are compiled per session from persona + project +
+// System instructions are compiled per session from the fixed Orchestrator identity + project +
 // memory + the hard-wired operative core (see
-// `super::persona::build_instructions`) and delivered as
+// `super::instructions::build_instructions`) and delivered as
 // `developerInstructions` on thread/start + thread/resume (keeps codex's own
 // base prompt — and with it the tool harness — intact, unlike
-// `baseInstructions`). Persona + project are captured per chat at start;
+// `baseInstructions`). Project context is captured per chat at start;
 // memory (global + project scope) is read fresh from disk each start/resume
 // (frozen per session).
 
@@ -102,9 +100,6 @@ struct ChatState {
     /// must never touch an operation that is already moving to the new
     /// process. Guards compare against THIS, never against `generation`.
     fence_generation: u64,
-    /// Persona captured at start/resume — reused for the developerInstructions
-    /// when chat_send has to transparently thread/resume after a respawn.
-    persona: PersonaSpec,
     /// The Conductor instance this chat belongs to (captured at start/resume).
     project: ProjectContext,
     current_turn_id: Option<String>,
@@ -208,9 +203,11 @@ fn instance_for(_app: &AppHandle, project_id: &str) -> Arc<Instance> {
 
 /// Does this project have a turn in flight (running or awaited)?
 fn project_has_running_turn(project_id: &str) -> bool {
-    SHARED.lock().chats.values().any(|c| {
-        c.project.id == project_id && (c.done_tx.is_some() || c.current_turn_id.is_some())
-    })
+    SHARED
+        .lock()
+        .chats
+        .values()
+        .any(|c| c.project.id == project_id && (c.done_tx.is_some() || c.current_turn_id.is_some()))
 }
 
 /// The idle reaper: every `REAP_TICK_SECS`, end the process of any instance
@@ -308,7 +305,11 @@ async fn ensure_conn(
 /// experimental dynamic-tools API in an actionable message.
 fn guard_dynamic_tools_error(err: String, version: Option<&str>) -> String {
     let lower = err.to_lowercase();
-    if lower.contains("dynamictools") || lower.contains("dynamic_tools") || lower.contains("experimental") || lower.contains("unknown field") {
+    if lower.contains("dynamictools")
+        || lower.contains("dynamic_tools")
+        || lower.contains("experimental")
+        || lower.contains("unknown field")
+    {
         format!(
             "the installed codex CLI ({}) does not support dynamic tools over app-server — SwarmZ needs the experimental dynamicTools API (verified working with codex {KNOWN_GOOD_VERSION}); update the codex CLI. Underlying error: {err}",
             version.unwrap_or("unknown version"),
@@ -349,9 +350,7 @@ async fn load_memory(app: &AppHandle, project_id: &str) -> MemoryBlocks {
         // strict scope construction — an invalid/reserved/empty id gets NO
         // project memory instead of a munged or aliased file name
         let project = match MemoryScope::project(&pid) {
-            Ok(scope) => {
-                super::memory::render_entries(&super::memory::read_entries(&dir, &scope))
-            }
+            Ok(scope) => super::memory::render_entries(&super::memory::read_entries(&dir, &scope)),
             Err(_) => String::new(),
         };
         MemoryBlocks { global, project }
@@ -362,19 +361,14 @@ async fn load_memory(app: &AppHandle, project_id: &str) -> MemoryBlocks {
 
 /// thread/start params: cwd = the project dir, read-only sandbox, no approval
 /// prompts (auto-declined anyway if one slips through), the compiled
-/// instructions (persona + project + memory + core) as developer message, and
+/// instructions (fixed identity + project + memory + core) as developer message, and
 /// the whole registry as dynamic tools.
 #[cfg(test)]
-fn thread_start_params(
-    persona: &PersonaSpec,
-    project: &ProjectContext,
-    memory: &MemoryBlocks,
-) -> Value {
-    thread_start_params_with_models(persona, project, memory, None)
+fn thread_start_params(project: &ProjectContext, memory: &MemoryBlocks) -> Value {
+    thread_start_params_with_models(project, memory, None)
 }
 
 fn thread_start_params_with_models(
-    persona: &PersonaSpec,
     project: &ProjectContext,
     memory: &MemoryBlocks,
     models: Option<&[ModelCatalogEntry]>,
@@ -383,7 +377,7 @@ fn thread_start_params_with_models(
         "cwd": thread_cwd(project),
         "sandbox": "read-only",
         "approvalPolicy": "never",
-        "developerInstructions": super::build_instructions_with_models(persona, project, memory, models),
+        "developerInstructions": super::build_instructions_with_models(project, memory, models),
         "dynamicTools": adapter::dynamic_tool_specs(),
     })
 }
@@ -392,18 +386,12 @@ fn thread_start_params_with_models(
 /// persists and restores them from the thread rollout (verified on 0.142.5).
 /// developerInstructions ARE re-sent, so memory changes land on the next resume.
 #[cfg(test)]
-fn thread_resume_params(
-    thread_id: &str,
-    persona: &PersonaSpec,
-    project: &ProjectContext,
-    memory: &MemoryBlocks,
-) -> Value {
-    thread_resume_params_with_models(thread_id, persona, project, memory, None)
+fn thread_resume_params(thread_id: &str, project: &ProjectContext, memory: &MemoryBlocks) -> Value {
+    thread_resume_params_with_models(thread_id, project, memory, None)
 }
 
 fn thread_resume_params_with_models(
     thread_id: &str,
-    persona: &PersonaSpec,
     project: &ProjectContext,
     memory: &MemoryBlocks,
     models: Option<&[ModelCatalogEntry]>,
@@ -413,7 +401,7 @@ fn thread_resume_params_with_models(
         "cwd": thread_cwd(project),
         "sandbox": "read-only",
         "approvalPolicy": "never",
-        "developerInstructions": super::build_instructions_with_models(persona, project, memory, models),
+        "developerInstructions": super::build_instructions_with_models(project, memory, models),
     })
 }
 
@@ -438,7 +426,11 @@ fn spawn_gen_dispatcher(
         while let Some(ev) = rx.recv().await {
             instance.touch();
             match ev {
-                ThreadEvent::Request { method, params, responder } => {
+                ThreadEvent::Request {
+                    method,
+                    params,
+                    responder,
+                } => {
                     handle_server_request(&app, generation, method, params, responder);
                 }
                 ThreadEvent::Notification { method, params } => {
@@ -476,7 +468,7 @@ fn claim_turn_slot(
     chat_id: &str,
     done_tx: oneshot::Sender<TurnOutcome>,
     busy_msg: &str,
-) -> Result<(u64, String, PersonaSpec, ProjectContext), String> {
+) -> Result<(u64, String, ProjectContext), String> {
     let mut shared = SHARED.lock();
     let chat = shared
         .chats
@@ -489,12 +481,7 @@ fn claim_turn_slot(
     chat.done_tx = Some(done_tx);
     chat.done_gen = None;
     chat.last_agent_message = None;
-    Ok((
-        chat.done_op,
-        chat.thread_id.clone(),
-        chat.persona.clone(),
-        chat.project.clone(),
-    ))
+    Ok((chat.done_op, chat.thread_id.clone(), chat.project.clone()))
 }
 
 /// Advance the chat's EVENT fence to `generation` — called BEFORE the awaited
@@ -613,13 +600,7 @@ fn handle_server_request(
             // normalized away in run_tool)
             let project_id = chat_id
                 .as_deref()
-                .and_then(|cid| {
-                    SHARED
-                        .lock()
-                        .chats
-                        .get(cid)
-                        .map(|c| c.project.id.clone())
-                })
+                .and_then(|cid| SHARED.lock().chats.get(cid).map(|c| c.project.id.clone()))
                 .unwrap_or_default();
             tokio::spawn(async move {
                 let tool = params
@@ -636,14 +617,8 @@ fn handle_server_request(
                         json!({ "tool": tool, "args_summary": adapter::summarize_args(&args) }),
                     );
                 }
-                let result = super::run_tool(
-                    &app,
-                    &tool,
-                    args,
-                    chat_id.clone(),
-                    Some(project_id),
-                )
-                .await;
+                let result =
+                    super::run_tool(&app, &tool, args, chat_id.clone(), Some(project_id)).await;
                 if let Some(cid) = &chat_id {
                     emit_chat_event(
                         &app,
@@ -852,12 +827,7 @@ fn handle_exit(app: &AppHandle, project_id: &str, event_gen: u64) {
 /// Register the thread's route on the (possibly fresh) connection and the
 /// chat bookkeeping. Idempotent per thread — a re-registration after a
 /// respawn just refreshes the route + generation.
-fn register_chat(
-    conn: &Connection,
-    sink: &EventSink,
-    generation: u64,
-    thread_id: &str,
-) -> String {
+fn register_chat(conn: &Connection, sink: &EventSink, generation: u64, thread_id: &str) -> String {
     conn.register_thread(thread_id, sink.clone());
     let mut shared = SHARED.lock();
     if let Some(existing) = shared.thread_to_chat.get(thread_id) {
@@ -886,22 +856,20 @@ fn register_chat(
     chat_id
 }
 
-/// Store the chat's persona + project after (re)registration — reused by
-/// chat_send's transparent resume so a respawn keeps voice AND scope.
-fn set_chat_context(chat_id: &str, persona: PersonaSpec, project: ProjectContext) {
+/// Store the chat's project after (re)registration — reused by chat_send's
+/// transparent resume so a respawn keeps its scope.
+fn set_chat_context(chat_id: &str, project: ProjectContext) {
     if let Some(chat) = SHARED.lock().chats.get_mut(chat_id) {
-        chat.persona = persona;
         chat.project = project;
     }
 }
 
 /// Start a fresh Conductor chat for one project (thread/start with all
-/// dynamic tools on that project's instance). The persona (voice) and the
-/// project are captured here; memory is read fresh from disk.
+/// dynamic tools on that project's instance). The project is captured here;
+/// memory is read fresh from disk.
 pub async fn chat_start(
     app: &AppHandle,
     codex_path: Option<String>,
-    persona: Option<PersonaSpec>,
     project: Option<ProjectContext>,
 ) -> Result<Value, String> {
     if codex_path.is_some() {
@@ -909,15 +877,16 @@ pub async fn chat_start(
         // an empty string clears the override back to plain `codex`
         host::set_codex_override(codex_path);
     }
-    let persona = persona.unwrap_or_default();
     let project = project.unwrap_or_default();
     let memory = load_memory(app, &project.id).await;
     let (conn, generation, sink) = ensure_conn(app, &project.id).await?;
-    let models = model_catalog_from_connection(&conn).await.unwrap_or_default();
+    let models = model_catalog_from_connection(&conn)
+        .await
+        .unwrap_or_default();
     let res = conn
         .request(
             "thread/start",
-            thread_start_params_with_models(&persona, &project, &memory, Some(&models)),
+            thread_start_params_with_models(&project, &memory, Some(&models)),
             THREAD_TIMEOUT_MS,
         )
         .await
@@ -928,39 +897,32 @@ pub async fn chat_start(
         .ok_or("thread/start: no thread id in response")?
         .to_string();
     let chat_id = register_chat(&conn, &sink, generation, &thread_id);
-    set_chat_context(&chat_id, persona, project);
+    set_chat_context(&chat_id, project);
     Ok(json!({ "chat_id": chat_id, "thread_id": thread_id }))
 }
 
 /// Reopen an existing app-server thread as a chat (thread/resume on its
 /// project's instance — dynamic tools are restored from the rollout by
-/// codex). Persona + project + fresh memory are re-sent as
-/// developerInstructions.
+/// codex). Fixed identity + project + fresh memory are re-sent as developerInstructions.
 pub async fn chat_resume(
     app: &AppHandle,
     thread_id: &str,
-    persona: Option<PersonaSpec>,
     project: Option<ProjectContext>,
 ) -> Result<Value, String> {
-    let persona = persona.unwrap_or_default();
     let project = project.unwrap_or_default();
     let memory = load_memory(app, &project.id).await;
     let (conn, generation, sink) = ensure_conn(app, &project.id).await?;
-    let models = model_catalog_from_connection(&conn).await.unwrap_or_default();
+    let models = model_catalog_from_connection(&conn)
+        .await
+        .unwrap_or_default();
     conn.request(
         "thread/resume",
-        thread_resume_params_with_models(
-            thread_id,
-            &persona,
-            &project,
-            &memory,
-            Some(&models),
-        ),
+        thread_resume_params_with_models(thread_id, &project, &memory, Some(&models)),
         THREAD_TIMEOUT_MS,
     )
     .await?;
     let chat_id = register_chat(&conn, &sink, generation, thread_id);
-    set_chat_context(&chat_id, persona, project);
+    set_chat_context(&chat_id, project);
     Ok(json!({ "chat_id": chat_id, "thread_id": thread_id }))
 }
 
@@ -990,7 +952,7 @@ pub async fn chat_send(
     // a TOKEN (C4); every error path below MUST clear_op, and the turn only
     // ever starts through `try_mark_turn_started`.
     let (done_tx, done_rx) = oneshot::channel();
-    let (op_token, thread_id, persona, project) = claim_turn_slot(
+    let (op_token, thread_id, project) = claim_turn_slot(
         chat_id,
         done_tx,
         "a turn is already running in this chat — interrupt it or wait",
@@ -1021,16 +983,12 @@ pub async fn chat_send(
         // turn/completed) must not touch this operation mid-respawn
         advance_fence(chat_id, generation);
         let memory = load_memory(app, &project.id).await;
-        let models = model_catalog_from_connection(&conn).await.unwrap_or_default();
+        let models = model_catalog_from_connection(&conn)
+            .await
+            .unwrap_or_default();
         if let Err(e) = host::resume_thread(
             &conn,
-            thread_resume_params_with_models(
-                &thread_id,
-                &persona,
-                &project,
-                &memory,
-                Some(&models),
-            ),
+            thread_resume_params_with_models(&thread_id, &project, &memory, Some(&models)),
         )
         .await
         {
@@ -1186,7 +1144,7 @@ pub async fn chat_compact(app: &AppHandle, chat_id: &str) -> Result<Value, Strin
     // same C4 discipline as chat_send: token-bound claim, fence advance
     // before the awaited resume, and no compaction turn for an operation
     // that was already failed
-    let (op_token, thread_id, persona, project) = claim_turn_slot(
+    let (op_token, thread_id, project) = claim_turn_slot(
         chat_id,
         done_tx,
         "a turn is already running in this chat — interrupt it or wait before compacting",
@@ -1207,21 +1165,20 @@ pub async fn chat_compact(app: &AppHandle, chat_id: &str) -> Result<Value, Strin
     if needs_resume {
         advance_fence(chat_id, generation);
         let memory = load_memory(app, &project.id).await;
-        let models = model_catalog_from_connection(&conn).await.unwrap_or_default();
+        let models = model_catalog_from_connection(&conn)
+            .await
+            .unwrap_or_default();
         if let Err(e) = host::resume_thread(
             &conn,
-            thread_resume_params_with_models(
-                &thread_id,
-                &persona,
-                &project,
-                &memory,
-                Some(&models),
-            ),
+            thread_resume_params_with_models(&thread_id, &project, &memory, Some(&models)),
         )
         .await
         {
             clear_op(chat_id, op_token);
-            return Err(format!("thread/resume before compaction failed: {}", e.message()));
+            return Err(format!(
+                "thread/resume before compaction failed: {}",
+                e.message()
+            ));
         }
         conn.register_thread(&thread_id, sink.clone());
         if let Some(chat) = SHARED.lock().chats.get_mut(chat_id) {
@@ -1339,7 +1296,10 @@ pub async fn chat_status(
         }
     };
     let version = conn.version().to_string();
-    let account = match conn.request("account/read", json!({}), RPC_TIMEOUT_MS).await {
+    let account = match conn
+        .request("account/read", json!({}), RPC_TIMEOUT_MS)
+        .await
+    {
         Ok(v) => {
             let acc = v.get("account").filter(|a| !a.is_null());
             json!({
@@ -1571,17 +1531,18 @@ mod tests {
 
     #[test]
     fn thread_params_carry_project_cwd_tools_sandbox_and_instructions() {
-        let persona = PersonaSpec::default();
         let project = project();
-        let start = thread_start_params(&persona, &project, &MemoryBlocks::default());
+        let start = thread_start_params(&project, &MemoryBlocks::default());
         assert_eq!(start["sandbox"], "read-only");
         assert_eq!(start["approvalPolicy"], "never");
         // the Conductor works IN the project — cwd is the project dir
         assert_eq!(start["cwd"], json!(project.dir));
         let instructions = start["developerInstructions"].as_str().unwrap();
         assert!(instructions.contains("Conductor of THIS project"));
-        // persona header is compiled in ahead of the operative core
-        assert!(instructions.contains("Maestro"));
+        // the single fixed identity is compiled ahead of the operative core
+        assert!(instructions.contains("You are Orchestrator"));
+        assert!(!instructions.contains("Maestro"));
+        assert!(!instructions.contains("Hive"));
         // the project block names the project (quoted literal since the
         // injection hardening)
         assert!(instructions.contains("Name: \"api\""));
@@ -1604,19 +1565,14 @@ mod tests {
                 description: String::new(),
             }],
         }];
-        let with_models = thread_start_params_with_models(
-            &persona,
-            &project,
-            &MemoryBlocks::default(),
-            Some(&catalog),
-        );
+        let with_models =
+            thread_start_params_with_models(&project, &MemoryBlocks::default(), Some(&catalog));
         let model_instructions = with_models["developerInstructions"].as_str().unwrap();
         assert!(model_instructions.contains("gpt-5.6-terra"));
         assert!(model_instructions.contains("supported efforts [medium]"));
 
         // memory snapshots flow into developerInstructions when present
         let with_mem = thread_start_params(
-            &persona,
             &project,
             &MemoryBlocks {
                 global: "- 2026-07-07 reviews go to Opus".into(),
@@ -1628,7 +1584,7 @@ mod tests {
         assert!(text.contains("uses pnpm"));
 
         // resume must NOT re-declare dynamicTools (restored from the rollout)
-        let resume = thread_resume_params("t-1", &persona, &project, &MemoryBlocks::default());
+        let resume = thread_resume_params("t-1", &project, &MemoryBlocks::default());
         assert_eq!(resume["threadId"], "t-1");
         assert!(resume.get("dynamicTools").is_none());
         assert_eq!(resume["sandbox"], "read-only");
@@ -1706,7 +1662,10 @@ mod tests {
         assert_eq!(chat_fence(&cid), Some(2));
 
         // the turn starts on generation 2
-        assert!(try_mark_turn_started(&cid, token, 2), "the live op must start");
+        assert!(
+            try_mark_turn_started(&cid, token, 2),
+            "the live op must start"
+        );
         // another late gen-1 exit: the turn runs on gen 2 → untouched
         assert!(take_exit_failures(&pid, 1).is_empty());
         // a GENUINE gen-2 exit fails exactly this operation
@@ -1803,7 +1762,8 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::channel(4_096);
         // resolve exactly like production — doubles as a regression test for
         // the built app's minimal GUI PATH (run with PATH=/usr/bin:/bin …)
-        let program = crate::codex::host::resolve_codex_program(None).expect("resolve codex binary");
+        let program =
+            crate::codex::host::resolve_codex_program(None).expect("resolve codex binary");
         println!("resolved codex: {program}");
         let client = Arc::new(
             Client::spawn(&program, events_tx)
@@ -1914,7 +1874,7 @@ mod tests {
     // Live proof against the REAL installed codex CLI: TWO Conductor
     // instances (two scratch projects) run in parallel over SEPARATE
     // processes with SEPARATE cwds, using the production thread params
-    // (persona + project + operative core + dynamic tools, read-only sandbox,
+    // (fixed identity + project + operative core + dynamic tools, read-only sandbox,
     // approvalPolicy never). Each runs a mini-turn that must report ITS
     // project folder; then instance A's process is shut down (the idle-reap
     // path) and transparently resumed — proving respawn transparency of one
@@ -1931,10 +1891,7 @@ mod tests {
         thread_id: String,
     }
 
-    async fn spike_start_conductor(
-        label: &'static str,
-        project: ProjectContext,
-    ) -> SpikeConductor {
+    async fn spike_start_conductor(label: &'static str, project: ProjectContext) -> SpikeConductor {
         let host = ProcessHost::new();
         let (conn, generation) = host.ensure().await.expect("spawn conductor app-server");
         println!(
@@ -1944,7 +1901,7 @@ mod tests {
         let started = conn
             .request(
                 "thread/start",
-                thread_start_params(&PersonaSpec::default(), &project, &MemoryBlocks::default()),
+                thread_start_params(&project, &MemoryBlocks::default()),
                 THREAD_TIMEOUT_MS,
             )
             .await
@@ -1956,7 +1913,10 @@ mod tests {
             .to_string();
         let (sink_tx, sink_rx) = mpsc::channel(crate::codex::host::ROUTE_CHANNEL_CAPACITY);
         conn.register_thread(&thread_id, sink_tx);
-        println!("[{label}] thread started: {thread_id} (cwd {})", project.dir);
+        println!(
+            "[{label}] thread started: {thread_id} (cwd {})",
+            project.dir
+        );
         SpikeConductor {
             label,
             project,
@@ -1994,7 +1954,11 @@ mod tests {
                 .unwrap_or_else(|_| panic!("[{}] spike turn timed out", c.label))
                 .expect("event sink closed");
             match ev {
-                ThreadEvent::Request { method, params, responder } => {
+                ThreadEvent::Request {
+                    method,
+                    params,
+                    responder,
+                } => {
                     // the production registry is declared — answer any tool
                     // call the model makes with a tiny fake result
                     println!("[{}] server request {method} ({})", c.label, params["tool"]);
@@ -2097,7 +2061,10 @@ mod tests {
         assert!(exited, "A must observe its process exit");
         println!("[A] process shut down (idle-reap path)");
         // B is untouched: still alive, same generation
-        assert!(b.host.alive().await.is_some(), "B's process must survive A's reap");
+        assert!(
+            b.host.alive().await.is_some(),
+            "B's process must survive A's reap"
+        );
         assert!(b.conn.is_alive());
 
         // next use of A: fresh spawn (generation bump) + transparent resume
@@ -2105,12 +2072,7 @@ mod tests {
         assert!(gen2 > a.generation, "respawn must bump the generation");
         host::resume_thread(
             &conn2,
-            thread_resume_params(
-                &a.thread_id,
-                &PersonaSpec::default(),
-                &a.project,
-                &MemoryBlocks::default(),
-            ),
+            thread_resume_params(&a.thread_id, &a.project, &MemoryBlocks::default()),
         )
         .await
         .expect("thread/resume after respawn");
@@ -2250,7 +2212,10 @@ mod tests {
             serde_json::from_str(report_text.trim()).expect("agent report must be pure JSON");
         println!("[loop] agent report: {report}");
         assert_eq!(report["done"], true, "agent must report done");
-        assert!(repo.join("GREETING.md").is_file(), "agent must have created the file");
+        assert!(
+            repo.join("GREETING.md").is_file(),
+            "agent must have created the file"
+        );
 
         // ---- (2) the Conductor: the [agent finished] autonomous turn
         let project = ProjectContext {
@@ -2263,7 +2228,7 @@ mod tests {
         let cstarted = cond_conn
             .request(
                 "thread/start",
-                thread_start_params(&PersonaSpec::default(), &project, &MemoryBlocks::default()),
+                thread_start_params(&project, &MemoryBlocks::default()),
                 THREAD_TIMEOUT_MS,
             )
             .await
@@ -2296,7 +2261,11 @@ mod tests {
                 .expect("conductor turn timed out")
                 .expect("conductor sink closed");
             match ev {
-                ThreadEvent::Request { method, params, responder } => {
+                ThreadEvent::Request {
+                    method,
+                    params,
+                    responder,
+                } => {
                     if method == "item/tool/call" {
                         let tool = params
                             .get("tool")
@@ -2449,7 +2418,7 @@ mod tests {
         let cstarted = cond_conn
             .request(
                 "thread/start",
-                thread_start_params(&PersonaSpec::default(), &project, &MemoryBlocks::default()),
+                thread_start_params(&project, &MemoryBlocks::default()),
                 THREAD_TIMEOUT_MS,
             )
             .await
@@ -2482,10 +2451,17 @@ mod tests {
                 .expect("conductor turn timed out")
                 .expect("conductor sink closed");
             match ev {
-                ThreadEvent::Request { method, params, responder } => {
+                ThreadEvent::Request {
+                    method,
+                    params,
+                    responder,
+                } => {
                     if method == "item/tool/call" {
-                        let tool =
-                            params.get("tool").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let tool = params
+                            .get("tool")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
                         tool_calls.push(tool.clone());
                         let answer = match tool.as_str() {
@@ -2593,7 +2569,11 @@ mod tests {
                 )
                 .await
                 .expect("agent thread/start");
-            let tid = started.pointer("/thread/id").and_then(|v| v.as_str()).unwrap().to_string();
+            let tid = started
+                .pointer("/thread/id")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string();
             let (tx, mut rx) = mpsc::channel(crate::codex::host::ROUTE_CHANNEL_CAPACITY);
             conn.register_thread(&tid, tx);
             let mut turn = json!({
@@ -2604,7 +2584,9 @@ mod tests {
             if let Some(s) = schema {
                 turn["outputSchema"] = s.clone();
             }
-            conn.request("turn/start", turn, RPC_TIMEOUT_MS).await.expect("agent turn/start");
+            conn.request("turn/start", turn, RPC_TIMEOUT_MS)
+                .await
+                .expect("agent turn/start");
             let mut final_text = String::new();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
             loop {
@@ -2702,17 +2684,22 @@ mod tests {
         // (e) gated worktree cleanup — refuses dirty, forces on a human call
         // =====================================================================
         // the impl agent left uncommitted work in the worktree → non-force refuses
-        let refused =
-            crate::worktree::remove(&wt.root, &wt.path, &wt.branch, false, None);
+        let refused = crate::worktree::remove(&wt.root, &wt.path, &wt.branch, false, None);
         assert!(
             refused.is_err(),
             "non-force cleanup must REFUSE a worktree with uncommitted work"
         );
-        println!("[e2e] gated cleanup correctly refused dirty worktree: {:?}", refused.err());
+        println!(
+            "[e2e] gated cleanup correctly refused dirty worktree: {:?}",
+            refused.err()
+        );
         // a human decision force-removes it
         crate::worktree::remove(&wt.root, &wt.path, &wt.branch, true, None)
             .expect("force remove must succeed");
-        assert!(!wt_path.exists(), "the worktree folder must be gone after force remove");
+        assert!(
+            !wt_path.exists(),
+            "the worktree folder must be gone after force remove"
+        );
         println!("[e2e] worktree force-removed ✓");
 
         // cleanup all scratch artifacts (processes died with their hosts)
@@ -2748,7 +2735,11 @@ mod tests {
             )
             .await
             .expect("thread/start");
-        let tid = started.pointer("/thread/id").and_then(|v| v.as_str()).unwrap().to_string();
+        let tid = started
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
         let (tx, mut rx) = mpsc::channel(crate::codex::host::ROUTE_CHANNEL_CAPACITY);
         conn.register_thread(&tid, tx);
 
@@ -2759,7 +2750,9 @@ mod tests {
             method: &str,
             params: Value,
         ) -> (String, bool) {
-            conn.request(method, params, RPC_TIMEOUT_MS).await.expect("request");
+            conn.request(method, params, RPC_TIMEOUT_MS)
+                .await
+                .expect("request");
             let mut final_message = String::new();
             let mut saw_compaction = false;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
@@ -2807,10 +2800,18 @@ mod tests {
         .await;
 
         // compaction turn
-        let (_m, saw_compaction) =
-            drive(&conn, &mut rx, "thread/compact/start", json!({ "threadId": tid })).await;
+        let (_m, saw_compaction) = drive(
+            &conn,
+            &mut rx,
+            "thread/compact/start",
+            json!({ "threadId": tid }),
+        )
+        .await;
         println!("[compact] contextCompaction item observed: {saw_compaction}");
-        assert!(saw_compaction, "compaction must emit a contextCompaction item");
+        assert!(
+            saw_compaction,
+            "compaction must emit a contextCompaction item"
+        );
 
         // turn 2: the codeword must survive compaction
         let (answer, _) = drive(

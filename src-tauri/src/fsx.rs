@@ -20,6 +20,105 @@
 
 use std::path::{Path, PathBuf};
 
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+
+/// Serializes the repo-local `.git/info/exclude` read-modify-write inside
+/// this process. The file lock inside `ensure_git_exclude` also coordinates
+/// multiple SwarmZ processes.
+static GIT_EXCLUDE_LOCK: Lazy<Mutex<()>> = Lazy::new(Mutex::default);
+
+/// Shared, anchored manager for SwarmZ's repo-local exclude entries. Callers
+/// provide accepted spellings and the canonical block to append. The update
+/// is bounded, no-follow, cross-process locked and atomic, so worktree and
+/// plan writers cannot race and overwrite each other's rule.
+pub(crate) fn ensure_git_exclude(
+    root: &Path,
+    accepted: &[&str],
+    block: &str,
+) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+
+    let _process_guard = GIT_EXCLUDE_LOCK.lock();
+    let root = DirHandle::open_root(root)?;
+    let git = root
+        .open_dir(".git")
+        .map_err(|e| format!("refusing the .git component (symlink?): {e}"))?;
+    let info = git
+        .ensure_dir("info")
+        .map_err(|e| format!("refusing the .git/info component (symlink?): {e}"))?;
+
+    let lock_name = ".swarmz-exclude.lock";
+    let lock_file = match info.open_file(lock_name) {
+        Ok(Some(file)) => file,
+        Ok(None) => match info.create_new(lock_name) {
+            Ok(file) => file,
+            Err(_) => info
+                .open_file(lock_name)?
+                .ok_or("could not establish git-exclude lock file")?,
+        },
+        Err(e) => return Err(format!("refusing git-exclude lock file: {e}")),
+    };
+    let locked = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+    if locked != 0 {
+        return Err(format!(
+            "could not lock .git/info/exclude: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    const EXCLUDE_CAP: u64 = 1024 * 1024;
+    let (current, oversized) = match info.open_file("exclude") {
+        Ok(Some(file)) => {
+            let mut s = String::new();
+            let read = file
+                .take(EXCLUDE_CAP + 1)
+                .read_to_string(&mut s)
+                .map_err(|e| e.to_string())?;
+            (s, read as u64 > EXCLUDE_CAP)
+        }
+        Ok(None) => (String::new(), false),
+        Err(e) => return Err(format!("refusing the exclude file (symlink?): {e}")),
+    };
+    if current.lines().any(|line| accepted.contains(&line.trim())) {
+        return Ok(());
+    }
+    if oversized {
+        return Err(format!(
+            ".git/info/exclude is larger than {EXCLUDE_CAP} bytes — refusing to rewrite it"
+        ));
+    }
+
+    let mut next = current;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(block);
+    if !next.ends_with('\n') {
+        next.push('\n');
+    }
+    let tmp_name = format!(
+        ".exclude.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let mut tmp = info.create_new(&tmp_name)?;
+    if let Err(e) = tmp.write_all(next.as_bytes()) {
+        let _ = info.unlink(&tmp_name);
+        return Err(e.to_string());
+    }
+    drop(tmp);
+    if let Err(e) = info.rename(&tmp_name, "exclude") {
+        let _ = info.unlink(&tmp_name);
+        return Err(e);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Path containment (fail closed)
 // ---------------------------------------------------------------------------
@@ -151,7 +250,12 @@ mod anchored {
         /// canonical roots are symlink-free anyway).
         pub fn open_root(path: &Path) -> Result<DirHandle, String> {
             let c = cstr(&path.to_string_lossy())?;
-            let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+            let fd = unsafe {
+                libc::open(
+                    c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
             if fd < 0 {
                 return Err(format!(
                     "could not open directory {}: {}",
@@ -159,7 +263,9 @@ mod anchored {
                     std::io::Error::last_os_error()
                 ));
             }
-            Ok(DirHandle { fd: unsafe { OwnedFd::from_raw_fd(fd) } })
+            Ok(DirHandle {
+                fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            })
         }
 
         /// Open one child directory NO-FOLLOW — a symlink (or non-directory)
@@ -180,7 +286,9 @@ mod anchored {
                     std::io::Error::last_os_error()
                 ));
             }
-            Ok(DirHandle { fd: unsafe { OwnedFd::from_raw_fd(fd) } })
+            Ok(DirHandle {
+                fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            })
         }
 
         /// mkdir the child if missing (EEXIST is fine), then open it no-follow.
@@ -242,9 +350,7 @@ mod anchored {
             // pre-check for friendly errors/missing semantics — NOT the gate
             match self.is_regular_file(name)? {
                 None => return Ok(None),
-                Some(false) => {
-                    return Err(format!("not a regular file (or a symlink): {name:?}"))
-                }
+                Some(false) => return Err(format!("not a regular file (or a symlink): {name:?}")),
                 Some(true) => {}
             }
             let c = cstr(name)?;
@@ -282,14 +388,25 @@ mod anchored {
         /// Create one child EXCLUSIVELY for writing (fails when it exists —
         /// used for fresh temp files that a later `rename` moves into place).
         pub fn create_new(&self, name: &str) -> Result<File, String> {
+            self.create_new_with_mode(name, 0o644)
+        }
+
+        /// Create one child exclusively with its FINAL initial Unix mode. This
+        /// is required for secrets: creating 0644 and chmodding after the copy
+        /// leaves a disclosure window and may stay open if chmod fails.
+        pub fn create_new_with_mode(&self, name: &str, mode: u32) -> Result<File, String> {
             assert_component(name)?;
             let c = cstr(name)?;
             let fd = unsafe {
                 libc::openat(
                     self.fd.as_raw_fd(),
                     c.as_ptr(),
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    0o644 as libc::c_uint,
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    mode as libc::c_uint,
                 )
             };
             if fd < 0 {
@@ -378,6 +495,7 @@ mod anchored {
 
         /// Read one child SYMLINK's target string (readlinkat — nothing is
         /// followed). None = missing.
+        #[allow(dead_code)]
         pub fn read_link(&self, name: &str) -> Result<Option<std::path::PathBuf>, String> {
             assert_component(name)?;
             let c = cstr(name)?;
@@ -407,6 +525,7 @@ mod anchored {
 
         /// Create one child as a SYMLINK to `target` (symlinkat; fails when
         /// the name already exists — never overwrites).
+        #[allow(dead_code)]
         pub fn symlink(&self, target: &Path, name: &str) -> Result<(), String> {
             use std::os::unix::ffi::OsStrExt;
             assert_component(name)?;
@@ -479,7 +598,9 @@ mod anchored_fallback {
             if !path.is_dir() {
                 return Err(format!("not a directory: {}", path.display()));
             }
-            Ok(DirHandle { path: path.to_path_buf() })
+            Ok(DirHandle {
+                path: path.to_path_buf(),
+            })
         }
 
         pub fn open_dir(&self, name: &str) -> Result<DirHandle, String> {
@@ -531,6 +652,12 @@ mod anchored_fallback {
                 .map_err(|e| e.to_string())
         }
 
+        pub fn create_new_with_mode(&self, name: &str, _mode: u32) -> Result<File, String> {
+            // SwarmZ ships on Unix/macOS. Non-Unix platforms have no portable
+            // Unix permission mode; retain exclusive no-overwrite semantics.
+            self.create_new(name)
+        }
+
         pub fn rename(&self, from: &str, to: &str) -> Result<(), String> {
             assert_component(from)?;
             assert_component(to)?;
@@ -543,7 +670,9 @@ mod anchored_fallback {
         }
 
         pub fn try_clone(&self) -> Result<DirHandle, String> {
-            Ok(DirHandle { path: self.path.clone() })
+            Ok(DirHandle {
+                path: self.path.clone(),
+            })
         }
 
         pub fn identity(&self) -> Result<(u64, u64), String> {
@@ -566,6 +695,7 @@ mod anchored_fallback {
             }
         }
 
+        #[allow(dead_code)]
         pub fn read_link(&self, name: &str) -> Result<Option<PathBuf>, String> {
             assert_component(name)?;
             match fs::read_link(self.path.join(name)) {
@@ -575,6 +705,7 @@ mod anchored_fallback {
             }
         }
 
+        #[allow(dead_code)]
         pub fn symlink(&self, _target: &Path, _name: &str) -> Result<(), String> {
             Err("symlink creation is not supported on this platform".into())
         }
@@ -627,6 +758,39 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn git_exclude_manager_preserves_concurrent_swarmz_rules() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".git/info")).unwrap();
+        let a = root.clone();
+        let b = root.clone();
+        let one = std::thread::spawn(move || {
+            ensure_git_exclude(&a, &["/.worktrees/"], "# worktrees\n/.worktrees/")
+        });
+        let two = std::thread::spawn(move || {
+            ensure_git_exclude(&b, &["/.swarmz/"], "# plans\n/.swarmz/")
+        });
+        one.join().unwrap().unwrap();
+        two.join().unwrap().unwrap();
+        let exclude = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains("/.worktrees/"), "{exclude}");
+        assert!(exclude.contains("/.swarmz/"), "{exclude}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_new_with_mode_is_private_from_first_open() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_dir();
+        let handle = DirHandle::open_root(&root).unwrap();
+        let file = handle.create_new_with_mode("secret.env", 0o600).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        drop(file);
+        fs::remove_dir_all(root).ok();
+    }
+
     #[cfg(unix)]
     #[test]
     fn dir_handle_refuses_symlinked_components_and_leaves() {
@@ -641,7 +805,11 @@ mod tests {
         let a = h.open_dir("a").unwrap();
         let b = a.open_dir("b").unwrap();
         let mut s = String::new();
-        b.open_file("f.md").unwrap().unwrap().read_to_string(&mut s).unwrap();
+        b.open_file("f.md")
+            .unwrap()
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
         assert_eq!(s, "hello");
 
         // symlinked INTERMEDIATE component refuses
@@ -658,8 +826,14 @@ mod tests {
         tmp.write_all(b"safe").unwrap();
         drop(tmp);
         b.rename(".t.tmp", "link.md").unwrap();
-        assert_eq!(fs::read_to_string(root.join("a/b/link.md")).unwrap(), "safe");
-        assert_eq!(fs::read_to_string(outside.join("victim.txt")).unwrap(), "secret");
+        assert_eq!(
+            fs::read_to_string(root.join("a/b/link.md")).unwrap(),
+            "safe"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("victim.txt")).unwrap(),
+            "secret"
+        );
 
         // traversal components are rejected outright
         assert!(h.open_dir("..").is_err());

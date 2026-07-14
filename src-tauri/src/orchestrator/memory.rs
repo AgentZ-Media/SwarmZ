@@ -493,7 +493,13 @@ mod tests {
         for i in 0..8 {
             let dir = dir.clone();
             handles.push(std::thread::spawn(move || {
-                append(&dir, &MemoryScope::Global, &format!("fact {i}"), "2026-07-10").unwrap();
+                append(
+                    &dir,
+                    &MemoryScope::Global,
+                    &format!("fact {i}"),
+                    "2026-07-10",
+                )
+                .unwrap();
             }));
         }
         for h in handles {
@@ -559,7 +565,10 @@ mod tests {
         assert_eq!(entries.len(), MAX_ENTRIES);
         // oldest (fact 0..4) dropped; newest kept
         assert_eq!(entries.first().unwrap().text, "fact 5");
-        assert_eq!(entries.last().unwrap().text, format!("fact {}", MAX_ENTRIES + 4));
+        assert_eq!(
+            entries.last().unwrap().text,
+            format!("fact {}", MAX_ENTRIES + 4)
+        );
         // the last append reported a drop
         let r = append(&dir, &p, "one more", "2026-07-07").unwrap();
         assert!(r.dropped >= 1);
@@ -575,7 +584,10 @@ mod tests {
         let dir = temp_dir();
         let err = append(&dir, &G, &"x".repeat(MAX_ENTRY_CHARS + 1), "2026-07-10").unwrap_err();
         assert!(err.contains("too long"), "{err}");
-        assert!(read_entries(&dir, &G).is_empty(), "nothing may have been stored");
+        assert!(
+            read_entries(&dir, &G).is_empty(),
+            "nothing may have been stored"
+        );
         // exactly at the cap still stores
         assert!(append(&dir, &G, &"y".repeat(MAX_ENTRY_CHARS), "2026-07-10").is_ok());
         // a hand-bloated file is read bounded, never slurped whole
@@ -609,7 +621,10 @@ mod tests {
         append(&dir, &G, "b", "2026-07-07").unwrap();
         append(&dir, &G, "c", "2026-07-07").unwrap();
         let left = remove(&dir, &G, 1).unwrap();
-        assert_eq!(left.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(), ["a", "c"]);
+        assert_eq!(
+            left.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            ["a", "c"]
+        );
         assert!(remove(&dir, &G, 9).is_err());
         fs::remove_dir_all(&dir).ok();
     }

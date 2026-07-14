@@ -11,6 +11,7 @@ import { useVibeUi } from "@/lib/vibe/ui-store";
 import { ConductorSidebar } from "./ConductorSidebar";
 import { FleetGrid } from "./FleetGrid";
 import { FocusStage } from "./FocusStage";
+import { PersistenceHealthBanner } from "@/components/PersistenceHealthBanner";
 import {
   CloseProjectConfirm,
   CloseSessionConfirm,
@@ -61,6 +62,7 @@ export function VibeLayer() {
       <div className="flex h-full w-full min-h-0 bg-bg">
         <ConductorSidebar />
         <div className="flex min-w-0 flex-1 flex-col">
+          <PersistenceHealthBanner />
           {focused && hasActive ? <FocusStage /> : <FleetGrid />}
         </div>
         <NewVibeSessionDialog />

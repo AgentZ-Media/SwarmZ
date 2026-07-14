@@ -13,6 +13,10 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { nanoid } from "nanoid";
 import { IS_TAURI, loadProjects, saveProjects } from "@/lib/transport";
+import {
+  createPersistenceCoordinator,
+  type HydrationStatus,
+} from "@/lib/persistence/coordinator";
 import type { PersistedProjects, Project } from "@/types";
 import {
   assignSessionsToProjects,
@@ -40,10 +44,6 @@ async function canonicalDir(dir: string): Promise<string> {
   }
 }
 
-// Project mutations are rare — a short debounce still batches bursts
-// (open + activate, migration + activate).
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
-
 function snapshot(): PersistedProjects {
   const s = useProjects.getState();
   return {
@@ -55,25 +55,20 @@ function snapshot(): PersistedProjects {
   };
 }
 
+const persistence = createPersistenceCoordinator({
+  name: "projects",
+  debounceMs: 500,
+  snapshot,
+  save: saveProjects,
+});
+
 function schedulePersist() {
-  if (persistTimer) return;
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    void saveProjects(snapshot());
-  }, 500);
+  persistence.schedule();
 }
 
 /** Write the pending debounce NOW — called from flushAllPersists at quit. */
 export async function flushProjectsPersist(): Promise<void> {
-  if (persistTimer) {
-    clearTimeout(persistTimer);
-    persistTimer = null;
-  }
-  try {
-    await saveProjects(snapshot());
-  } catch {
-    /* never block quitting on a failed write */
-  }
+  await persistence.flush();
 }
 
 export interface ProjectsState {
@@ -88,6 +83,9 @@ export interface ProjectsState {
    * would otherwise read as "no projects exist" and strip every
    * chat→project link. In-memory, never persisted. */
   hydrated: boolean;
+  /** Explicit read health. `failed` keeps persistence write-gated. */
+  hydrateStatus: HydrationStatus;
+  hydrateError: string | null;
 
   /**
    * Open a project for a folder: dedupe by canonical path — an existing
@@ -142,6 +140,8 @@ export const useProjects = create<ProjectsState>((set, get) => ({
   order: [],
   activeProjectId: null,
   hydrated: false,
+  hydrateStatus: "pending",
+  hydrateError: null,
 
   openProject: async (dir, opts) => {
     const canon = await canonicalDir(dir);
@@ -279,13 +279,19 @@ export const useProjects = create<ProjectsState>((set, get) => ({
     let data: PersistedProjects | null = null;
     try {
       data = await loadProjects();
-    } catch {
+    } catch (error) {
       // load failed — `hydrated` stays false, downstream migrations skip
+      persistence.hydrationFailed(error);
+      set({
+        hydrateStatus: "failed",
+        hydrateError: error instanceof Error ? error.message : String(error),
+      });
       return;
     }
     if (!data) {
       // fresh install: nothing persisted IS a successful hydration
-      set({ hydrated: true });
+      set({ hydrated: true, hydrateStatus: "ready", hydrateError: null });
+      persistence.hydrationSucceeded();
       return;
     }
     // null-prototype map + own-property checks: a persisted id like
@@ -321,7 +327,10 @@ export const useProjects = create<ProjectsState>((set, get) => ({
           ? active
           : fallbackActive(projects),
       hydrated: true,
+      hydrateStatus: "ready",
+      hydrateError: null,
     });
+    persistence.hydrationSucceeded();
   },
 }));
 

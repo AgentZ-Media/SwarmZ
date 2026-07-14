@@ -42,7 +42,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
 use super::protocol::{self, Incoming};
 
@@ -119,11 +119,12 @@ const SHUTDOWN_KILL_AFTER_MS: u64 = 5_000;
 
 /// Hard cap on ONE protocol line from the child's stdout (audit R8): a
 /// broken/hostile child streaming an endless line must not OOM the app.
-/// Generous — real codex events (full-diff notifications included) stay far
-/// below this; an oversized line is consumed and DROPPED with a log (the
-/// protocol is line-delimited JSON, so one lost record degrades a feature,
-/// never corrupts the framing).
-const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+/// Enforced BEFORE parse/enqueue. Together with the 32-slot raw and route
+/// queues this gives an approximate 64 MiB queued-payload ceiling per client
+/// across both stages (plus JSON object overhead), rather than a count-only
+/// bound whose theoretical footprint was multiple GiB. An oversized record
+/// is consumed and dropped; framing remains intact.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// Stderr is log output — one line beyond this is noise, not data.
 const MAX_STDERR_LINE_BYTES: usize = 8 * 1024;
 /// Server-event queue between the reader task and the router (audit R8):
@@ -131,11 +132,19 @@ const MAX_STDERR_LINE_BYTES: usize = 8 * 1024;
 /// growing an unbounded queue. The router forwards to per-thread route
 /// queues that are bounded too (F10, `ROUTE_CHANNEL_CAPACITY`) — a stalled
 /// consumer backpressures end to end instead of ballooning memory.
-const EVENTS_CHANNEL_CAPACITY: usize = 4_096;
+const EVENTS_CHANNEL_CAPACITY: usize = 32;
 /// Outgoing-line queue to the writer task (audit R8): RPCs and approval
 /// responses are small and rare; a full queue means the child stopped
 /// reading its stdin — failing fast is correct then.
-const STDIN_CHANNEL_CAPACITY: usize = 1_024;
+const STDIN_CHANNEL_CAPACITY: usize = 256;
+
+/// Process-wide child budget shared by Conductors and worker sessions. A
+/// project/session storm must not turn the desktop app into an unbounded
+/// process launcher. The permit lives in the reader/reaper task and is only
+/// returned after the OS child has actually exited.
+const MAX_CODEX_PROCESSES: usize = 48;
+static CODEX_PROCESS_BUDGET: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(MAX_CODEX_PROCESSES)));
 
 /// One bounded read from a line-delimited stream.
 enum BoundedLine {
@@ -179,7 +188,9 @@ where
                 if buf.last() == Some(&b'\r') {
                     buf.pop();
                 }
-                return Ok(BoundedLine::Line(String::from_utf8_lossy(&buf).into_owned()));
+                return Ok(BoundedLine::Line(
+                    String::from_utf8_lossy(&buf).into_owned(),
+                ));
             }
             None => {
                 let len = chunk.len();
@@ -206,9 +217,10 @@ pub struct Client {
     pending: Arc<PendingRpc>,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
-    /// fired by the shutdown watchdog once the EOF grace period elapsed —
-    /// the reader task (which owns the child) then force-kills it
-    kill: Arc<tokio::sync::Notify>,
+    /// Persistent cancellation signal fired by the shutdown watchdog once the
+    /// EOF grace period elapsed. Unlike `Notify::notify_waiters`, a watch value
+    /// cannot be lost while the reader is blocked forwarding into a full queue.
+    kill: watch::Sender<bool>,
 }
 
 impl Client {
@@ -216,15 +228,23 @@ impl Client {
     /// requests and notifications go to `events` (bounded — see
     /// `EVENTS_CHANNEL_CAPACITY`); responses resolve the pending map. Must
     /// run inside a tokio runtime.
-    pub async fn spawn(
-        program: &str,
-        events: mpsc::Sender<ServerEvent>,
-    ) -> Result<Self, String> {
+    pub async fn spawn(program: &str, events: mpsc::Sender<ServerEvent>) -> Result<Self, String> {
+        let process_permit = CODEX_PROCESS_BUDGET
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                format!(
+                    "refusing to start another codex app-server: global process budget ({MAX_CODEX_PROCESSES}) is exhausted — close idle agents and retry"
+                )
+            })?;
         // enrich the child's PATH with the binary's own dir — the built app's
         // minimal GUI PATH otherwise breaks anything codex spawns by name
         // (user-configured MCP servers etc.)
         let mut cmd = Command::new(program);
-        if let Some(dir) = std::path::Path::new(program).parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Some(dir) = std::path::Path::new(program)
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+        {
             let base = std::env::var("PATH").unwrap_or_default();
             cmd.env("PATH", format!("{}:{}", dir.display(), base));
         }
@@ -237,15 +257,29 @@ impl Client {
         let mcp_off = tokio::task::spawn_blocking(mcp_disable_args)
             .await
             .map_err(|e| e.to_string())??;
-        let mut child = cmd
-            .arg("app-server")
+        cmd.arg("app-server")
             .args(&mcp_off)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        unsafe {
+            // Own process group: a force-stop must also terminate commands or
+            // helpers the app-server still owns.
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to start `{program} app-server`: {e}"))?;
+        #[cfg(unix)]
+        let child_pid = child.id().ok_or("app-server: no process id")? as libc::pid_t;
         let mut stdin = child.stdin.take().ok_or("app-server: no stdin")?;
         let stdout = child.stdout.take().ok_or("app-server: no stdout")?;
         let stderr = child.stderr.take();
@@ -285,7 +319,7 @@ impl Client {
             });
         }
 
-        let kill = Arc::new(tokio::sync::Notify::new());
+        let (kill, mut kill_rx) = watch::channel(false);
 
         // reader: classify each line; owns the child for reaping on EOF and
         // for the force-kill fallback (the kill notify fires when a graceful
@@ -295,11 +329,24 @@ impl Client {
         {
             let pending = pending.clone();
             let alive = alive.clone();
-            let kill = kill.clone();
             tokio::spawn(async move {
+                // Held until this task reaps the child at the bottom.
+                let process_permit = process_permit;
                 let mut reader = BufReader::new(stdout);
-                loop {
+                'reader: loop {
                     tokio::select! {
+                        biased;
+                        changed = kill_rx.changed() => {
+                            if changed.is_err() || *kill_rx.borrow() {
+                                eprintln!("[codex host] app-server ignored stdin EOF — force-killing");
+                                #[cfg(unix)]
+                                unsafe {
+                                    libc::killpg(child_pid, libc::SIGKILL);
+                                }
+                                let _ = child.start_kill();
+                                break 'reader;
+                            }
+                        }
                         line = next_line_bounded(&mut reader, MAX_LINE_BYTES) => {
                             let line = match line {
                                 Ok(BoundedLine::Line(line)) => line,
@@ -316,26 +363,52 @@ impl Client {
                                     }
                                 }
                                 Some(Incoming::ServerRequest { id, method, params }) => {
-                                    let _ = events.send(ServerEvent::Request { id, method, params }).await;
+                                    tokio::select! {
+                                        biased;
+                                        changed = kill_rx.changed() => {
+                                            if changed.is_err() || *kill_rx.borrow() {
+                                                #[cfg(unix)]
+                                                unsafe {
+                                                    libc::killpg(child_pid, libc::SIGKILL);
+                                                }
+                                                let _ = child.start_kill();
+                                                break 'reader;
+                                            }
+                                        }
+                                        _ = events.send(ServerEvent::Request { id, method, params }) => {}
+                                    }
                                 }
                                 Some(Incoming::Notification { method, params }) => {
-                                    let _ = events.send(ServerEvent::Notification { method, params }).await;
+                                    tokio::select! {
+                                        biased;
+                                        changed = kill_rx.changed() => {
+                                            if changed.is_err() || *kill_rx.borrow() {
+                                                #[cfg(unix)]
+                                                unsafe {
+                                                    libc::killpg(child_pid, libc::SIGKILL);
+                                                }
+                                                let _ = child.start_kill();
+                                                break 'reader;
+                                            }
+                                        }
+                                        _ = events.send(ServerEvent::Notification { method, params }) => {}
+                                    }
                                 }
                                 None => {} // unknown/unparseable line: ignore silently
                             }
-                        }
-                        _ = kill.notified() => {
-                            // graceful shutdown ignored — force-kill; the
-                            // stream then EOFs and the normal cleanup runs
-                            eprintln!("[codex host] app-server ignored stdin EOF — force-killing");
-                            let _ = child.start_kill();
                         }
                     }
                 }
                 alive.store(false, Ordering::SeqCst);
                 pending.fail_all("codex app-server exited");
-                let _ = events.send(ServerEvent::Exited).await;
                 let _ = child.wait().await; // reap
+                                            // The global process slot represents an OS process, not event
+                                            // delivery. Release it immediately after reap even if the
+                                            // router remains backpressured behind a stalled route.
+                drop(process_permit);
+                tokio::spawn(async move {
+                    let _ = events.send(ServerEvent::Exited).await;
+                });
             });
         }
 
@@ -377,7 +450,7 @@ impl Client {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(SHUTDOWN_KILL_AFTER_MS)).await;
             if alive.load(Ordering::SeqCst) {
-                kill.notify_waiters();
+                let _ = kill.send(true);
             }
         });
     }
@@ -484,7 +557,13 @@ pub(crate) fn resolve_codex_program(override_path: Option<&str>) -> Result<Strin
     let mut known: Vec<std::path::PathBuf> =
         vec!["/opt/homebrew/bin".into(), "/usr/local/bin".into()];
     if let Some(h) = dirs::home_dir() {
-        for rel in [".local/bin", ".bun/bin", ".volta/bin", ".cargo/bin", ".npm-global/bin"] {
+        for rel in [
+            ".local/bin",
+            ".bun/bin",
+            ".volta/bin",
+            ".cargo/bin",
+            ".npm-global/bin",
+        ] {
             known.push(h.join(rel));
         }
     }
@@ -542,11 +621,10 @@ async fn resolved_program() -> Result<String, String> {
         return Ok(p);
     }
     let override_path = RESOLVER.lock().override_path.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
-        resolve_codex_program(override_path.as_deref())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let resolved =
+        tokio::task::spawn_blocking(move || resolve_codex_program(override_path.as_deref()))
+            .await
+            .map_err(|e| e.to_string())??;
     RESOLVER.lock().resolved = Some(resolved.clone());
     Ok(resolved)
 }
@@ -602,8 +680,9 @@ fn is_bare_toml_key(name: &str) -> bool {
 
 /// The per-spawn CLI args that disable MCP servers for one `codex
 /// app-server` child (pure — unit-tested; `config_text` is the user's
-/// config.toml, empty/unparseable degrades to just the `apps` opt-out —
-/// codex itself refuses a config IT can't parse, so nothing boots then).
+/// config.toml. Empty means no configured servers; malformed or schema-wrong
+/// input refuses locally rather than relying on a downstream Codex version to
+/// reject the same bytes in exactly the same way.
 ///
 /// FAIL-CLOSED (audit R12): a server whose name cannot ride a bare `-c`
 /// dotted path CANNOT be disabled per process — if that server is ENABLED,
@@ -612,12 +691,14 @@ fn is_bare_toml_key(name: &str) -> bool {
 /// that is already `enabled = false` in the config is safely skipped.
 pub(crate) fn mcp_disable_args_from(config_text: &str) -> Result<Vec<String>, String> {
     let mut args: Vec<String> = vec!["--disable".into(), "apps".into()];
-    let parsed: toml::Table = match config_text.parse() {
-        Ok(v) => v,
-        Err(_) => return Ok(args), // codex itself will complain about its config
-    };
-    let Some(servers) = parsed.get("mcp_servers").and_then(|v| v.as_table()) else {
-        return Ok(args);
+    let parsed: toml::Table = config_text
+        .parse()
+        .map_err(|e| format!("refusing to start codex: cannot parse MCP config safely: {e}"))?;
+    let servers = match parsed.get("mcp_servers") {
+        None => return Ok(args),
+        Some(value) => value.as_table().ok_or_else(|| {
+            "refusing to start codex: mcp_servers in config.toml is not a table".to_string()
+        })?,
     };
     for (name, table) in servers {
         if is_bare_toml_key(name) {
@@ -643,9 +724,27 @@ pub(crate) fn mcp_disable_args_from(config_text: &str) -> Result<Vec<String>, St
 /// Missing file = no user servers = just the `apps` opt-out. Recomputed per
 /// spawn so config edits apply to the next process.
 fn mcp_disable_args() -> Result<Vec<String>, String> {
-    let text = codex_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
+    mcp_disable_args_at(codex_config_path().as_deref())
+}
+
+/// File-reading half split out for deterministic failure tests. A missing
+/// config genuinely means no configured servers. Any OTHER read failure is
+/// ambiguous and therefore refuses the child spawn: treating permission/I/O
+/// errors as an empty config could silently boot every global MCP server.
+fn mcp_disable_args_at(path: Option<&std::path::Path>) -> Result<Vec<String>, String> {
+    let text = match path {
+        None => String::new(),
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(format!(
+                    "refusing to start codex: cannot safely read MCP config {}: {e}",
+                    path.display()
+                ));
+            }
+        },
+    };
     mcp_disable_args_from(&text)
 }
 
@@ -660,7 +759,7 @@ fn mcp_disable_args() -> Result<Vec<String>, String> {
 /// queue and ultimately the child's stdout pipe. Consumers (the session and
 /// orchestrator dispatchers) drain fast and never await back into the
 /// router, so a full queue means a genuine flood, not a deadlock.
-pub const ROUTE_CHANNEL_CAPACITY: usize = 1_024;
+pub const ROUTE_CHANNEL_CAPACITY: usize = 32;
 
 /// Where a registered thread's server events land. Multiple threads may
 /// share one sink (the orchestrator does — one dispatcher for all chats).
@@ -820,11 +919,7 @@ impl Connection {
 /// ignored, server requests are refused with -32601 (the server treats that
 /// as a denial and the turn continues/fails) — same net behavior the
 /// orchestrator dispatcher had for unknown methods.
-fn spawn_router(
-    client: Arc<Client>,
-    routes: Arc<RouteTable>,
-    mut rx: mpsc::Receiver<ServerEvent>,
-) {
+fn spawn_router(client: Arc<Client>, routes: Arc<RouteTable>, mut rx: mpsc::Receiver<ServerEvent>) {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             match ev {
@@ -852,11 +947,14 @@ fn spawn_router(
                                 // consumer gone (sink dropped) — the request
                                 // must still be answered or the server hangs
                                 if let ThreadEvent::Request { responder, .. } = failed.0 {
-                                    responder.error(-32601, "SwarmZ consumer for this thread is gone");
+                                    responder
+                                        .error(-32601, "SwarmZ consumer for this thread is gone");
                                 }
                             }
                         }
-                        None => responder.error(-32601, "no SwarmZ consumer registered for this thread"),
+                        None => {
+                            responder.error(-32601, "no SwarmZ consumer registered for this thread")
+                        }
                     }
                 }
                 ServerEvent::Notification { method, params } => {
@@ -865,7 +963,9 @@ fn spawn_router(
                         .and_then(|v| v.as_str())
                         .and_then(|tid| routes.get(tid))
                     {
-                        let _ = sink.send(ThreadEvent::Notification { method, params }).await;
+                        let _ = sink
+                            .send(ThreadEvent::Notification { method, params })
+                            .await;
                     }
                     // no sink: account-level or foreign-thread notification — ignore
                 }
@@ -1108,26 +1208,58 @@ enabled = false
     #[test]
     fn mcp_disable_args_handle_edge_configs() {
         // no config / no mcp_servers table → just the built-in apps opt-out
-        for text in ["", "model = \"o3\"", "not [ valid toml"] {
+        for text in ["", "model = \"o3\""] {
             assert_eq!(
                 mcp_disable_args_from(text).unwrap(),
                 vec!["--disable".to_string(), "apps".to_string()],
                 "{text:?}"
             );
         }
+        // Parse and schema doubt are fail-closed locally; never assume a
+        // downstream Codex build will reject exactly the same malformed form.
+        for text in ["not [ valid toml", "mcp_servers = \"wrong-type\""] {
+            let err = mcp_disable_args_from(text).unwrap_err();
+            assert!(err.contains("refusing to start codex"), "{err}");
+        }
         // inline-table form counts too
         let args = mcp_disable_args_from(r#"mcp_servers = { foo = { command = "x" } }"#).unwrap();
-        assert!(args.chunks(2).any(|c| c == ["-c", "mcp_servers.foo.enabled=false"]));
+        assert!(args
+            .chunks(2)
+            .any(|c| c == ["-c", "mcp_servers.foo.enabled=false"]));
         // FAIL-CLOSED (audit R12): an ENABLED server whose name can't ride a
         // bare dotted -c path refuses the spawn — never silently boots
         let err = mcp_disable_args_from("[mcp_servers.\"we ird\"]\ncommand = \"x\"\n").unwrap_err();
         assert!(err.contains("cannot be disabled"), "{err}");
         // …but a quoted-name server that is ALREADY disabled is safely skipped
-        let args = mcp_disable_args_from(
-            "[mcp_servers.\"we ird\"]\ncommand = \"x\"\nenabled = false\n",
-        )
-        .unwrap();
+        let args =
+            mcp_disable_args_from("[mcp_servers.\"we ird\"]\ncommand = \"x\"\nenabled = false\n")
+                .unwrap();
         assert_eq!(args, vec!["--disable".to_string(), "apps".to_string()]);
+    }
+
+    #[test]
+    fn mcp_config_read_errors_fail_closed_but_missing_is_empty() {
+        let root = std::env::temp_dir().join(format!(
+            "swarmz-mcp-read-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let missing = root.join("missing.toml");
+        assert_eq!(
+            mcp_disable_args_at(Some(&missing)).unwrap(),
+            vec!["--disable".to_string(), "apps".to_string()]
+        );
+
+        // Reading a directory as a file fails reliably across the supported
+        // platforms and models an unreadable/invalid config path.
+        let err = mcp_disable_args_at(Some(&root)).unwrap_err();
+        assert!(err.contains("refusing to start codex"), "{err}");
+        assert!(err.contains("MCP config"), "{err}");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Audit R8 (frozen): the bounded line reader never buffers more than the
@@ -1165,6 +1297,51 @@ enabled = false
             next_line_bounded(&mut reader, 64).await.unwrap(),
             BoundedLine::Eof
         ));
+    }
+
+    /// A reader blocked on a full event queue must still observe cancellation,
+    /// reap the child/process group and return its global process permit.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn saturated_event_queue_cancels_and_releases_process_budget() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "swarmz-host-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let program = root.join("fake-codex");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s\\n' '{\"method\":\"one\",\"params\":{}}' '{\"method\":\"two\",\"params\":{}}'\nsleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let before = CODEX_PROCESS_BUDGET.available_permits();
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let client = Client::spawn(&program.to_string_lossy(), events_tx)
+            .await
+            .unwrap();
+        assert_eq!(CODEX_PROCESS_BUDGET.available_permits() + 1, before);
+
+        // Give the reader time to fill slot one and block on notification two.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client.kill.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.is_alive() || CODEX_PROCESS_BUDGET.available_permits() < before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancel must reap and release the permit even behind backpressure");
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1210,7 +1387,10 @@ enabled = false
             shared_rx.try_recv().is_err(),
             "shared sink must get exactly ONE Exited despite two routes"
         );
-        assert!(routes.get("t-1").is_none(), "routes drained with the process");
+        assert!(
+            routes.get("t-1").is_none(),
+            "routes drained with the process"
+        );
     }
 
     // ---- session spike (Vibe Mode Phase 1) ----
@@ -1253,7 +1433,10 @@ enabled = false
         // strategy (b): a private ProcessHost slot for this one session
         let host = ProcessHost::new();
         let (conn, generation) = host.ensure().await.expect("spawn dedicated app-server");
-        push(&log, format!("process up (generation {generation}, {})", conn.version()));
+        push(
+            &log,
+            format!("process up (generation {generation}, {})", conn.version()),
+        );
 
         let started = conn
             .request(
@@ -1311,9 +1494,12 @@ enabled = false
                 .expect("spike session timed out")
                 .expect("event sink closed");
             match ev {
-                ThreadEvent::Request { method, params, responder } => match method.as_str() {
-                    "item/commandExecution/requestApproval"
-                    | "item/fileChange/requestApproval" => {
+                ThreadEvent::Request {
+                    method,
+                    params,
+                    responder,
+                } => match method.as_str() {
+                    "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                         push(
                             &log,
                             format!(
@@ -1334,7 +1520,10 @@ enabled = false
                         responder.ok(&json!({ "decision": "accept" }));
                     }
                     other => {
-                        push(&log, format!("unexpected server request {other} — refusing"));
+                        push(
+                            &log,
+                            format!("unexpected server request {other} — refusing"),
+                        );
                         responder.error(-32601, "not supported by the spike");
                     }
                 },
@@ -1381,7 +1570,10 @@ enabled = false
                     }
                     "turn/diff/updated" => {
                         let diff = params.get("diff").and_then(|v| v.as_str()).unwrap_or("");
-                        push(&log, format!("turn/diff/updated ({} chars): {diff:?}", diff.len()));
+                        push(
+                            &log,
+                            format!("turn/diff/updated ({} chars): {diff:?}", diff.len()),
+                        );
                         last_diff = Some(diff.to_string());
                     }
                     "thread/tokenUsage/updated" => {
@@ -1418,9 +1610,10 @@ enabled = false
             Err(ResumeError::ThreadNotFound(m)) => {
                 push(&log, format!("bogus thread/resume → ThreadNotFound: {m}"))
             }
-            Err(ResumeError::Other(m)) => {
-                push(&log, format!("bogus thread/resume → OTHER (classifier miss!): {m}"))
-            }
+            Err(ResumeError::Other(m)) => push(
+                &log,
+                format!("bogus thread/resume → OTHER (classifier miss!): {m}"),
+            ),
             Ok(_) => push(&log, "bogus thread/resume unexpectedly SUCCEEDED".into()),
         }
         assert!(
@@ -1482,7 +1675,11 @@ enabled = false
         println!("turn windows overlapped (true parallelism): {overlapped}");
 
         for (s, cwd, file) in [(&a, &cwd_a, "probe_a.txt"), (&b, &cwd_b, "probe_b.txt")] {
-            assert_eq!(s.turn_status, "completed", "[{}] turn must complete", s.label);
+            assert_eq!(
+                s.turn_status, "completed",
+                "[{}] turn must complete",
+                s.label
+            );
             assert!(
                 s.cmd_approvals >= 1,
                 "[{}] untrusted policy must force a command approval for `touch`",
@@ -1595,7 +1792,11 @@ enabled = false
                 .expect("mcp spike timed out")
                 .expect("event sink closed");
             match ev {
-                ThreadEvent::Request { method, params, responder } => match method.as_str() {
+                ThreadEvent::Request {
+                    method,
+                    params,
+                    responder,
+                } => match method.as_str() {
                     "item/tool/call" => {
                         tool_calls += 1;
                         first_tool_call_ms.get_or_insert(t_turn.elapsed().as_millis());
@@ -1653,7 +1854,10 @@ enabled = false
         println!("dynamic tool calls: {tool_calls} (first after {first_tool_call_ms:?} ms)");
         println!("final message: {final_message:?}");
 
-        assert_eq!(turn_status, "completed", "the FIRST turn must complete cleanly");
+        assert_eq!(
+            turn_status, "completed",
+            "the FIRST turn must complete cleanly"
+        );
         assert!(
             mcp_boots.is_empty(),
             "a SwarmZ-spawned app-server must boot NO MCP servers, got: {mcp_boots:?}"

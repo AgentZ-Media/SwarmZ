@@ -91,7 +91,12 @@ pub(crate) fn git_command_net(bin: &str, cwd: &Path) -> Command {
     let mut cmd = Command::new(bin);
     cmd.arg("-C").arg(cwd);
     cmd.args(GIT_SUPPRESSIONS);
-    cmd.args(["-c", "protocol.ext.allow=never", "-c", "core.sshCommand=ssh"]);
+    cmd.args([
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "core.sshCommand=ssh",
+    ]);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd
 }
@@ -207,11 +212,7 @@ pub(crate) fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> std::
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn git(bin: &str, cwd: &str, args: &[&str]) -> Option<String> {
-    let out = output_with_timeout(
-        git_command(bin, Path::new(cwd)).args(args),
-        GIT_TIMEOUT,
-    )
-    .ok()?;
+    let out = output_with_timeout(git_command(bin, Path::new(cwd)).args(args), GIT_TIMEOUT).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -246,7 +247,11 @@ fn to_https(remote: &str) -> Option<String> {
         }
         None => url.to_string(),
     };
-    Some(url.trim_end_matches('/').trim_end_matches(".git").to_string())
+    Some(
+        url.trim_end_matches('/')
+            .trim_end_matches(".git")
+            .to_string(),
+    )
 }
 
 pub fn git_info(cwd: &str, bin_override: Option<&str>) -> Option<GitInfo> {
@@ -271,7 +276,13 @@ pub fn git_info(cwd: &str, bin_override: Option<&str>) -> Option<GitInfo> {
     if let Some(numstat) = git(
         bin,
         cwd,
-        &["diff", "--no-ext-diff", "--no-textconv", "--numstat", "HEAD"],
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--numstat",
+            "HEAD",
+        ],
     ) {
         for line in numstat.lines() {
             let mut cols = line.split('\t');

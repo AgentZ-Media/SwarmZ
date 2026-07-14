@@ -96,10 +96,11 @@ mod tests {
             br#"{"settings":{"a":1}}"#
         );
         // … and the corrupt file kept as evidence
-        let corrupt_kept = fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|e| e.file_name().to_string_lossy().starts_with("swarmz.json.corrupt-"));
+        let corrupt_kept = fs::read_dir(&dir).unwrap().filter_map(Result::ok).any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("swarmz.json.corrupt-")
+        });
         assert!(corrupt_kept);
         fs::remove_dir_all(&dir).ok();
     }
@@ -111,10 +112,11 @@ mod tests {
         rescue(&dir);
         // no backup to restore — the app starts fresh, but the evidence stays
         assert!(!dir.join(STORE).exists());
-        let corrupt_kept = fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|e| e.file_name().to_string_lossy().starts_with("swarmz.json.corrupt-"));
+        let corrupt_kept = fs::read_dir(&dir).unwrap().filter_map(Result::ok).any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("swarmz.json.corrupt-")
+        });
         assert!(corrupt_kept);
         fs::remove_dir_all(&dir).ok();
     }

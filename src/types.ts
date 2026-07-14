@@ -240,13 +240,6 @@ export interface AppSettings {
   /** default scan roots for the orchestrator's list_projects when the model passes none */
   orchestratorScanRoots?: string[];
   /**
-   * the orchestrator's persona (voice/self-image only — never its tools or
-   * safety rules, those are hard-wired in the operative core). Unset = the
-   * "Maestro" default seed; edited in Settings → Orchestrator. Only
-   * name/role/tone/principles reach the backend; emoji/accent are UI-only.
-   */
-  orchestratorPersona?: OrchestratorPersona;
-  /**
    * Phase 5 auto-review: when a conductor-tasked agent finishes a lane that
    * changed code, a detached codex review runs automatically BEFORE the
    * Conductor's agent-finished turn — the findings ride into that turn, so
@@ -300,25 +293,6 @@ export interface AppSettings {
    * autonomous cascade pushing/posting/approving on the user's repo.
    */
   autonomousGithubWrites?: boolean;
-}
-
-/**
- * The orchestrator persona. `name`/`role`/`tone`/`principles` are compiled
- * into the system instructions (Rust `build_instructions`); `emoji`/`accent`
- * are UI-only (Conductor card, panel header, composer placeholder).
- */
-export interface OrchestratorPersona {
-  name: string;
-  /** one-sentence self-image, compiled after "You are {name} — " */
-  role: string;
-  /** voice/directness, e.g. "Calm, precise, leading." */
-  tone: string;
-  /** 1–6 short principles */
-  principles: string[];
-  /** UI avatar emoji (Conductor dot / panel header) */
-  emoji?: string;
-  /** UI accent tint (optional dot color) */
-  accent?: string;
 }
 
 // ---- Quick notes ----
@@ -500,14 +474,15 @@ export interface VibeSessionWorktree {
  */
 export interface VibeSession {
   id: string;
-  /** display name — renamable; starts as the generated agent name */
+  /** display label — renamable; starts as the generated temporary lane label */
   name: string;
   /** owning project tab (`Project.id`) — the rail scopes on this */
   projectId: string;
   /**
-   * The generated agent identity (names.ts pool), collision-free per project
-   * and immutable — Phase 4 derives branch names from it (`swarm/maya-…`).
-   * Migrated sessions carry their old display name here.
+   * Stable operational lane label (legacy field name), collision-free per
+   * project. It is not a persona or reusable identity. Mission attempts will
+   * derive branches from task/attempt ids; migrated sessions retain their old
+   * display label for historical readability.
    */
   agentName: string;
   spawnedBy: VibeSpawnedBy;

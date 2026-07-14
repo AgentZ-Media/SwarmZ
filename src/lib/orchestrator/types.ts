@@ -133,8 +133,8 @@ export interface OrchestratorToolDefinition {
 
 /**
  * Response of `orchestrator_tools`: the single-source system instructions
- * (compiled by `persona::build_instructions` — persona + memory + operative
- * core) plus the tool catalog — the dev hook exposes the whole object.
+ * (compiled by `instructions::build_instructions` — fixed identity + memory +
+ * operative core) plus the tool catalog — the dev hook exposes the whole object.
  */
 export interface OrchestratorToolsResponse {
   instructions: string;

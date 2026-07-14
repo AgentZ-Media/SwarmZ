@@ -46,7 +46,7 @@ interface VibeUiState {
   conductorOpen: boolean;
   setConductorOpen: (open: boolean) => void;
   toggleConductor: () => void;
-  /** sidebar width in px (drag handle; clamped 300–680) */
+  /** preferred sidebar width in px (300–680; the view adds a viewport clamp) */
   conductorWidth: number;
   setConductorWidth: (w: number) => void;
   /** active fleet-grid filter chip */

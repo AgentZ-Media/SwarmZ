@@ -75,7 +75,7 @@ export function QuitConfirmDialog() {
               className="flex items-center gap-2 rounded-md border border-line bg-card px-2 py-1.5 text-12 text-txt"
             >
               <span className="shrink-0 font-mono leading-none text-err">■</span>
-              <span className="truncate">Conductor · {name}</span>
+              <span className="truncate">Orchestrator · {name}</span>
               <span className="ml-auto pl-2 font-mono text-10 text-fnt">mid-turn</span>
             </li>
           ))}
@@ -84,8 +84,8 @@ export function QuitConfirmDialog() {
               <span className="shrink-0 font-mono leading-none text-err">■</span>
               <span className="truncate">
                 {claimedTimers === 1
-                  ? "A Conductor timer is firing right now — quitting drops it"
-                  : `${claimedTimers} Conductor timers are firing right now — quitting drops them`}
+                  ? "An Orchestrator timer is firing right now — quitting drops it"
+                  : `${claimedTimers} Orchestrator timers are firing right now — quitting drops them`}
               </span>
             </li>
           )}
@@ -132,8 +132,8 @@ export function QuitConfirmDialog() {
         {pendingTimers > 0 && (
           <p className="mb-4 text-11 text-fnt">
             {pendingTimers === 1
-              ? "1 Conductor timer is pending"
-              : `${pendingTimers} Conductor timers are pending`}{" "}
+              ? "1 Orchestrator timer is pending"
+              : `${pendingTimers} Orchestrator timers are pending`}{" "}
             — they persist and fire again on the next launch.
           </p>
         )}

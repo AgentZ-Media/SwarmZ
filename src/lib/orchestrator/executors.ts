@@ -1332,7 +1332,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
     if (!note) throw new Error("note must not be empty");
     const resolved = resolveFireAt(Date.now(), args.delay_seconds, args.at_iso);
     if ("error" in resolved) throw new Error(resolved.error);
-    const timer = createTimer(projectId, note, resolved.at);
+    const timer = await createTimer(projectId, note, resolved.at);
     return {
       timer_id: timer.id,
       note: timer.note,
@@ -1357,7 +1357,7 @@ export const executors: Record<OrchestratorToolName, ToolExecutor> = {
   cancel_timer: async (args, ctx) => {
     const { id: projectId } = requireProject(ctx);
     const timerId = String(args.timer_id ?? "").trim();
-    const timer = cancelTimer(projectId, timerId);
+    const timer = await cancelTimer(projectId, timerId);
     return { cancelled: true, timer_id: timer.id, note: timer.note };
   },
 

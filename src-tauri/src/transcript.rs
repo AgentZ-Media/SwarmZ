@@ -84,8 +84,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// file, the window starts at the first complete line inside it. Returns
 /// (bytes, was_byte_truncated).
 fn read_tail_window(path: &Path, max_bytes: u64) -> Result<(Vec<u8>, bool), String> {
-    let mut f =
-        fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let mut f = fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let size = f.metadata().map_err(|e| e.to_string())?.len();
     let cap = max_bytes.max(4096); // a uselessly small cap would return nothing
     if size <= cap {
@@ -93,7 +92,8 @@ fn read_tail_window(path: &Path, max_bytes: u64) -> Result<(Vec<u8>, bool), Stri
         f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
         return Ok((buf, false));
     }
-    f.seek(SeekFrom::Start(size - cap)).map_err(|e| e.to_string())?;
+    f.seek(SeekFrom::Start(size - cap))
+        .map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(cap as usize);
     f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
     // drop the partial first line — parse only complete lines
@@ -272,7 +272,11 @@ pub fn read_transcript_file(path: &Path, opts: &TranscriptOpts) -> Result<Transc
     let (bytes, byte_truncated) = read_tail_window(path, opts.max_bytes)?;
     let mut messages = {
         let (events, items) = parse_codex_lines(&bytes);
-        if events.is_empty() { items } else { events }
+        if events.is_empty() {
+            items
+        } else {
+            events
+        }
     };
     let tail = opts.tail_messages.max(1);
     let dropped = messages.len() > tail;
@@ -347,10 +351,7 @@ fn read_doc_bounded(dir: &Path, name: &str, cap: usize) -> Option<(String, u64, 
     let file = handle.open_file(name).ok()??; // symlink/FIFO → None via Err
     let size = file.metadata().ok()?.len();
     let mut bytes = Vec::new();
-    (&file)
-        .take(cap as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    (&file).take(cap as u64 + 1).read_to_end(&mut bytes).ok()?;
     let cut = bytes.len() > cap;
     if cut {
         bytes.truncate(cap);
@@ -372,7 +373,11 @@ fn read_doc_bounded(dir: &Path, name: &str, cap: usize) -> Option<(String, u64, 
     if cut {
         bytes.truncate(cap);
     }
-    Some((String::from_utf8_lossy(&bytes).into_owned(), meta.len(), cut))
+    Some((
+        String::from_utf8_lossy(&bytes).into_owned(),
+        meta.len(),
+        cut,
+    ))
 }
 
 pub fn project_docs(root: &str) -> ProjectDocs {
@@ -444,7 +449,11 @@ mod tests {
     #[test]
     fn codex_user_and_agent_messages() {
         let dir = temp_dir();
-        let p = write_file(&dir, "rollout-2026-01-02T09-00-00-019fabc.jsonl", CODEX_FIXTURE);
+        let p = write_file(
+            &dir,
+            "rollout-2026-01-02T09-00-00-019fabc.jsonl",
+            CODEX_FIXTURE,
+        );
         let view = read_transcript_file(&p, &TranscriptOpts::default()).unwrap();
         let texts: Vec<(&str, &str)> = view
             .messages
@@ -461,17 +470,18 @@ mod tests {
         );
         assert_eq!(view.first_user_message.as_deref(), Some("Fix the bug"));
         assert!(view.summaries.is_empty());
-        assert_eq!(
-            view.messages[0].at.as_deref(),
-            Some("2026-01-02T09:00:02Z")
-        );
+        assert_eq!(view.messages[0].at.as_deref(), Some("2026-01-02T09:00:02Z"));
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn tail_limit_keeps_the_last_messages() {
         let dir = temp_dir();
-        let p = write_file(&dir, "rollout-2026-01-02T09-00-00-019fabc.jsonl", CODEX_FIXTURE);
+        let p = write_file(
+            &dir,
+            "rollout-2026-01-02T09-00-00-019fabc.jsonl",
+            CODEX_FIXTURE,
+        );
         let view = read_transcript_file(
             &p,
             &TranscriptOpts {
@@ -528,7 +538,11 @@ mod tests {
         let content = format!(
             r#"{{"timestamp":"2026-01-02T09:00:00Z","type":"event_msg","payload":{{"type":"user_message","message":"{long}"}}}}"#
         );
-        let p = write_file(&dir, "rollout-2026-01-02T09-00-00-019fddd.jsonl", &format!("{content}\n"));
+        let p = write_file(
+            &dir,
+            "rollout-2026-01-02T09-00-00-019fddd.jsonl",
+            &format!("{content}\n"),
+        );
         let view = read_transcript_file(&p, &TranscriptOpts::default()).unwrap();
         assert_eq!(view.messages.len(), 1);
         assert_eq!(view.messages[0].text.chars().count(), 1501);
@@ -569,7 +583,11 @@ mod tests {
         let dir = temp_dir();
         let sub = dir.join("2026").join("01").join("02");
         fs::create_dir_all(&sub).unwrap();
-        write_file(&sub, "rollout-2026-01-02T09-00-00-019fabc.jsonl", CODEX_FIXTURE);
+        write_file(
+            &sub,
+            "rollout-2026-01-02T09-00-00-019fabc.jsonl",
+            CODEX_FIXTURE,
+        );
         let found = codex_session_path(&dir, "019fabc").unwrap();
         assert!(found.ends_with("rollout-2026-01-02T09-00-00-019fabc.jsonl"));
         assert!(codex_session_path(&dir, "does-not-exist").is_none());

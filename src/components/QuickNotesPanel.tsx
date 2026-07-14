@@ -11,6 +11,12 @@ import {
 import { useSwarm } from "@/store";
 import { useVibe } from "@/lib/vibe/session-store";
 import { ScrollArea } from "./ui/misc";
+import {
+  Dialog,
+  DialogDescription,
+  DialogTitle,
+  DrawerContent,
+} from "./ui/dialog";
 import { cn, folderName, shortPath } from "@/lib/utils";
 import type { NoteItem } from "@/types";
 
@@ -32,7 +38,6 @@ export function QuickNotesPanel() {
   // remembered so the active project keeps its chip even while it has no notes
   const [projectRoot, setProjectRoot] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const panelRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -48,27 +53,6 @@ export function QuickNotesPanel() {
     // capture should be instant — focus the input once the drawer mounted
     setTimeout(() => inputRef.current?.focus(), 0);
   }, [open]);
-
-  // Escape closes the drawer; capture + stopPropagation so window-level
-  // handlers don't react to the same press
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      // a real dialog stacked above the drawer (Settings via the title bar)
-      // owns Escape — don't steal it and close the drawer underneath
-      if (
-        document.querySelector('[role="dialog"]:not([aria-label="Quick Notes"])')
-      )
-        return;
-      e.stopPropagation();
-      setOpen(false);
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [open, setOpen]);
-
-  if (!open) return null;
 
   const list = scope ? (quickNotes.folders[scope] ?? []) : quickNotes.global;
   const doneCount = list.filter((n) => n.done).length;
@@ -125,24 +109,20 @@ export function QuickNotesPanel() {
   };
 
   return (
-    <>
-      <div
-        className="animate-zoverlay fixed inset-0 z-30 bg-[rgba(5,5,8,0.55)] backdrop-blur-[2px]"
-        onClick={() => setOpen(false)}
-      />
-      <div
-        ref={panelRef}
-        role="dialog"
-        aria-label="Quick Notes"
-        tabIndex={-1}
-        className="animate-ztoast fixed right-0 top-0 z-40 flex h-full w-[380px] flex-col border-l border-line2 bg-panel shadow-modal outline-none"
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DrawerContent
+        className="w-[380px]"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          inputRef.current?.focus();
+        }}
       >
         <div className="flex items-center justify-between border-b border-line px-4 py-3">
           <div className="min-w-0">
-            <h2 className="text-14 font-semibold tracking-[-0.01em]">Quick Notes</h2>
-            <p className="truncate font-mono text-11 text-fnt" title={scope ?? undefined}>
+            <DialogTitle className="text-14">Quick Notes</DialogTitle>
+            <DialogDescription className="truncate font-mono text-11" title={scope ?? undefined}>
               {scope ? shortPath(scope) : "Global · not tied to a project"}
-            </p>
+            </DialogDescription>
           </div>
           <div className="flex shrink-0 items-center gap-1">
             {doneCount > 0 && (
@@ -156,6 +136,7 @@ export function QuickNotesPanel() {
             )}
             <button
               onClick={() => setOpen(false)}
+              aria-label="Close Quick Notes"
               className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-fnt hover:bg-card hover:text-txt"
             >
               <X size={16} />
@@ -225,8 +206,8 @@ export function QuickNotesPanel() {
             </span>
           )}
         </form>
-      </div>
-    </>
+      </DrawerContent>
+    </Dialog>
   );
 }
 
@@ -247,6 +228,7 @@ function ScopeChip({
     <button
       onClick={onClick}
       title={title}
+      aria-pressed={active}
       className={cn(
         "focus-ring flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-12 font-medium transition-colors",
         active ? "bg-acc/10 text-txt" : "text-fnt hover:text-txt",
@@ -300,6 +282,8 @@ function NoteRow({
       ) : (
         <button
           onClick={() => updateNote(scope, note.id, { done: !note.done })}
+          aria-label={`${note.done ? "Mark incomplete" : "Mark complete"}: ${note.text}`}
+          aria-pressed={note.done}
           className={cn(
             "focus-ring mt-px flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors",
             note.done
@@ -348,6 +332,7 @@ function NoteRow({
           }
           className="focus-ring flex h-4 w-4 items-center justify-center rounded text-fnt hover:bg-card hover:text-txt"
           title={note.plain ? "Turn into checkbox item" : "Turn into plain text"}
+          aria-label={note.plain ? "Turn into checkbox item" : "Turn into plain text"}
         >
           {note.plain ? <Square size={10} /> : <Type size={10} />}
         </button>
@@ -355,6 +340,7 @@ function NoteRow({
           onClick={() => deleteNote(scope, note.id)}
           className="focus-ring flex h-4 w-4 items-center justify-center rounded text-fnt hover:bg-err/15 hover:text-err"
           title="Delete note"
+          aria-label={`Delete note: ${note.text}`}
         >
           <X size={11} />
         </button>

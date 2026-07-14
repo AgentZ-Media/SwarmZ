@@ -244,9 +244,9 @@ mod tests {
             &[],
             &[
                 known(&repo, "workspace"),
-                known(&wt, "notes"),                    // collapses onto repo
-                known(&repo.join("trailing/"), "x"),    // nonexistent → own entry
-                known(&repo, "workspace"),              // exact duplicate
+                known(&wt, "notes"),                 // collapses onto repo
+                known(&repo.join("trailing/"), "x"), // nonexistent → own entry
+                known(&repo, "workspace"),           // exact duplicate
             ],
         );
         let repo_entry = entries
@@ -319,7 +319,12 @@ mod tests {
         let mut map = HashMap::new();
         add_entry(&mut map, &old.to_string_lossy(), Some(1000), "codex");
         add_entry(&mut map, &new.to_string_lossy(), Some(2000), "codex");
-        add_entry(&mut map, &dir.join("no-activity").to_string_lossy(), None, "workspace");
+        add_entry(
+            &mut map,
+            &dir.join("no-activity").to_string_lossy(),
+            None,
+            "workspace",
+        );
         let mut entries: Vec<ProjectEntry> = map.into_values().collect();
         sort_entries(&mut entries);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();

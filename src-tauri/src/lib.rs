@@ -79,7 +79,10 @@ async fn worktree_add(
 }
 
 #[tauri::command]
-async fn worktree_status(path: String, bin: Option<String>) -> Result<worktree::WorktreeStatus, String> {
+async fn worktree_status(
+    path: String,
+    bin: Option<String>,
+) -> Result<worktree::WorktreeStatus, String> {
     tauri::async_runtime::spawn_blocking(move || worktree::status(&path, bin.as_deref()))
         .await
         .map_err(|e| e.to_string())
@@ -101,7 +104,13 @@ async fn worktree_remove(
     bin: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        worktree::remove(&root, &path, &branch, force.unwrap_or(false), bin.as_deref())
+        worktree::remove(
+            &root,
+            &path,
+            &branch,
+            force.unwrap_or(false),
+            bin.as_deref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -325,23 +334,21 @@ async fn discover_projects(
 
 /// The tool catalog + the Conductor system instructions, both single-source
 /// in Rust. The catalog is handed to Codex as `dynamicTools` (and the
-/// instructions as `developerInstructions`). `persona` is the current
-/// Settings persona (None = the Maestro seed), `project` the Conductor's
-/// project context (None = no project block — dev hook); memory (global +
+/// instructions as `developerInstructions`). The Orchestrator identity is
+/// fixed; `project` is the Conductor's project context (None = no project
+/// block — dev hook); memory (global +
 /// project) is read fresh so every consumer compiles the SAME instructions
 /// from one source.
 #[tauri::command]
 async fn orchestrator_tools(
     app: AppHandle,
-    persona: Option<orchestrator::PersonaSpec>,
     project: Option<orchestrator::ProjectContext>,
 ) -> serde_json::Value {
-    let persona = persona.unwrap_or_default();
     let project = project.unwrap_or_default();
     let memory = orchestrator_memory_blocks(&app, &project.id).await;
     let models = orchestrator::model_catalog(&app).await.unwrap_or_default();
     serde_json::json!({
-        "instructions": orchestrator::build_instructions_with_models(&persona, &project, &memory, Some(&models)),
+        "instructions": orchestrator::build_instructions_with_models(&project, &memory, Some(&models)),
         "tools": orchestrator::tool_definitions(),
     })
 }
@@ -453,7 +460,9 @@ async fn orchestrator_run_tool(
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     if !cfg!(debug_assertions) {
-        return Err("orchestrator_run_tool is a dev-only hook and disabled in release builds".into());
+        return Err(
+            "orchestrator_run_tool is a dev-only hook and disabled in release builds".into(),
+        );
     }
     // dev-hook surface — no chat/project context (executors skip
     // touched-session tracking and resolve sessions unscoped)
@@ -481,10 +490,9 @@ fn orchestrator_tool_response(id: String, ok: bool, payload: serde_json::Value) 
 async fn orchestrator_chat_start(
     app: AppHandle,
     codex_path: Option<String>,
-    persona: Option<orchestrator::PersonaSpec>,
     project: Option<orchestrator::ProjectContext>,
 ) -> Result<serde_json::Value, String> {
-    orchestrator::chat_start(&app, codex_path, persona, project).await
+    orchestrator::chat_start(&app, codex_path, project).await
 }
 
 /// Send one user message; resolves with the final assistant text when the
@@ -523,10 +531,9 @@ async fn orchestrator_chat_compact(
 async fn orchestrator_chat_resume(
     app: AppHandle,
     thread_id: String,
-    persona: Option<orchestrator::PersonaSpec>,
     project: Option<orchestrator::ProjectContext>,
 ) -> Result<serde_json::Value, String> {
-    orchestrator::chat_resume(&app, &thread_id, persona, project).await
+    orchestrator::chat_resume(&app, &thread_id, project).await
 }
 
 /// Liveness + codex version + account summary. Never errors — spawn
@@ -785,10 +792,7 @@ async fn conductor_fs_list(
 }
 
 #[tauri::command]
-async fn conductor_fs_read(
-    project_dir: String,
-    path: String,
-) -> Result<explore::FsFile, String> {
+async fn conductor_fs_read(project_dir: String, path: String) -> Result<explore::FsFile, String> {
     tauri::async_runtime::spawn_blocking(move || explore::read(&project_dir, &path))
         .await
         .map_err(|e| e.to_string())?

@@ -18,10 +18,10 @@ import {
 import {
   contextTokens,
   decayedSignal,
-  hasPendingApproval,
   VIBE_CTX_WARN,
   VIBE_FINISHED_WINDOW_MS,
 } from "@/lib/vibe/ui";
+import { hasHumanAttention } from "@/lib/vibe/attention";
 import { recentCodexModels } from "@/lib/orchestrator/models";
 import { splitUnifiedDiff } from "@/lib/vibe/diff";
 import { ModelEffortPicker } from "@/components/orchestrator/ModelEffortPicker";
@@ -83,7 +83,7 @@ function CrossSessionBanner({ sessionId }: { sessionId: string }) {
     for (const id of s.order) {
       if (id === sessionId) continue;
       const e = s.sessions[id];
-      if (e && hasPendingApproval(e)) n++;
+      if (e && hasHumanAttention(e)) n++;
     }
     return n;
   });
@@ -91,7 +91,7 @@ function CrossSessionBanner({ sessionId }: { sessionId: string }) {
     for (const id of s.order) {
       if (id === sessionId) continue;
       const e = s.sessions[id];
-      if (e && hasPendingApproval(e)) return id;
+      if (e && hasHumanAttention(e)) return id;
     }
     return "";
   });
@@ -110,10 +110,10 @@ function CrossSessionBanner({ sessionId }: { sessionId: string }) {
       </span>
       <span className="min-w-0 truncate">
         {otherCount > 1
-          ? `${otherCount} agents wait for approval`
-          : `«${firstName}» waits for approval`}
+          ? `${otherCount} workers need your input`
+          : `«${firstName}» needs your input`}
       </span>
-      <span className="ml-auto shrink-0 text-attn/80">View agent →</span>
+      <span className="ml-auto shrink-0 text-attn/80">View worker →</span>
     </button>
   );
 }
@@ -167,7 +167,7 @@ function useStageState(sessionId: string): "working" | "needs" | "finished" | "i
   const busy = useVibe((s) => !!s.busy[sessionId]);
   const needs = useVibe((s) => {
     const e = s.sessions[sessionId];
-    return e ? hasPendingApproval(e) : false;
+    return e ? hasHumanAttention(e) : false;
   });
   const lastBusyEndAt = useVibe((s) => s.sessions[sessionId]?.lastBusyEndAt ?? null);
   const [, setTick] = useState(0);

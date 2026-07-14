@@ -10,6 +10,7 @@ import {
   latchAutonomyUnavailable,
   noteAutonomousTurn,
   noteHumanTurn,
+  persistAutonomyReservation,
   registerAutonomyPersist,
   releaseAutonomousTurn,
   resetAutonomyBudgets,
@@ -194,6 +195,19 @@ describe("autonomy budget", () => {
     // a human turn with nothing to change stays silent
     noteHumanTurn("p");
     expect(dirty).toBe(before + 2);
+  });
+
+  it("offers a write-through seam for a reservation before dispatch", async () => {
+    const calls: string[] = [];
+    registerAutonomyPersist(
+      () => calls.push("dirty"),
+      async () => {
+        calls.push("flush");
+      },
+    );
+    noteAutonomousTurn("p", T0);
+    expect(await persistAutonomyReservation()).toBe(true);
+    expect(calls).toEqual(["dirty", "flush"]);
   });
 
   it("breaker-state changes notify subscribers (trip + re-arm)", () => {

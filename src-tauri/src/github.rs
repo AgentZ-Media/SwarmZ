@@ -108,8 +108,7 @@ pub fn agent_gh_writes_allowed() -> bool {
 /// In-flight gh/git WRITE ops (pr_create/comment/review) — a `git push` or a
 /// PR mutation mid-flight. The quit guard reads this so quitting mid-write
 /// warns instead of killing a push (`gh_writes` in the QuitConfirm dialog).
-static WRITES_IN_FLIGHT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static WRITES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Number of gh write ops currently running (for the quit guard).
 pub fn writes_in_flight() -> usize {
@@ -302,9 +301,7 @@ fn run_gh(
     cmd.env("GH_PROMPT_DISABLED", "1").env("NO_COLOR", "1");
     let out = match output_with_timeout(&mut cmd, timeout) {
         Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(GhOutcome::NotInstalled)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(GhOutcome::NotInstalled),
         Err(e) => return Err(GhOutcome::Error(format!("gh did not run: {e}"))),
     };
     if !out.status.success() {
@@ -353,7 +350,12 @@ pub fn auth_status(bin_override: Option<&str>) -> GhAuthStatus {
         };
     }
     // --json makes gh exit 0 even for auth issues; state carries the truth
-    match run_gh(&bin, None, &["auth", "status", "--json", "hosts"], GH_TIMEOUT) {
+    match run_gh(
+        &bin,
+        None,
+        &["auth", "status", "--json", "hosts"],
+        GH_TIMEOUT,
+    ) {
         Ok(stdout) => {
             let v: Value = serde_json::from_str(&stdout).unwrap_or(Value::Null);
             let account = v
@@ -380,10 +382,7 @@ pub fn auth_status(bin_override: Option<&str>) -> GhAuthStatus {
             GhAuthStatus {
                 installed: true,
                 authenticated: ok,
-                login: acc
-                    .get("login")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                login: acc.get("login").and_then(Value::as_str).map(str::to_string),
                 scopes: acc
                     .get("scopes")
                     .and_then(Value::as_str)
@@ -523,10 +522,7 @@ pub(crate) fn summarize_checks(rollup: &Value) -> ChecksSummary {
             .and_then(Value::as_str)
             .or_else(|| e.get("context").and_then(Value::as_str))
             .unwrap_or("");
-        let workflow = e
-            .get("workflowName")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let workflow = e.get("workflowName").and_then(Value::as_str).unwrap_or("");
         let name = if check.is_empty() && workflow.is_empty() {
             // nameless: never collapse — a failing anonymous check must not
             // hide behind a passing one
@@ -775,6 +771,16 @@ fn finish_capped_diff(raw: String, clipped: bool) -> (String, bool) {
 /// capped WHILE reading, never after fully buffering (a monster PR diff must
 /// not exhaust memory). Best-effort like before: any failure → None.
 fn gh_diff_capped(bin: &str, dir: &str, n: &str, cap: usize) -> Option<(String, bool)> {
+    gh_diff_capped_with_timeout(bin, dir, n, cap, GH_TIMEOUT)
+}
+
+fn gh_diff_capped_with_timeout(
+    bin: &str,
+    dir: &str,
+    n: &str,
+    cap: usize,
+    timeout: Duration,
+) -> Option<(String, bool)> {
     use std::process::Stdio;
     if !Path::new(dir).is_dir() {
         return None;
@@ -787,21 +793,51 @@ fn gh_diff_capped(bin: &str, dir: &str, n: &str, cap: usize) -> Option<(String, 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Match `output_with_timeout`: isolate gh and every helper it may
+        // spawn, so a timeout cannot leave descendants holding pipes or
+        // network activity after the parent is killed.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
     let mut child = cmd.spawn().ok()?;
+    #[cfg(unix)]
+    let child_pid = child.id() as libc::pid_t;
     let out_buf = drain_capped(child.stdout.take(), cap);
-    let deadline = Instant::now() + GH_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::killpg(child_pid, libc::SIGKILL);
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(_) => return None,
+            Err(_) => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::killpg(child_pid, libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     };
     if !status.success() {
@@ -958,11 +994,18 @@ pub fn pr_create(
     // the branch actually checked out in the given folder (C1: through the
     // suppression builder — local read, no transports, no hooks)
     let branch_out = output_with_timeout(
-        crate::git::git_command(git, Path::new(dir)).args(["symbolic-ref", "--short", "-q", "HEAD"]),
+        crate::git::git_command(git, Path::new(dir)).args([
+            "symbolic-ref",
+            "--short",
+            "-q",
+            "HEAD",
+        ]),
         Duration::from_secs(10),
     )
     .map_err(|e| format!("git did not run: {e}"))?;
-    let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+    let branch = String::from_utf8_lossy(&branch_out.stdout)
+        .trim()
+        .to_string();
     if branch.is_empty() {
         return Err("the folder has no checked-out branch (detached HEAD?)".into());
     }
@@ -1061,7 +1104,11 @@ pub fn pr_review(
         "approve" => "--approve",
         "request_changes" => "--request-changes",
         "comment" => "--comment",
-        other => return Err(format!("unknown review action {other:?} — use approve | request_changes | comment")),
+        other => {
+            return Err(format!(
+                "unknown review action {other:?} — use approve | request_changes | comment"
+            ))
+        }
     };
     let body = body.unwrap_or("").trim();
     // GitHub requires a body for comment/request-changes reviews
@@ -1394,7 +1441,8 @@ mod tests {
 
     #[test]
     fn stderr_classification_is_typed() {
-        match classify_gh_stderr::<()>("To get started with GitHub CLI, please run:  gh auth login") {
+        match classify_gh_stderr::<()>("To get started with GitHub CLI, please run:  gh auth login")
+        {
             GhOutcome::NotAuthenticated => {}
             other => panic!("expected NotAuthenticated, got {other:?}"),
         }
@@ -1446,7 +1494,12 @@ mod tests {
         let s = summarize_checks(&rollup);
         assert_eq!(
             s,
-            ChecksSummary { passing: 3, failing: 0, pending: 0, total: 3 }
+            ChecksSummary {
+                passing: 3,
+                failing: 0,
+                pending: 0,
+                total: 3
+            }
         );
     }
 
@@ -1463,7 +1516,12 @@ mod tests {
         let s = summarize_checks(&rollup);
         assert_eq!(
             s,
-            ChecksSummary { passing: 1, failing: 3, pending: 2, total: 6 }
+            ChecksSummary {
+                passing: 1,
+                failing: 3,
+                pending: 2,
+                total: 6
+            }
         );
         // a rerun that flips pass → fail must surface the failure
         let flipped = json!([
@@ -1486,13 +1544,29 @@ mod tests {
             { "name": "test", "workflowName": "Nightly", "status": "COMPLETED", "conclusion": "FAILURE", "startedAt": "b" }
         ]);
         let s = summarize_checks(&two_workflows);
-        assert_eq!(s, ChecksSummary { passing: 1, failing: 1, pending: 0, total: 2 });
+        assert_eq!(
+            s,
+            ChecksSummary {
+                passing: 1,
+                failing: 1,
+                pending: 0,
+                total: 2
+            }
+        );
         // a rerun WITHIN one workflow still dedupes (newest start wins)
         let rerun = json!([
             { "name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE", "startedAt": "2026-01-01T00:00:00Z" },
             { "name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-01-02T00:00:00Z" }
         ]);
-        assert_eq!(summarize_checks(&rerun), ChecksSummary { passing: 1, failing: 0, pending: 0, total: 1 });
+        assert_eq!(
+            summarize_checks(&rerun),
+            ChecksSummary {
+                passing: 1,
+                failing: 0,
+                pending: 0,
+                total: 1
+            }
+        );
         // nameless entries: a failing anonymous check must not hide behind a
         // passing one
         let nameless = json!([
@@ -1500,7 +1574,15 @@ mod tests {
             { "status": "COMPLETED", "conclusion": "FAILURE", "startedAt": "b" }
         ]);
         let s = summarize_checks(&nameless);
-        assert_eq!(s, ChecksSummary { passing: 1, failing: 1, pending: 0, total: 2 });
+        assert_eq!(
+            s,
+            ChecksSummary {
+                passing: 1,
+                failing: 1,
+                pending: 0,
+                total: 2
+            }
+        );
     }
 
     fn pr(number: u64, title: &str, checks: ChecksSummary) -> GhPr {
@@ -1521,8 +1603,18 @@ mod tests {
 
     #[test]
     fn pr_diffing_reports_opened_closed_and_field_changes() {
-        let ok = ChecksSummary { passing: 2, failing: 0, pending: 0, total: 2 };
-        let bad = ChecksSummary { passing: 1, failing: 1, pending: 0, total: 2 };
+        let ok = ChecksSummary {
+            passing: 2,
+            failing: 0,
+            pending: 0,
+            total: 2,
+        };
+        let bad = ChecksSummary {
+            passing: 1,
+            failing: 1,
+            pending: 0,
+            total: 2,
+        };
 
         // first poll = baseline, silent
         assert!(diff_pr_sets(&HashMap::new(), &[pr(1, "a", ok.clone())], true).is_empty());
@@ -1532,13 +1624,19 @@ mod tests {
         old.insert(2, PrSig::of(&pr(2, "b", ok.clone())));
 
         // unchanged → silent
-        assert!(
-            diff_pr_sets(&old, &[pr(1, "a", ok.clone()), pr(2, "b", ok.clone())], false)
-                .is_empty()
-        );
+        assert!(diff_pr_sets(
+            &old,
+            &[pr(1, "a", ok.clone()), pr(2, "b", ok.clone())],
+            false
+        )
+        .is_empty());
 
         // checks flip + a new PR + a closed PR, sorted by number
-        let changes = diff_pr_sets(&old, &[pr(1, "a", bad.clone()), pr(3, "c", ok.clone())], false);
+        let changes = diff_pr_sets(
+            &old,
+            &[pr(1, "a", bad.clone()), pr(3, "c", ok.clone())],
+            false,
+        );
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[0].number, 1);
         assert_eq!(changes[0].kind, "checks");
@@ -1570,7 +1668,12 @@ mod tests {
     /// flag disambiguates the empty old map (double-review MEDIUM 7).
     #[test]
     fn first_pr_after_a_zero_pr_baseline_reports_opened() {
-        let ok = ChecksSummary { passing: 1, failing: 0, pending: 0, total: 1 };
+        let ok = ChecksSummary {
+            passing: 1,
+            failing: 0,
+            pending: 0,
+            total: 1,
+        };
         // baseline with zero PRs: silent
         assert!(diff_pr_sets(&HashMap::new(), &[], true).is_empty());
         // next poll (NOT first): a PR appeared against the empty known set
@@ -1588,15 +1691,16 @@ mod tests {
         // the write entry points refuse BEFORE touching gh
         assert!(pr_comment("/nonexistent", 1, "hi", None).is_err());
         assert!(pr_review("/nonexistent", 1, "approve", None, None).is_err());
-        assert!(
-            pr_create("/nonexistent", "t", "b", None, false, None, None).is_err()
-        );
+        assert!(pr_create("/nonexistent", "t", "b", None, false, None, None).is_err());
         set_integration(true);
         assert!(require_integration().is_ok());
         // input validation still guards
         assert!(pr_comment("/nonexistent", 1, "   ", None).is_err());
         assert!(pr_review("/nonexistent", 1, "merge", None, None).is_err());
-        assert!(pr_review("/nonexistent", 1, "comment", None, None).is_err(), "comment review needs a body");
+        assert!(
+            pr_review("/nonexistent", 1, "comment", None, None).is_err(),
+            "comment review needs a body"
+        );
         set_integration(false);
     }
 
@@ -1662,7 +1766,10 @@ mod tests {
         while std::sync::Arc::strong_count(&buf) > 1 && Instant::now() < grace {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let (bytes, clipped) = { let g = buf.lock(); (g.0.clone(), g.1) };
+        let (bytes, clipped) = {
+            let g = buf.lock();
+            (g.0.clone(), g.1)
+        };
         assert_eq!(bytes.len(), 1000);
         assert!(clipped);
         // line trimming of a clipped diff
@@ -1673,6 +1780,60 @@ mod tests {
         let (text, truncated) = finish_capped_diff("a\nb\n".into(), false);
         assert_eq!(text, "a\nb\n");
         assert!(!truncated);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capped_diff_timeout_kills_the_entire_helper_process_group() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "swarmz-gh-group-kill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pidfile = root.join("helper.pid");
+        let fake = root.join("fake-gh");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(gh_diff_capped_with_timeout(
+            &fake.to_string_lossy(),
+            &root.to_string_lossy(),
+            "1",
+            1024,
+            Duration::from_millis(500),
+        )
+        .is_none());
+        let helper_pid: libc::pid_t = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let alive = unsafe { libc::kill(helper_pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gh timeout left helper process {helper_pid} alive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// Double-review HIGH 4: failed-push stderr is redacted before it can
@@ -1687,7 +1848,10 @@ mod tests {
         assert!(!s.contains("hunter2"), "{s}");
         assert!(s.contains("https://***@github.com/o/r.git"), "{s}");
         // GitHub token shapes
-        let s = redact_credentials("remote: https://ghp_abcDEF123456789012345678@x.test failed", 800);
+        let s = redact_credentials(
+            "remote: https://ghp_abcDEF123456789012345678@x.test failed",
+            800,
+        );
         assert!(!s.contains("ghp_abc"), "{s}");
         let s = redact_credentials("token github_pat_11ABCDEF0_abcdefghij was rejected", 800);
         assert!(!s.contains("github_pat_11"), "{s}");
@@ -1732,7 +1896,10 @@ mod tests {
         let auth = auth_status(None);
         println!("auth: {auth:?}");
         assert!(auth.installed, "gh must be installed for the live spike");
-        assert!(auth.authenticated, "gh must be logged in for the live spike");
+        assert!(
+            auth.authenticated,
+            "gh must be logged in for the live spike"
+        );
         assert!(auth.login.is_some());
         assert!(auth.version.unwrap().starts_with("gh version"));
 
@@ -1753,8 +1920,15 @@ mod tests {
         for pr in &prs {
             println!(
                 "  #{} {:?} by {} [{} → {}] draft={} mergeable={} review={:?} checks={:?}",
-                pr.number, pr.title, pr.author, pr.head_ref, pr.base_ref,
-                pr.is_draft, pr.mergeable, pr.review_decision, pr.checks
+                pr.number,
+                pr.title,
+                pr.author,
+                pr.head_ref,
+                pr.base_ref,
+                pr.is_draft,
+                pr.mergeable,
+                pr.review_decision,
+                pr.checks
             );
             assert!(pr.number > 0);
             assert!(!pr.title.is_empty());

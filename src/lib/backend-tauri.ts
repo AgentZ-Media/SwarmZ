@@ -45,11 +45,7 @@ export const tauriBackend: Backend = {
   },
 
   loadQuickNotes: async () => {
-    try {
-      return (await store.get<QuickNotesData>("quickNotes")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<QuickNotesData>("quickNotes")) ?? null;
   },
   saveQuickNotes: async (data) => {
     await store.set("quickNotes", data);
@@ -57,14 +53,9 @@ export const tauriBackend: Backend = {
   },
 
   loadOrchestratorChats: async () => {
-    try {
-      return (
-        (await store.get<PersistedOrchestratorChats>("orchestratorChats")) ??
-        null
-      );
-    } catch {
-      return null;
-    }
+    return (
+      (await store.get<PersistedOrchestratorChats>("orchestratorChats")) ?? null
+    );
   },
   saveOrchestratorChats: async (data) => {
     await store.set("orchestratorChats", data);
@@ -72,11 +63,7 @@ export const tauriBackend: Backend = {
   },
 
   loadVibeSessions: async () => {
-    try {
-      return (await store.get<PersistedVibeSessions>("vibeSessions")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<PersistedVibeSessions>("vibeSessions")) ?? null;
   },
   saveVibeSessions: async (data) => {
     await store.set("vibeSessions", data);
@@ -84,11 +71,7 @@ export const tauriBackend: Backend = {
   },
 
   loadProjects: async () => {
-    try {
-      return (await store.get<PersistedProjects>("projects")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<PersistedProjects>("projects")) ?? null;
   },
   saveProjects: async (data) => {
     await store.set("projects", data);
@@ -134,11 +117,7 @@ export const tauriBackend: Backend = {
   },
 
   loadUsageHistory: async () => {
-    try {
-      return (await store.get<UsageHistoryEntry[]>("usageHistory")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<UsageHistoryEntry[]>("usageHistory")) ?? null;
   },
   saveUsageHistory: async (entries) => {
     await store.set("usageHistory", entries);
@@ -146,11 +125,7 @@ export const tauriBackend: Backend = {
   },
 
   loadSettings: async () => {
-    try {
-      return (await store.get<AppSettings>("settings")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<AppSettings>("settings")) ?? null;
   },
   saveSettings: async (settings) => {
     await store.set("settings", settings);
@@ -158,11 +133,7 @@ export const tauriBackend: Backend = {
   },
 
   loadSchemaVersion: async () => {
-    try {
-      return (await store.get<number>("schemaVersion")) ?? null;
-    } catch {
-      return null;
-    }
+    return (await store.get<number>("schemaVersion")) ?? null;
   },
   saveSchemaVersion: async (version) => {
     await store.set("schemaVersion", version);

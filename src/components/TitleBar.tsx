@@ -14,7 +14,7 @@ import {
 import { useSwarm } from "@/store";
 import { useProjects, openProjectIds } from "@/lib/projects/store";
 import { useVibe } from "@/lib/vibe/session-store";
-import { hasPendingApproval } from "@/lib/vibe/ui";
+import { hasHumanAttention } from "@/lib/vibe/attention";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import {
   activateProject,
@@ -64,7 +64,7 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
       style={{ paddingLeft: IS_TAURI ? 80 : 16 }}
     >
       {/* Conductor sidebar toggle (⌘B) */}
-      <Tip label={conductorOpen ? "Collapse the Conductor (⌘B)" : "Open the Conductor (⌘B)"}>
+      <Tip label={conductorOpen ? "Collapse the Orchestrator (⌘B)" : "Open the Orchestrator (⌘B)"}>
         <button onClick={toggleConductor} className={BAR_BTN}>
           <PanelLeft
             size={16}
@@ -134,12 +134,12 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
           </button>
         </Tip>
 
-        <Tip label="New agent (⌘T)">
+        <Tip label="New worker (⌘T)">
           <button
             onClick={() => useVibeUi.getState().setNewSessionOpen(true)}
             className="no-drag focus-ring ml-1 flex h-8 items-center gap-1.5 rounded-md bg-acc px-3 text-12 font-semibold text-white hover:brightness-110"
           >
-            <Plus size={13} strokeWidth={2.8} /> New agent
+            <Plus size={13} strokeWidth={2.8} /> New worker
           </button>
         </Tip>
       </div>
@@ -180,7 +180,7 @@ function NeedsYouPill() {
   return (
     <button
       onClick={jump}
-      title="Jump to the next agent that needs you (⌘⇧A)"
+      title="Jump to the next worker that needs you (⌘⇧A)"
       className="no-drag focus-ring mr-1 flex h-8 items-center gap-1.5 rounded-md border border-attn/30 bg-attn/10 px-3 font-mono text-12 font-semibold text-attn hover:bg-attn/15"
     >
       <span aria-hidden className="animate-zattn">
@@ -239,7 +239,7 @@ function useProjectStats(id: string) {
     let n = 0;
     for (const sid of s.order) {
       const e = s.sessions[sid];
-      if (e && e.session.projectId === id && hasPendingApproval(e)) n++;
+      if (e && e.session.projectId === id && hasHumanAttention(e)) n++;
     }
     return n;
   });
@@ -386,7 +386,7 @@ function ProjectTab({
           {stats.attn > 0 && (
             <span
               className="font-mono text-10 font-semibold tabular-nums text-attn"
-              title={`${stats.attn} agent${stats.attn > 1 ? "s" : ""} need${stats.attn > 1 ? "" : "s"} your input`}
+              title={`${stats.attn} worker${stats.attn > 1 ? "s" : ""} need${stats.attn > 1 ? "" : "s"} your input`}
             >
               ⚑{stats.attn}
             </span>

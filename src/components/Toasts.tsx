@@ -54,7 +54,7 @@ function toToast(e: FleetEvent): Toast | null {
         kind: e.kind,
         sessionId: e.sessionId,
         title: `${e.sessionName} started`,
-        sub: "new agent",
+        sub: "new worker",
       };
     default:
       // orch prompts and exits stay ticker-only — not toast-worthy

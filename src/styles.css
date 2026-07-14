@@ -86,7 +86,7 @@
   /* -------- text ladder ---------------------------------------------------- */
   --txt: #e9eaee; /* primary text */
   --mut: #9da0ab; /* secondary text */
-  --fnt: #62646f; /* tertiary/faint: meta, placeholders, section labels */
+  --fnt: #858892; /* readable tertiary/meta text; ≥ AA on app surfaces */
 
   /* -------- semantics ------------------------------------------------------ */
   --attn: #f0a13a; /* "needs you" — approvals, waiting; never decorative */
@@ -495,7 +495,7 @@ select {
    every hand-rolled <button>/focusable span; mouse clicks stay ring-free. */
 .focus-ring:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--acc) 40%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--acc) 80%, transparent);
 }
 
 /* the SwarmZ mark: hexagon (clip) + bolt. `.hex-mark` clips any element to

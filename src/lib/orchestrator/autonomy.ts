@@ -101,11 +101,23 @@ function notifyAutonomyChange(): void {
 // ---- persistence seam (the module stays store/tauri-free) ----
 
 let persistSink: (() => void) | null = null;
+let flushPersistSink: (() => Promise<void>) | null = null;
 
 /** Install the persist scheduler (store.ts) — called on every budget-state
  * mutation so the durable copy tracks the in-memory one. */
-export function registerAutonomyPersist(fn: (() => void) | null): void {
+export function registerAutonomyPersist(
+  fn: (() => void) | null,
+  flush?: (() => Promise<void>) | null,
+): void {
   persistSink = fn;
+  flushPersistSink = flush ?? null;
+}
+
+/** Durably persist a just-booked reservation before its autonomous side
+ * effect starts. Store wiring remains outside this pure budget module. */
+export async function persistAutonomyReservation(): Promise<boolean> {
+  await flushPersistSink?.();
+  return !budgetsUnavailable;
 }
 
 function markDirty(): void {

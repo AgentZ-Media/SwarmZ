@@ -7,7 +7,7 @@ import { useVibe, type VibeSessionEntry } from "@/lib/vibe/session-store";
 import { activateProject, focusSession } from "@/lib/vibe/controller";
 import { useProjects, openProjectIds } from "@/lib/projects/store";
 import { vibeTriageEntries } from "@/lib/vibe/triage";
-import { hasPendingApproval } from "@/lib/vibe/ui";
+import { hasHumanAttention } from "@/lib/vibe/attention";
 import { useVibeUi } from "@/lib/vibe/ui-store";
 import { pickDirectory } from "@/lib/transport";
 import { cn, shortPath } from "@/lib/utils";
@@ -63,7 +63,7 @@ export function CommandPalette({
               <Command.Input
                 value={search}
                 onValueChange={setSearch}
-                placeholder="Jump to an agent or action…"
+                placeholder="Jump to a worker or action…"
                 className="h-11 w-full bg-transparent text-14 text-txt outline-none placeholder:text-fnt"
               />
               <kbd className="rounded-xs border border-line2 px-1 font-mono text-10 text-fnt">
@@ -122,7 +122,7 @@ export function CommandPalette({
                 </PaletteItem>
               </PaletteGroup>
 
-              <PaletteGroup heading="Agents">
+              <PaletteGroup heading="Workers">
                 {order.map((id) => {
                   const entry = sessions[id];
                   if (!entry) return null;
@@ -151,7 +151,7 @@ export function CommandPalette({
                   }
                 >
                   <ActionDot />
-                  <span className="truncate text-txt">New agent</span>
+                  <span className="truncate text-txt">New worker</span>
                   <Shortcut>⌘T</Shortcut>
                 </PaletteItem>
                 <PaletteItem
@@ -161,7 +161,7 @@ export function CommandPalette({
                   }
                 >
                   <ActionDot />
-                  <span className="truncate text-txt">Focus Conductor</span>
+                  <span className="truncate text-txt">Focus Orchestrator</span>
                   <Shortcut>⌘⇧O</Shortcut>
                 </PaletteItem>
                 <PaletteItem
@@ -172,7 +172,7 @@ export function CommandPalette({
                 >
                   <ActionDot />
                   <span className="truncate text-txt">
-                    Toggle Conductor sidebar
+                    Toggle Orchestrator sidebar
                   </span>
                   <Shortcut>⌘B</Shortcut>
                 </PaletteItem>
@@ -187,7 +187,7 @@ export function CommandPalette({
                 >
                   <ActionDot />
                   <span className="truncate text-txt">
-                    Jump to agent waiting for input
+                    Jump to worker waiting for input
                   </span>
                   {waiting > 0 && (
                     <span className="ml-1.5 rounded-xs bg-acc/15 px-1 font-mono text-10 tabular-nums text-acc">
@@ -291,7 +291,7 @@ function ActionDot() {
  * accent), faint for idle. */
 function SessionDot({ entry }: { entry: VibeSessionEntry }) {
   const busy = useVibe((s) => !!s.busy[entry.session.id]);
-  const needsYou = hasPendingApproval(entry);
+  const needsYou = hasHumanAttention(entry);
   return (
     <>
       <span

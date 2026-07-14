@@ -63,7 +63,7 @@ export function ItemFeed({ sessionId }: { sessionId: string }) {
       <div className="flex flex-1 items-center justify-center px-6 text-center">
         <p className="max-w-xs text-12 leading-normal text-fnt">
           No messages yet. Say what you want built below — commands, diffs and
-          approvals will appear here as the agent works.
+          approvals will appear here as the worker runs.
         </p>
       </div>
     );
@@ -134,7 +134,7 @@ function UserRow({ text, via }: { text: string; via?: "conductor" }) {
     <div className="flex flex-col items-end gap-1">
       {via === "conductor" && (
         <span className="flex items-center gap-1 pr-1 font-mono text-10 text-acc/80">
-          <span aria-hidden>//</span> via Conductor
+          <span aria-hidden>//</span> via Orchestrator
         </span>
       )}
       <div
@@ -401,9 +401,9 @@ function ApprovalRow({
             // did NOT give themselves (the Conductor decided this routine one)
             <span
               className="ml-auto shrink-0 rounded-sm border border-acc/40 bg-acc/10 px-1.5 py-px text-10 text-acc"
-              title="Decided autonomously by the Conductor (a routine, read-only/test approval). Destructive approvals always wait for you."
+              title="Decided autonomously by the Orchestrator (a routine, read-only/test approval). Destructive approvals always wait for you."
             >
-              ⟐ Conductor{item.escalation === "routine" ? " · routine" : ""}
+              ⟐ Orchestrator{item.escalation === "routine" ? " · routine" : ""}
             </span>
           )}
         </div>

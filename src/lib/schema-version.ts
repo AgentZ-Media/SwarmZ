@@ -8,9 +8,12 @@
 //   2 — projects & swarm data model (rebuild Phase 2): the dead pane-era
 //       keys are deleted once, sessions carry projectId (the per-slice
 //       hydrators do the actual value migration tolerantly).
+//   3 — one fixed Orchestrator identity: the removed persona editor's nested
+//       `settings.orchestratorPersona` value is stripped while every other
+//       setting (especially memory, stored under separate keys) is retained.
 
 /** The schema version this build reads and writes. */
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 /**
  * Pane-era store keys that are no longer read anywhere. Deleted once by the
@@ -52,6 +55,8 @@ export function normalizeSchemaVersion(raw: unknown): NormalizedSchemaVersion {
 export interface SchemaMigrationPlan {
   /** delete the DEAD_STORE_KEYS from swarmz.json (one-time v2 cleanup) */
   cleanupDeadKeys: boolean;
+  /** strip the removed nested settings.orchestratorPersona value */
+  cleanupLegacyPersona: boolean;
   /** write this version back, or null when the stored stamp already suffices */
   stampVersion: number | null;
 }
@@ -74,7 +79,31 @@ export function planSchemaMigration(raw: unknown): SchemaMigrationPlan {
     Number.isInteger(raw) &&
     raw >= CURRENT_SCHEMA_VERSION
   ) {
-    return { cleanupDeadKeys: false, stampVersion: null };
+    return {
+      cleanupDeadKeys: false,
+      cleanupLegacyPersona: false,
+      stampVersion: null,
+    };
   }
-  return { cleanupDeadKeys: true, stampVersion: CURRENT_SCHEMA_VERSION };
+  const version =
+    typeof raw === "number" && Number.isInteger(raw) && raw >= 1 ? raw : 0;
+  return {
+    cleanupDeadKeys: version < 2,
+    cleanupLegacyPersona: version < 3,
+    stampVersion: CURRENT_SCHEMA_VERSION,
+  };
+}
+
+/**
+ * Strip the only nested value removed by schema v3. Memory is deliberately
+ * not part of AppSettings and therefore cannot be touched by this migration.
+ */
+export function migrateSettingsV3<T extends Record<string, unknown>>(
+  settings: T,
+): { settings: Omit<T, "orchestratorPersona">; removedLegacyPersona: boolean } {
+  if (!("orchestratorPersona" in settings)) {
+    return { settings, removedLegacyPersona: false };
+  }
+  const { orchestratorPersona: _removed, ...rest } = settings;
+  return { settings: rest, removedLegacyPersona: true };
 }

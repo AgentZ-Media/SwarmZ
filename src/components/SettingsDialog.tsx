@@ -5,14 +5,12 @@ import {
   FolderOpen,
   Plus,
   RefreshCw,
-  RotateCcw,
   Trash2,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { Button } from "./ui/button";
 import { Input, Label } from "./ui/input";
 import { Switch } from "./ui/switch";
-import { Textarea } from "./ui/textarea";
 import { useSwarm } from "@/store";
 import { useUpdates } from "@/lib/updates";
 import { IS_TAURI, openUrl, pickDirectory } from "@/lib/transport";
@@ -20,16 +18,9 @@ import { prettyModel } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
 import { recentCodexModels } from "@/lib/orchestrator/models";
 import { ModelEffortPicker } from "./orchestrator/ModelEffortPicker";
-import {
-  DEFAULT_PERSONA,
-  effectivePersona,
-  PERSONA_PRESETS,
-  type PersonaPreset,
-} from "@/lib/orchestrator/persona";
 import { readMemory, removeMemory } from "@/lib/orchestrator/memory";
 import { useProjects } from "@/lib/projects/store";
 import type { OrchestratorMemoryEntry } from "@/lib/orchestrator/types";
-import type { OrchestratorPersona } from "@/types";
 import { appDataDir, join } from "@tauri-apps/api/path";
 import { cn, shortPath } from "@/lib/utils";
 
@@ -124,27 +115,6 @@ function Row({
   );
 }
 
-/** Label + help above a full-width control (for text inputs). */
-function StackedRow({
-  label,
-  help,
-  children,
-}: {
-  label: string;
-  help?: ReactNode;
-  children: ReactNode;
-}) {
-  return (
-    <div className="border-t border-line py-3">
-      <div className="text-13 font-medium text-txt">{label}</div>
-      <div className="mt-2">{children}</div>
-      {help && (
-        <div className="mt-1.5 text-11 leading-relaxed text-fnt">{help}</div>
-      )}
-    </div>
-  );
-}
-
 /** Card row: title + subtext on the left, a Switch on the right. */
 function ToggleCard({
   title,
@@ -227,11 +197,11 @@ function ConductorSection() {
   if (!IS_TAURI) {
     return (
       <Section
-        label="Conductor"
-        sub="The AI team lead behind the Conductor stage (⌘⇧O)."
+        label="Orchestrator"
+        sub="The persistent AI engineering lead for each project."
       >
         <p className="border-t border-line py-3 text-12 leading-relaxed text-mut">
-          The Conductor ships with the native macOS app.
+          The Orchestrator ships with the native macOS app.
         </p>
       </Section>
     );
@@ -239,151 +209,11 @@ function ConductorSection() {
 
   return (
     <Section
-      label="Conductor"
-      sub="The AI team lead behind the Conductor stage (⌘⇧O) — runs on your ChatGPT subscription via the codex CLI."
+      label="Orchestrator"
+      sub="The project's fixed AI engineering lead — runs on your ChatGPT subscription via the codex CLI."
     >
       <CodexDefaultsRows />
-      <PersonaControls />
     </Section>
-  );
-}
-
-/**
- * Persona editor: a preset picker (Maestro / Hive / Orchestrator) plus the
- * editable voice fields. Persona is voice/self-image only — it never reaches
- * the orchestrator's tools or safety rules (those are hard-wired in Rust).
- * Editing writes the full persona object; unset = the Maestro seed.
- */
-function PersonaControls() {
-  const stored = useSwarm((s) => s.settings.orchestratorPersona);
-  const updateSettings = useSwarm((s) => s.updateSettings);
-  const persona = effectivePersona(stored);
-
-  const patch = (p: Partial<OrchestratorPersona>) =>
-    updateSettings({ orchestratorPersona: { ...persona, ...p } });
-
-  const applyPreset = (preset: PersonaPreset) =>
-    updateSettings({
-      orchestratorPersona: {
-        name: preset.name,
-        role: preset.role,
-        tone: preset.tone,
-        principles: [...preset.principles],
-        emoji: preset.emoji,
-      },
-    });
-
-  const activePresetId = PERSONA_PRESETS.find(
-    (p) =>
-      p.name === persona.name &&
-      p.role === persona.role &&
-      p.tone === persona.tone &&
-      p.principles.join("\n") === persona.principles.join("\n"),
-  )?.id;
-
-  return (
-    <StackedRow
-      label="Persona"
-      help="Who the orchestrator is — its name, self-image, voice and principles. This shapes tone only; its tools, safety rules and delivery contract are fixed and can't be overridden here."
-    >
-      <div className="flex flex-col gap-3">
-        <div className="grid grid-cols-3 gap-1.5">
-          {PERSONA_PRESETS.map((preset) => (
-            <button
-              key={preset.id}
-              onClick={() => applyPreset(preset)}
-              className={cn(
-                "focus-ring flex flex-col gap-0.5 rounded-lg border px-2.5 py-2 text-left transition-colors",
-                activePresetId === preset.id
-                  ? "border-acc/60 ring-1 ring-acc/30"
-                  : "border-line hover:border-line2",
-              )}
-            >
-              <span className="flex items-center gap-1.5 text-12 font-semibold text-txt">
-                <span>{preset.emoji}</span>
-                {preset.name}
-              </span>
-              <span className="text-10 leading-snug text-fnt">
-                {preset.blurb}
-              </span>
-            </button>
-          ))}
-        </div>
-
-        <div className="flex items-center gap-2">
-          <Input
-            value={persona.emoji ?? ""}
-            onChange={(e) => patch({ emoji: e.target.value.slice(0, 4) })}
-            className="w-14 text-center"
-            placeholder="🎼"
-            aria-label="Persona emoji"
-          />
-          <Input
-            value={persona.name}
-            onChange={(e) => patch({ name: e.target.value })}
-            className="flex-1 text-12"
-            placeholder="Name"
-            aria-label="Persona name"
-          />
-        </div>
-
-        <label className="flex flex-col gap-1">
-          <span className="font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
-            Self-image
-          </span>
-          <Input
-            value={persona.role}
-            onChange={(e) => patch({ role: e.target.value })}
-            className="text-12"
-            placeholder="the fleet's conductor — you keep the tempo, the agents play"
-          />
-        </label>
-
-        <label className="flex flex-col gap-1">
-          <span className="font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
-            Voice
-          </span>
-          <Input
-            value={persona.tone}
-            onChange={(e) => patch({ tone: e.target.value })}
-            className="text-12"
-            placeholder="Calm, precise, leading."
-          />
-        </label>
-
-        <label className="flex flex-col gap-1">
-          <span className="font-mono text-10 font-medium uppercase tracking-[.08em] text-fnt">
-            Principles (one per line)
-          </span>
-          <Textarea
-            value={persona.principles.join("\n")}
-            onChange={(e) =>
-              patch({
-                principles: e.target.value
-                  .split("\n")
-                  .map((l) => l.trim())
-                  .filter(Boolean),
-              })
-            }
-            rows={3}
-            className="resize-none text-12"
-            placeholder={"Clarity over chatter.\nYou delegate, you don't do the work yourself."}
-          />
-        </label>
-
-        {stored !== undefined && (
-          <div>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => updateSettings({ orchestratorPersona: undefined })}
-            >
-              <RotateCcw size={12} /> Reset to {DEFAULT_PERSONA.name}
-            </Button>
-          </div>
-        )}
-      </div>
-    </StackedRow>
   );
 }
 
@@ -401,13 +231,13 @@ function AutonomySection() {
       <div className="flex flex-col gap-2">
         <ToggleCard
           title="Auto-review finished lanes"
-          sub="When an agent the Conductor tasked finishes work that changed code, a detached codex review runs automatically and its findings ride into the Conductor's report — you hear about reviewed work, not just finished work. Costs an extra review turn per lane."
+          sub="When an Orchestrator-assigned worker finishes code changes, a detached Codex review runs automatically and its findings join the Orchestrator report. Costs one extra review turn per lane."
           checked={autoReview}
           onChange={(v) => updateSettings({ autoReviewFinishedLanes: v })}
         />
         <ToggleCard
           title="Auto-compact context"
-          sub="When a session or Conductor chat nears its context window (≥85%), it compacts automatically before the next turn — the model keeps a summarized history so it stays coherent on long runs. Your visible transcript is never touched. Only when idle. You can also compact any time via the ctx gauge."
+          sub="When a worker or Orchestrator chat nears its context window (≥85%), it compacts automatically before the next turn. The visible transcript stays intact."
           checked={autoCompact}
           onChange={(v) => updateSettings({ autoCompact: v })}
         />
@@ -417,7 +247,7 @@ function AutonomySection() {
         />
         <InfoRow
           title="Approval policy"
-          text="Routine (read-only/test) approvals can be decided by the Conductor; anything destructive always waits for you."
+          text="Routine read-only/test approvals can be decided by the Orchestrator; anything destructive always waits for you."
         />
       </div>
     </Section>
@@ -457,26 +287,26 @@ function GithubSection() {
       <div className="flex flex-col gap-2">
         <ToggleCard
           title="GitHub integration"
-          sub="Gives the Conductor its GitHub tools (PRs listen/read/create/review/comment/watch), starts the PR watcher and the Deck indicator, and lets it decide routine agent approvals for gh comment/review. Merging and closing PRs always stay with you."
+          sub="Gives the Orchestrator GitHub PR tools, starts the watcher and Deck indicator, and permits routine review/comment approvals. Merging and closing PRs always stay with you."
           checked={enabled}
           onChange={(v) => updateSettings({ githubIntegration: v })}
         />
         <div className={enabled ? "flex flex-col gap-2" : "pointer-events-none flex flex-col gap-2 opacity-40"}>
           <ToggleCard
             title="Auto-review new PRs"
-            sub="A newly opened PR wakes the Conductor with an autonomous review turn (budget-capped like every autonomous turn)."
+            sub="A newly opened PR wakes the Orchestrator for an autonomous, budget-capped review turn."
             checked={!!settings.githubAutoReviewPrs}
             onChange={(v) => updateSettings({ githubAutoReviewPrs: v })}
           />
           <ToggleCard
             title="Suggest a PR when a lane finishes"
-            sub="When a Conductor-tasked agent finishes work on a branch without an open PR, the Conductor's report suggests opening one. Creating it still needs your order."
+            sub="When an Orchestrator-assigned worker finishes a branch without an open PR, the report suggests opening one. Creation still needs your order."
             checked={!!settings.githubSuggestPrOnFinish}
             onChange={(v) => updateSettings({ githubSuggestPrOnFinish: v })}
           />
           <ToggleCard
             title="Autonomous GitHub writes"
-            sub="Lets the Conductor open PRs, comment and post reviews DURING an autonomous turn (a fleet event drove it, not your message). Off = it must propose these to you instead; turns you trigger directly always allow them. Merging and closing a PR always stay with you. A safety cap against a prompt-injected autonomous cascade posting on your repo — leave off unless you want hands-off GitHub."
+            sub="Lets the Orchestrator open PRs, comment and post reviews during autonomous turns. Off means it proposes those writes first. Merge and close always remain human-only."
             checked={!!settings.autonomousGithubWrites}
             onChange={(v) => updateSettings({ autonomousGithubWrites: v })}
           />
@@ -602,7 +432,7 @@ function MemorySection() {
       <p className="text-11 leading-relaxed text-fnt">
         Durable facts the orchestrator chose to remember (preferences,
         corrections, recurring workflows) — injected into every new session.
-        Global facts reach every project's Conductor; project facts only its
+        Global facts reach every project's Orchestrator; project facts only its
         own. The orchestrator writes these itself via its{" "}
         <code className="font-mono">remember</code> tool; here you can review
         and prune them.
@@ -993,7 +823,7 @@ function AboutSection() {
           </span>
         </div>
         <p className="mt-1 text-12 leading-relaxed text-mut">
-          Run and monitor a swarm of native Codex agents — live sessions,
+          Run and monitor a swarm of temporary Codex workers — live sessions,
           approvals, tokens &amp; cost. 100% local.
         </p>
       </div>

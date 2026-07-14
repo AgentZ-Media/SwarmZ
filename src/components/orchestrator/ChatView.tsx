@@ -243,7 +243,7 @@ function SystemRow({
         // washed chip, deliberately NOT a user bubble; the trigger kind
         // rides in the tooltip.
         <span
-          title={`Autonomous turn — the Conductor acted on its own (trigger: ${msg.trigger ?? "event"})`}
+          title={`Autonomous turn — the Orchestrator acted on its own (trigger: ${msg.trigger ?? "event"})`}
           className="shrink-0 rounded-sm border border-acc/40 bg-acc/10 px-1.5 py-px font-mono text-10 font-medium text-acc"
         >
           ⚡ autonomous
@@ -552,7 +552,7 @@ function PaneChip({ pane }: { pane: OrchestratorPaneRef }) {
     if (!pane.runtime) return null;
     return (
       <span
-        title={`Closed agent — spawned with ${runtimeLabel}`}
+        title={`Closed worker — started with ${runtimeLabel}`}
         className="flex shrink-0 items-center gap-1.5 rounded-sm border border-line bg-card px-2 py-px font-mono text-11 text-fnt"
       >
         {content}
@@ -562,7 +562,7 @@ function PaneChip({ pane }: { pane: OrchestratorPaneRef }) {
   return (
     <button
       onClick={() => focusSession(pane.id)}
-      title={`Jump to agent "${name}" — ${runtimeLabel}`}
+      title={`Jump to worker "${name}" — ${runtimeLabel}`}
       className="focus-ring flex shrink-0 items-center gap-1.5 rounded-sm border border-line bg-card px-2 py-px font-mono text-11 text-mut transition-colors hover:border-acc/55 hover:text-txt"
     >
       {content}
@@ -579,11 +579,11 @@ function EmptyChat() {
           className="hex-mark hex-mark-orb mx-auto block h-7 w-7 opacity-80"
         />
         <p className="mt-3 text-12 leading-normal text-mut">
-          Give the Conductor a goal — it decomposes the work, staffs agents
+          Give the Orchestrator a goal — it decomposes the work, staffs workers
           and reports back.
         </p>
         <p className="mt-1.5 text-11 leading-normal text-fnt">
-          It reads transcripts and git, spawns and steers agents, manages
+          It reads transcripts and git, starts and steers workers, manages
           worktrees, sets follow-up timers and decides routine approvals.
         </p>
       </div>

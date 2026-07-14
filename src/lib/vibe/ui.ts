@@ -8,6 +8,13 @@ import type { VibeItem } from "@/types";
 import type { VibeSessionEntry } from "./session-store";
 import { unifiedDiffStats } from "./diff";
 import { prettyModel } from "@/lib/utils";
+import { hasHumanAttention } from "./attention";
+
+export {
+  hasPendingApproval,
+  oldestPendingApprovalAt,
+  pendingApprovals,
+} from "./attention";
 
 /** The ephemeral "✓ finished" window — same ~5 min as the fleet cards. */
 export const VIBE_FINISHED_WINDOW_MS = 5 * 60_000;
@@ -29,38 +36,6 @@ export function agentRuntimeLabel(
   effort: string | null | undefined,
 ): string {
   return `${model ? prettyModel(model) : "Codex default"} · ${effort || "default effort"}`;
-}
-
-/** Pending approval items of a session, in transcript order (queue order). */
-export function pendingApprovals(
-  entry: VibeSessionEntry,
-): Extract<VibeItem, { kind: "approval" }>[] {
-  const out: Extract<VibeItem, { kind: "approval" }>[] = [];
-  for (const id of entry.order) {
-    const it = entry.items[id];
-    if (it && it.kind === "approval" && it.status === "pending") out.push(it);
-  }
-  return out;
-}
-
-/** True while any approval item is still waiting on the human. */
-export function hasPendingApproval(entry: VibeSessionEntry): boolean {
-  for (const id of entry.order) {
-    const it = entry.items[id];
-    if (it && it.kind === "approval" && it.status === "pending") return true;
-  }
-  return false;
-}
-
-/** Epoch ms of the oldest still-pending approval, or null. */
-export function oldestPendingApprovalAt(entry: VibeSessionEntry): number | null {
-  let at: number | null = null;
-  for (const id of entry.order) {
-    const it = entry.items[id];
-    if (it && it.kind === "approval" && it.status === "pending")
-      at = at === null ? it.at : Math.min(at, it.at);
-  }
-  return at;
 }
 
 /**
@@ -93,7 +68,7 @@ export function vibeSignal(
   busy: boolean,
   now: number,
 ): VibeSignal {
-  return decayedSignal(busy, hasPendingApproval(entry), entry.lastBusyEndAt, now);
+  return decayedSignal(busy, hasHumanAttention(entry), entry.lastBusyEndAt, now);
 }
 
 /** Compact age for status lines: "now" / "4m" / "2h". */

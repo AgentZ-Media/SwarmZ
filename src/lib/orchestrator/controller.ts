@@ -48,6 +48,7 @@ import { timerWireText } from "./timers-core";
 import {
   checkAutonomyBudget,
   noteAutonomousTurn,
+  persistAutonomyReservation,
   noteHumanTurn,
   releaseAutonomousTurn,
 } from "./autonomy";
@@ -1033,7 +1034,14 @@ export async function sendMessage(chatId: string, text: string): Promise<void> {
   // a latched circuit breaker) — the human is back in the loop
   const projectId = chatProjectId(chatId);
   if (projectId) noteHumanTurn(projectId);
-  await dispatchTurn(chatId, trimmed);
+  const result = await dispatchTurn(chatId, trimmed);
+  if (result !== "completed") {
+    throw new Error(
+      result === "never-started"
+        ? "The Orchestrator turn could not start. Your draft was kept."
+        : "The Orchestrator turn failed. Your draft was kept.",
+    );
+  }
 }
 
 /** How a dispatch ended: "completed" = the turn ran to its end; "failed" =
@@ -1210,6 +1218,17 @@ export async function runAutonomousTurn(
   }
   const reservedAt = Date.now();
   noteAutonomousTurn(projectId, reservedAt);
+  // The reservation is a durable claim: never begin an autonomous Codex turn
+  // while its consumed budget exists only in memory. The store's write path
+  // serializes/retries and latches autonomy fail-closed on persistent errors.
+  if (!(await persistAutonomyReservation())) {
+    releaseAutonomousTurn(projectId, reservedAt);
+    // Best-effort persistence of the compensating release. The global
+    // fail-closed latch still prevents another autonomous dispatch if this
+    // write cannot recover.
+    await persistAutonomyReservation();
+    return "retry";
+  }
   lastAutonomousAt.set(chatId, reservedAt);
   // ONE marker across retries: a previous never-started attempt left its
   // message — reuse it instead of stacking markers (verified still present;
@@ -1240,6 +1259,7 @@ export async function runAutonomousTurn(
   if (result === "never-started") {
     // nothing ran — release the reservation, keep the marker for the retry
     releaseAutonomousTurn(projectId, reservedAt);
+    await persistAutonomyReservation();
     return "retry";
   }
   pendingAutonomousMarkers.delete(markerKey);

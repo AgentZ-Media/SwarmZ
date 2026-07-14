@@ -214,10 +214,7 @@ pub fn list(project_dir: &str, rel: &str, depth: u32) -> Result<FsListing, Strin
                 kind,
                 size,
             });
-            if kind == "dir"
-                && remaining > 1
-                && !NO_DESCEND.contains(&name.as_str())
-            {
+            if kind == "dir" && remaining > 1 && !NO_DESCEND.contains(&name.as_str()) {
                 if let Ok(child) = dir.open_dir(&name) {
                     let mut next = below.clone();
                     next.push(name.clone());
@@ -346,7 +343,9 @@ mod tests {
         assert!(paths.contains(&"src/main.rs"));
         assert!(paths.contains(&"src/lib/util.rs"));
         // hidden entries are absent entirely
-        assert!(!paths.iter().any(|p| p.contains(".env") || p.contains(".git")));
+        assert!(!paths
+            .iter()
+            .any(|p| p.contains(".env") || p.contains(".git")));
         // node_modules shows as a dir but is never descended into
         assert!(paths.contains(&"node_modules"));
         assert!(!paths.iter().any(|p| p.starts_with("node_modules/")));

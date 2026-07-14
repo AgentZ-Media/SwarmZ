@@ -7,7 +7,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useSwarm } from "@/store";
-import { currentPersonaWire, type PersonaWire } from "./persona";
 
 /** Identifies one chat: the in-process id + the persistent thread id. */
 export interface OrchestratorChatRef {
@@ -75,11 +74,6 @@ function codexPath(): string {
   return useSwarm.getState().settings.codexPath ?? "";
 }
 
-/** The current persona (voice) reduced to the wire shape Rust compiles. */
-function persona(): PersonaWire {
-  return currentPersonaWire(useSwarm.getState().settings.orchestratorPersona);
-}
-
 /**
  * Start a fresh Conductor chat on one project's instance (spawns that
  * project's app-server lazily; the thread cwd is the project dir).
@@ -89,7 +83,6 @@ export function chatStart(
 ): Promise<OrchestratorChatRef> {
   return invoke<OrchestratorChatRef>("orchestrator_chat_start", {
     codexPath: codexPath(),
-    persona: persona(),
     project,
   });
 }
@@ -134,7 +127,6 @@ export function chatResume(
 ): Promise<OrchestratorChatRef> {
   return invoke<OrchestratorChatRef>("orchestrator_chat_resume", {
     threadId,
-    persona: persona(),
     project,
   });
 }

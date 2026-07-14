@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Dices, Folder, FolderOpen } from "lucide-react";
+import { Folder, FolderOpen, RefreshCw } from "lucide-react";
 import { pickDirectory } from "@/lib/transport";
 import { discoverProjects } from "@/lib/orchestrator/native";
 import {
@@ -47,8 +47,8 @@ function takenSessionNames(): string[] {
 }
 
 /**
- * The New-agent dialog (Vibe v3). Project = the active tab by default,
- * generated agent name with 🎲 reroll, runtime is codex (the only one),
+ * The New-worker dialog. Project = the active tab by default,
+ * deterministic temporary lane label, runtime is codex (the only one),
  * model/effort/access, an optional git worktree (own branch + folder, reroll)
  * and an optional first prompt that starts the agent working immediately.
  */
@@ -58,7 +58,6 @@ export function NewVibeSessionDialog() {
 
   const [projectDir, setProjectDir] = useState<string | undefined>();
   const [name, setName] = useState("");
-  const [nameEdited, setNameEdited] = useState(false);
   const [access, setAccess] = useState<VibeAccess>("workspace");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState<(typeof EFFORTS)[number]>("default");
@@ -72,7 +71,7 @@ export function NewVibeSessionDialog() {
   // reset + load recents on the opening edge only. The folder defaults to
   // the ACTIVE project (⌘T = new agent there); picking another folder
   // opens/reuses that project's tab on create. The name comes prefilled
-  // from the agent-name pool (🎲 rerolls).
+  // from the deterministic temporary-lane pool.
   useEffect(() => {
     if (!open) return;
     const projects = useProjects.getState();
@@ -81,7 +80,6 @@ export function NewVibeSessionDialog() {
       : null;
     setProjectDir(active?.dir);
     setName(pickAgentName(takenSessionNames()));
-    setNameEdited(false);
     setAccess("workspace");
     setModel("");
     setEffort("default");
@@ -104,11 +102,6 @@ export function NewVibeSessionDialog() {
   const choose = (dir: string) => {
     setProjectDir(dir);
     setBranch(generateBranchName(folderName(dir)));
-  };
-
-  const reroll = () => {
-    setName(pickAgentName([...takenSessionNames(), name]));
-    setNameEdited(false);
   };
 
   const pick = async () => {
@@ -145,7 +138,8 @@ export function NewVibeSessionDialog() {
         createdWorktree = { root: info.root, path: info.path, branch: info.branch };
       }
       const id = await startSession({
-        // the generated (or user-typed) name doubles as the agent identity
+        // The generated (or user-typed) name is only this temporary lane's
+        // display label; it never grants a persona, memory or reusable role.
         name: name.trim() || undefined,
         projectDir: cwd,
         projectId,
@@ -192,10 +186,10 @@ export function NewVibeSessionDialog() {
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="max-h-[86vh] max-w-[480px] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>New agent</DialogTitle>
+          <DialogTitle>New worker</DialogTitle>
           <DialogDescription>
-            Spin up a native Codex agent on a project folder. The Conductor
-            will track it.
+            Start one temporary Codex worker for a concrete assignment. The
+            Orchestrator tracks it and retires the lane when the work is done.
           </DialogDescription>
         </DialogHeader>
 
@@ -257,33 +251,20 @@ export function NewVibeSessionDialog() {
 
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <Label>Agent name</Label>
+              <Label>Lane label</Label>
               <div className="flex items-center gap-2">
                 <Input
                   value={name}
                   onChange={(e) => {
-                    setNameEdited(true);
                     setName(e.target.value);
                   }}
-                  placeholder="agent name"
+                  placeholder="task lane name"
                   onKeyDown={(e) => e.key === "Enter" && void submit()}
                 />
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  onClick={reroll}
-                  title="Roll a new name"
-                  aria-label="Roll a new name"
-                  className="shrink-0"
-                >
-                  <Dices size={15} />
-                </Button>
               </div>
-              {!nameEdited && (
-                <p className="mt-1 text-10 text-fnt">
-                  Auto-generated — edit or 🎲 reroll.
-                </p>
-              )}
+              <p className="mt-1 text-10 text-fnt">
+                Lowest free lane · temporary, editable display label.
+              </p>
             </div>
             <div>
               <Label>Runtime</Label>
@@ -386,7 +367,7 @@ export function NewVibeSessionDialog() {
                     aria-label="Reroll branch name"
                     className="h-7 w-7 shrink-0"
                   >
-                    <Dices size={13} />
+                    <RefreshCw size={13} />
                   </Button>
                 </div>
                 <p className="mt-2 text-11 leading-normal text-fnt">
@@ -403,7 +384,7 @@ export function NewVibeSessionDialog() {
               rows={2}
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              placeholder="What should this agent start on?"
+              placeholder="What concrete assignment should this worker complete?"
               className="w-full select-text resize-none rounded-md border border-line bg-card px-3 py-2.5 text-12 leading-normal text-txt transition-colors placeholder:text-fnt focus-visible:border-acc/55 focus-visible:outline-none"
             />
           </div>
@@ -422,7 +403,7 @@ export function NewVibeSessionDialog() {
             Cancel
           </Button>
           <Button onClick={() => void submit()} disabled={creating || !projectDir}>
-            {creating ? "Starting…" : "Start agent"}
+            {creating ? "Starting…" : "Start worker"}
           </Button>
         </div>
       </DialogContent>
@@ -453,8 +434,8 @@ export function CloseProjectConfirm() {
         <div className="flex flex-col gap-1.5">
           <ContextLine glyph="▸" glyphCls="text-acc" textCls="text-txt">
             {confirm?.busyCount === 1
-              ? "1 agent in this project is still working."
-              : `${confirm?.busyCount ?? 0} agents in this project are still working.`}
+              ? "1 worker in this project is still working."
+              : `${confirm?.busyCount ?? 0} workers in this project are still working.`}
           </ContextLine>
           <ContextLine glyph="·" glyphCls="text-fnt" textCls="text-mut">
             They keep running in the background — closing only hides the tab;
@@ -499,7 +480,7 @@ export function CloseSessionConfirm() {
         </DialogHeader>
         <div className="flex flex-col gap-1.5">
           <ContextLine glyph="■" glyphCls="text-err" textCls="text-txt">
-            This agent is mid-turn — closing stops it and ends the process.
+            This worker is mid-turn — closing stops it and ends the process.
           </ContextLine>
           <ContextLine glyph="·" glyphCls="text-fnt" textCls="text-mut">
             The transcript is discarded.

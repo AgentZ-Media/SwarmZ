@@ -35,7 +35,6 @@ import type {
 import { shouldAutoCompact } from "@/lib/compact";
 import { beginInflight } from "@/lib/inflight";
 import {
-  registerSessionEvictionSink,
   useVibe,
   type NewVibeSession,
 } from "./session-store";
@@ -485,8 +484,10 @@ function recordTurnOutcome(
   sessionId: string,
   outcome: LastTurnOutcome["outcome"],
 ) {
-  const turnId = useVibe.getState().sessions[sessionId]?.turnId ?? null;
+  const store = useVibe.getState();
+  const turnId = store.sessions[sessionId]?.turnId ?? null;
   lastTurnOutcomes.set(sessionId, { outcome, turnId });
+  store.setTurnOutcome(sessionId, outcome);
 }
 
 function handleEvent(sessionId: string, event: VibeSessionEvent) {
@@ -1374,10 +1375,8 @@ export async function setModelEffort(
 /**
  * Tear down one session's backend PROCESS + all controller-side per-session
  * maps — but NOT the store entry (the caller owns that). Shared by
- * closeSession (which drops the store entry after) and the cap-eviction sink
- * (the store already removed the entry). The final usage mirror + map deletes
- * run BEFORE the invokeClose await, so the accounting flushes while the store
- * entry is still present (the eviction sink is invoked pre-removal).
+ * closeSession (which drops the store entry after). The final usage mirror +
+ * map deletes run before the invokeClose await while the entry still exists.
  */
 async function cleanupSessionBackend(sessionId: string): Promise<void> {
   // flush a pending accounting mirror before the entry disappears
@@ -1403,13 +1402,6 @@ export async function closeSession(sessionId: string): Promise<void> {
   await cleanupSessionBackend(sessionId);
   useVibe.getState().dropSession(sessionId);
 }
-
-// The per-project session cap EVICTS a project's oldest sessions by deleting
-// them from the store directly — route those evictions through the same
-// backend teardown so the Rust child process + controller maps never leak.
-registerSessionEvictionSink((ids) => {
-  for (const id of ids) void cleanupSessionBackend(id);
-});
 
 /**
  * Bring a session into view: switch to its PROJECT tab first (reopening a

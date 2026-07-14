@@ -92,7 +92,7 @@ function MessageComposer({ sessionId }: { sessionId: string }) {
             send();
           }
         }}
-        placeholder="Message this agent…"
+        placeholder="Message this worker…"
         className="min-h-5 flex-1 select-text resize-none bg-transparent text-13 leading-relaxed text-txt placeholder:text-fnt focus:outline-none"
       />
       {busy ? (

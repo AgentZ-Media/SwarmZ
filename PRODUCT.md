@@ -1,40 +1,70 @@
-# Product
+# SwarmZ Product
 
-> **⚠️ Legacy / interim (rebuild `codex-only-v1`):** this document still
-> describes the pre-rebuild terminal-grid product (PTY panes, workspaces,
-> Claude runtime, dictation). Do NOT build against it — the app is codex-only
-> now (see `docs/plans/rebuild-codex-only-v1.md` and `AGENTS.md`). The product
-> doc is rewritten in a later phase.
+## Product
 
+SwarmZ is a native macOS Mission Control for orchestrating temporary Codex
+workers across large software-engineering goals. It turns a backlog of tasks
+into bounded, observable work, keeps every task tied to a project and
+worktree, and helps the user reach one reviewed and verified integrated result.
 
-## Register
-
-product
+The removed terminal-grid, Claude runtime, reusable agent profiles, workspace
+presets and voice paths are historical only. Git history and the archived
+rebuild plan preserve that context; they are not product inputs.
 
 ## Users
 
-SwarmZ is for developers and technical operators who run multiple Claude Code and Codex CLI agents at once inside local repositories. They are usually monitoring parallel coding work, comparing branches, keeping terminals alive, and jumping between agents without losing context.
+SwarmZ is for developers and technical creators who build substantial apps
+with Codex and need to coordinate many changes without manually supervising
+every lane. They care about speed, but they care more about knowing what is
+running, what needs them, what evidence proves a task is complete, and whether
+parallel branches form one coherent product.
 
-## Product Purpose
+## Core model
 
-SwarmZ turns many local agent terminals into one manageable native macOS workspace: tiled panes, persisted workspaces, usage visibility, git state, quick commands, notes, dictation, and managed worktrees. Success means the user can run ambitious parallel agent workflows while still trusting what is running, where it is running, and what local state might be lost.
+- One project-scoped **Orchestrator** owns decomposition, coordination and
+  learning. It has one fixed product identity plus transparent global/project
+  memory; it is the only persistent agent identity.
+- **Workers are temporary task attempts.** They have no persona or memory, are
+  never reused for a different assignment, and may resume only to recover or
+  continue the same active attempt.
+- A **Mission** is durable structured state: tasks, dependencies, acceptance
+  criteria, attempts, evidence, decisions, budgets and an event log. Markdown
+  is an import/export and human-readable projection, not the source of truth.
+- A task is not done until its configured verification and integration gates
+  pass. A finished worker is an input to that process, not proof of completion.
 
-## Brand Personality
+## Product principles
 
-Focused, capable, and quiet. The product should feel like a serious native tool for people already deep in code: fast, dense, local-first, and confident without theatrical decoration.
+1. Mission state over chat memory.
+2. Bounded autonomy over unbounded activity.
+3. Fresh temporary workers over reusable personalities.
+4. One writer per worktree and explicit ownership of every task attempt.
+5. Evidence over self-reported success.
+6. Integrated product state over a pile of finished branches.
+7. Human authority for destructive, outward-facing and consequential choices.
+8. Local-first, fail-closed security with visible recovery when state is
+   uncertain.
 
-## Anti-references
+## Experience principles
 
-Avoid marketing-page composition, novelty dashboards, decorative gradients, over-bright agent identity colors, oversized hero typography, and playful UI that distracts from terminal work. Do not make routine controls feel experimental; familiar tool affordances are a strength here.
+- Mission progress, blockers, risk, critical path and the next human decision
+  must be understandable without reading transcripts.
+- Fleet and focus views remain the live execution lens; Mission Control is the
+  default planning, verification and integration surface.
+- Approvals, structured questions, failed gates, conflicts and PR/CI issues
+  share one global Attention Inbox.
+- Dense information is welcome; hidden state, ambiguous color and decorative
+  complexity are not.
+- Every primary flow is keyboard-operable, WCAG-AA legible, responsive at the
+  supported minimum window and compatible with reduced motion.
 
-## Design Principles
+## Trust boundaries
 
-1. Keep the terminal and agent state primary.
-2. Make risky actions explicit, especially when they can kill processes or delete work.
-3. Prefer dense, scannable controls over explanatory surfaces.
-4. Preserve local trust: show where data lives and avoid surprising network or filesystem behavior.
-5. Use color only for state, focus, selection, and destructive intent.
-
-## Accessibility & Inclusion
-
-Follow WCAG AA contrast expectations for text and controls. Keep keyboard workflows first-class, preserve visible focus states, do not rely on color alone for status, and respect reduced-motion preferences for any nonessential animation.
+- Worker output, repository content, memory entries and external PR/CI data are
+  untrusted data. None may grant authority or alter the fixed operating manual.
+- Persistence read failures never become empty data, and durable claims are
+  written before autonomous side effects begin.
+- Worktree, filesystem, process, output, concurrency, time and token usage are
+  explicitly bounded.
+- No automatic push, merge, comment, review or other outward-facing action runs
+  outside the user's approved mission envelope and the existing Rust gates.

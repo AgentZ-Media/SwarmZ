@@ -64,7 +64,9 @@ impl Access {
         match raw {
             "workspace" => Ok(Access::Workspace),
             "full" => Ok(Access::Full),
-            other => Err(format!("unknown access \"{other}\" (expected workspace|full)")),
+            other => Err(format!(
+                "unknown access \"{other}\" (expected workspace|full)"
+            )),
         }
     }
 
@@ -134,6 +136,17 @@ struct SessionState {
     /// send while the fence stays ahead).
     route_generation: u64,
     profile: SessionProfile,
+    /// Access policy that the CURRENT live thread/turn is known to have
+    /// applied. `profile.access` is the requested policy for the next fresh
+    /// turn; changing it does not retune an already-running turn. Keeping the
+    /// two values separate closes the downgrade window where a FULL-access
+    /// turn could otherwise be steered by the Conductor after the UI merely
+    /// requested workspace access.
+    applied_access: Access,
+    /// Monotone revision of the requested access profile. A turn/resume keeps
+    /// the revision it started with and may clear `access_override_pending`
+    /// only when no newer access choice arrived while its RPC was in flight.
+    access_revision: u64,
     /// running turn id (for interrupt); None between turns
     current_turn_id: Option<String>,
     /// one turn per session at a time — claimed synchronously in `send`
@@ -234,7 +247,10 @@ fn rg_args_safe(args: &[String]) -> bool {
         if a.starts_with("--") {
             // exact or `=`-value spelling of the exec-capable flags
             let name = a.split('=').next().unwrap_or(a);
-            !matches!(name, "--pre" | "--pre-glob" | "--hostname-bin" | "--search-zip")
+            !matches!(
+                name,
+                "--pre" | "--pre-glob" | "--hostname-bin" | "--search-zip"
+            )
         } else {
             // short flags may combine (`-iz`): any `z` in a short cluster is
             // --search-zip → human
@@ -331,18 +347,22 @@ fn operands_confined(head: &str, args: &[String], cwd: &str) -> bool {
     })
 }
 
-/// Read-only git subcommands (argument-gated in `git_is_routine` — a
-/// subcommand alone is not enough, mutating flags flip to destructive).
-const ROUTINE_GIT_SUBCOMMANDS: &[&str] = &[
-    "status", "diff", "log", "show", "branch", "remote", "rev-parse",
-    "describe", "blame",
-];
-
 /// Substrings that force a command to the human regardless of its head —
 /// secrets, credentials and system config are never the Conductor's call.
 const SENSITIVE_PATTERNS: &[&str] = &[
-    ".env", "id_rsa", "id_ed25519", ".ssh", ".aws", ".npmrc", ".netrc",
-    "credentials", "secret", "keychain", "password", "token", "/etc/",
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    ".ssh",
+    ".aws",
+    ".npmrc",
+    ".netrc",
+    "credentials",
+    "secret",
+    "keychain",
+    "password",
+    "token",
+    "/etc/",
 ];
 
 /// Path COMPONENTS that route a fileChange straight to the human (audit C2):
@@ -420,8 +440,9 @@ fn tokenize_strict(cmd: &str) -> Option<Vec<String>> {
                     st = St::Double;
                     has_cur = true;
                 }
-                '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{' | '}' | '$' | '`' | '\\'
-                | '\n' => return None,
+                '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{' | '}' | '$' | '`' | '\\' | '\n' => {
+                    return None
+                }
                 c if c.is_whitespace() => {
                     if has_cur {
                         tokens.push(std::mem::take(&mut cur));
@@ -494,51 +515,6 @@ fn unwrap_shell_strict(tokens: &[String]) -> Option<&str> {
     Some(tokens[2].as_str())
 }
 
-/// Argument gate for the read-only git subcommands. The token AFTER `git`
-/// must be the subcommand itself — global options (`-c key=val` can execute
-/// arbitrary alias code, `-C` retargets the repo) are rejected. Output-writing
-/// flags flip read-only subcommands to destructive.
-fn git_is_routine(args: &[String]) -> bool {
-    let Some(sub) = args.first() else {
-        return false; // bare `git` → human (fail closed)
-    };
-    if sub.starts_with('-') {
-        return false;
-    }
-    if !ROUTINE_GIT_SUBCOMMANDS.contains(&sub.as_str()) {
-        return false;
-    }
-    let rest = &args[1..];
-    match sub.as_str() {
-        // pure readers — but never with flags that write files or run
-        // external programs
-        "status" | "diff" | "log" | "show" | "rev-parse" | "describe" | "blame" => {
-            !rest.iter().any(|a| {
-                a == "-o"
-                    || a.starts_with("--output")
-                    || a.starts_with("--ext-diff")
-                    || a.starts_with("--textconv")
-            })
-        }
-        // `git branch` only in its pure LIST forms — any value-taking or
-        // unknown flag, and any bare name (that CREATES a branch) → human
-        "branch" => rest.iter().all(|a| {
-            matches!(
-                a.as_str(),
-                "-v" | "-vv" | "-a" | "-r" | "--all" | "--list" | "--show-current"
-            )
-        }),
-        // `git remote` bare, `-v`, or `show <name>` — never add/remove/set-url
-        "remote" => match rest.first().map(|s| s.as_str()) {
-            None => true,
-            Some("-v") | Some("--verbose") => rest.len() == 1,
-            Some("show") => rest.iter().skip(1).all(|a| !a.starts_with('-')),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
 /// Is this full command line routine? Pure, fail-closed, recursion-bounded.
 /// `cwd` is the session's TRUSTED working directory — every path-bearing
 /// operand of a routine candidate must stay inside it (audit R3).
@@ -587,7 +563,13 @@ fn classify_command_str(raw: &str, cwd: &str, depth: u8, gh_writes: bool) -> boo
         return head != "rg" || rg_args_safe(args);
     }
     match head {
-        "git" => git_is_routine(args),
+        // Even apparently read-only shell git commands can execute
+        // repository-controlled config (aliases, textconv/ext-diff, filters,
+        // fsmonitor, pager) outside the backend's hardened `git_command`
+        // builder. Agent-originated shell git is therefore always a human
+        // decision. Read-only status for the Conductor uses the native Rust
+        // git surface instead.
+        "git" => false,
         // GitHub CLI (Phase 7) — tiny read allowlist + the two gated writes
         "gh" => gh_is_routine(args, gh_writes),
         // Build/test/script runners (`cargo`, `pnpm`, `npm`, `yarn`, `tsc`,
@@ -802,7 +784,12 @@ fn gh_is_routine(args: &[String], gh_writes: bool) -> bool {
                         .filter(|f| {
                             matches!(
                                 **f,
-                                "--approve" | "-a" | "--request-changes" | "-r" | "--comment" | "-c"
+                                "--approve"
+                                    | "-a"
+                                    | "--request-changes"
+                                    | "-r"
+                                    | "--comment"
+                                    | "-c"
                             )
                         })
                         .count();
@@ -815,8 +802,7 @@ fn gh_is_routine(args: &[String], gh_writes: bool) -> bool {
         // `gh repo view <owner/repo>` retargets — positionals are forbidden,
         // only the session repo's own view is routine
         "repo" => {
-            rest.first().map(|s| s.as_str()) == Some("view")
-                && gh_read_no_positional(&rest[1..])
+            rest.first().map(|s| s.as_str()) == Some("view") && gh_read_no_positional(&rest[1..])
         }
         "issue" => match rest.first().map(|s| s.as_str()) {
             Some("list") => gh_read_no_positional(&rest[1..]),
@@ -877,10 +863,7 @@ fn file_changes_within(params: &Value, cwd: &str) -> bool {
         };
         let lower = path.to_lowercase();
         let sensitive = SENSITIVE_PATTERNS.iter().any(|s| lower.contains(s));
-        kind_ok
-            && !sensitive
-            && !touches_protected_dir(cwd, path)
-            && path_within(cwd, path)
+        kind_ok && !sensitive && !touches_protected_dir(cwd, path) && path_within(cwd, path)
     })
 }
 
@@ -971,7 +954,10 @@ fn map_notification(method: &str, params: &Value) -> Option<(&'static str, Value
         }
         "item/agentMessage/delta" => {
             let text = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-            Some(("delta", json!({ "item_id": params.get("itemId"), "text": text })))
+            Some((
+                "delta",
+                json!({ "item_id": params.get("itemId"), "text": text }),
+            ))
         }
         // commandExecution output streams incrementally while a command runs —
         // live-verified in the Phase-2 spike. The store appends it to the
@@ -985,7 +971,10 @@ fn map_notification(method: &str, params: &Value) -> Option<(&'static str, Value
             } else {
                 delta.to_string()
             };
-            Some(("item_output_delta", json!({ "item_id": params.get("itemId"), "delta": delta })))
+            Some((
+                "item_output_delta",
+                json!({ "item_id": params.get("itemId"), "delta": delta }),
+            ))
         }
         "item/started" => {
             let item = params.get("item")?;
@@ -1059,7 +1048,10 @@ fn map_notification(method: &str, params: &Value) -> Option<(&'static str, Value
                 .get("willRetry")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            Some(("warning", json!({ "message": message, "will_retry": will_retry })))
+            Some((
+                "warning",
+                json!({ "message": message, "will_retry": will_retry }),
+            ))
         }
         "warning" => {
             let message = params
@@ -1091,8 +1083,19 @@ fn spawn_session_dispatcher(
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             match ev {
-                ThreadEvent::Request { method, params, responder } => {
-                    handle_server_request(&app, &session_id, generation, &method, params, responder);
+                ThreadEvent::Request {
+                    method,
+                    params,
+                    responder,
+                } => {
+                    handle_server_request(
+                        &app,
+                        &session_id,
+                        generation,
+                        &method,
+                        params,
+                        responder,
+                    );
                 }
                 ThreadEvent::Notification { method, params } => {
                     handle_notification(&app, &session_id, generation, &method, &params);
@@ -1154,8 +1157,12 @@ fn handle_server_request(
             // gh-write gate reads the Rust-side flags (integration master
             // toggle AND the autonomous-writes opt-in — final hardening
             // F2), never anything frontend-claimed per request.
-            let escalation =
-                classify_approval(kind, &params, &cwd, crate::github::agent_gh_writes_allowed());
+            let escalation = classify_approval(
+                kind,
+                &params,
+                &cwd,
+                crate::github::agent_gh_writes_allowed(),
+            );
             // Phase-7 stale-toggle guard: is this routine ONLY because the
             // integration is on right now? (classified again with the flag
             // off — a difference marks it for the live re-check on respond)
@@ -1180,7 +1187,11 @@ fn handle_server_request(
                 );
                 st.pending_approvals.insert(
                     approval_id.clone(),
-                    PendingApproval { responder, escalation, gh_write_gated },
+                    PendingApproval {
+                        responder,
+                        escalation,
+                        gh_write_gated,
+                    },
                 );
                 approval_id
             };
@@ -1212,10 +1223,7 @@ type CompactWaiter = oneshot::Sender<(String, Option<String>)>;
 /// turn/busy state and takes the compact waiter ONLY when the event's
 /// generation is still the session's live one. Returns `None` when the event
 /// was stale (nothing mutated), `Some(compact_done)` when it applied.
-fn turn_completed_bookkeeping(
-    session_id: &str,
-    generation: u64,
-) -> Option<Option<CompactWaiter>> {
+fn turn_completed_bookkeeping(session_id: &str, generation: u64) -> Option<Option<CompactWaiter>> {
     let mut sessions = SESSIONS.lock();
     let st = sessions
         .get_mut(session_id)
@@ -1229,10 +1237,7 @@ fn turn_completed_bookkeeping(
 /// after the session already respawned onto gen N+1 must not clear the NEW
 /// turn's busy flag or drop the NEW process' approvals. Returns `None` when
 /// stale.
-fn exit_bookkeeping(
-    session_id: &str,
-    generation: u64,
-) -> Option<Option<CompactWaiter>> {
+fn exit_bookkeeping(session_id: &str, generation: u64) -> Option<Option<CompactWaiter>> {
     let mut sessions = SESSIONS.lock();
     let st = sessions
         .get_mut(session_id)
@@ -1402,6 +1407,7 @@ fn register_session(
     thread_id: &str,
     profile: SessionProfile,
 ) {
+    let applied_access = profile.access;
     let (tx, rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
     spawn_session_dispatcher(app.clone(), session_id.to_string(), generation, rx);
     // state BEFORE route (audit R6 ordering): once an event can arrive, the
@@ -1414,6 +1420,8 @@ fn register_session(
             generation,
             route_generation: generation,
             profile,
+            applied_access,
+            access_revision: 0,
             current_turn_id: None,
             busy: false,
             access_override_pending: false,
@@ -1475,7 +1483,11 @@ pub async fn session_start(
     // R7: a post-spawn failure must not leak the freshly spawned child —
     // shut it down explicitly before erroring out
     let res = match conn
-        .request("thread/start", thread_start_params(&profile), host::THREAD_TIMEOUT_MS)
+        .request(
+            "thread/start",
+            thread_start_params(&profile),
+            host::THREAD_TIMEOUT_MS,
+        )
         .await
     {
         Ok(res) => res,
@@ -1492,7 +1504,9 @@ pub async fn session_start(
         host.shutdown().await;
         return Err("thread/start: no thread id in response".into());
     };
-    register_session(app, session_id, host, &conn, generation, &thread_id, profile);
+    register_session(
+        app, session_id, host, &conn, generation, &thread_id, profile,
+    );
     Ok(json!({ "thread_id": thread_id }))
 }
 
@@ -1595,6 +1609,39 @@ fn conductor_access_gate(access: Access, require_workspace: bool) -> Result<(), 
     Ok(())
 }
 
+/// Gate an operation that reuses an already-existing turn/thread capability
+/// (steer/review). Both the requested and last ACKed access must be workspace:
+/// a pending downgrade is not effective until a fresh turn applies it, while
+/// a pending upgrade must be treated as full immediately.
+fn conductor_reuse_access_gate(
+    requested: Access,
+    applied: Access,
+    require_workspace: bool,
+) -> Result<(), String> {
+    if require_workspace && (requested == Access::Full || applied == Access::Full) {
+        return Err(
+            "refused: this session has FULL access applied or pending — the Conductor may not prompt, steer or review it until workspace access has been applied by a fresh turn"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Commit the access policy ACKed by a turn/start or thread/resume without
+/// losing a newer UI choice that arrived while the RPC was in flight.
+fn commit_applied_access(session_id: &str, applied: Access, revision: u64) {
+    if let Some(st) = SESSIONS.lock().get_mut(session_id) {
+        st.applied_access = applied;
+        if st.access_revision == revision {
+            st.access_override_pending = false;
+        } else {
+            // A newer request exists. It still needs a fresh turn exactly when
+            // it differs from what this older ACK just made effective.
+            st.access_override_pending = st.profile.access != st.applied_access;
+        }
+    }
+}
+
 /// Send one user message — NON-blocking: returns the turn id after the
 /// `turn/start` ack; the transcript + completion stream as events. One turn
 /// per session at a time (a busy session rejects). Transparently resumes after
@@ -1611,13 +1658,16 @@ pub async fn session_send(
     require_workspace: bool,
 ) -> Result<Value, String> {
     // atomically claim the turn slot + snapshot what we need for the roundtrip
-    let (host, mut thread_id, gen_stored, override_pending, profile) = {
+    let (host, mut thread_id, gen_stored, override_pending, access_revision, profile) = {
         let mut sessions = SESSIONS.lock();
         let st = sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
         // F5: checked INSIDE the lock, against the live profile — before the
         // busy claim, so a refusal leaves the session untouched
+        // A fresh turn atomically carries a pending access override, so the
+        // requested profile is the effective policy for THIS new turn. Reuse
+        // operations use the stricter requested+applied gate below.
         conductor_access_gate(st.profile.access, require_workspace)?;
         if st.busy {
             return Err("a turn is already running in this session — interrupt it or wait".into());
@@ -1632,6 +1682,7 @@ pub async fn session_send(
             thread_id,
             st.route_generation,
             st.access_override_pending,
+            st.access_revision,
             st.profile.clone(),
         )
     };
@@ -1700,6 +1751,9 @@ pub async fn session_send(
                 return Err(format!("resuming the session after a restart failed: {m}"));
             }
         }
+        // thread/resume or the lost-rollout thread/start above both apply the
+        // requested profile before any new turn can run in this generation.
+        commit_applied_access(session_id, profile.access, access_revision);
         // fresh generation-tagged dispatcher — the old one only ever serves
         // (and drops) the dead process' stragglers. The state's fence moved
         // in `adopt_generation` already (F11); the ROUTE generation commits
@@ -1732,9 +1786,9 @@ pub async fn session_send(
                 .map(str::to_string);
             if let Some(st) = SESSIONS.lock().get_mut(session_id) {
                 st.current_turn_id = turn_id.clone();
-                if override_pending {
-                    st.access_override_pending = false;
-                }
+            }
+            if override_pending {
+                commit_applied_access(session_id, profile.access, access_revision);
             }
             Ok(json!({ "turn_id": turn_id }))
         }
@@ -1801,7 +1855,10 @@ pub async fn session_compact(app: &AppHandle, session_id: &str) -> Result<Value,
                     .into(),
             );
         }
-        let thread_id = st.thread_id.clone().ok_or("this session has no thread yet")?;
+        let thread_id = st
+            .thread_id
+            .clone()
+            .ok_or("this session has no thread yet")?;
         st.busy = true;
         st.compact_done = Some(done_tx);
         (
@@ -1832,11 +1889,13 @@ pub async fn session_compact(app: &AppHandle, session_id: &str) -> Result<Value,
         for pending in adopt_generation(session_id, generation) {
             pending.responder.ok(&json!({ "decision": "cancel" }));
         }
-        if let Err(e) =
-            host::resume_thread(&conn, thread_resume_params(&thread_id, &profile)).await
+        if let Err(e) = host::resume_thread(&conn, thread_resume_params(&thread_id, &profile)).await
         {
             release(session_id);
-            return Err(format!("resuming the session before compaction failed: {}", e.message()));
+            return Err(format!(
+                "resuming the session before compaction failed: {}",
+                e.message()
+            ));
         }
         let (tx, rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
         spawn_session_dispatcher(app.clone(), session_id.to_string(), generation, rx);
@@ -1911,7 +1970,7 @@ pub async fn session_steer(
             .get(session_id)
             .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
         // F5: against the live profile, before any turn state is read
-        conductor_access_gate(st.profile.access, require_workspace)?;
+        conductor_reuse_access_gate(st.profile.access, st.applied_access, require_workspace)?;
         // the "steer-race:" tag matters: Rust clears current_turn_id on
         // turn/completed BEFORE the frontend busy flag clears, so an early
         // no-turn here is the SAME lost race as the wire-level mismatch —
@@ -2046,8 +2105,11 @@ pub async fn session_review(
             .get(session_id)
             .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
         // C3: gate FIRST — a refused full-access session stays untouched
-        conductor_access_gate(st.profile.access, require_workspace)?;
-        let thread_id = st.thread_id.clone().ok_or("this session has no thread yet")?;
+        conductor_reuse_access_gate(st.profile.access, st.applied_access, require_workspace)?;
+        let thread_id = st
+            .thread_id
+            .clone()
+            .ok_or("this session has no thread yet")?;
         (
             st.host.clone(),
             thread_id,
@@ -2061,7 +2123,12 @@ pub async fn session_review(
     if current_gen != generation {
         host::resume_thread(&conn, thread_resume_params(&thread_id, &profile))
             .await
-            .map_err(|e| format!("resuming the session before the review failed: {}", e.message()))?;
+            .map_err(|e| {
+                format!(
+                    "resuming the session before the review failed: {}",
+                    e.message()
+                )
+            })?;
         // NOTE: the session's own event route is re-established by its next
         // send; the review only needs the thread loaded.
     }
@@ -2094,7 +2161,9 @@ pub async fn session_review(
             Ok(None) | Err(_) => break,
         };
         match ev {
-            ThreadEvent::Request { method, responder, .. } => {
+            ThreadEvent::Request {
+                method, responder, ..
+            } => {
                 // a review must never execute anything — cancel approvals,
                 // refuse everything else
                 if approval_kind(&method).is_some() {
@@ -2191,7 +2260,10 @@ pub async fn session_respond_approval(
     decision: &str,
     require_routine: bool,
 ) -> Result<(), String> {
-    if !matches!(decision, "accept" | "acceptForSession" | "decline" | "cancel") {
+    if !matches!(
+        decision,
+        "accept" | "acceptForSession" | "decline" | "cancel"
+    ) {
         return Err(format!(
             "unknown approval decision \"{decision}\" (accept|acceptForSession|decline|cancel)"
         ));
@@ -2234,6 +2306,7 @@ pub async fn session_set_access(session_id: &str, access: &str) -> Result<(), St
         .ok_or_else(|| format!("unknown vibe session \"{session_id}\""))?;
     if st.profile.access != access {
         st.profile.access = access;
+        st.access_revision = st.access_revision.wrapping_add(1);
         st.access_override_pending = true;
     }
     Ok(())
@@ -2501,10 +2574,16 @@ mod tests {
         assert_eq!(data["modelContextWindow"], 258400);
 
         let (m, p) = notif(FIX_TURN_DONE);
-        assert_eq!(map_notification(&m, &p).unwrap(), ("turn_completed", json!({ "status": "completed" })));
+        assert_eq!(
+            map_notification(&m, &p).unwrap(),
+            ("turn_completed", json!({ "status": "completed" }))
+        );
 
         let (m, p) = notif(FIX_TURN_INTERRUPTED);
-        assert_eq!(map_notification(&m, &p).unwrap(), ("turn_completed", json!({ "status": "interrupted" })));
+        assert_eq!(
+            map_notification(&m, &p).unwrap(),
+            ("turn_completed", json!({ "status": "interrupted" }))
+        );
 
         let (m, p) = notif(FIX_TURN_FAILED);
         let (kind, data) = map_notification(&m, &p).unwrap();
@@ -2544,6 +2623,21 @@ mod tests {
             "pwd",
             "which cargo",
             "echo hello",
+            "node --version",
+            "/bin/zsh -lc 'ls -la'",
+            "sh -c 'pwd'",
+        ] {
+            assert_eq!(classify_cmd(c), "routine", "{c}");
+        }
+    }
+
+    /// Agent-side shell git never uses the backend's hardened command builder
+    /// and may execute repo-controlled aliases/diff drivers/filters/pagers.
+    /// Keep the entire surface human-only, including apparently read-only
+    /// forms and strict shell wrappers around them.
+    #[test]
+    fn all_agent_shell_git_commands_are_destructive() {
+        for c in [
             "git status",
             "git diff",
             "git diff --stat HEAD~1",
@@ -2553,15 +2647,10 @@ mod tests {
             "git describe --tags",
             "git blame src/main.rs",
             "git branch --list",
-            "git branch -vv",
             "git remote -v",
-            "git remote show origin",
-            "node --version",
-            "/bin/zsh -lc 'ls -la'",
             "/bin/bash -c 'git status'",
-            "sh -c 'pwd'",
         ] {
-            assert_eq!(classify_cmd(c), "routine", "{c}");
+            assert_eq!(classify_cmd(c), "destructive", "{c}");
         }
     }
 
@@ -2625,7 +2714,7 @@ mod tests {
                 "proposedExecpolicyAmendment": ["some", "amendment"],
             })
         };
-        for cmd in ["ls -la", "cat src/x.rs", "git status", "/bin/zsh -lc 'ls'"] {
+        for cmd in ["ls -la", "cat src/x.rs", "/bin/zsh -lc 'ls'"] {
             assert_eq!(
                 classify_approval("command", &with_amendment(cmd), "/repo/wt", true),
                 "destructive",
@@ -2638,6 +2727,16 @@ mod tests {
                 "{cmd} without amendment"
             );
         }
+        // Shell git is human-only even without an amendment.
+        assert_eq!(
+            classify_approval(
+                "command",
+                &json!({ "command": "git status" }),
+                "/repo/wt",
+                true
+            ),
+            "destructive"
+        );
         // gh is exempt: the network escalation is expected and separately gated
         assert_eq!(
             classify_approval(
@@ -2649,12 +2748,7 @@ mod tests {
             "routine"
         );
         assert_eq!(
-            classify_approval(
-                "command",
-                &with_amendment("gh pr list"),
-                "/repo/wt",
-                false,
-            ),
+            classify_approval("command", &with_amendment("gh pr list"), "/repo/wt", false,),
             "routine"
         );
         // …but a NON-gh command can't ride the exemption, and a gh write
@@ -2683,7 +2777,10 @@ mod tests {
             json!({ "command": "ls", "proposedExecpolicyAmendment": [] }),
             json!({ "command": "ls" }),
         ] {
-            assert_eq!(classify_approval("command", &benign, "/repo/wt", false), "routine");
+            assert_eq!(
+                classify_approval("command", &benign, "/repo/wt", false),
+                "routine"
+            );
         }
         // unknown amendment shapes fail closed
         assert_eq!(
@@ -2745,7 +2842,7 @@ mod tests {
             "node_modules/.bin/tsc",
             "/tmp/ls",
             "X=1 ls",
-            // git: read-only subcommands only, with read-only flags only
+            // git: every agent-side shell invocation is human-only
             "git checkout .",
             "git checkout -f main",
             "git restore --staged --worktree .",
@@ -2801,13 +2898,19 @@ mod tests {
             assert_eq!(classify_cmd(c), "destructive", "{c}");
         }
         // missing command field / non-string → human
-        assert_eq!(classify_no_gh("command", &json!({}), "/repo/wt"), "destructive");
+        assert_eq!(
+            classify_no_gh("command", &json!({}), "/repo/wt"),
+            "destructive"
+        );
         assert_eq!(
             classify_no_gh("command", &json!({ "command": 42 }), "/repo/wt"),
             "destructive"
         );
         // unknown approval kinds → human
-        assert_eq!(classify_no_gh("elicitation", &json!({}), "/repo/wt"), "destructive");
+        assert_eq!(
+            classify_no_gh("elicitation", &json!({}), "/repo/wt"),
+            "destructive"
+        );
     }
 
     /// Audit R2 (frozen): rg's exec-capable flags are never routine — `--pre`
@@ -3046,7 +3149,11 @@ mod tests {
         ] {
             assert_eq!(classify_gh(c, true), "routine", "{c} (integration on)");
             // master toggle OFF → every gh write is hard human-only
-            assert_eq!(classify_gh(c, false), "destructive", "{c} (integration off)");
+            assert_eq!(
+                classify_gh(c, false),
+                "destructive",
+                "{c} (integration off)"
+            );
         }
     }
 
@@ -3074,8 +3181,14 @@ mod tests {
         assert_eq!((on, off), ("routine", "destructive"));
         // a plain read never becomes gh-write-gated
         let read = json!({ "command": "gh pr view 12" });
-        assert_eq!(classify_approval("command", &read, "/repo/wt", true), "routine");
-        assert_eq!(classify_approval("command", &read, "/repo/wt", false), "routine");
+        assert_eq!(
+            classify_approval("command", &read, "/repo/wt", true),
+            "routine"
+        );
+        assert_eq!(
+            classify_approval("command", &read, "/repo/wt", false),
+            "routine"
+        );
     }
 
     #[test]
@@ -3149,7 +3262,11 @@ mod tests {
             "gh pr comment 12 --body \"$(cat /repo/wt/notes.md)\"",
         ] {
             assert_eq!(classify_gh(c, true), "destructive", "{c} (integration on)");
-            assert_eq!(classify_gh(c, false), "destructive", "{c} (integration off)");
+            assert_eq!(
+                classify_gh(c, false),
+                "destructive",
+                "{c} (integration off)"
+            );
         }
         // sensitive substrings force human even under a read-only gh head
         assert_eq!(
@@ -3171,13 +3288,19 @@ mod tests {
             )
         };
         // the frozen payload: an otherwise-harmless command retargeted at /etc
-        assert_eq!(classify("touch owned", json!("/etc"), "/repo/wt"), "destructive");
+        assert_eq!(
+            classify("touch owned", json!("/etc"), "/repo/wt"),
+            "destructive"
+        );
         assert_eq!(classify("ls", json!("/etc"), "/repo/wt"), "destructive");
         // routine command in the session cwd (or inside it) stays routine
         assert_eq!(classify("ls", json!("/repo/wt"), "/repo/wt"), "routine");
         assert_eq!(classify("ls", json!("/repo/wt/src"), "/repo/wt"), "routine");
         // traversal in the request cwd → human
-        assert_eq!(classify("ls", json!("/repo/wt/../../etc"), "/repo/wt"), "destructive");
+        assert_eq!(
+            classify("ls", json!("/repo/wt/../../etc"), "/repo/wt"),
+            "destructive"
+        );
         // absent / null cwd = the session cwd → fine; junk types → human
         assert_eq!(classify_cmd("ls"), "routine");
         assert_eq!(classify("ls", Value::Null, "/repo/wt"), "routine");
@@ -3199,15 +3322,32 @@ mod tests {
         );
         // metasyntax anywhere unquoted → None
         for c in [
-            "a | b", "a && b", "a; b", "a > b", "a < b", "a & b", "$(x)", "`x`",
-            "a \\; b", "a {x,y}", "echo \"$(x)\"", "echo \"`x`\"", "'open",
+            "a | b",
+            "a && b",
+            "a; b",
+            "a > b",
+            "a < b",
+            "a & b",
+            "$(x)",
+            "`x`",
+            "a \\; b",
+            "a {x,y}",
+            "echo \"$(x)\"",
+            "echo \"`x`\"",
+            "'open",
         ] {
             assert_eq!(tokenize_strict(c), None, "{c}");
         }
         // ONLY the genuine shell wrapper unwraps, with exactly one script arg
         let toks = |s: &str| tokenize_strict(s).unwrap();
-        assert_eq!(unwrap_shell_strict(&toks("/bin/zsh -lc 'ls -la'")), Some("ls -la"));
-        assert_eq!(unwrap_shell_strict(&toks("bash -c 'git status'")), Some("git status"));
+        assert_eq!(
+            unwrap_shell_strict(&toks("/bin/zsh -lc 'ls -la'")),
+            Some("ls -la")
+        );
+        assert_eq!(
+            unwrap_shell_strict(&toks("bash -c 'git status'")),
+            Some("git status")
+        );
         assert_eq!(unwrap_shell_strict(&toks("evil -c 'ls'")), None);
         assert_eq!(unwrap_shell_strict(&toks("grep -c foo file.txt")), None);
         assert_eq!(unwrap_shell_strict(&toks("bash 'ls'")), None);
@@ -3242,19 +3382,30 @@ mod tests {
 
         // pure create inside the tree → routine
         assert_eq!(
-            classify_no_gh("fileChange", &change(&p("src/new.rs"), json!({"type":"add"})), &cwd),
+            classify_no_gh(
+                "fileChange",
+                &change(&p("src/new.rs"), json!({"type":"add"})),
+                &cwd
+            ),
             "routine"
         );
         // in-place edit inside the tree → routine
         assert_eq!(
-            classify_no_gh("fileChange", &change(&p("src/existing.rs"), json!({"type":"update"})), &cwd),
+            classify_no_gh(
+                "fileChange",
+                &change(&p("src/existing.rs"), json!({"type":"update"})),
+                &cwd
+            ),
             "routine"
         );
         // update with move_path (either spelling) = rename → human
         assert_eq!(
             classify_no_gh(
                 "fileChange",
-                &change(&p("src/existing.rs"), json!({"type":"update","move_path": p("src/renamed.rs")})),
+                &change(
+                    &p("src/existing.rs"),
+                    json!({"type":"update","move_path": p("src/renamed.rs")})
+                ),
                 &cwd
             ),
             "destructive"
@@ -3262,28 +3413,47 @@ mod tests {
         assert_eq!(
             classify_no_gh(
                 "fileChange",
-                &change(&p("src/existing.rs"), json!({"type":"update","movePath": p("src/renamed.rs")})),
+                &change(
+                    &p("src/existing.rs"),
+                    json!({"type":"update","movePath": p("src/renamed.rs")})
+                ),
                 &cwd
             ),
             "destructive"
         );
         // delete → human, always
         assert_eq!(
-            classify_no_gh("fileChange", &change(&p("src/existing.rs"), json!({"type":"delete"})), &cwd),
+            classify_no_gh(
+                "fileChange",
+                &change(&p("src/existing.rs"), json!({"type":"delete"})),
+                &cwd
+            ),
             "destructive"
         );
         // add OVER an existing file is an overwrite → human
         assert_eq!(
-            classify_no_gh("fileChange", &change(&p("src/existing.rs"), json!({"type":"add"})), &cwd),
+            classify_no_gh(
+                "fileChange",
+                &change(&p("src/existing.rs"), json!({"type":"add"})),
+                &cwd
+            ),
             "destructive"
         );
         // missing/unknown kind → human (fail closed)
         assert_eq!(
-            classify_no_gh("fileChange", &json!({ "changes": [{ "path": p("src/x.rs") }] }), &cwd),
+            classify_no_gh(
+                "fileChange",
+                &json!({ "changes": [{ "path": p("src/x.rs") }] }),
+                &cwd
+            ),
             "destructive"
         );
         assert_eq!(
-            classify_no_gh("fileChange", &change(&p("src/x.rs"), json!({"type":"weird"})), &cwd),
+            classify_no_gh(
+                "fileChange",
+                &change(&p("src/x.rs"), json!({"type":"weird"})),
+                &cwd
+            ),
             "destructive"
         );
         // `..` traversal is rejected lexically, before any fs lookup
@@ -3316,7 +3486,10 @@ mod tests {
         assert_eq!(
             classify_no_gh(
                 "fileChange",
-                &change(&dirlink.join("new.rs").to_string_lossy(), json!({"type":"add"})),
+                &change(
+                    &dirlink.join("new.rs").to_string_lossy(),
+                    json!({"type":"add"})
+                ),
                 &cwd
             ),
             "destructive"
@@ -3334,7 +3507,11 @@ mod tests {
         );
         // sensitive names stay human even inside the tree
         assert_eq!(
-            classify_no_gh("fileChange", &change(&p(".env"), json!({"type":"add"})), &cwd),
+            classify_no_gh(
+                "fileChange",
+                &change(&p(".env"), json!({"type":"add"})),
+                &cwd
+            ),
             "destructive"
         );
         // one bad change poisons the batch
@@ -3350,7 +3527,10 @@ mod tests {
             "destructive"
         );
         // no paths to judge → human
-        assert_eq!(classify_no_gh("fileChange", &json!({}), &cwd), "destructive");
+        assert_eq!(
+            classify_no_gh("fileChange", &json!({}), &cwd),
+            "destructive"
+        );
         assert_eq!(
             classify_no_gh("fileChange", &json!({ "changes": [] }), &cwd),
             "destructive"
@@ -3383,9 +3563,7 @@ mod tests {
         let cwd = root.to_string_lossy().into_owned();
         std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
 
-        let change = |path: &str, kind: Value| {
-            json!({ "changes": [{ "path": path, "kind": kind, "diff": "d" }] })
-        };
+        let change = |path: &str, kind: Value| json!({ "changes": [{ "path": path, "kind": kind, "diff": "d" }] });
         let p = |rel: &str| root.join(rel).to_string_lossy().into_owned();
 
         // creates/edits under protected components — all human, every VCS
@@ -3436,7 +3614,12 @@ mod tests {
         // NO false positives: names that merely CONTAIN the substrings stay
         // routine when everything else is fine
         std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
-        for rel in ["agitator.txt", "digit.rs", ".gitignore", ".github/workflows/ci.yml"] {
+        for rel in [
+            "agitator.txt",
+            "digit.rs",
+            ".gitignore",
+            ".github/workflows/ci.yml",
+        ] {
             assert_eq!(
                 classify_no_gh("fileChange", &change(&p(rel), json!({"type":"add"})), &cwd),
                 "routine",
@@ -3487,6 +3670,8 @@ mod tests {
                     effort: None,
                     access: Access::Workspace,
                 },
+                applied_access: Access::Workspace,
+                access_revision: 0,
                 current_turn_id: Some("turn-gen2".into()),
                 busy: true,
                 access_override_pending: false,
@@ -3539,6 +3724,81 @@ mod tests {
         assert!(conductor_access_gate(Access::Full, false).is_ok());
     }
 
+    /// A requested downgrade is not an applied downgrade. Existing
+    /// capabilities remain human-only until a fresh workspace turn ACKs the
+    /// override; pending upgrades are treated as full immediately.
+    #[test]
+    fn conductor_reuse_gate_closes_the_access_downgrade_window() {
+        assert!(conductor_reuse_access_gate(Access::Workspace, Access::Workspace, true,).is_ok());
+
+        for (requested, applied) in [
+            (Access::Workspace, Access::Full),
+            (Access::Full, Access::Workspace),
+            (Access::Full, Access::Full),
+        ] {
+            let err = conductor_reuse_access_gate(requested, applied, true).unwrap_err();
+            assert!(err.contains("FULL access"), "{err}");
+        }
+
+        assert!(conductor_reuse_access_gate(Access::Full, Access::Full, false).is_ok());
+    }
+
+    /// A stale turn/start or respawn ACK must never consume an access choice
+    /// made while that RPC was in flight. In particular, a FULL ACK followed
+    /// by a newer workspace request must leave the downgrade pending.
+    #[test]
+    fn access_ack_cas_preserves_newer_requests_and_clears_matching_respawn() {
+        let sid = format!("access-cas-test-{}", std::process::id());
+        let (tx, _rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
+        SESSIONS.lock().insert(
+            sid.clone(),
+            SessionState {
+                host: Arc::new(ProcessHost::new()),
+                thread_id: Some("t".into()),
+                generation: 1,
+                route_generation: 1,
+                profile: SessionProfile {
+                    cwd: "/repo".into(),
+                    model: None,
+                    effort: None,
+                    access: Access::Workspace,
+                },
+                applied_access: Access::Workspace,
+                access_revision: 2,
+                current_turn_id: None,
+                busy: true,
+                access_override_pending: true,
+                pending_approvals: HashMap::new(),
+                compact_done: None,
+                sink: tx,
+                approval_counter: 0,
+            },
+        );
+
+        // Revision 1's FULL turn ACK lands after revision 2 requested
+        // workspace. FULL is accurately recorded as effective, and the newer
+        // downgrade remains pending for the next fresh turn.
+        commit_applied_access(&sid, Access::Full, 1);
+        {
+            let sessions = SESSIONS.lock();
+            let st = sessions.get(&sid).unwrap();
+            assert_eq!(st.applied_access, Access::Full);
+            assert_eq!(st.profile.access, Access::Workspace);
+            assert!(st.access_override_pending);
+        }
+
+        // A matching revision-2 resume/turn ACK applies the downgrade and may
+        // now consume the pending bit.
+        commit_applied_access(&sid, Access::Workspace, 2);
+        {
+            let sessions = SESSIONS.lock();
+            let st = sessions.get(&sid).unwrap();
+            assert_eq!(st.applied_access, Access::Workspace);
+            assert!(!st.access_override_pending);
+        }
+        SESSIONS.lock().remove(&sid);
+    }
+
     /// Audit C3 (frozen): the DETACHED REVIEW runs the same Conductor access
     /// gate as send/steer — a human-granted FULL-access session refuses
     /// BEFORE the resume/review touches the process at all. This closes the
@@ -3562,6 +3822,8 @@ mod tests {
                     effort: None,
                     access: Access::Full,
                 },
+                applied_access: Access::Full,
+                access_revision: 0,
                 current_turn_id: None,
                 busy: false,
                 access_override_pending: false,
@@ -3602,6 +3864,8 @@ mod tests {
                     effort: None,
                     access: Access::Workspace,
                 },
+                applied_access: Access::Workspace,
+                access_revision: 0,
                 current_turn_id: Some("stale-turn-gen1".into()),
                 // …while a NEW send already claimed busy and is respawning
                 busy: true,
@@ -3620,7 +3884,10 @@ mod tests {
             let sessions = SESSIONS.lock();
             let st = sessions.get(&sid).unwrap();
             assert_eq!(st.generation, 2, "the fence moved forward");
-            assert_eq!(st.route_generation, 1, "the route commits only after the resume");
+            assert_eq!(
+                st.route_generation, 1,
+                "the route commits only after the resume"
+            );
             assert!(st.current_turn_id.is_none(), "the dead turn id cleared");
             assert!(st.busy, "the in-flight operation keeps its busy claim");
         }
@@ -3628,12 +3895,18 @@ mod tests {
         // THE RACE: the delayed gen-1 Exited arrives now — pre-fix it
         // cleared busy (state was still on gen 1); post-fix the fence
         // rejects it and the operation's busy claim survives
-        assert!(exit_bookkeeping(&sid, 1).is_none(), "stale exit must not apply");
+        assert!(
+            exit_bookkeeping(&sid, 1).is_none(),
+            "stale exit must not apply"
+        );
         assert!(turn_completed_bookkeeping(&sid, 1).is_none());
         {
             let sessions = SESSIONS.lock();
             let st = sessions.get(&sid).unwrap();
-            assert!(st.busy, "the delayed gen-1 exit must not clear the new operation's busy flag");
+            assert!(
+                st.busy,
+                "the delayed gen-1 exit must not clear the new operation's busy flag"
+            );
         }
 
         // gen-2 events apply normally once the turn actually runs
@@ -3659,7 +3932,10 @@ mod tests {
 
     #[test]
     fn review_targets_map_to_wire_shapes() {
-        assert_eq!(review_target("").unwrap(), json!({ "type": "uncommittedChanges" }));
+        assert_eq!(
+            review_target("").unwrap(),
+            json!({ "type": "uncommittedChanges" })
+        );
         assert_eq!(
             review_target("uncommitted").unwrap(),
             json!({ "type": "uncommittedChanges" })
@@ -3678,8 +3954,14 @@ mod tests {
 
     #[test]
     fn approval_request_is_classified_and_passed_through() {
-        assert_eq!(approval_kind("item/commandExecution/requestApproval"), Some("command"));
-        assert_eq!(approval_kind("item/fileChange/requestApproval"), Some("fileChange"));
+        assert_eq!(
+            approval_kind("item/commandExecution/requestApproval"),
+            Some("command")
+        );
+        assert_eq!(
+            approval_kind("item/fileChange/requestApproval"),
+            Some("fileChange")
+        );
         assert_eq!(approval_kind("item/tool/requestUserInput"), None);
 
         // the whole request (itemId, reason, command, availableDecisions) must
@@ -3735,7 +4017,7 @@ mod tests {
     // (needs codex + login + network — CI stays green); run with:
     //   cargo test sessions_spike -- --ignored --nocapture
 
-    use crate::codex::host::{ResumeError, THREAD_TIMEOUT_MS, RPC_TIMEOUT_MS};
+    use crate::codex::host::{ResumeError, RPC_TIMEOUT_MS, THREAD_TIMEOUT_MS};
     use std::time::Duration;
 
     #[tokio::test]
@@ -3753,15 +4035,29 @@ mod tests {
             let host = ProcessHost::new();
             let (conn, _gen) = host.ensure().await.expect("spawn");
             let started = conn
-                .request("thread/start", thread_start_params(&profile), THREAD_TIMEOUT_MS)
+                .request(
+                    "thread/start",
+                    thread_start_params(&profile),
+                    THREAD_TIMEOUT_MS,
+                )
                 .await
                 .expect("thread/start");
-            let thread_id = started.pointer("/thread/id").and_then(|v| v.as_str()).unwrap().to_string();
+            let thread_id = started
+                .pointer("/thread/id")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string();
             let (tx, mut rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
             conn.register_thread(&thread_id, tx);
             conn.request(
                 "turn/start",
-                turn_params(&thread_id, "Run the shell command `sleep 30` and tell me when it finishes.", &profile, false, None),
+                turn_params(
+                    &thread_id,
+                    "Run the shell command `sleep 30` and tell me when it finishes.",
+                    &profile,
+                    false,
+                    None,
+                ),
                 RPC_TIMEOUT_MS,
             )
             .await
@@ -3772,34 +4068,54 @@ mod tests {
             let mut interrupted_sent = false;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             let status = loop {
-                let ev = tokio::time::timeout_at(deadline, rx.recv()).await.expect("timeout").expect("closed");
+                let ev = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("timeout")
+                    .expect("closed");
                 match ev {
                     ThreadEvent::Notification { method, params } => {
                         if method == "turn/started" {
-                            turn_id = params.pointer("/turn/id").and_then(|v| v.as_str()).map(str::to_string);
+                            turn_id = params
+                                .pointer("/turn/id")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string);
                         }
                         if method == "item/started"
-                            && params.pointer("/item/type").and_then(|v| v.as_str()) == Some("commandExecution")
+                            && params.pointer("/item/type").and_then(|v| v.as_str())
+                                == Some("commandExecution")
                             && !interrupted_sent
                         {
                             if let Some(tid) = &turn_id {
                                 println!("[a] command running — sending turn/interrupt");
-                                conn.request("turn/interrupt", json!({ "threadId": thread_id, "turnId": tid }), RPC_TIMEOUT_MS)
-                                    .await
-                                    .expect("turn/interrupt");
+                                conn.request(
+                                    "turn/interrupt",
+                                    json!({ "threadId": thread_id, "turnId": tid }),
+                                    RPC_TIMEOUT_MS,
+                                )
+                                .await
+                                .expect("turn/interrupt");
                                 interrupted_sent = true;
                             }
                         }
                         if method == "turn/completed" {
-                            break params.pointer("/turn/status").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                            break params
+                                .pointer("/turn/status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                                .to_string();
                         }
                     }
-                    ThreadEvent::Request { responder, .. } => responder.ok(&json!({ "decision": "accept" })),
+                    ThreadEvent::Request { responder, .. } => {
+                        responder.ok(&json!({ "decision": "accept" }))
+                    }
                     ThreadEvent::Exited => panic!("[a] process exited mid-spike"),
                 }
             };
             println!("[a] interrupt → turn status = {status}");
-            assert_eq!(status, "interrupted", "(a) turn/interrupt must yield status interrupted");
+            assert_eq!(
+                status, "interrupted",
+                "(a) turn/interrupt must yield status interrupted"
+            );
         }
 
         // (b) DECLINE — workspace + on-request only gates commands that
@@ -3810,7 +4126,9 @@ mod tests {
             println!("\n==== (b) decline ====");
             let cwd = std::env::temp_dir().join("swarmz-sessions-spike-b");
             std::fs::create_dir_all(&cwd).ok();
-            let outside = dirs::home_dir().unwrap().join("swarmz_spike_declined.marker");
+            let outside = dirs::home_dir()
+                .unwrap()
+                .join("swarmz_spike_declined.marker");
             std::fs::remove_file(&outside).ok();
             let profile = SessionProfile {
                 cwd: cwd.to_string_lossy().into_owned(),
@@ -3821,10 +4139,18 @@ mod tests {
             let host = ProcessHost::new();
             let (conn, _g) = host.ensure().await.expect("spawn");
             let started = conn
-                .request("thread/start", thread_start_params(&profile), THREAD_TIMEOUT_MS)
+                .request(
+                    "thread/start",
+                    thread_start_params(&profile),
+                    THREAD_TIMEOUT_MS,
+                )
                 .await
                 .expect("thread/start");
-            let thread_id = started.pointer("/thread/id").and_then(|v| v.as_str()).unwrap().to_string();
+            let thread_id = started
+                .pointer("/thread/id")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string();
             let (tx, mut rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
             conn.register_thread(&thread_id, tx);
             let prompt = format!(
@@ -3843,10 +4169,20 @@ mod tests {
             let mut cmd_status: Option<String> = None;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
             let status = loop {
-                let ev = tokio::time::timeout_at(deadline, rx.recv()).await.expect("timeout").expect("closed");
+                let ev = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("timeout")
+                    .expect("closed");
                 match ev {
-                    ThreadEvent::Request { method, params, responder } => {
-                        println!("[b] server request {method} — reason={:?}", params.get("reason").and_then(|v| v.as_str()));
+                    ThreadEvent::Request {
+                        method,
+                        params,
+                        responder,
+                    } => {
+                        println!(
+                            "[b] server request {method} — reason={:?}",
+                            params.get("reason").and_then(|v| v.as_str())
+                        );
                         if approval_kind(&method).is_some() {
                             responder.ok(&json!({ "decision": "decline" }));
                             declined = true;
@@ -3856,13 +4192,21 @@ mod tests {
                     }
                     ThreadEvent::Notification { method, params } => {
                         if method == "item/completed"
-                            && params.pointer("/item/type").and_then(|v| v.as_str()) == Some("commandExecution")
+                            && params.pointer("/item/type").and_then(|v| v.as_str())
+                                == Some("commandExecution")
                         {
-                            cmd_status = params.pointer("/item/status").and_then(|v| v.as_str()).map(str::to_string);
+                            cmd_status = params
+                                .pointer("/item/status")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string);
                             println!("[b] commandExecution completed status={cmd_status:?}");
                         }
                         if method == "turn/completed" {
-                            break params.pointer("/turn/status").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                            break params
+                                .pointer("/turn/status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                                .to_string();
                         }
                     }
                     ThreadEvent::Exited => panic!("[b] process exited mid-spike"),
@@ -3870,7 +4214,10 @@ mod tests {
             };
             println!("[b] declined={declined} cmd_status={cmd_status:?} turn_status={status}");
             assert!(declined, "(b) a command approval must have been requested");
-            assert!(!outside.is_file(), "(b) the declined command must NOT have run");
+            assert!(
+                !outside.is_file(),
+                "(b) the declined command must NOT have run"
+            );
             std::fs::remove_file(&outside).ok();
             println!("[b] turn continued to status={status} after the decline");
         }
@@ -3887,10 +4234,18 @@ mod tests {
             let host = ProcessHost::new();
             let (conn, _g) = host.ensure().await.expect("spawn");
             let started = conn
-                .request("thread/start", thread_start_params(&profile), THREAD_TIMEOUT_MS)
+                .request(
+                    "thread/start",
+                    thread_start_params(&profile),
+                    THREAD_TIMEOUT_MS,
+                )
                 .await
                 .expect("thread/start");
-            let thread_id = started.pointer("/thread/id").and_then(|v| v.as_str()).unwrap().to_string();
+            let thread_id = started
+                .pointer("/thread/id")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string();
             let (tx, mut rx) = mpsc::channel(host::ROUTE_CHANNEL_CAPACITY);
             conn.register_thread(&thread_id, tx);
             conn.request(
@@ -3904,9 +4259,14 @@ mod tests {
             let mut output_deltas = 0usize;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
             loop {
-                let ev = tokio::time::timeout_at(deadline, rx.recv()).await.expect("timeout").expect("closed");
+                let ev = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("timeout")
+                    .expect("closed");
                 match ev {
-                    ThreadEvent::Request { responder, .. } => responder.ok(&json!({ "decision": "accept" })),
+                    ThreadEvent::Request { responder, .. } => {
+                        responder.ok(&json!({ "decision": "accept" }))
+                    }
                     ThreadEvent::Notification { method, .. } => {
                         if method == "item/commandExecution/outputDelta" {
                             output_deltas += 1;
@@ -3937,7 +4297,10 @@ mod tests {
                 thread_resume_params("019f0000-0000-7000-8000-000000000000", &profile),
             )
             .await;
-            assert!(matches!(bogus, Err(ResumeError::ThreadNotFound(_))), "bogus resume must classify as ThreadNotFound");
+            assert!(
+                matches!(bogus, Err(ResumeError::ThreadNotFound(_))),
+                "bogus resume must classify as ThreadNotFound"
+            );
         }
     }
 
@@ -3970,7 +4333,11 @@ mod tests {
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         git(&repo, &["init", "-q", "-b", "main"]);
@@ -3998,7 +4365,11 @@ mod tests {
             let host = ProcessHost::new();
             let (conn, _g) = host.ensure().await.expect("spawn");
             let started = conn
-                .request("thread/start", thread_start_params(&profile), THREAD_TIMEOUT_MS)
+                .request(
+                    "thread/start",
+                    thread_start_params(&profile),
+                    THREAD_TIMEOUT_MS,
+                )
                 .await
                 .expect("thread/start");
             let tid = started
@@ -4072,7 +4443,10 @@ mod tests {
         // cleanup, safe-gated: the worktree is dirty (untracked marker) →
         // the re-check must REFUSE (the tools' gate)
         let st = crate::worktree::status(&wt.path, None);
-        println!("[iv] status before cleanup: dirty={} ahead={}", st.dirty, st.ahead);
+        println!(
+            "[iv] status before cleanup: dirty={} ahead={}",
+            st.dirty, st.ahead
+        );
         assert!(st.dirty, "the marker file must make the worktree dirty");
         // a gated cleanup refuses here — resolve the work, re-check, remove
         std::fs::remove_file(&marker).unwrap();
@@ -4135,7 +4509,11 @@ mod tests {
         let host = ProcessHost::new();
         let (conn, _g) = host.ensure().await.expect("spawn");
         let started = conn
-            .request("thread/start", thread_start_params(&profile), THREAD_TIMEOUT_MS)
+            .request(
+                "thread/start",
+                thread_start_params(&profile),
+                THREAD_TIMEOUT_MS,
+            )
             .await
             .expect("thread/start");
         let thread_id = started
@@ -4196,16 +4574,28 @@ mod tests {
             serde_json::from_str(final_message.trim()).expect("final message must be pure JSON");
         assert!(report["done"].is_boolean(), "done must be a boolean");
         assert!(report["summary"].is_string(), "summary must be a string");
-        assert!(report["needs_human"].is_boolean(), "needs_human must be a boolean");
-        assert!(report["files_changed"].is_array(), "files_changed must be an array");
+        assert!(
+            report["needs_human"].is_boolean(),
+            "needs_human must be a boolean"
+        );
+        assert!(
+            report["files_changed"].is_array(),
+            "files_changed must be an array"
+        );
         assert!(report["followups"].is_array(), "followups must be an array");
         assert_eq!(report["done"], true, "the tiny task must be done: {report}");
         // and the reported work is real
         let created = cwd.join("STATUS.md");
         assert!(created.is_file(), "the agent must have created STATUS.md");
         let content = std::fs::read_to_string(&created).unwrap();
-        assert!(content.contains("phase5 spike"), "unexpected content: {content}");
-        println!("[phase5] outputSchema forced a valid report — done={} summary={:?}", report["done"], report["summary"]);
+        assert!(
+            content.contains("phase5 spike"),
+            "unexpected content: {content}"
+        );
+        println!(
+            "[phase5] outputSchema forced a valid report — done={} summary={:?}",
+            report["done"], report["summary"]
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -4235,7 +4625,11 @@ mod tests {
         let host = ProcessHost::new();
         let (conn, _gen) = host.ensure().await.expect("spawn app-server");
         let started = conn
-            .request("thread/start", thread_start_params(&profile), THREAD_TIMEOUT_MS)
+            .request(
+                "thread/start",
+                thread_start_params(&profile),
+                THREAD_TIMEOUT_MS,
+            )
             .await
             .expect("thread/start");
         let tid = started
@@ -4248,9 +4642,7 @@ mod tests {
 
         // wait for THIS turn's terminal event — the same signal the fixed
         // `session_compact` blocks on (turn/completed resolves compact_done)
-        async fn wait_turn_completed(
-            rx: &mut mpsc::Receiver<ThreadEvent>,
-        ) -> (String, String) {
+        async fn wait_turn_completed(rx: &mut mpsc::Receiver<ThreadEvent>) -> (String, String) {
             let mut final_message = String::new();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
             loop {

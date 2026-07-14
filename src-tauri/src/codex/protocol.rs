@@ -16,7 +16,10 @@ use serde_json::{json, Value};
 #[derive(Debug)]
 pub enum Incoming {
     /// Answer to one of OUR requests (`id` echoes the numeric id we sent).
-    Response { id: u64, result: Result<Value, String> },
+    Response {
+        id: u64,
+        result: Result<Value, String>,
+    },
     /// SERVER-initiated request (e.g. `item/tool/call`, approvals) — must be
     /// answered. `id` is kept as raw JSON so the response echoes it exactly
     /// (`RequestId` is `number | string` on the wire).
@@ -371,7 +374,9 @@ mod tests {
         // schema) — parse defensively, never require it
         let decisions = params["availableDecisions"].as_array().unwrap();
         assert!(decisions.contains(&json!("accept")));
-        assert!(decisions.iter().any(|d| d.get("acceptWithExecpolicyAmendment").is_some()));
+        assert!(decisions
+            .iter()
+            .any(|d| d.get("acceptWithExecpolicyAmendment").is_some()));
 
         // the four plain response decisions (CommandExecutionApprovalDecision)
         // — "accept"/"decline" live-verified on 0.144.1 (a decline marks the
